@@ -80,7 +80,7 @@ The merge queue takes one change at a time and re-tests each against everything 
 python3 workflow-cost.py <run-id> --prs 4 --baseline-per-pr 66
 ```
 
-Point it at a run directory or a bare run id. Prices are list prices in the `PRICES` table at the top; edit them to whatever you actually pay. This is the only file here you can use unmodified.
+Point it at a run directory or a bare run id. Prices are list prices in the `PRICES` table at the top; edit them to whatever you actually pay. This and `asset-provenance.py` are the two files here you can use unmodified.
 
 After each batch, compare two things: cost per change, and what the critic caught versus what got past it. When the critic misses something, the fix is a new scripted check, not a more expensive critic. When a critic finds nothing on a tier for three batches, drop it from that tier.
 
@@ -100,7 +100,23 @@ Three things came out of it that transfer to any project where agents produce fi
 
 **Gate the bytes.** A script now walks each image and fails the build if it finds provenance metadata: in a PNG that is an optional named chunk, in an SVG a metadata element holding a signed blob, in a JPEG a segment near the front. Detection is cheap. `strings file.png | grep -i c2pa` is enough to tell you whether you have this problem right now, and most people who generate assets do.
 
+`asset-provenance.py` in this repo is that script. It walks a whole tree, parses each container, and exits 1 if it finds anything that is not picture data: a C2PA manifest or a text chunk in a PNG, an EXIF, XMP or C2PA chunk in a WebP, an APP1 or APP11 segment in a JPEG, a metadata element or an editor namespace in an SVG, and bytes appended past the end of any of them. A PNG chunk it does not recognise counts as a finding too, so a provenance format that does not exist yet still trips it.
+
+```
+python3 asset-provenance.py .            # scan, exit 1 on a finding
+python3 asset-provenance.py . --strip    # remove what it found, in place
+```
+
+Put it wherever your other checks run. In a Node project that is one line in each of two scripts:
+
+```
+"test":     "... && python3 asset-provenance.py .",
+"prebuild": "... && python3 asset-provenance.py ."
+```
+
 **Filter, do not re-encode.** The obvious fix is to run everything through an image tool with a strip flag. That works and it rewrites every pixel, which changes the file hash. If any of your evidence is a hash, and mine was, you have just invalidated it and you will not notice. Dropping the optional chunks and leaving the rest alone keeps the image data identical byte for byte. Verify it: parse the result, check the checksums, compare the compressed image stream before and after.
+
+`--strip` copies the chunks that are the picture and drops the rest, so the compressed stream is never rewritten. It proves that before it writes: it hashes the image data before and after and refuses the write if they differ. Planting a 5.5 KB C2PA manifest into a real shipped asset and stripping it again returned a file byte for byte identical to the original. SVG is the exception. It is text, so the script reports it and leaves the edit to you rather than guessing at your XML.
 
 **Scan the whole repository, not the diff.** I pointed the new check at every asset rather than only the changed ones. It immediately found a file that had carried a screenshot's camera metadata since the day it was committed, months earlier. A check scoped to the diff would never have seen it, and that is true of every check scoped to the diff.
 
