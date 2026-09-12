@@ -124,6 +124,52 @@ The general form: list what your agents produce that your checks cannot read. Im
 
 One process note, since it nearly cost me the fix. The change was in the merge queue when I found this, and a queued branch cannot be pushed to. I had to pull it out of the queue first. Whatever your equivalent is, know how to do it before you need to, because the window is however long the queue takes.
 
+## 10. A check that passes having checked nothing
+
+Every recurring failure I have had this year is one shape. Not a check that fails when it should
+not. A check that reports success without having checked anything, because silence and success look
+identical and nobody investigates a pass.
+
+I had two in one afternoon, on a release that was otherwise ready.
+
+**The preflight script passed having run no tests.** It takes the test classes to run as arguments.
+Given none, it did the restore, the build and every file scan, then printed `all checks passed`. I
+read that line, believed it, and pushed. CI caught the real problem eighteen minutes later.
+
+What makes this worth writing down is that the same script already refused the identical hole one
+level down: a named class matching zero tests was treated as a failure, with a comment explaining
+that a filter matching nothing still "finishes cleanly, exit 0". The reasoning was right and was
+applied one level too shallow. The fix is six lines.
+
+```bash
+if [ ${#classes[@]} -eq 0 ] && [ "$no_tests" -eq 0 ]; then
+  echo "no -class given, so no test would run and this would pass having tested nothing."
+  exit 1
+fi
+```
+
+**Nothing compared three files that pin the same version.** A release moves a version in one file
+and the others are forgotten. An integration test caught it, correctly, eighteen minutes into CI.
+The test was doing its job. Nothing was doing the job of saying so before the build.
+`check-pinned-values.sh` in this repository is the general form: give it file and capture pairs and
+it fails with a diff.
+
+Note what I did not do. The test that caught it pins the version as a literal on purpose, so that
+bumping the constant is a conscious act rather than something carried along automatically. Deleting
+it to stop the noise would have removed the only thing that noticed. The new check runs earlier; it
+does not replace it.
+
+**The general form.** For every check you own, ask what it does when handed nothing to do. Not what
+it does when it finds a problem, which is the case you designed and tested. A test runner given an
+empty filter. A linter given no files. A scanner pointed at a directory that moved. A comparison
+where both sides are empty strings, which are equal. Each of those exits 0, and an exit code of 0
+is the only thing anyone reads.
+
+Then make it fail before you trust it. Revert the fix and watch the gate go red, or feed the check
+the exact mistake it exists to catch. Both of the gates above were written that way, and testing
+the empty-capture case is what found that two unreadable files would have compared equal and passed.
+That is the bug this whole section is about, sitting inside its own fix.
+
 ## What this does not fix
 
 A backlog with no definition of finished refills faster than it drains. Automation widens the drain. It does not close the tap. Decide what done means first.
