@@ -170,6 +170,52 @@ the exact mistake it exists to catch. Both of the gates above were written that 
 the empty-capture case is what found that two unreadable files would have compared equal and passed.
 That is the bug this whole section is about, sitting inside its own fix.
 
+## 11. The machine has a ceiling too
+
+Section 6 caps changes in flight because of the merge queue. There is a second ceiling, and it is
+the machine the agents run on.
+
+On 13 September 2026 I had thirteen agents running at once on a three core, 16 GB box. Every brief
+was reasonable on its own. Five of them were building the same .NET solution and starting Postgres
+containers for integration tests; the rest were installing npm packages and driving Playwright.
+Load average reached 44. The same box serves live sites. They held up, the static site still
+answered in about a tenth of a second, but that was down to what those sites are, not to any plan.
+
+Nothing in this method said how many agents a machine can carry, because I had only ever measured
+tokens. Cost per change looked fine. The cost that was climbing was not on the bill.
+
+**Check before you fan out.** `nproc` and `uptime`, before the first agent starts, not after the
+fans do.
+
+**Queue the heavy commands, not the agents.** Reading code and writing a change is cheap. Compiling,
+installing packages, starting containers and running a browser is what saturates a machine. So let
+every agent run, and put only those commands in a queue: one lane per toolchain, one command per
+lane. A .NET build and an npm install can overlap; two builds cannot.
+
+**Run agent work at the lowest priority.** `nice -n 19` means a live service wins every contest for
+CPU. For processes already running, `renice` does the same without restarting anything.
+
+**Stop build servers from lingering.** MSBuild keeps worker nodes alive after a build for the next
+one. With several agents that is a dozen idle processes holding memory. `-nodeReuse:false` makes
+them exit.
+
+After lowering the priority of what was running and putting the builds in a queue, load roughly
+halved within a few minutes. Two agents finishing in that window helped, so I will not claim the
+whole drop for the fix.
+
+The mistake worth naming is how I first applied it. I sent the rule to twelve running agents as a
+message. That is the instruction form section 4 warns against: it has to reach every agent, and the
+next one I start will not have it. `heavy.sh` in this repository is the script form.
+
+```
+bash heavy.sh dotnet dotnet build MySolution.sln -nodeReuse:false
+bash heavy.sh node   npm ci
+```
+
+It takes a lane lock with `flock`, runs the command under `nice -n 19`, says so when it is waiting,
+and fails when handed no command instead of taking the lock and exiting 0. Name it once in the
+agent brief; the queue does the rest.
+
 ## What this does not fix
 
 A backlog with no definition of finished refills faster than it drains. Automation widens the drain. It does not close the tap. Decide what done means first.
