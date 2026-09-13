@@ -46,4 +46,9 @@ if ! flock -n "$lock" true 2>/dev/null; then
   echo "heavy.sh: lane '$lane' is busy, waiting" >&2
 fi
 
-exec flock "$lock" nice -n 19 "$@"
+# -o closes the lock before the command runs. Without it every child the command starts inherits
+# the lock, and a child that outlives the build keeps it. The Roslyn compiler server does exactly
+# that: it stays up for minutes after `dotnet build` exits, so the lane stayed locked with nothing
+# building and every other agent waited on it. The lock still covers the whole command, because
+# flock keeps its own copy until the command exits.
+exec flock -o "$lock" nice -n 19 "$@"

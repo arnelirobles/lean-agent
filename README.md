@@ -216,6 +216,17 @@ It takes a lane lock with `flock`, runs the command under `nice -n 19`, says so 
 and fails when handed no command instead of taking the lock and exiting 0. Name it once in the
 agent brief; the queue does the rest.
 
+The first version of that script had a bug the same night. It took the lock with a plain `flock`,
+so every process the command started inherited the lock. `dotnet build` starts the Roslyn compiler
+server, which stays up for minutes after the build exits, and it kept the lock the whole time. Four
+agents waited about ten minutes on a lane where nothing was running. `flock -o` closes the lock
+before the command starts, so only the command itself holds it. The test that proved it: a job
+that leaves a 6 second child running made the next job wait 6.0 seconds before the change and 0.0
+after, while two jobs in the same lane still took 4.0 seconds for two 2 second sleeps.
+
+The general form is the one from section 10. A lock that is released when its holder exits is only
+as reliable as your knowledge of every process that can become its holder.
+
 ## What this does not fix
 
 A backlog with no definition of finished refills faster than it drains. Automation widens the drain. It does not close the tap. Decide what done means first.
