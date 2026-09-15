@@ -227,6 +227,18 @@ after, while two jobs in the same lane still took 4.0 seconds for two 2 second s
 The general form is the one from section 10. A lock that is released when its holder exits is only
 as reliable as your knowledge of every process that can become its holder.
 
+## 12. The critic is a skill, and it argues with itself
+
+The critic in section 2 is now a Claude Code skill: [`skills/adversarial-review`](skills/adversarial-review/SKILL.md). Copy the folder into `.claude/skills/` in a repository, or into `~/.claude/skills/` to use it everywhere.
+
+Two changes made it better than the brief I used to paste.
+
+**The finder is never the judge.** One fresh agent hunts for defects against the six questions, a contract question and the repository's own rules file. A second fresh agent, which never sees the first one's reasoning, tries to prove each finding wrong: it looks for the guard elsewhere, confirms the change caused it, and runs the smallest check that settles it. Only survivors are reported. A reviewer that scores its own findings keeps the confident ones, and confident is not the same as right.
+
+**The repository's rules come first.** A review bot does not know that a stricter validation is a breaking change here, that a console refuses an API whose contract version it does not list, or that nothing hashed from a secret may sit in a publicly readable record. On one night in September 2026 a bot caught a stale cache timestamp, a webhook replay check in the wrong order and a missing timeout, and missed two pull requests that would have locked every released console out of the next API. The critic caught those two because the rules file lists each consumer and the version range it accepts. Keep a `docs/review-rules.md` per repository; `review-rules.example.md` shows the shape.
+
+Run both. The bot is good at general stability and correctness patterns; the critic is good at what only this codebase knows. `log-review.sh` appends one line per review so section 7's comparison has numbers, and a category the critic keeps confirming becomes a scripted check.
+
 ## What this does not fix
 
 A backlog with no definition of finished refills faster than it drains. Automation widens the drain. It does not close the tap. Decide what done means first.
