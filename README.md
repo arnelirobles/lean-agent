@@ -28,7 +28,9 @@ The cheap model drafts every tier. Before a change is opened, the preflight scri
 
 Read section 10 before you trust that paragraph. It described a script I had not written for two weeks, and the critic below answered question 1 yes over a revert that never happened.
 
-**It only answers the question when the hunk modifies a file that already existed.** A file the change adds outright is one hunk covering the whole file, so holding it out deletes the file and nothing compiles, and the run ends inconclusive having proven nothing. I found that on the first real branch I pointed it at: ten production files, all of them new, every binding inconclusive by construction. On the twelve changes merged before it, seven touched no production code at all and four of the remaining five modified existing files, so the case it handles is the common one. That is a measurement on one repository, not a law.
+**It answers the question when the hunk can be removed without breaking a reference to it.** Holding a hunk out is a revert, so the tree has to still compile afterwards or no test runs and the answer is inconclusive. That rules out a file the change adds outright, and it rules out a new method other code already calls. It does not rule out large hunks: one 197 line hunk held out cleanly, because what it replaced was self-contained, while a 41 line new method failed because the file called it three lines later. Size is not the predictor. Whether anything else refers to the code is.
+
+In practice that means a change to code that already existed, which is most bug fixes and most hardening work, and not a greenfield feature. Six runs on one repository: three passed, three were inconclusive, and every inconclusive was a hunk something else referred to.
 
 A second cheap agent, fresh context, reviews every change in a checked-out copy it can build and run. Six questions, each answered yes or no with the line that proves it:
 
@@ -206,26 +208,34 @@ that tests nothing has to say so in writing next to the diff rather than simply 
 It ships with a fixture suite that runs a known one-hunk change past eleven cases, every failure
 path included, and preflight fails if any of them stops returning its exit code.
 
-**What running it has actually shown, after three changes.** It cost 24 to 34 seconds per binding,
-two builds and two test runs included, where I had expected minutes and had written down slowness
-as the thing most likely to kill it. That is one repository on one laptop, and integration tests
-that need containers will cost more.
+**What running it has actually shown, after nine runs on one repository.** Cost was 24 to 62 seconds
+per binding, two builds and two test runs included, integration tests on containers at the top of
+that range. I had expected minutes and had written slowness down as the thing most likely to kill
+it. It is not.
 
-It caught one false binding: a line I added that could never execute, with a test bound to it that
-passed either way. One catch on the only branch where the question could be put honestly. The other
-two runs ended inconclusive for reasons that say nothing about the idea, one because every
-production file on that branch was new, one because Docker was stopped and the bound class needed
-containers.
+Of the six runs against real merged changes, three passed and three were inconclusive. A pass is
+worth reading precisely: the named tests failed while their hunk was held out and passed again once
+it was restored, so the test does depend on the code it claims to. Three of three inconclusives were
+the same cause, a hunk that something else referred to, so reverting it did not compile and no test
+ran.
 
-Running it also found three defects in itself and one thing it had never supported. It resolved the
+It caught one false binding, on a change I built to be catchable: a line that could never execute,
+with a test bound to it that passed either way. One catch in nine runs, and the eight others were
+either honest passes or inconclusive. That is not evidence it finds defects in the wild. It is
+evidence the mechanism does what it says when the question can be asked.
+
+Running it found four defects in itself and one thing it had never supported. It resolved the
 repository from its own file path, so a copy run from anywhere else reported a git error for what
 was a path bug. It spent two builds discovering that a whole-file hunk cannot be held out, which the
-diff header says for free. It reported a stopped Docker as a broken branch. And it never parsed the
-`none:` declaration, although the change that introduced it put `none:` in its own description. Each
-of those came from use, not from review.
+diff header says for free. It reported a stopped Docker as a broken branch. It said "all bindings
+held out and failed as required" on a change where every hunk was declared untested and nothing had
+been held out, which is this whole document's bug appearing inside its own fix. And it never parsed
+the `none:` declaration, although the change that introduced it put `none:` in its own description.
+Five findings, none of them from review, all of them from use.
 
-Three changes is not twenty, so the number that would make me delete it still stands: twenty with
-no catch, or more than half coming back inconclusive.
+Nine runs is not twenty, and only six were against changes I did not write for the purpose. The
+number that would make me delete it still stands: twenty with no catch, or more than half coming
+back inconclusive.
 
 ## 11. The machine has a ceiling too
 

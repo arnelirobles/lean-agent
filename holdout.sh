@@ -274,6 +274,17 @@ run_class() {  # prints total:failed, or "none" when no summary line appeared
   echo "${total}:${failed:-0}"
 }
 
+# Every hunk declared untested and nothing bound. That is a legitimate answer for a change that
+# ships data rather than behaviour, so it passes, but it must not borrow the words of a run that
+# held something out. Say what happened, and stop before spending a build proving nothing.
+if [ ${#bindings[@]} -eq 0 ]; then
+  echo "holdout: no bindings. ${#untested[@]} hunk(s) declared untested, nothing was held out."
+  for u in ${untested[@]+"${untested[@]}"}; do
+    echo "         untested  $(printf '%s' "$u" | cut -f1) $(printf '%s' "$u" | cut -f2)"
+  done
+  exit 0
+fi
+
 echo "== holdout: building the clean tree =="
 ( cd "$wt" && eval "$HOLDOUT_BUILD_CMD" >/dev/null 2>&1 ) \
   || { echo "holdout: the clean tree does not build, nothing can be proven"; exit 3; }
@@ -352,7 +363,7 @@ for b in ${bindings[@]+"${bindings[@]}"}; do
 done
 
 case "$status" in
-  0) echo "holdout: all bindings held out and failed as required" ;;
+  0) echo "holdout: ${#bindings[@]} binding(s) held out, each named test failed and passed again on restore" ;;
   1) echo "holdout: a test passed with its hunk held out" ;;
   2) echo "holdout: a binding could not be resolved, so nothing was proven for it" ;;
   3) echo "holdout: inconclusive, the held-out tree did not build" ;;
