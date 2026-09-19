@@ -28,6 +28,8 @@ The cheap model drafts every tier. Before a change is opened, the preflight scri
 
 Read section 10 before you trust that paragraph. It described a script I had not written for two weeks, and the critic below answered question 1 yes over a revert that never happened.
 
+**It only answers the question when the hunk modifies a file that already existed.** A file the change adds outright is one hunk covering the whole file, so holding it out deletes the file and nothing compiles, and the run ends inconclusive having proven nothing. I found that on the first real branch I pointed it at: ten production files, all of them new, every binding inconclusive by construction. On the twelve changes merged before it, seven touched no production code at all and four of the remaining five modified existing files, so the case it handles is the common one. That is a measurement on one repository, not a law.
+
 A second cheap agent, fresh context, reviews every change in a checked-out copy it can build and run. Six questions, each answered yes or no with the line that proves it:
 
 1. Did the holdout check run, and is its output on the change? Not "was the hunk reverted", which an agent can answer from the description alone.
@@ -201,11 +203,29 @@ success and the gate is green forever over a check that never ran, which is this
 reappearing inside the fix for this section's bug. It also fails on an unclaimed hunk, so a change
 that tests nothing has to say so in writing next to the diff rather than simply staying quiet.
 
-It ships with a fixture suite that runs a known one-hunk change past all eight cases, every failure
-path included, and preflight fails if any of them stops returning its exit code. That is the only
-part of this I would call proven. Whether the check catches anything real is still unknown, and I
-have written down the number that would make me delete it: twenty changes with no catch, or more
-than half coming back inconclusive.
+It ships with a fixture suite that runs a known one-hunk change past eleven cases, every failure
+path included, and preflight fails if any of them stops returning its exit code.
+
+**What running it has actually shown, after three changes.** It cost 24 to 34 seconds per binding,
+two builds and two test runs included, where I had expected minutes and had written down slowness
+as the thing most likely to kill it. That is one repository on one laptop, and integration tests
+that need containers will cost more.
+
+It caught one false binding: a line I added that could never execute, with a test bound to it that
+passed either way. One catch on the only branch where the question could be put honestly. The other
+two runs ended inconclusive for reasons that say nothing about the idea, one because every
+production file on that branch was new, one because Docker was stopped and the bound class needed
+containers.
+
+Running it also found three defects in itself and one thing it had never supported. It resolved the
+repository from its own file path, so a copy run from anywhere else reported a git error for what
+was a path bug. It spent two builds discovering that a whole-file hunk cannot be held out, which the
+diff header says for free. It reported a stopped Docker as a broken branch. And it never parsed the
+`none:` declaration, although the change that introduced it put `none:` in its own description. Each
+of those came from use, not from review.
+
+Three changes is not twenty, so the number that would make me delete it still stands: twenty with
+no catch, or more than half coming back inconclusive.
 
 ## 11. The machine has a ceiling too
 
