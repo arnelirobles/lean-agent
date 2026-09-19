@@ -24,11 +24,13 @@ Close duplicates and anything already solved by other means while you are in the
 
 ## 2. The cascade
 
-The cheap model drafts every tier. Before a change is opened, the preflight script runs the mutation check: the change description names the production line each new test depends on, the script reverts that line, and the named tests must fail. A test that passes either way is a gate failure, not a nit.
+The cheap model drafts every tier. Before a change is opened, the preflight script runs the holdout check: the change description names the production hunk each new test depends on, the script holds that hunk out and rebuilds, and the named tests must fail. A test that passes either way is a gate failure, not a nit.
+
+Read section 10 before you trust that paragraph. It described a script I had not written for two weeks, and the critic below answered question 1 yes over a revert that never happened.
 
 A second cheap agent, fresh context, reviews every change in a checked-out copy it can build and run. Six questions, each answered yes or no with the line that proves it:
 
-1. Was the mutation reverted, and did the named tests fail?
+1. Did the holdout check run, and is its output on the change? Not "was the hunk reverted", which an agent can answer from the description alone.
 2. Is every new route in every inventory, with the gate the issue asked for?
 3. Does every session and raw query in the change name its tenant?
 4. Does every new document, event or index have a migration or an upcaster?
@@ -88,7 +90,9 @@ After each batch, compare two things: cost per change, and what the critic caugh
 
 My first version of this escalated to the expensive model only when the automated checks failed. I tested that against the twelve real defects the expensive reviewers had caught that week, and every one of them was, by definition, something the checks had not noticed. The rule would have called in the strong model zero times for the things that mattered.
 
-That is why the critic runs on every change now, and why the mutation check exists. Run your own version of that test before you trust any of this.
+That is why the critic runs on every change now, and why the holdout check was written. Run your own version of that test before you trust any of this, and note that attacking the method is what eventually found that the holdout check had never run at all.
+
+Be honest about the ceiling while you are at it. Nine of those twelve defects would still pass the holdout check, because a check cannot see what a test does not test. It closes the other three, the tests that pass either way. It does not replace the critic.
 
 ## 9. Your checks read text. Half of what an agent makes is not text.
 
@@ -169,6 +173,39 @@ Then make it fail before you trust it. Revert the fix and watch the gate go red,
 the exact mistake it exists to catch. Both of the gates above were written that way, and testing
 the empty-capture case is what found that two unreadable files would have compared equal and passed.
 That is the bug this whole section is about, sitting inside its own fix.
+
+**The worst one I have had was a check that did not exist.** Section 2 above has described a
+mutation check since early September: name the production line a test depends on, revert it, the
+test must fail. Question 1 of the critic's list asked whether that had happened. For two weeks
+critics answered yes.
+
+There was no script. The preflight file had no revert step and no hunk parsing, and not one of the
+last forty merged changes carried a binding. The check I wrote to catch gates that cannot fail was
+one, and it had the strongest possible output: a reviewer affirming it in writing, on every change.
+
+Two things in that are worth more than the fix.
+
+**An item phrased as a fact can be answered from the description.** "Was the mutation reverted" is
+a claim about the world that a reader satisfies by believing the change description. "Did the
+holdout check run, and is its output here" names an artefact that either exists or does not. Phrase
+every checklist item as the second kind. If an item can be satisfied by an opinion, it will be.
+
+**Nothing found it. A person did**, reading the script against the document that described it. When
+the answer to "what caught this" is a name rather than a mechanism, the mechanism is the finding.
+
+The replacement holds a hunk out in a throwaway copy, rebuilds, and requires the named test to
+fail, then restores and requires it to pass. One decision in it matters more than the rest:
+**a held-out tree that does not compile is inconclusive, not a pass.** Reverting one hunk of a typed
+language usually breaks the build, and a tree that does not build runs no tests. Score that as
+success and the gate is green forever over a check that never ran, which is this section's bug
+reappearing inside the fix for this section's bug. It also fails on an unclaimed hunk, so a change
+that tests nothing has to say so in writing next to the diff rather than simply staying quiet.
+
+It ships with a fixture suite that runs a known one-hunk change past all eight cases, every failure
+path included, and preflight fails if any of them stops returning its exit code. That is the only
+part of this I would call proven. Whether the check catches anything real is still unknown, and I
+have written down the number that would make me delete it: twenty changes with no catch, or more
+than half coming back inconclusive.
 
 ## 11. The machine has a ceiling too
 
