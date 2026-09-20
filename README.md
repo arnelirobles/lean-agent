@@ -361,7 +361,21 @@ So, honestly:
 
 The honest conclusion is that this is a cheap pre-filter that buys a few tests and the occasional latent trap, and it is not a substitute for an adversarial pass. If it stays, keep the import half and the questions, and treat the symbol list as optional.
 
-That is two changes of evidence, not twenty, and both were large. A smaller change with a narrow surface may well look different. Attack it again before trusting either direction.
+That is two changes of evidence, not twenty, and both were large. A smaller change with a narrow surface may well look different.
+
+### The third run, which pays for the other two
+
+The next change was a narrow one, four screens that each handled the same optimistic concurrency response their own way. The symbol list printed nothing at all, both times it ran. The import list printed twenty four entries, eleven crossed by an existing or new test, twelve dismissed with a sentence in the pull request.
+
+The twenty fourth was a real defect that would have shipped. A presets module appeared on the list only because it imports the site module. It turned out to hold a fourth answer to the same conflict response, writing the same document, which meant the change's own title was wrong and one screen would still have told a person to try again where the other three now merge silently. Nothing in eight hundred tests pointed at it. The list did.
+
+Both of the two questions paid on that change too. The configuration one found that re-seeding after a save had dropped the header a deployment can be configured to require, so the second save from an open editor would have been refused. The failure-path one is the whole subject, and following every caller of the three old handlers into the one new handler is what surfaced the fourth.
+
+So across three changes: the symbol list produced no defect on any of them, and was pure noise on two. The import list produced nothing, nothing, and then the one defect that mattered. The questions paid on all three.
+
+The symbol list is now off by default, behind `--symbols`. Keeping it on meant paying to read fifty entries on every change to find the three that were real, and it never once held the answer.
+
+Two other things that run tells you. That change also found two silent overwrites, both of which wrote an older document under a precondition the server accepted, so somebody's edit vanished with no error anywhere. Neither came from any reviewer; they came from unifying four code paths and seeing what they disagreed about. And the review bot returned nothing on it at all, the first time all day, on the change with the most dangerous bugs in it. A quiet reviewer is not evidence of a clean change.
 
 The other half of this is that the operator is a failure source too, and a cheaper one to fix. Three traps from the same run, all mine rather than an agent's:
 

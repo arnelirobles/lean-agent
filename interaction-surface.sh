@@ -16,13 +16,19 @@
 # It finds candidates, it does not judge them. The output is the list the author has to account
 # for: for each entry, either a test that crosses that boundary, or a sentence saying why not.
 #
-# Usage:  interaction-surface.sh [base-ref]        (default: origin/master)
-#         interaction-surface.sh --wip             (uncommitted work against HEAD)
+# Usage:  interaction-surface.sh [base-ref]            (default: origin/master)
+#         interaction-surface.sh --wip                 (uncommitted work against HEAD)
+#         interaction-surface.sh --symbols [base-ref]  (also list exported-symbol callers)
+#
+# The symbol list is off by default. Across three changes it produced no defect, while the import
+# list produced the one real find, so paying to read it by default was not earning its place.
 #
 # Exit codes: 0 always. This reports, it does not gate. A gate that guesses gets switched off.
 
 set -uo pipefail
 
+WITH_SYMBOLS=0
+if [ "${1:-}" = "--symbols" ]; then WITH_SYMBOLS=1; shift; fi
 BASE=${1:-origin/master}
 if [ "$BASE" = "--wip" ]; then BASE=HEAD; fi
 
@@ -65,6 +71,7 @@ SYMBOLS=$(echo "$SYMBOLS" | awk 'length($0) >= 4')
 CHANGED_RE=$(echo "$CHANGED" | sed 's/[].[^$\\*/]/\\&/g' | paste -sd'|' -)
 
 found_any=0
+if [ "$WITH_SYMBOLS" = "1" ]; then
 echo "== Unchanged files using a symbol this diff defines =="
 echo
 while IFS= read -r sym; do
@@ -83,6 +90,7 @@ while IFS= read -r sym; do
 done <<< "$SYMBOLS"
 [ "$found_any" = "0" ] && echo "  none"
 echo
+fi
 
 echo "== Unchanged files importing a changed file =="
 echo
