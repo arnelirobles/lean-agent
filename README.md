@@ -412,6 +412,40 @@ The gate that catches this already existed and runs everything in order. It was 
 
 A check that demands a change and a check that consumes it are different checks, and the second one is the one nobody thinks of. That is the whole argument for having a single entry point that runs all of them, and for using it even when you are confident you know which one matters.
 
+## 14b. Every wait loop needs a deadline, not just a condition
+
+Agents wait on things: a test run, a CI job, a pull request's checks. They write the obvious loop,
+which polls until a condition holds, and the loop is correct. It is also unbounded, and the thing it
+waits for can stop being reachable while it waits.
+
+This happened twice in one day, with different causes and the same shape.
+
+The first time, twelve shells polled with `pgrep -f 'dotnet test ...'`. That pattern matched each
+shell's own command line, so every one of them found itself, concluded the suite was still running,
+and slept again. They kept each other alive too. The oldest ran for nearly three hours.
+
+The second time, three shells waited on work that had been overtaken. One waited for a commit to
+appear in a CI run, but that commit never landed because the pull request merged while it was in
+flight. One waited for a merged pull request's head to change, which it never will. One waited for a
+file to disappear that is still there. Between them they made roughly eight hundred pointless API
+calls over three and a half hours.
+
+None of this shows up as a failure. The task list just shows something waiting patiently, which is
+indistinguishable from something working.
+
+Three rules, in order of how much they buy:
+
+1. **Bound every loop.** A deadline turns a stuck wait into a report. `for i in $(seq 1 60); do ...
+   done` and then say plainly that it timed out, rather than `until ...; do sleep; done`.
+2. **Never match on a command string that your own command line contains.** Watch a file the run
+   writes, check a process id you captured when you started it, or exclude `$$`.
+3. **Re-check the premise, not only the condition.** A loop waiting for a pull request should stop
+   when that pull request merges, whatever its head commit says. The condition and the reason for
+   waiting are different things, and only the first one is usually written down.
+
+The harness will re-invoke an agent when tracked work finishes, so most of these loops should not
+exist at all. When one genuinely must, it gets a deadline.
+
 ## 14a. Give every agent its own scratchpad directory
 
 Agents running in one session share a scratchpad. Two of them wrote a pull request body to
