@@ -412,6 +412,36 @@ The gate that catches this already existed and runs everything in order. It was 
 
 A check that demands a change and a check that consumes it are different checks, and the second one is the one nobody thinks of. That is the whole argument for having a single entry point that runs all of them, and for using it even when you are confident you know which one matters.
 
+## 15. What a reader should be able to observe, and the two goals that poison themselves
+
+The point of all of this is that somebody following it sees cheaper, faster, less back and forth, fewer defects, fewer security findings, and no loss of quality. Five of those six are safe to chase. Two of them are not, and chasing them makes the method worse while every number improves.
+
+**Fewer review findings is not a goal.** A change with no findings is either a clean change or a weak review, and the count alone cannot tell you which. On one real pull request the review bot returned nothing at all. That change held two silent overwrites: the editor sent the version of its latest read rather than of the read its edit was built from, so with a conflict banner on screen saying nothing had been saved, Save wrote the older document under a precondition the server accepted and somebody's edit vanished with no error anywhere. By finding count it was the best change of the day. It was the most dangerous.
+
+**Fewer security findings has the same shape, and worse consequences.** Scanner findings go down when you scan less, when you stop adding the kind of code scanners understand, and when somebody dismisses an alert. One of today's scanner findings was a genuine false positive, verified and left open rather than dismissed; three others on the same branch were real. A number that moves for four unrelated reasons is not a signal.
+
+So neither is a target. What replaces them:
+
+- **Findings move earlier.** A defect caught before the push costs one local run. The same defect caught after costs a push, a CI round, a review, a fix, another push and another round. On a repository where the test job is twenty five minutes that is the difference between a minute and an hour.
+- **Escaped defects fall.** A defect traced back to a change that already merged is the only number that distinguishes better code from a softer review, and it is the number nobody keeps.
+
+`log-review.sh` now records four more counts per change: where each finding was caught (`pre_push`, `ci`, `review`) and how many escaped. An older eight column log is widened in place on the next write, so the history from before the columns existed stays comparable.
+
+Then the claims are testable rather than felt:
+
+| Claim | What it looks like in the log |
+| --- | --- |
+| Findings move earlier | `pre_push` rises as a share, and the total does not fall |
+| The code is getting better | `escaped` falls |
+| The review still works | `review` stays non-zero while `escaped` stays at zero |
+| The review has gone soft | `review` falls and `escaped` rises |
+
+The last two rows are identical if you only count findings. That is the whole reason for the columns.
+
+**What can be claimed today, honestly.** Faster is the clearest: the same shape of task took thirty minutes on a cheaper model against one to eight hours. Cheaper is real but invisible in tokens, since the count barely moved and the saving is all in the rate. Less back and forth is partly true through grouping, nine pull requests carrying about twenty issues, and partly undone by two avoidable CI rounds and a port collision that were the coordinator's errors, not any agent's. Quality held, and is provable through the gates rather than asserted: tests proven red before the fix, a holdout check that binds each test to the hunk it covers, and a pixel comparison against a captured design that cannot be talked into passing.
+
+Fewer defects and fewer vulnerabilities are not yet claimable in either direction. The columns above are how that gets answered, and it takes batches, not a day.
+
 ## What this does not fix
 
 A backlog with no definition of finished refills faster than it drains. Automation widens the drain. It does not close the tap. Decide what done means first.
