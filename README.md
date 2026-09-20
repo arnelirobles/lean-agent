@@ -60,6 +60,7 @@ Four scripts do what I used to write into every agent brief. They live in the re
 - `scripts/needs-review.sh` prints the rules above.
 - `scripts/strip-asset-provenance.py` removes embedded provenance metadata from images, and fails the build in `--check` mode if any is left. Section 9 is why.
 - `interaction-surface.sh`, in this repository, prints what a diff touches that it did not write. Section 13 is why.
+- `agent-hygiene.sh`, in this repository, reports what parallel agents leave behind: stuck wait loops, orphaned servers, scratchpad collisions, worktrees on merged branches. Section 14a is why.
 
 They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `scripts/`. Copy the shape, replace the checks with your own.
 
@@ -412,7 +413,58 @@ The gate that catches this already existed and runs everything in order. It was 
 
 A check that demands a change and a check that consumes it are different checks, and the second one is the one nobody thinks of. That is the whole argument for having a single entry point that runs all of them, and for using it even when you are confident you know which one matters.
 
-## 14b. Every wait loop needs a deadline, not just a condition
+## 14a. Sweep for what parallel agents leave behind, because none of it announces itself
+
+Four to six agents running in parallel for one day left, all of it silently:
+
+- twelve shells polling forever on a pattern that matched their own command line, keeping each other alive;
+- three more waiting on work that had been overtaken, making about eight hundred pointless API calls;
+- four web servers orphaned nine days earlier by sessions that had ended, listening on every interface;
+- two agents on the same fixed test port, each driving the other's code;
+- two agents publishing each other's pull request bodies, which left an issue open whose work had merged;
+- about sixty five gigabytes of worktrees on branches that had all merged.
+
+Not one of these showed up as a failure. That is the whole problem. A stuck wait and a working one look identical in a task list. An orphaned server answers requests normally. A worktree on a merged branch looks exactly like one on live work. A test run that reuses somebody else's server goes green.
+
+So this is not a rule to remember, because remembering is what failed. It is `agent-hygiene.sh`, run between batches. It reports and never deletes, because deciding what is live is the part a script cannot do.
+
+```
+./agent-hygiene.sh                    # the current repository
+./agent-hygiene.sh ~/dev/a ~/dev/b    # several
+```
+
+Two things learned writing it. Container workloads are excluded by parent process, because a poller inside a container is doing its job and a check that reports it every run teaches people to skip the output. And merged state has to come from the pull request, never from a commit count, because a squash merge leaves the original commits looking unmerged and a count will tell you nine branches have unlanded work when they have none.
+
+## 14b. Give every agent its own scratchpad directory
+
+Agents running in one session share a scratchpad. Two of them wrote a pull request body to
+`scratchpad/pr-body.md`, and the second write published the first agent's body onto the wrong pull
+request. It happened twice in one day.
+
+The first time cost a real thing. The overwritten body carried the line that closes an issue, so the
+issue stayed open although its work had merged, and the merged pull request kept a permanent record
+of a change it did not contain. Nobody noticed for hours, and only then because the issue count
+looked wrong.
+
+The second time an agent caught it on a final check before handing back, and said the thing worth
+repeating: this one was visible because a pull request body gets published. A plan file or a notes
+file clobbered the same way is just quietly wrong, and nothing ever shows you.
+
+So: every agent writes under its own subdirectory, named for the agent or the branch, and never at
+the root of the shared scratchpad. Bare names are the trap, because every agent independently
+invents the same three: `pr-body.md`, `notes.md`, `plan.md`.
+
+One line in the brief does it:
+
+> Write every file you create under `scratchpad/<your-branch-name>/`. Never write to the root of the
+> scratchpad, and never use a bare name like `pr-body.md`, because another agent is using the same
+> directory and will pick the same name.
+
+This is the same class as the fixed test port in section 14: shared mutable state with a predictable
+name, where the failure is silent and looks like success. Worth looking for wherever agents run in
+parallel, because they do not collide randomly. They collide on the obvious name.
+
+## 14c. Every wait loop needs a deadline, not just a condition
 
 Agents wait on things: a test run, a CI job, a pull request's checks. They write the obvious loop,
 which polls until a condition holds, and the loop is correct. It is also unbounded, and the thing it
@@ -445,35 +497,6 @@ Three rules, in order of how much they buy:
 
 The harness will re-invoke an agent when tracked work finishes, so most of these loops should not
 exist at all. When one genuinely must, it gets a deadline.
-
-## 14a. Give every agent its own scratchpad directory
-
-Agents running in one session share a scratchpad. Two of them wrote a pull request body to
-`scratchpad/pr-body.md`, and the second write published the first agent's body onto the wrong pull
-request. It happened twice in one day.
-
-The first time cost a real thing. The overwritten body carried the line that closes an issue, so the
-issue stayed open although its work had merged, and the merged pull request kept a permanent record
-of a change it did not contain. Nobody noticed for hours, and only then because the issue count
-looked wrong.
-
-The second time an agent caught it on a final check before handing back, and said the thing worth
-repeating: this one was visible because a pull request body gets published. A plan file or a notes
-file clobbered the same way is just quietly wrong, and nothing ever shows you.
-
-So: every agent writes under its own subdirectory, named for the agent or the branch, and never at
-the root of the shared scratchpad. Bare names are the trap, because every agent independently
-invents the same three: `pr-body.md`, `notes.md`, `plan.md`.
-
-One line in the brief does it:
-
-> Write every file you create under `scratchpad/<your-branch-name>/`. Never write to the root of the
-> scratchpad, and never use a bare name like `pr-body.md`, because another agent is using the same
-> directory and will pick the same name.
-
-This is the same class as the fixed test port in section 14: shared mutable state with a predictable
-name, where the failure is silent and looks like success. Worth looking for wherever agents run in
-parallel, because they do not collide randomly. They collide on the obvious name.
 
 ## 15. What a reader should be able to observe, and the two goals that poison themselves
 
