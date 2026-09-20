@@ -45,14 +45,17 @@ fi
 echo "Interaction surface against $BASE"
 echo
 
-# Symbols this diff defines or redefines, taken from added lines only. The patterns cover the
-# declaration forms of the languages this has been used on; an unmatched language yields fewer
-# candidates rather than a wrong answer, which is the failure direction to prefer.
+# Exported symbols this diff defines, taken from added lines only. Exported, not merely top level:
+# the first version matched module-local names too, and on a real branch half the output was a
+# local called `order` or `base` colliding with an unrelated file's local of the same name. A
+# caller cannot depend on what it cannot reach, so a name nothing exports is not a boundary.
+# The patterns cover the declaration forms of the languages this has been used on; an unmatched
+# language yields fewer candidates rather than a wrong answer, which is the direction to prefer.
 SYMBOLS=$(git diff "$BASE" -- $CHANGED 2>/dev/null \
     | grep '^+' | grep -v '^+++' \
     | sed 's/^+//' \
     | grep -vE '^[[:space:]]*(//|\*|/\*|#|--|<!--)' \
-    | grep -oE '^((export|public|internal|protected)[[:space:]]+([A-Za-z]+[[:space:]]+)*|[[:space:]]{0,2})(function|const|let|var|class|interface|type|enum|def|record|struct)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' \
+    | grep -oE '^(export|public|internal|protected)[[:space:]]+([A-Za-z]+[[:space:]]+)*(function|const|let|var|class|interface|type|enum|def|record|struct)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' \
     | awk '{print $NF}' \
     | sort -u)
 

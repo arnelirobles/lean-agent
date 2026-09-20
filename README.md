@@ -309,7 +309,7 @@ Run both. The bot is good at general stability and correctness patterns; the cri
 
 ## 13. Every finding is an interaction, so look there before you push
 
-In one run in September 2026, nine agent-made pull requests across three repositories went through the critic and a review bot. Every defect that survived verification was an interaction between two things. Not one was a defect inside the thing the agent built.
+In one run in September 2026, agent-made pull requests across three repositories went through the critic and a review bot. Over the first five, every defect that survived verification was an interaction between two things and not one was a defect inside the thing the agent built.
 
 - A diagnostic route supplied a query scope the page route does not pass, so it reported a binding as resolving that the live page leaves unbound.
 - A purge generation expired after a day, while a cache entry with the backstop turned off never expires, so a container could fall back onto a key another one still held.
@@ -330,6 +330,18 @@ So the target is not fewer findings. It is earlier ones. A finding caught after 
 I checked it against a case whose answer I already knew. The pull request that added per-collection settings changed `src/related.ts` and left `src/screens/post-view.tsx` alone. The script names that exact pair. The defect that escaped that pull request was in that exact pair, and it was fixed two pull requests later. One local run, before the push, would have put it in front of the author.
 
 Two callers deserve a second look whatever the list says, because both produced real defects above while every test passed: a path that reads configuration the change also reads, and a path that runs when the change fails rather than when it succeeds.
+
+### What the sixth pull request did to that claim
+
+The next change through was bigger than the five before it, and it broke the pattern. Six findings: three were interactions, a search control pointing at a route that cannot read a query, one of two code paths clamping a limit while the other did not, and a fallback that survived for the default configuration but not a replaced one. The other three were defects inside the new code, an unfiltered read, an unvalidated repeated query parameter, and a fixture linking to a page nothing served.
+
+So the honest claim is most, not all, and it thins out as a change gets larger and carries more new surface of its own. A tool aimed at interactions cannot reach the other half, and nothing here should be sold as if it can.
+
+The same run gave the tool its first real use and two corrections worth taking. The author ran it after pushing rather than before, so it was not a clean test of whether it reduces findings. It printed fifteen symbol groups over fifty files, of which about half were pure name collisions, a local called `order` in one module matching an unrelated local of the same name elsewhere. The fix was to match exported declarations only rather than exported or top level: a caller cannot depend on what it cannot reach, so a name nothing exports is not a boundary. On the same branch that took fifteen groups down to three, and two of the three were the exact surface the change was about.
+
+The author's own verdict is the part worth keeping. Reading fifty entries to find three worth acting on still beat a review round trip, but the value was not the file list. It was the two questions at the end, which are prompts rather than search results, and which produced the two tests that were missing: a scope that could shadow a tenant's own field name, and a read whose failure must not throw because it would break a consumer's build. It also surfaced one thing that would otherwise have shipped, a second copy of a mapping that the change had just made redundant.
+
+A list of files is cheap to generate and expensive to read. A short list of questions about the boundary is the opposite. Weight accordingly.
 
 The other half of this is that the operator is a failure source too, and a cheaper one to fix. Three traps from the same run, all mine rather than an agent's:
 
