@@ -343,6 +343,26 @@ The author's own verdict is the part worth keeping. Reading fifty entries to fin
 
 A list of files is cheap to generate and expensive to read. A short list of questions about the boundary is the opposite. Weight accordingly.
 
+### The second run, used properly, and the answer is no
+
+The next change ran it before pushing rather than after, which is the test the first one could not be. It did not reduce review findings.
+
+That change drew fourteen findings from elsewhere: three from the code scanner on regular expressions that stripped scripts, ten from an adversarial reviewer, and one from the review bot. The script found one thing, a latent name collision between two files in the same directory exporting the same two type names, which nothing imported together yet. It prompted five tests that are worth having. It did not find a single one of the fourteen.
+
+Two of those fourteen were serious and neither was reachable from a file list. A block named for sticking never stuck, because every block is wrapped in a div exactly as tall as its contents and a sticky element cannot move outside its containing block; measured, its top went from 0 to minus 400 after a 400 pixel scroll, and no test or screenshot could see it because the look check captures at rest. And a test runner checked that something answered on a port rather than that the thing answering was the process it had just started, so a stale server would have passed the whole suite.
+
+The author's own summary was that every bug that mattered came from somewhere else.
+
+So, honestly:
+
+- **The import half earns its place.** Which unchanged files import a file you changed was useful on both runs. It is a small list and every entry is a real dependency.
+- **The symbol half did not, until it was narrowed.** Before matching exported declarations only it was about ninety five percent noise, local names colliding with unrelated local names. After, it went from eighteen groups to three on the same branch. Even then it produced no defect.
+- **The two questions did more work than the tool.** One of them, the path that runs when the change fails, named exactly the category of the stale-server hole. The script did not find it. The adversarial reviewer did. A question that makes an author go and look beats a list that makes them go and read.
+
+The honest conclusion is that this is a cheap pre-filter that buys a few tests and the occasional latent trap, and it is not a substitute for an adversarial pass. If it stays, keep the import half and the questions, and treat the symbol list as optional.
+
+That is two changes of evidence, not twenty, and both were large. A smaller change with a narrow surface may well look different. Attack it again before trusting either direction.
+
 The other half of this is that the operator is a failure source too, and a cheaper one to fix. Three traps from the same run, all mine rather than an agent's:
 
 - **Run the gates that consume a change, not only the gate that checks it.** After bumping thirteen package versions I ran the version gate and shipped. The test that guards the template's pinned version failed in CI, and fixing that made the template package itself a changed version, which failed the same gate again. Two full test rounds for something one local run would have caught.
