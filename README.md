@@ -412,6 +412,35 @@ The gate that catches this already existed and runs everything in order. It was 
 
 A check that demands a change and a check that consumes it are different checks, and the second one is the one nobody thinks of. That is the whole argument for having a single entry point that runs all of them, and for using it even when you are confident you know which one matters.
 
+## 14a. Give every agent its own scratchpad directory
+
+Agents running in one session share a scratchpad. Two of them wrote a pull request body to
+`scratchpad/pr-body.md`, and the second write published the first agent's body onto the wrong pull
+request. It happened twice in one day.
+
+The first time cost a real thing. The overwritten body carried the line that closes an issue, so the
+issue stayed open although its work had merged, and the merged pull request kept a permanent record
+of a change it did not contain. Nobody noticed for hours, and only then because the issue count
+looked wrong.
+
+The second time an agent caught it on a final check before handing back, and said the thing worth
+repeating: this one was visible because a pull request body gets published. A plan file or a notes
+file clobbered the same way is just quietly wrong, and nothing ever shows you.
+
+So: every agent writes under its own subdirectory, named for the agent or the branch, and never at
+the root of the shared scratchpad. Bare names are the trap, because every agent independently
+invents the same three: `pr-body.md`, `notes.md`, `plan.md`.
+
+One line in the brief does it:
+
+> Write every file you create under `scratchpad/<your-branch-name>/`. Never write to the root of the
+> scratchpad, and never use a bare name like `pr-body.md`, because another agent is using the same
+> directory and will pick the same name.
+
+This is the same class as the fixed test port in section 14: shared mutable state with a predictable
+name, where the failure is silent and looks like success. Worth looking for wherever agents run in
+parallel, because they do not collide randomly. They collide on the obvious name.
+
 ## 15. What a reader should be able to observe, and the two goals that poison themselves
 
 The point of all of this is that somebody following it sees cheaper, faster, less back and forth, fewer defects, fewer security findings, and no loss of quality. Five of those six are safe to chase. Two of them are not, and chasing them makes the method worse while every number improves.
