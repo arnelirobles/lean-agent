@@ -385,6 +385,33 @@ The other half of this is that the operator is a failure source too, and a cheap
 
 One honest tension with section 1, which says a review finding is fixed in the change or dropped. That run filed twelve follow-up issues. Most were genuinely out of scope, an API change in another repository or a product decision an agent should not make alone, and every actual review finding was fixed in its change. But twelve is close enough to a growing backlog that it is worth counting next time rather than trusting the distinction.
 
+## 14. Cheap drafting works, and it stops short
+
+Section 2's cascade was not used for a whole day of work, which makes that day a clean no-cascade baseline. Then the same shape of task was given to a cheaper model. One change, two issues, an API addition and a module change with tests.
+
+| | Expensive, same day | Cheaper |
+| --- | --- | --- |
+| Tokens for comparable work | 197k to 493k | 342k |
+| Wall clock | 1 to 8 hours | 30 minutes |
+
+The token count is the same. The saving is entirely in the rate, so it is real but it is not visible in any token number, and measuring tokens alone will tell you nothing happened. Measure cost, as section 7 says, not volume.
+
+The quality held. It caught that a sibling checkout was six commits behind and pulled it before reading the parser it was documenting against. It left a field out of the documentation because the parser no longer reads it, although the issue text still mentioned it. It bumped the module version the release gate requires without being reminded. When a holdout binding matched zero tests it found the cause, that the binding takes a class name rather than a class and a method, and fixed the declaration instead of deleting the check.
+
+**What it did not do is finish.** It handed back twice without pushing the branch or opening the pull request, each time with an accurate list of what was left. The work was right and the job was not done, and the difference cost the coordinator a full gate run to finish.
+
+So one line goes in every brief, and it is worth more than any instruction about quality:
+
+> You are not done until the pull request URL exists. If you hand back without one, the first line of your report says so and names exactly what remains.
+
+The second fix from the same day is not about models at all.
+
+**Run the script that runs every gate, not the gate you are thinking about.** Thirteen module versions had to move for a release. The module version gate demanded a bump to the template package; making that bump broke a different gate that wants the core package, the template package and the version a scaffolded module targets to move together. That landed on the default branch, so every branch then failed its own preflight at a step none of them had touched.
+
+The gate that catches this already existed and runs everything in order. It was not run, because the one gate that seemed relevant had been run and passed. That mistake happened twice in one day, on the same branch, from the same reasoning.
+
+A check that demands a change and a check that consumes it are different checks, and the second one is the one nobody thinks of. That is the whole argument for having a single entry point that runs all of them, and for using it even when you are confident you know which one matters.
+
 ## What this does not fix
 
 A backlog with no definition of finished refills faster than it drains. Automation widens the drain. It does not close the tap. Decide what done means first.
