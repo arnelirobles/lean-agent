@@ -59,6 +59,7 @@ Four scripts do what I used to write into every agent brief. They live in the re
 - `scripts/sync-master.sh` merges the default branch, regenerates lock files when a project file changed, and reports conflicts.
 - `scripts/needs-review.sh` prints the rules above.
 - `scripts/strip-asset-provenance.py` removes embedded provenance metadata from images, and fails the build in `--check` mode if any is left. Section 9 is why.
+- `interaction-surface.sh`, in this repository, prints what a diff touches that it did not write. Section 13 is why.
 
 They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `scripts/`. Copy the shape, replace the checks with your own.
 
@@ -305,6 +306,38 @@ Two changes made it better than the brief I used to paste.
 **The repository's rules come first.** A review bot does not know that a stricter validation is a breaking change here, that a console refuses an API whose contract version it does not list, or that nothing hashed from a secret may sit in a publicly readable record. On one night in September 2026 a bot caught a stale cache timestamp, a webhook replay check in the wrong order and a missing timeout, and missed two pull requests that would have locked every released console out of the next API. The critic caught those two because the rules file lists each consumer and the version range it accepts. Keep a `docs/review-rules.md` per repository; `review-rules.example.md` shows the shape.
 
 Run both. The bot is good at general stability and correctness patterns; the critic is good at what only this codebase knows. `log-review.sh` appends one line per review so section 7's comparison has numbers, and a category the critic keeps confirming becomes a scripted check.
+
+## 13. Every finding is an interaction, so look there before you push
+
+In one run in September 2026, nine agent-made pull requests across three repositories went through the critic and a review bot. Every defect that survived verification was an interaction between two things. Not one was a defect inside the thing the agent built.
+
+- A diagnostic route supplied a query scope the page route does not pass, so it reported a binding as resolving that the live page leaves unbound.
+- A purge generation expired after a day, while a cache entry with the backstop turned off never expires, so a container could fall back onto a key another one still held.
+- A replay claim was written before the purge it claimed, so a store that threw left the retry told the work was done.
+- Animated blocks were correct on screen and empty to a screen reader, because the only text in the accessibility tree was hidden by the animation.
+
+That is not carelessness and it will not go to zero. An agent has whole context on what it builds and partial context on what it calls. The tests it writes cover what it thought of, which by definition excludes what it did not.
+
+So the target is not fewer findings. It is earlier ones. A finding caught after the push costs push, CI, review, fix, push, CI again. The same finding caught before the push costs one local test run. On a .NET repository where the test job is twenty-five minutes, that is the difference between an hour and a minute.
+
+`interaction-surface.sh` prints the part the agent did not think of. For a diff it answers two questions: which unchanged files use a symbol the diff defines, and which unchanged files import a changed file. It finds candidates, it does not judge them. For each entry the author must produce one of two things before pushing: a test that crosses that boundary, or a sentence saying why that caller is unaffected. An entry with neither is where the critic finds its next defect.
+
+```
+./interaction-surface.sh origin/master      # a branch
+./interaction-surface.sh --wip              # uncommitted work
+```
+
+I checked it against a case whose answer I already knew. The pull request that added per-collection settings changed `src/related.ts` and left `src/screens/post-view.tsx` alone. The script names that exact pair. The defect that escaped that pull request was in that exact pair, and it was fixed two pull requests later. One local run, before the push, would have put it in front of the author.
+
+Two callers deserve a second look whatever the list says, because both produced real defects above while every test passed: a path that reads configuration the change also reads, and a path that runs when the change fails rather than when it succeeds.
+
+The other half of this is that the operator is a failure source too, and a cheaper one to fix. Three traps from the same run, all mine rather than an agent's:
+
+- **Run the gates that consume a change, not only the gate that checks it.** After bumping thirteen package versions I ran the version gate and shipped. The test that guards the template's pinned version failed in CI, and fixing that made the template package itself a changed version, which failed the same gate again. Two full test rounds for something one local run would have caught.
+- **A warning about the thing you just changed is the failure, not noise.** That same run printed `BarakoCMS.Testing 4.0.0 was not found, 4.3.0 was resolved instead` on my own machine. I read it and judged it low risk. It was the CI failure, stated in advance.
+- **A wait loop that greps for a command string matches its own command line.** Twelve background shells polled with `pgrep -f 'dotnet test ...'`, each matched itself, and none could ever exit. They also kept each other alive. Watch a file the run writes, or exclude your own process id.
+
+One honest tension with section 1, which says a review finding is fixed in the change or dropped. That run filed twelve follow-up issues. Most were genuinely out of scope, an API change in another repository or a product decision an agent should not make alone, and every actual review finding was fixed in its change. But twelve is close enough to a growing backlog that it is worth counting next time rather than trusting the distinction.
 
 ## What this does not fix
 
