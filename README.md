@@ -61,6 +61,7 @@ Four scripts do what I used to write into every agent brief. They live in the re
 - `scripts/strip-asset-provenance.py` removes embedded provenance metadata from images, and fails the build in `--check` mode if any is left. Section 9 is why.
 - `interaction-surface.sh`, in this repository, prints what a diff touches that it did not write. Section 13 is why.
 - `agent-hygiene.sh`, in this repository, reports what parallel agents leave behind: stuck wait loops, orphaned servers, scratchpad collisions, worktrees on merged branches. Section 14a is why.
+- `bump-version.sh`, in this repository, moves a Node package's version including the two lock file fields that belong to it and none that do not. Three bumps in one day went wrong in three different ways, which is one more than care can be expected to cover.
 
 They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `scripts/`. Copy the shape, replace the checks with your own.
 
