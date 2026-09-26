@@ -146,6 +146,8 @@ flowchart LR
     F --> X
 ```
 
+**Where the script goes decides who benefits.** A script that works on any repository (landing a stack of pull requests, collecting retro signals, a wait with a deadline, the hygiene sweep) goes to this repository as a pull request, with its test and a line in section 4's list, and every project uses it from here. A script that knows one repository's layout or rules (its preflight, a site's cutover) goes to that repository's `scripts/`; if part of it is general, that part comes here too. Either way it arrives as a pull request, gets the same adversarial review as any change, and a person merges it. Nothing is pushed straight to the default branch of this repository or any other.
+
 Three rules keep it honest:
 
 - **The script gets a test.** A script that passes having done nothing is worse than a brief, because it looks finished. The stack-landing script in 14d stopped the landing twice for a reason that turned out to be its own bug, and the local runner in 14g got three things wrong until it had tests.

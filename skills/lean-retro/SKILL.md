@@ -48,4 +48,4 @@ One short file, in the owner's style (plain, short, no em or en dashes, no arrow
 
 ## 5. After approval
 
-For each approved proposal, open one pull request to the method (and to the repository's scripts if a check is added), update memory and the CLAUDE.md layers that summarise the method, and append a line to `retro-log.md`: date, proposal, the number to watch. Rejected proposals are logged too, with the reason, so they are not proposed again without new evidence.
+For each approved proposal, open one pull request to the method. A new script goes where its dependencies are: one that works on any repository is a pull request to lean-agent-method (with a test and a line in section 4's list); one tied to a repository goes to that repository's `scripts/`, with any general part also offered to the method. Then update memory and the CLAUDE.md layers that summarise the method, and append a line to `retro-log.md`: date, proposal, the number to watch. Rejected proposals are logged too, with the reason, so they are not proposed again without new evidence.
