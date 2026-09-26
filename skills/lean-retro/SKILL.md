@@ -12,7 +12,7 @@ The method improves only through this routine, and only with a person's approval
 Run, for the batch's window and every repository it touched:
 
 ```bash
-REVIEW_LOG=<path to review-log.tsv, if there is one> ./retro-signals.sh --since <YYYY-MM-DD> owner/repo ...
+REVIEW_LOG=<path to review-log.tsv, if there is one> ${CLAUDE_PLUGIN_ROOT}/bin/retro-signals.sh --since <YYYY-MM-DD> owner/repo ...
 ```
 
 Also gather, from the session or the coordinator's notes:

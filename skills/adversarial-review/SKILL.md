@@ -128,7 +128,7 @@ Append one line per review with `log-review.sh`, so each batch can compare what 
 CI and any review bot:
 
 ```bash
-skills/adversarial-review/log-review.sh <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" "<caught elsewhere first>"
+${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" "<caught elsewhere first>"
 ```
 
 When a category keeps surviving refutation, turn it into a scripted check. When a tier has
