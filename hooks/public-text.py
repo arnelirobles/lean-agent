@@ -178,6 +178,8 @@ def self_test():
         'git commit -m "x" -m "Claude-Session: https://claude.ai/code/session_1"',
         'gh pr create --title t --body "done\n\nGenerated with [Claude Code](https://x)"',
         'gh issue comment 5 --body "see https://claude.ai/code/session_abc"',
+        'gh issue create --title t --body "Simulation page: https://claude.ai/code/' + 'artifact/05af"',
+        "gh pr create --title t --body 'the plan: `https://claude.ai/code/" + "artifact/cb6f`'",
         'git commit -m "add a robust retry"',
         'gh pr create --title t --body "fast \u2014 and safe"',
         'gh release create v1 --notes "old \u2192 new"',

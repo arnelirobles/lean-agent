@@ -15,6 +15,7 @@ ATTRIBUTION = [
     r"(^|[\"'])\s*co-authored-by:[^\n]*(claude|anthropic|copilot|cursor|codex|gemini|\[bot\])",
     r"(^|[\"'])\s*claude-session:",
     r"claude\.ai/code/session_",
+    r"claude\.ai/(code/)?(artifact|share|chat)/",
     r"generated with \[?claude code",
     r"noreply@anthropic\.com",
 ]
@@ -70,6 +71,8 @@ def self_test():
     hits = {
         "Co-Authored-By: Cla" + "ude <x@example.com>": "attribution",
         "see https://claude.ai/code/" + "session_abc": "attribution",
+        "Plan page: https://claude.ai/code/" + "artifact/09aef3dd": "attribution",
+        "see https://claude.ai/" + "share/abc": "attribution",
         "a " + "rob" + "ust retry": "slop",
         "fast \u2014 and safe": "slop",
         "Done. Addition" + "ally, it logs.": "slop",
