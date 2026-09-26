@@ -59,6 +59,8 @@ What you get:
 
 Everything else in this README still works without the plugin. The scripts at the root are links into `bin/`.
 
+Claude Code updates an installed plugin only when its version changes. A change to `skills/`, `hooks/`, `bin/` or `lib/` moves the version in `.claude-plugin/plugin.json`, and the merge is tagged `v<version>`; `tests/run-all.sh` fails when those files changed since the current version's tag. `claude plugin update lean-agent@lean-agent` then picks it up.
+
 ## 0. Shape the ticket for the agent, not for a person
 
 My issues were written for me, or for a developer: a problem, why it matters, a rough idea of the fix. An agent reads them differently. Every issue it opens costs it the issue, the linked issues, the repository rules and the code around the change, and a backlog of small issues about one area makes it read the same files again for each one. The expensive part of a ticket is not the change. It is everything around it.

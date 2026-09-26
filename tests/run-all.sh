@@ -41,6 +41,20 @@ else
   failed=$((failed + 1))
 fi
 
+# Claude Code updates an installed plugin only when its version changes, so a change to what
+# installs, made after the current version was tagged, never reaches anyone until the version moves.
+version=$(python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')
+if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+  if git diff --quiet "v$version" HEAD -- skills hooks bin lib .claude-plugin; then
+    echo "ok   version $version matches its tag"
+  else
+    echo "FAIL skills, hooks, bin or lib changed since v$version: bump the version in .claude-plugin/plugin.json"
+    failed=$((failed + 1))
+  fi
+else
+  echo "ok   version $version is not tagged yet; tag v$version when it merges"
+fi
+
 missing=$(grep -L -- '--self-test' bin/* hooks/*.py 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')
 [ -n "$missing" ] && echo "no self-test: $missing"
 
