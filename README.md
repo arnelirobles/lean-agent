@@ -33,7 +33,7 @@ flowchart TD
 This repository is a Claude Code plugin and its own marketplace:
 
 ```bash
-claude plugin marketplace add arnelirobles/lean-agent-method
+claude plugin marketplace add arnelirobles/lean-agent
 claude plugin install lean-agent@lean-agent
 ```
 
