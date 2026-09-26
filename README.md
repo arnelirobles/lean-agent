@@ -1,4 +1,4 @@
-# The lean agent method
+# Lean agent
 
 How I run AI coding agents over a ticket backlog without burning a plan in a night. Written after doing exactly that, on my own project, in September 2026. The story is in the article; this is the method.
 
@@ -34,15 +34,15 @@ This repository is a Claude Code plugin and its own marketplace:
 
 ```bash
 claude plugin marketplace add arnelirobles/lean-agent-method
-claude plugin install lean-agent-method@lean-agent-method
+claude plugin install lean-agent@lean-agent
 ```
 
 What you get:
 
 - `method`, the condensed rules, loaded by the agent when it plans, files, reviews or finishes a batch. You do not call it.
-- `/lean-agent-method:shape-ticket` writes an issue in the agent-ready shape from section 0, after searching for one it belongs to.
-- `/lean-agent-method:adversarial-review` is the critic from section 12.
-- `/lean-agent-method:lean-retro` is the retro from section 16.
+- `/lean-agent:shape-ticket` writes an issue in the agent-ready shape from section 0, after searching for one it belongs to.
+- `/lean-agent:adversarial-review` is the critic from section 12.
+- `/lean-agent:lean-retro` is the retro from section 16.
 - Every script in `bin/` on the agent's PATH while the plugin is enabled.
 - A hook that blocks a commit, tag, pull request, issue or release whose text carries agent attribution (a `Co-Authored-By` for an AI tool, a session link, a "Generated with" line) or slop: em and en dashes, arrow glyphs, and the filler words listed in `SLOP` at the top of the script. It checks message files passed with `-F`, `--body-file` or `--notes-file` too. Attribution was the step that kept getting forgotten, which is what section 16 says turns a rule into a check. `LEAN_ALLOW_ATTRIBUTION=1` or `LEAN_ALLOW_SLOP=1` turns either half off, and `python3 hooks/public-text.py --self-test` proves it.
 

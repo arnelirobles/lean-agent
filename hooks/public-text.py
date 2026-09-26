@@ -154,7 +154,7 @@ def main():
     command = (event.get("tool_input") or {}).get("command") or ""
     found = problems(command, event.get("cwd") or ".")
     if found:
-        print("Blocked by lean-agent-method, public text needs fixing:\n  "
+        print("Blocked by lean-agent, public text needs fixing:\n  "
               + "\n  ".join(found)
               + "\nRewrite it plainly (commas, periods or parentheses for dashes, "
               "words for arrows, no attribution) and run the command again.",

@@ -1,10 +1,10 @@
 ---
 name: method
-description: The lean agent method's working rules for coding agents on a backlog. Load whenever planning, filing or triaging issues, starting or reviewing a change, running agents in parallel, writing a script, or finishing a batch.
+description: Lean agent's working rules for coding agents on a backlog. Load whenever planning, filing or triaging issues, starting or reviewing a change, running agents in parallel, writing a script, or finishing a batch.
 user-invocable: false
 ---
 
-# The lean agent method, condensed
+# Lean agent, condensed
 
 Full text: ${CLAUDE_PLUGIN_ROOT}/README.md
 

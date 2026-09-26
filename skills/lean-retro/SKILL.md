@@ -1,6 +1,6 @@
 ---
 name: lean-retro
-description: Run the lean agent method's retro after a batch of changes merges. Collects facts with retro-signals.sh, checks them against fixed triggers, checks whether the last method change helped, and proposes changes to the method with evidence for a person to approve. Use it at the end of every batch, weekly at the latest, and whenever asked for a retro, a method review or "what should we change about how we work".
+description: Run lean agent's retro after a batch of changes merges. Collects facts with retro-signals.sh, checks them against fixed triggers, checks whether the last method change helped, and proposes changes to the method with evidence for a person to approve. Use it at the end of every batch, weekly at the latest, and whenever asked for a retro, a method review or "what should we change about how we work".
 ---
 
 # Lean retro
