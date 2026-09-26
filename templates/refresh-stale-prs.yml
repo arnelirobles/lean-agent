@@ -1,0 +1,119 @@
+name: Refresh stale pull requests
+
+# When a fix lands on the default branch, every open pull request that was red for the same reason
+# stays red on its older base until somebody notices and updates it by hand.
+#
+# So: when the default branch moves, any pull request that is behind it AND failing gets its branch
+# updated. Nothing is merged and nothing is retried. A failure that is really the branch's own comes
+# back on the next run with the stale base ruled out.
+#
+# Deliberately narrow. Updating a green pull request spends CI minutes to learn nothing. Retrying a
+# failed job instead of rebuilding on a newer base is how a flake becomes invisible.
+#
+# Safety: this job never checks out or runs pull request code. It only calls the GitHub API, and pull
+# request data reaches the shell through files and variables, never through ${{ }} expressions.
+# Forks are skipped, since their branches are not ours to push to.
+#
+# To use it: copy to .github/workflows/, set the branch under `push` to your default branch, and
+# label a pull request `no-self-heal` to keep it on its current base.
+
+on:
+  push:
+    branches: [main]
+  # A fix can also arrive from outside the repository (an image republished, a registry back up),
+  # and nothing pushes when that happens.
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+# update-branch needs pull-requests: write and writes a merge commit to the head branch, so
+# contents: write. checks and statuses are read to see which pull requests are failing.
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: refresh-stale-prs
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Update branches that are behind and failing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Update every pull request that is behind the default branch and red
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # A ceiling, so a bad day cannot start thirty CI runs at once.
+          MAX: "10"
+        run: |
+          set -euo pipefail
+
+          BASE=$(gh api "repos/$REPO" --jq '.default_branch')
+          printf '| PR | behind | checks | action |\n|---|---|---|---|\n' > summary.md
+          acted=0
+
+          gh pr list --repo "$REPO" --state open --base "$BASE" --limit 100 \
+            --json number,isDraft,isCrossRepository,headRefOid,labels,statusCheckRollup \
+            > prs.json
+
+          COUNT=$(jq 'length' prs.json)
+          echo "open pull requests against $BASE: $COUNT"
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            jq ".[$i]" prs.json > pr.json
+            N=$(jq -r '.number' pr.json)
+            SHA=$(jq -r '.headRefOid' pr.json)
+
+            if [ "$(jq -r '.isCrossRepository' pr.json)" = "true" ]; then
+              printf '| #%s | - | - | skipped, fork |\n' "$N" >> summary.md; continue
+            fi
+            if [ "$(jq -r '.isDraft' pr.json)" = "true" ]; then
+              printf '| #%s | - | - | skipped, draft |\n' "$N" >> summary.md; continue
+            fi
+            if [ "$(jq -r '[.labels[].name] | index("no-self-heal") != null' pr.json)" = "true" ]; then
+              printf '| #%s | - | - | skipped, no-self-heal |\n' "$N" >> summary.md; continue
+            fi
+            # The head sha is hex, so it is safe in a URL where a branch name might not be.
+            case "$SHA" in
+              *[!0-9a-f]*|"") printf '| #%s | - | - | skipped, unexpected head sha |\n' "$N" >> summary.md; continue ;;
+            esac
+
+            # A check run reports `conclusion`, a commit status reports `state`; the rollup mixes both.
+            # A cancelled required check blocks a pull request just as a failed one does.
+            FAILING=$(jq -r '[.statusCheckRollup[]? | (.conclusion // .state) | select(. == "FAILURE" or . == "TIMED_OUT" or . == "CANCELLED" or . == "ERROR" or . == "STARTUP_FAILURE")] | length' pr.json)
+            BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA" --jq '.behind_by' 2>/dev/null || echo 0)
+
+            if [ "$BEHIND" -eq 0 ]; then
+              printf '| #%s | 0 | %s failing | up to date |\n' "$N" "$FAILING" >> summary.md; continue
+            fi
+            if [ "$FAILING" -eq 0 ]; then
+              printf '| #%s | %s | green | left alone, green |\n' "$N" "$BEHIND" >> summary.md; continue
+            fi
+            if [ "$acted" -ge "$MAX" ]; then
+              printf '| #%s | %s | %s failing | deferred, hit the ceiling of %s |\n' "$N" "$BEHIND" "$FAILING" "$MAX" >> summary.md; continue
+            fi
+
+            # expected_head_sha makes the update refuse if someone pushed since the list was read.
+            # A 422 usually means a conflict, which a person resolves: report it and move on.
+            if OUT=$(gh api --method PUT "repos/$REPO/pulls/$N/update-branch" -f expected_head_sha="$SHA" 2>&1); then
+              acted=$((acted + 1))
+              printf '| #%s | %s | %s failing | **updated onto %s** |\n' "$N" "$BEHIND" "$FAILING" "$BASE" >> summary.md
+              echo "updated #$N, was $BEHIND behind with $FAILING failing"
+            else
+              printf '| #%s | %s | %s failing | could not update, needs a person |\n' "$N" "$BEHIND" "$FAILING" >> summary.md
+              echo "could not update #$N: $(printf '%s' "$OUT" | tail -n 2)"
+            fi
+          done
+
+          {
+            echo "## Stale pull requests"
+            echo
+            echo "Updated $acted branch(es) that were behind \`$BASE\` with failing checks."
+            echo
+            cat summary.md
+          } >> "$GITHUB_STEP_SUMMARY"

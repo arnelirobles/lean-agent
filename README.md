@@ -574,6 +574,14 @@ This is the same class as the fixed test port in section 14: shared mutable stat
 name, where the failure is silent and looks like success. Worth looking for wherever agents run in
 parallel, because they do not collide randomly. They collide on the obvious name.
 
+The same goes for a file every change appends to. Parallel agents adding entries to one changelog
+left conflict markers and duplicate entries. One fragment file per change, assembled at release,
+gives them nothing to collide on.
+
+An agent in its own worktree has one more rule: it runs git as plain single commands from the
+worktree root, with no `cd x &&` in front and no pipe behind. The harness refuses a command it cannot
+verify, and a compound one is exactly that.
+
 ## 14c. Every wait loop needs a deadline, not just a condition
 
 Agents wait on things: a test run, a CI job, a pull request's checks. They write the obvious loop,
@@ -605,8 +613,11 @@ Three rules, in order of how much they buy:
    when that pull request merges, whatever its head commit says. The condition and the reason for
    waiting are different things, and only the first one is usually written down.
 
-The harness will re-invoke an agent when tracked work finishes, so most of these loops should not
-exist at all. When one genuinely must, it gets a deadline.
+I wrote here that the harness re-invokes an agent when tracked work finishes, so most of these
+loops should not exist. That is true for the session I talk to. It is wrong for a subagent: a
+subagent is never told that background work finished, so it waits on something long done and
+stalls. So a subagent runs its commands in the foreground, and every piece of a gate is sized to
+finish under the tool timeout of 600 seconds. When a loop genuinely must exist, it gets a deadline.
 
 ## 14d. Landing a stack of pull requests is its own job
 
@@ -619,6 +630,8 @@ Seven pull requests, each built on the one before, all reviewed and green. Squas
 
 Write the landing as a script with those checks and stop at the first surprise. Landing a stack by hand makes the same four mistakes, one at a time.
 
+One more thing keeps pull requests from landing, and nobody owns it. A fix lands on the default branch, and every open pull request that was red for the same reason stays red on its old base until somebody notices. [`templates/refresh-stale-prs.yml`](templates/refresh-stale-prs.yml) is a workflow for that: when the default branch moves, it updates the branch of every open pull request that is behind it and failing. It never retries a job, because a retry hides a flake, while a newer base rules out one cause and leaves a real failure visible. It never merges, skips forks and drafts, and leaves alone any pull request labelled `no-self-heal`.
+
 ## 14e. Test what you published, not what you built
 
 A release moved the types every module is compiled against into a new package. Namespaces were unchanged, so every module in the repository still built, every test passed, and the changelog said no module needed an edit. The modules already published, compiled against the old release, could not load, and a host that referenced any of them did not start at all. Nothing in the repository could see it, because the repository only ever built from source.
@@ -626,6 +639,12 @@ A release moved the types every module is compiled against into a new package. N
 It was found by installing the published packages into a fresh host, which is one CI job. The fix was type forwarders, which the project's own public API rule required; the missed step was never testing the thing users install.
 
 If a release changes where public types live, a job that installs the previous release's published packages against the new build is the only check that sees it.
+
+The same holds after a deploy: assert content and identity, not status codes or ratios.
+
+- **A page baked empty still answers 200.** A fresh image prerendered while its data source was unreachable, so its pages carried an error notice instead of content until the next revalidation, and every one answered 200. A status check called it a good release. The check now looks for text the page must contain.
+- **A ratio hides what it averages.** A pixel comparison on a tall page reported 45 wrong dates as 0.005 percent of the pixels, under its cap, and passed. Read the diff image, not the number.
+- **A version string is not an identity.** Today's 0.1.0 and yesterday's 0.1.0 are the same string and can be different builds. Bake the commit sha in at build time and compare that against the commit you meant to deploy.
 
 ## 14f. A rehearsal proves only what it copies
 
@@ -644,6 +663,14 @@ A private repository ran out of free CI minutes in a month: 1,903 of 2,000, near
 The answer was to keep the workflow file as the definition and run its jobs locally: each job in a clean checkout of the commit, every run step in order with the shell the hosted runner uses, stopping at the first failure. A pull request is green when that run passes at its head, and the output goes in the pull request. Turning hosted CI back on changes nothing, because the definition never moved.
 
 The first version was a script in the repository. It got three things wrong that a hosted runner gets right: pipefail on steps that do not ask for it, a missing runner temp directory, and not rewriting a port inside a step's environment. As a separate tool with its own tests it got all three right. A local runner needs its own tests for the same reason a check does: one that passes having checked nothing is worse than none.
+
+## 14h. Plan the steps that need a person
+
+Some steps are not an agent's to take: a merge with no standing permission, anything in production, a write to an outside service, a force push or a deleted branch. Found at the end, each one is a stall: an agent waiting, or a hand-back that says a person is needed and gives no command.
+
+So they get planned at the start, like the tickets. Before a batch begins, list the steps that need a person. When the person gives a standing permission, such as "merge each pull request of this release once CI is green and the review passes", write it down with its scope: which pull requests, which repositories, until when, and what it does not cover. Production stayed outside it even then.
+
+A run ends with one block of exact commands for the person, in order, ready to paste, each with what it proves when it succeeds. Not a list of things to do. Turning a summary back into commands is the step that goes wrong.
 
 ## 15. What a reader should be able to observe, and the two goals that poison themselves
 
@@ -715,6 +742,8 @@ The first run, on one repository for two days, already said something: a stack o
 **Every change carries its own test.** A proposed change names the signal that triggered it and the number that should move if it works. The next retro reads that number first. If it did not move, or moved the wrong way, the retro proposes reverting the change. That is section 8 on a timer.
 
 **One experiment running now: review the ticket before the code.** Section 0 predicts that answering the review's questions in the ticket, plus one cheap agent reading the ticket and the code before anyone builds, cuts fix rounds and findings per change. The baseline is the table above. The claim holds if fix rounds and findings fall while the review after the code still finds something and escaped defects stay at zero. If the review after the code drops to nothing and escaped defects rise, the review before has made everyone overconfident, and it comes out.
+
+**After each milestone, a lean pass over what shipped.** No number triggers this one. Agent-written code and comments over-explain, and none of the gates asks whether the result is lean, so the pass deletes comments that restate the code and shortens what a newer language feature says more plainly, without touching code it is not otherwise changing.
 
 **What it does not do.** It never changes the method, the scripts or anyone's instructions by itself. It proposes; a person decides. A method that rewrites itself unattended drifts toward whatever the numbers reward, which is section 15's warning about goals that poison themselves.
 

@@ -19,7 +19,8 @@ Also gather, from the session or the coordinator's notes:
 - the adversarial review findings of the batch, by category (the review reports, or `review-log.tsv`);
 - tokens or cost per change if known (`workflow-cost.py` for workflow runs, agent usage lines otherwise);
 - every step that needed a person (an approval, a production apply, a permission change);
-- anything an agent worked out by reasoning that an earlier agent had also worked out.
+- anything an agent worked out by reasoning that an earlier agent had also worked out;
+- `.lean/lessons.tsv` in each repository, if it exists: one line per lesson (date, commit sha, subject), written by the lessons commit hook. Take the lines in the batch's window as facts, the same as the script's rows.
 
 ## 2. Check the last change first
 
