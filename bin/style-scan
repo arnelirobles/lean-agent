@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Scan the lines a branch adds for house-style problems, and fail on any.
+
+The hooks catch prose at write time; this is the same check on the diff, for
+a preflight or CI step. It reads the lines added since the merge base with
+BASE (default origin/HEAD, then origin/main, then origin/master), including
+uncommitted and staged changes, and every line of untracked files that are not
+ignored. Each added line is checked for agent attribution and slop (the lists
+in lib/house_style.py) and for any character at or above U+2000 (dashes, curly
+quotes, arrows, emoji), which is how a stray em dash or smart quote shows up.
+
+Skipped: binary files, lock files (package-lock.json, yarn.lock, go.sum,
+*.lock and similar), minified files, and vendored paths (node_modules/,
+vendor/, third_party/, dist/). A line containing `style-scan: allow` is
+skipped, for test data that has to spell the thing it tests.
+
+  style-scan [--base REF]    exit 0 clean, 1 on a hit, 2 when it cannot run
+  LEAN_ALLOW_WIDE_CHARS=1    skip the U+2000 check (text in other scripts)
+  style-scan --self-test
+"""
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from house_style import scan, wide_char  # noqa: E402
+
+LOCK_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "go.sum",
+              "packages.lock.json", "composer.lock", "Gemfile.lock", "Cargo.lock", "poetry.lock",
+              "uv.lock", "Pipfile.lock", "flake.lock"}
+VENDORED = re.compile(r"(^|/)(node_modules|vendor|third_party|dist)/")
+MINIFIED = re.compile(r"\.min\.(js|css)$")
+ALLOW_MARK = "style-scan: allow"
+MAX_UNTRACKED_BYTES = 2_000_000
+
+
+class ScanError(Exception):
+    pass
+
+
+def git(*args, cwd="."):
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=120)
+    if result.returncode != 0:
+        raise ScanError(f"git {' '.join(args)}: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def skipped(path):
+    name = os.path.basename(path)
+    return name in LOCK_NAMES or name.endswith(".lock") or bool(VENDORED.search(path) or MINIFIED.search(path))
+
+
+def base_commit(base, cwd):
+    candidates = [base] if base else ["origin/HEAD", "origin/main", "origin/master"]
+    for ref in candidates:
+        try:
+            return git("merge-base", ref, "HEAD", cwd=cwd).decode().strip()
+        except ScanError:
+            continue
+    raise ScanError(f"no merge base with {' or '.join(candidates)}; pass --base REF")
+
+
+def added_lines(base, cwd="."):
+    """Yield (path, line number, text) for every added line."""
+    diff = git("diff", "--no-color", "--no-ext-diff", "--unified=0", base, "--", cwd=cwd)
+    path, number = None, 0
+    for raw in diff.decode("utf-8", errors="replace").split("\n"):
+        if raw.startswith("+++ "):
+            target = raw[4:]
+            path = target[2:] if target.startswith("b/") else None
+        elif raw.startswith("@@"):
+            match = re.search(r"\+(\d+)", raw)
+            number = int(match.group(1)) if match else 0
+        elif raw.startswith("+") and path and not skipped(path):
+            yield path, number, raw[1:]
+            number += 1
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z", cwd=cwd)
+    for name in untracked.decode("utf-8", errors="replace").split("\0"):
+        full = os.path.join(cwd, name)
+        if not name or skipped(name) or not os.path.isfile(full) or os.path.islink(full):
+            continue
+        if os.path.getsize(full) > MAX_UNTRACKED_BYTES:
+            continue
+        with open(full, "rb") as fh:
+            data = fh.read()
+        if b"\0" in data[:8192]:
+            continue
+        for number, text in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
+            yield name, number, text
+
+
+def findings(base, cwd="."):
+    check_wide = os.environ.get("LEAN_ALLOW_WIDE_CHARS") != "1"
+    out = []
+    for path, number, text in added_lines(base_commit(base, cwd), cwd):
+        if ALLOW_MARK in text:
+            continue
+        problems = [f"{kind} {what}" for kind, what in scan(text)]
+        ch = wide_char(text) if check_wide else None
+        if ch and not any(ch in p for p in problems):
+            problems.append(f"character U+{ord(ch):04X} at or above U+2000")
+        if problems:
+            out.append(f"{path}:{number}: {'; '.join(problems)}: {text.strip()[:120]}")
+    return out
+
+
+def main(argv):
+    base = None
+    if argv[:1] == ["--base"] and len(argv) == 2:
+        base = argv[1]
+    elif argv:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        found = findings(base)
+    except (ScanError, subprocess.SubprocessError, OSError) as exc:
+        print(f"style-scan: {exc}", file=sys.stderr)
+        return 2
+    for line in found:
+        print(line)
+    if found:
+        print(f"style-scan: {len(found)} added line(s) need rewriting", file=sys.stderr)
+        return 1
+    return 0
+
+
+def self_test():
+    import tempfile
+
+    failures = 0
+    word = "rob" + "ust"
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(*args):
+            subprocess.run(["git", "-c", "user.email=t@example.org", "-c", "user.name=t", *args], cwd=tmp,
+                           check=True, capture_output=True)
+
+        def write(name, text, mode="w"):
+            full = os.path.join(tmp, name)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, mode) as fh:
+                fh.write(text)
+
+        run("init", "-q", "-b", "main")
+        write("README.md", f"an old {word} line stays out of scope\n")
+        run("add", ".")
+        run("commit", "-q", "-m", "init")
+        base = "main"
+
+        def expect(name, want_paths):
+            nonlocal failures
+            got = sorted({line.split(":")[0] for line in findings(base, tmp)})
+            if got != sorted(want_paths):
+                print(f"FAIL {name}: got {got}, want {sorted(want_paths)}")
+                failures += 1
+
+        expect("clean branch", [])
+        run("checkout", "-q", "-b", "work")
+        write("README.md", "plain new line\n", "a")
+        run("commit", "-q", "-am", "plain")
+        expect("plain added line", [])
+        write("README.md", f"a {word} claim\n", "a")
+        expect("uncommitted slop", ["README.md"])
+        run("checkout", "-q", "--", "README.md")
+        write("notes/new.txt", "caf\u00e9 is fine, \u201csmart quotes\u201d are not\n")
+        expect("untracked wide char", ["notes/new.txt"])
+        os.remove(os.path.join(tmp, "notes/new.txt"))
+        write("package-lock.json", f"{word}\n")
+        write("node_modules/x/README.md", f"{word}\n")
+        write("image.bin", "\0\0\0 " + word)
+        write("test_data.py", f'SAMPLE = "{word}"  # style-scan: allow\n')
+        expect("skipped files and allow mark", [])
+        write("src/app.py", "x = 1\n# see claude.ai/code/" + "session_x\n")
+        run("add", "src/app.py")
+        run("commit", "-q", "-m", "app")
+        found = findings(base, tmp)
+        if not any(line.startswith("src/app.py:2: attribution") for line in found):
+            print(f"FAIL committed attribution line number: {found}")
+            failures += 1
+        try:
+            findings("no-such-ref", tmp)
+            print("FAIL a missing base did not raise")
+            failures += 1
+        except ScanError:
+            pass
+    print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    sys.exit(main(sys.argv[1:]))

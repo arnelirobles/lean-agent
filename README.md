@@ -44,7 +44,18 @@ What you get:
 - `/lean-agent:adversarial-review` is the critic from section 12.
 - `/lean-agent:lean-retro` is the retro from section 16.
 - Every script in `bin/` on the agent's PATH while the plugin is enabled.
-- A hook that blocks a commit, tag, pull request, issue or release whose text carries agent attribution (a `Co-Authored-By` for an AI tool, a session link, a "Generated with" line) or slop: em and en dashes, arrow glyphs, and the filler words listed in `SLOP` at the top of the script. It checks message files passed with `-F`, `--body-file` or `--notes-file` too. Attribution was the step that kept getting forgotten, which is what section 16 says turns a rule into a check. `LEAN_ALLOW_ATTRIBUTION=1` or `LEAN_ALLOW_SLOP=1` turns either half off, and `python3 hooks/public-text.py --self-test` proves it.
+- Hooks, each with its own off switch. Three block, the rest add a note for the agent and never stop the call. Set an off switch in the `env` block of your Claude Code settings, or for one Bash command inline in front of it (`LEAN_ALLOW_SLOP=1 git commit ...`):
+  - `public-text.py` blocks a commit, tag, pull request, issue, release or `gh api` write whose text carries agent attribution (a `Co-Authored-By` for an AI tool, a session link, a "Generated with" line) or slop: em and en dashes, arrow glyphs, and the filler words in `SLOP` in `lib/house_style.py`. Slop is checked only in the message values (`-m`, `--title`, `--body`, `--notes`, field values, message files, a heredoc fed to `-F -`), with code spans removed; attribution is checked in the whole command. It reads message files passed with `-F`, `--body-file`, `--notes-file`, `--input` or `-F body=@file` too. Attribution was the step that kept getting forgotten, which is what section 16 says turns a rule into a check. Off: `LEAN_ALLOW_ATTRIBUTION=1` or `LEAN_ALLOW_SLOP=1`.
+  - `commit-author.py` blocks `git commit` when the author email git would use is unset, ends in a local host name, or is a `users.noreply.github.com` address without the numeric id. A `.local`, `.lan` or `.internal` domain counts only when a remote is on github.com. Off: `LEAN_ALLOW_COMMIT_AUTHOR=1`.
+  - `scratchpad-root.py` blocks writing `pr-body.md`, `body*.md`, `notes.md` or `plan.md` straight into a scratchpad root, where agents overwrite each other; use a per-task subdirectory. Off: `LEAN_ALLOW_SCRATCHPAD_ROOT=1`.
+  - `style-note.py` notes slop and attribution in the text just written to a `.md`, `.txt` or message-like file. Off: `LEAN_SKIP_STYLE_NOTE=1`.
+  - `record-test-run.py` and `test-before-push.py` record each passing compiled test run (not one piped into `tail`, since the pipe hides its exit code) and note, on `git push`, `gh pr create` or `gh pr merge`, the changed source files edited since. Off: `LEAN_SKIP_TEST_BEFORE_PUSH=1`.
+  - `verify-claim.py` asks, before a `gh` comment or review of 30 words or more, whether each claim was checked or should say "I think". Off: `LEAN_SKIP_VERIFY_CLAIM=1`.
+  - `docs-containers.py` notes `docker compose up/run` or `docker run` when every changed file is documentation. Off: `LEAN_SKIP_DOCS_CONTAINERS=1`.
+  - `lesson-log.py` appends a commit whose subject says fix, revert, flaky, silent, gate or regress to `.lean/lessons.tsv` (format in the script header) for the retro, and adds `.lean/` to `.git/info/exclude` so it is not committed. Off: `LEAN_SKIP_LESSON_LOG=1`.
+- `style-scan` runs the same slop, attribution and U+2000 checks over the lines a branch adds, untracked files included, for a preflight or CI step.
+- With the plugin on, `"attribution": {"commit": "", "pr": ""}` in your Claude Code settings is no longer needed, since the hook blocks the trailer anyway. Setting it too is harmless.
+- `tests/run-all.sh` runs every `--self-test` in the repository.
 
 Everything else in this README still works without the plugin. The scripts at the root are links into `bin/`.
 
