@@ -1,0 +1,1 @@
+bin/check-deployed-sha.sh
