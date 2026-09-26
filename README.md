@@ -10,6 +10,24 @@ Shape the ticket for the agent before anyone starts: one ticket is one agent pas
 
 That took me from about 66 dollars of model use per change to about 25, with no drop in what got caught.
 
+The whole loop, with the section that covers each step:
+
+```mermaid
+flowchart TD
+    A[Ideas and findings] --> B["Shape the ticket (0)<br/>one agent pass, agent-ready, risks answered"]
+    B --> C["Cheap model drafts (2, 14)"]
+    C --> D["Scripts run the mechanical checks (4)<br/>preflight, holdout, needs-review"]
+    D --> E{"Diff fires a rule? (3)"}
+    E -- no --> H[Merge queue, four in flight at most (6)]
+    E -- yes --> F["Cheap critic, six questions (2, 12)"]
+    F -- closed --> H
+    F -- a no not fixed in one round --> G["Back to the same drafter (5)<br/>expensive model only if it still fails"]
+    G --> D
+    H --> I["Measure the batch (7, 15)"]
+    I --> J["Something repeated or slipped through?<br/>Script it (4a)"]
+    J --> D
+```
+
 ## 0. Shape the ticket for the agent, not for a person
 
 My issues were written for me, or for a developer: a problem, why it matters, a rough idea of the fix. An agent reads them differently. Every issue it opens costs it the issue, the linked issues, the repository rules and the code around the change, and a backlog of small issues about one area makes it read the same files again for each one. The expensive part of a ticket is not the change. It is everything around it.
@@ -105,6 +123,37 @@ They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `s
 One trap worth inheriting along with the shape: `needs-review.sh` takes no arguments and diffs the working tree, folding untracked files in as new. That is deliberate, because a rule that only reads committed changes misses the file an agent has written and not yet added. It also means running it in a checkout full of other work walks all of that too. Run it inside a clean copy of the branch. I lost a few minutes to this before writing it down.
 
 An instruction in a prompt is forgotten within a day. A script is not, and it costs no tokens to obey.
+
+## 4a. The second time an agent reasons its way through something, it becomes a script
+
+Section 4 moved the checks I kept writing into briefs into scripts. The same rule goes further: anything an agent works out by reasoning, and then needs again, gets written down as something that runs.
+
+The first time, the agent spends tokens understanding the problem: how to land a stack of pull requests safely, how to cut a site over with a rollback, how to run a workflow's jobs without the hosted runner. The second time, if nothing was written down, it spends them again, and gets a slightly different answer. Written as a script, the next agent runs one command, waits, and reads the result. The tokens are spent once, on writing it.
+
+```mermaid
+flowchart LR
+    T[A task comes up] --> Q{"Done before?"}
+    Q -- no --> R[The agent reasons it through]
+    R --> W{"Will it come up again?"}
+    W -- no --> Done[Done]
+    W -- yes --> S["Write it as a script,<br/>with a test that fails when it is wrong"]
+    S --> Done
+    Q -- yes --> X[Run the script and wait for the result]
+    X --> V{"Did it do the job?"}
+    V -- yes --> Done
+    V -- no --> F[Fix the script, not the run]
+    F --> X
+```
+
+Three rules keep it honest:
+
+- **The script gets a test.** A script that passes having done nothing is worse than a brief, because it looks finished. The stack-landing script in 14d stopped the landing twice for a reason that turned out to be its own bug, and the local runner in 14g got three things wrong until it had tests.
+- **Fix the script, not the run.** When a script is wrong, correcting its output by hand this once means the next agent meets the same bug. Change the script and run it again.
+- **It stops at the first surprise and says so.** A script cannot judge what it was not written for, so it checks its assumptions, stops when one fails, and names the failure. Deciding what to do then is the part that stays with a person or an agent.
+
+This is what site reliability engineering calls eliminating toil, and what operations people call a runbook written as code. With agents it matters more, because the reasoning is the expensive part, and it is exactly the part a script lets you skip.
+
+Examples from one day: landing a stack of seven pull requests (14d), a production cutover with backups, confirmations and a tested rollback (14f), running a repository's workflow locally when its CI minutes ran out (14g), and the holdout and preflight checks that run on every change (2, 4).
 
 ## 5. Send work back to the agent that did it
 
