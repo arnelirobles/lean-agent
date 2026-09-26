@@ -122,9 +122,9 @@ Your continuous integration and whatever code review bot you use still run. They
 
 ## 3. The diff decides whether a critic runs, not the ticket
 
-Tier from the ticket title is wrong, because the tickets that read as small are the ones that touch auth. `needs-review.sh` prints every rule a change fires; any output means a critic runs.
+Tier from the ticket title is wrong, because the tickets that read as small are the ones that touch auth. `needs-review.sh` prints every rule a change fires; any output means a critic runs. It ships in this plugin and reads its rules from `.lean/needs-review.rules` in your repository, so the script is shared and the rules are yours. Start from `examples/needs-review.rules`.
 
-The rules in the script are specific to my codebase. The categories transfer: authentication and permissions, anything anonymous, raw SQL, schema and migrations, secrets and logging, concurrency and background work, deletion and retention, build and dependency files, and a test file that removes assertions. Docs, additive fields and assertion-only test additions fire nothing.
+The patterns are specific to a codebase. The categories transfer: authentication and permissions, anything anonymous, raw SQL, schema and migrations, secrets and logging, concurrency and background work, deletion and retention, build and dependency files, and a test file that removes assertions. Docs, additive fields and assertion-only test additions fire nothing.
 
 ## 4. Scripts, not instructions
 
@@ -132,12 +132,21 @@ Four scripts do what I used to write into every agent brief. They live in the re
 
 - `scripts/preflight.sh` builds, runs the named test classes, checks the changelog and module versions, restores in locked mode before building so a stale lock file cannot pass, fails when a test filter matches zero tests, scans added lines including untracked files for house style, and parses any changed workflow file with a duplicate-key-rejecting parser.
 - `scripts/sync-master.sh` merges the default branch, regenerates lock files when a project file changed, and reports conflicts.
-- `scripts/needs-review.sh` prints the rules above.
+- `needs-review.sh`, in this repository, prints the rules above, read from `.lean/needs-review.rules`. A missing rules file or merge base prints a line too, so a check that could not run never looks like a quiet diff.
 - `scripts/strip-asset-provenance.py` removes embedded provenance metadata from images, and fails the build in `--check` mode if any is left. Section 9 is why.
 - `interaction-surface.sh`, in this repository, prints what a diff touches that it did not write. Section 13 is why.
 - `agent-hygiene.sh`, in this repository, reports what parallel agents leave behind: stuck wait loops, orphaned servers, scratchpad collisions, worktrees on merged branches. Section 14a is why.
 - `retro-signals.sh`, in this repository, collects the facts a retro starts from. Section 16 is why.
 - `bump-version.sh`, in this repository, moves a Node package's version including the two lock file fields that belong to it and none that do not. Three bumps in one day went wrong in three different ways, which is one more than care can be expected to cover.
+- `heavy.sh`, in this repository, queues heavy commands per lane with a deadline on the wait (`HEAVY_WAIT`, default 300 seconds, then exit 75), and names the processes holding the lane. Section 11 is why.
+- `pr-blockers.sh <pr>`, in this repository, lists every reason a pull request cannot merge in one read-only call: failing or missing required checks, runs waiting for fork approval, unresolved threads, requested changes, ruleset rules, the head author's identity, how far behind it is, and which `gh pr merge` form the base accepts. A hook points at it when `gh pr merge` fails.
+- `assert-ran.sh`, in this repository, reads the executed test count from a runner's JSON, trx, `go test -json` or JUnit output and fails at zero or below `--min`. Section 10 is why.
+- `why-red.sh <log>`, in this repository, names environmental causes in a failed log (no Docker, a port in use, the inotify limit, wrong architecture, wrong Node, a full disk, DNS) before anyone debugs the code.
+- `check-conflict-markers.sh`, `check-top-level-md.sh` and `check-workflow-keys.py`, in this repository, fail on conflict markers in tracked or untracked files, on a new root Markdown file that is not on an allowlist (pull request bodies get committed this way), and on duplicate keys in a changed workflow file.
+- `sync-default.sh`, in this repository, refuses a dirty tree, merges the default branch, lists conflicts, then runs a locked restore for each lock file present so a stale lock file fails here instead of in CI. It never resets, stashes or checks out files.
+- `check-deployed-sha.sh <url> <sha>`, in this repository, proves a deploy by the commit sha the running build reports, not a 200 or a version string. Section 14e is why.
+- `check-runtime.sh`, in this repository, compares the Node, .NET and Go versions a repository declares with the binaries on PATH.
+- `self-test-all.sh`, in this repository, runs every script's `--self-test` and lists any script without one.
 
 They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `scripts/`. Copy the shape, replace the checks with your own.
 

@@ -22,8 +22,103 @@
 #
 # Given no command it fails rather than taking the lock and exiting 0. A queue step that succeeds
 # having run nothing is the failure section 10 is about.
+#
+# The wait has a deadline: HEAVY_WAIT seconds (default 300), then exit 75 naming the lock and the
+# processes holding it. An agent's tool call is cut off at 600 seconds, and a cut-off call becomes a
+# background job the agent is never told about, so a wait with no deadline is a stalled agent. When
+# the lane is busy, the holders are printed once, from /proc/*/fd (only processes you can see, so
+# normally your own user's). A holder that is not a build at all is how a stuck lane is diagnosed:
+# a compiler server that inherited the lock looked exactly like a slow build for ten minutes.
+#
+#   heavy.sh --self-test
 
 set -uo pipefail
+
+lock_holders() { # $1 lock path; prints "pid command" for every visible process with it open
+  local lock fd pid
+  lock=$(readlink -f "$1")
+  for fd in /proc/[0-9]*/fd/*; do
+    [ "$(readlink "$fd" 2>/dev/null)" = "$lock" ] || continue
+    pid=${fd#/proc/}; pid=${pid%%/*}
+    printf '  pid %s: %s\n' "$pid" "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-150)"
+  done 2>/dev/null | sort -u
+}
+
+run_lane() { # $1 lane, rest: command
+  local lane=$1 dir lock wait marker holders child rc
+  shift
+  case "$lane" in
+    *[!A-Za-z0-9._-]*) echo "lane '$lane' must be letters, digits, dot, dash or underscore" >&2; return 2 ;;
+  esac
+  wait=${HEAVY_WAIT:-300}
+  case "$wait" in ''|*[!0-9]*) echo "HEAVY_WAIT must be a whole number of seconds" >&2; return 2 ;; esac
+  dir=${HEAVY_LOCK_DIR:-/tmp/heavy-locks}
+  mkdir -p "$dir"
+  lock="$dir/$lane.lock"
+  : >> "$lock"
+
+  if ! flock -n "$lock" true 2>/dev/null; then
+    holders=$(lock_holders "$lock")
+    echo "heavy.sh: lane '$lane' is busy, waiting up to ${wait}s. Held by:" >&2
+    printf '%s\n' "${holders:-  (no visible process; another user may hold it)}" >&2
+  fi
+
+  # -o closes the lock before the command runs. Without it every child the command starts inherits
+  # the lock, and a child that outlives the build keeps it. The Roslyn compiler server does exactly
+  # that: it stays up for minutes after `dotnet build` exits, so the lane stayed locked with nothing
+  # building and every other agent waited on it. The lock still covers the whole command, because
+  # flock keeps its own copy until the command exits.
+  #
+  # The marker tells a timeout (flock's 75) from a command that itself exits 75.
+  marker=$(mktemp)
+  rm -f "$marker"
+  flock -o -w "$wait" -E 75 "$lock" sh -c ': > "$0"; exec nice -n 19 "$@"' "$marker" "$@" &
+  child=$!
+  trap 'kill -TERM "$child" 2>/dev/null' TERM INT HUP
+  wait "$child"; rc=$?
+  trap - TERM INT HUP
+  if [ "$rc" = 75 ] && [ ! -e "$marker" ]; then
+    holders=$(lock_holders "$lock")
+    echo "heavy.sh: timed out after ${wait}s waiting for lane '$lane' ($lock). Held by:" >&2
+    printf '%s\n' "${holders:-  (no visible process; another user may hold it)}" >&2
+    echo "  Nothing ran. If the holder is not a build (a compiler server, a stuck shell), that is the" >&2
+    echo "  problem; otherwise run again later or raise HEAVY_WAIT, keeping it under your tool timeout." >&2
+  fi
+  rm -f "$marker"
+  return "$rc"
+}
+
+self_test() {
+  local fails=0 holder out rc i
+  t=$(mktemp -d)
+  holder=""
+  trap 'rm -rf "$t"; [ -n "${holder:-}" ] && kill "$holder" 2>/dev/null' EXIT
+  export HEAVY_LOCK_DIR="$t/locks"
+  out=$( (run_lane l1 sh -c 'exit 3') 2>&1 ); rc=$?
+  [ "$rc" = 3 ] || { echo "self-test failed: command exit code not passed through ($rc)"; fails=$((fails + 1)); }
+  out=$( (run_lane l1 sh -c 'exit 75') 2>&1 ); rc=$?
+  { [ "$rc" = 75 ] && ! grep -q 'timed out' <<<"$out"; } || { echo "self-test failed: a command exiting 75 read as a timeout: $out"; fails=$((fails + 1)); }
+  out=$( (run_lane 'bad/lane' true) 2>&1 ); [ $? = 2 ] || { echo "self-test failed: bad lane name accepted"; fails=$((fails + 1)); }
+
+  mkdir -p "$HEAVY_LOCK_DIR"
+  timeout 30 flock "$HEAVY_LOCK_DIR/l2.lock" sleep 25 &
+  holder=$!
+  for i in $(seq 1 50); do flock -n "$HEAVY_LOCK_DIR/l2.lock" true 2>/dev/null || break; sleep 0.1; done
+  out=$(lock_holders "$HEAVY_LOCK_DIR/l2.lock")
+  grep -q 'sleep 25' <<<"$out" || { echo "self-test failed: holder not listed: '$out'"; fails=$((fails + 1)); }
+  out=$( (HEAVY_WAIT=1 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
+  [ "$rc" = 75 ] || { echo "self-test failed: timeout exit was $rc, want 75"; fails=$((fails + 1)); }
+  grep -q "timed out after 1s waiting for lane 'l2'" <<<"$out" || { echo "self-test failed: no timeout message: $out"; fails=$((fails + 1)); }
+  [ "$(grep -c 'Held by' <<<"$out")" = 2 ] && grep -q 'pid [0-9]*: .*sleep 25' <<<"$out" || { echo "self-test failed: holders not printed once while waiting and once at timeout: $out"; fails=$((fails + 1)); }
+  [ ! -e "$t/ran" ] || { echo "self-test failed: the command ran without the lock"; fails=$((fails + 1)); }
+  kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; holder=""
+  out=$( (HEAVY_WAIT=5 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
+  { [ "$rc" = 0 ] && [ -e "$t/ran" ]; } || { echo "self-test failed: free lane did not run: $rc $out"; fails=$((fails + 1)); }
+  [ "$fails" = 0 ] && echo "self-test passed" && return 0
+  return 1
+}
+
+if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
 
 if [ $# -lt 2 ]; then
   echo "usage: heavy.sh <lane> <command> [args...]" >&2
@@ -31,24 +126,4 @@ if [ $# -lt 2 ]; then
   exit 2
 fi
 
-lane=$1
-shift
-
-case "$lane" in
-  *[!A-Za-z0-9._-]*) echo "lane '$lane' must be letters, digits, dot, dash or underscore" >&2; exit 2 ;;
-esac
-
-dir=${HEAVY_LOCK_DIR:-/tmp/heavy-locks}
-mkdir -p "$dir"
-lock="$dir/$lane.lock"
-
-if ! flock -n "$lock" true 2>/dev/null; then
-  echo "heavy.sh: lane '$lane' is busy, waiting" >&2
-fi
-
-# -o closes the lock before the command runs. Without it every child the command starts inherits
-# the lock, and a child that outlives the build keeps it. The Roslyn compiler server does exactly
-# that: it stays up for minutes after `dotnet build` exits, so the lane stayed locked with nothing
-# building and every other agent waited on it. The lock still covers the whole command, because
-# flock keeps its own copy until the command exits.
-exec flock -o "$lock" nice -n 19 "$@"
+run_lane "$@"

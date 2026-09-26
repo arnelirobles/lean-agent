@@ -1,0 +1,57 @@
+# Rules for needs-review.sh. Copy to .lean/needs-review.rules in your repository and edit.
+#
+# Each section is one rule. Keys (all regexes are Python syntax, matched with search):
+#   label    what the output line says
+#   path     repo-relative path. Alone, the rule fires when a changed file matches. With added or
+#            removed, it only limits which files those apply to.
+#   added    an added line
+#   removed  a removed line
+#
+# Sections with the same label print as one line. That is how a rule says "this path, or this kind
+# of line": two sections, one label.
+#
+# These are generic starting points. The categories transfer between codebases; the patterns do
+# not, so replace them with the names your code uses. Every rule should trace to a defect that
+# reached review. When one stops firing on anything real for several batches, delete it; when a
+# reviewer keeps finding the same thing and no rule names it, add one.
+
+[auth-files]
+label = authentication or permissions touched
+path  = (?i)(^|/)(auth|authn|authz|security|permissions?|roles?|acl|policies|middleware)(/|\.|_)
+
+[auth-code]
+label = authentication or permissions touched
+added = (?i)\b(authorize|authorization|authenticate|permission|role|scope|claims?|jwt|oauth|session|csrf|cors)\b
+
+[anonymous]
+label = anonymous or public access added
+added = (?i)(AllowAnonymous|@PermitAll|permit_all|public_route|skip_auth|no_auth|login_required\s*=\s*False|isPublic\s*[:=]\s*true)
+
+[raw-sql]
+label = raw SQL built in code
+added = (?i)(\b(execute|exec|raw|query)\w*\s*\(\s*f?["'`]\s*(select|insert|update|delete|with)\b|\b(select|update|delete)\b.+\+\s*\w|\$\{.*\}.*\b(where|from)\b|\bFromSqlRaw\b|\bExecuteSqlRaw\b)
+
+[schema]
+label = schema or migration touched
+path  = (?i)(^|/)(migrations?|schema|db/)|\.sql$|(^|/)prisma/schema\.prisma$
+
+[secrets]
+label = secrets, tokens or credentials touched
+added = (?i)(secret|token|password|passwd|api[_-]?key|private[_-]?key|credential|connection[_-]?string)
+
+[concurrency]
+label = background work or concurrency touched
+added = (?i)(\b(thread(ing)?|mutex|semaphore|asyncio\.gather|Promise\.all|setInterval|BackgroundService|IHostedService|goroutine|sync\.WaitGroup|cron|lease)\b|\block\s*\(|\bgo\s+func\b)
+
+[delete]
+label = deletion or retention touched
+added = (?i)\b(delete(many|where|all)?|purge|truncate|drop\s+(table|column|database|index)|hard[_-]?delete|erase|retention|destroy)\b
+
+[ci-and-dependencies]
+label = CI or dependency files touched
+path  = (^|/)(\.github/workflows/|Dockerfile|docker-compose|compose\.ya?ml$|package\.json$|package-lock\.json$|pnpm-lock\.yaml$|yarn\.lock$|go\.(mod|sum)$|Cargo\.(toml|lock)$|requirements.*\.txt$|pyproject\.toml$|poetry\.lock$|uv\.lock$|Directory\.Packages\.props$|[^/]+\.csproj$|global\.json$|\.nvmrc$)
+
+[weakened-assertion]
+label = test assertion removed
+path    = (?i)(^|/)(tests?|spec|__tests__)/|[._-](test|spec)s?\.[a-z]+$|Tests?\.cs$
+removed = (^\s*(assert\b|assert[A-Z_]\w*\(|Assert\.|expect\(|\S+\.Should\(|\.should\b|require\.|t\.(Error|Fatal)|self\.assert))
