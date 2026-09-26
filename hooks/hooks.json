@@ -1,0 +1,16 @@
+{
+  "description": "Block agent attribution and AI slop in commits, pull requests, issues and releases.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/public-text.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
