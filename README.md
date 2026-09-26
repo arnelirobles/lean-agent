@@ -44,7 +44,18 @@ What you get:
 - `/lean-agent:adversarial-review` is the critic from section 12.
 - `/lean-agent:lean-retro` is the retro from section 16.
 - Every script in `bin/` on the agent's PATH while the plugin is enabled.
-- A hook that blocks a commit, tag, pull request, issue or release whose text carries agent attribution (a `Co-Authored-By` for an AI tool, a session link, a "Generated with" line) or slop: em and en dashes, arrow glyphs, and the filler words listed in `SLOP` at the top of the script. It checks message files passed with `-F`, `--body-file` or `--notes-file` too. Attribution was the step that kept getting forgotten, which is what section 16 says turns a rule into a check. `LEAN_ALLOW_ATTRIBUTION=1` or `LEAN_ALLOW_SLOP=1` turns either half off, and `python3 hooks/public-text.py --self-test` proves it.
+- Hooks, each with its own off switch. Three block, the rest add a note for the agent and never stop the call. Set an off switch in the `env` block of your Claude Code settings, or for one Bash command inline in front of it (`LEAN_ALLOW_SLOP=1 git commit ...`):
+  - `public-text.py` blocks a commit, tag, pull request, issue, release or `gh api` write whose text carries agent attribution (a `Co-Authored-By` for an AI tool, a session link, a "Generated with" line) or slop: em and en dashes, arrow glyphs, and the filler words in `SLOP` in `lib/house_style.py`. Slop is checked only in the message values (`-m`, `--title`, `--body`, `--notes`, field values, message files, a heredoc fed to `-F -`), with code spans removed; attribution is checked in the whole command. It reads message files passed with `-F`, `--body-file`, `--notes-file`, `--input` or `-F body=@file` too. Attribution was the step that kept getting forgotten, which is what section 16 says turns a rule into a check. Off: `LEAN_ALLOW_ATTRIBUTION=1` or `LEAN_ALLOW_SLOP=1`.
+  - `commit-author.py` blocks `git commit` when the author email git would use is unset, ends in a local host name, or is a `users.noreply.github.com` address without the numeric id. A `.local`, `.lan` or `.internal` domain counts only when a remote is on github.com. Off: `LEAN_ALLOW_COMMIT_AUTHOR=1`.
+  - `scratchpad-root.py` blocks writing `pr-body.md`, `body*.md`, `notes.md` or `plan.md` straight into a scratchpad root, where agents overwrite each other; use a per-task subdirectory. Off: `LEAN_ALLOW_SCRATCHPAD_ROOT=1`.
+  - `style-note.py` notes slop and attribution in the text just written to a `.md`, `.txt` or message-like file. Off: `LEAN_SKIP_STYLE_NOTE=1`.
+  - `record-test-run.py` and `test-before-push.py` record each passing compiled test run (not one piped into `tail`, since the pipe hides its exit code) and note, on `git push`, `gh pr create` or `gh pr merge`, the changed source files edited since. Off: `LEAN_SKIP_TEST_BEFORE_PUSH=1`.
+  - `verify-claim.py` asks, before a `gh` comment or review of 30 words or more, whether each claim was checked or should say "I think". Off: `LEAN_SKIP_VERIFY_CLAIM=1`.
+  - `docs-containers.py` notes `docker compose up/run` or `docker run` when every changed file is documentation. Off: `LEAN_SKIP_DOCS_CONTAINERS=1`.
+  - `lesson-log.py` appends a commit whose subject says fix, revert, flaky, silent, gate or regress to `.lean/lessons.tsv` (format in the script header) for the retro, and adds `.lean/` to `.git/info/exclude` so it is not committed. Off: `LEAN_SKIP_LESSON_LOG=1`.
+- `style-scan` runs the same slop, attribution and U+2000 checks over the lines a branch adds, untracked files included, for a preflight or CI step.
+- With the plugin on, `"attribution": {"commit": "", "pr": ""}` in your Claude Code settings is no longer needed, since the hook blocks the trailer anyway. Setting it too is harmless.
+- `tests/run-all.sh` runs every `--self-test` in the repository, lists scripts that have none, and fails on a duplicate key in the plugin JSON.
 
 Everything else in this README still works without the plugin. The scripts at the root are links into `bin/`.
 
@@ -122,26 +133,34 @@ Your continuous integration and whatever code review bot you use still run. They
 
 ## 3. The diff decides whether a critic runs, not the ticket
 
-Tier from the ticket title is wrong, because the tickets that read as small are the ones that touch auth. `needs-review.sh` prints every rule a change fires; any output means a critic runs.
+Tier from the ticket title is wrong, because the tickets that read as small are the ones that touch auth. `needs-review.sh` prints every rule a change fires; any output means a critic runs. It ships in this plugin and reads its rules from `.lean/needs-review.rules` in your repository, so the script is shared and the rules are yours. Start from `examples/needs-review.rules`.
 
-The rules in the script are specific to my codebase. The categories transfer: authentication and permissions, anything anonymous, raw SQL, schema and migrations, secrets and logging, concurrency and background work, deletion and retention, build and dependency files, and a test file that removes assertions. Docs, additive fields and assertion-only test additions fire nothing.
+The patterns are specific to a codebase. The categories transfer: authentication and permissions, anything anonymous, raw SQL, schema and migrations, secrets and logging, concurrency and background work, deletion and retention, build and dependency files, and a test file that removes assertions. Docs, additive fields and assertion-only test additions fire nothing.
 
 ## 4. Scripts, not instructions
 
-Four scripts do what I used to write into every agent brief. They live in the repository and are public:
+These scripts do what I used to write into every agent brief. The two under `scripts/` are my API repository's own; the rest ship in this repository's `bin/`, each with a `--self-test`:
 
 - `scripts/preflight.sh` builds, runs the named test classes, checks the changelog and module versions, restores in locked mode before building so a stale lock file cannot pass, fails when a test filter matches zero tests, scans added lines including untracked files for house style, and parses any changed workflow file with a duplicate-key-rejecting parser.
 - `scripts/sync-master.sh` merges the default branch, regenerates lock files when a project file changed, and reports conflicts.
-- `scripts/needs-review.sh` prints the rules above.
-- `scripts/strip-asset-provenance.py` removes embedded provenance metadata from images, and fails the build in `--check` mode if any is left. Section 9 is why.
+- `needs-review.sh`, in this repository, prints the rules above, read from `.lean/needs-review.rules`. A missing rules file or merge base prints a line too, so a check that could not run never looks like a quiet diff.
+- `asset-provenance.py`, in this repository, finds embedded provenance metadata in images and removes it with `--strip`. Section 9 is why.
 - `interaction-surface.sh`, in this repository, prints what a diff touches that it did not write. Section 13 is why.
 - `agent-hygiene.sh`, in this repository, reports what parallel agents leave behind: stuck wait loops, orphaned servers, scratchpad collisions, worktrees on merged branches. Section 14a is why.
 - `retro-signals.sh`, in this repository, collects the facts a retro starts from. Section 16 is why.
 - `bump-version.sh`, in this repository, moves a Node package's version including the two lock file fields that belong to it and none that do not. Three bumps in one day went wrong in three different ways, which is one more than care can be expected to cover.
+- `heavy.sh`, in this repository, queues heavy commands per lane with a deadline on the wait (`HEAVY_WAIT`, default 300 seconds, then exit 75), and names the processes holding the lane. Section 11 is why.
+- `pr-blockers.sh <pr>`, in this repository, lists every reason a pull request cannot merge in one read-only call: failing or missing required checks, runs waiting for fork approval, unresolved threads, requested changes, ruleset rules, the head author's identity, how far behind it is, and which `gh pr merge` form the base accepts. A hook points at it when `gh pr merge` fails.
+- `assert-ran.sh`, in this repository, reads the executed test count from a runner's JSON, trx, `go test -json` or JUnit output and fails at zero or below `--min`. Section 10 is why.
+- `why-red.sh <log>`, in this repository, names environmental causes in a failed log (no Docker, a port in use, the inotify limit, wrong architecture, wrong Node, a full disk, DNS) before anyone debugs the code.
+- `check-conflict-markers.sh`, `check-top-level-md.sh` and `check-workflow-keys.py`, in this repository, fail on conflict markers in tracked or untracked files, on a new root Markdown file that is not on an allowlist (pull request bodies get committed this way), and on duplicate keys in a changed workflow file.
+- `sync-default.sh`, in this repository, refuses a dirty tree, merges the default branch, lists conflicts, then runs a locked restore for each lock file present so a stale lock file fails here instead of in CI. It never resets, stashes or checks out files.
+- `check-deployed-sha.sh <url> <sha>`, in this repository, proves a deploy by the commit sha the running build reports, not a 200 or a version string. Section 14e is why.
+- `check-runtime.sh`, in this repository, compares the Node, .NET and Go versions a repository declares with the binaries on PATH.
 
-They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `scripts/`. Copy the shape, replace the checks with your own.
+The general parts of the two `scripts/` entries now ship here as `sync-default.sh`, `check-workflow-keys.py`, `assert-ran.sh` and `style-scan`. For the rest, copy the shape and replace the checks with your own.
 
-One trap worth inheriting along with the shape: `needs-review.sh` takes no arguments and diffs the working tree, folding untracked files in as new. That is deliberate, because a rule that only reads committed changes misses the file an agent has written and not yet added. It also means running it in a checkout full of other work walks all of that too. Run it inside a clean copy of the branch. I lost a few minutes to this before writing it down.
+One trap worth inheriting along with the shape: `needs-review.sh` diffs the working tree against the merge base, folding untracked files in as new. That is deliberate, because a rule that only reads committed changes misses the file an agent has written and not yet added. It also means running it in a checkout full of other work walks all of that too. Run it inside a clean copy of the branch. I lost a few minutes to this before writing it down.
 
 An instruction in a prompt is forgotten within a day. A script is not, and it costs no tokens to obey.
 
