@@ -6,9 +6,46 @@ The numbers here are mine, at list prices, on one .NET codebase. Treat them as a
 
 ## The short version
 
-A cheaper model drafts every change. Scripts, not instructions, run the mechanical checks. A cheap critic reviews every change against six fixed questions. The expensive model only sees what the critic cannot close. At most four changes in flight.
+Shape the ticket for the agent before anyone starts: one ticket is one agent pass, written so the agent needs nothing else, with the review's questions answered in advance. A cheaper model drafts every change. Scripts, not instructions, run the mechanical checks. A cheap critic reviews every change against six fixed questions. The expensive model only sees what the critic cannot close. At most four changes in flight.
 
 That took me from about 66 dollars of model use per change to about 25, with no drop in what got caught.
+
+## 0. Shape the ticket for the agent, not for a person
+
+My issues were written for me, or for a developer: a problem, why it matters, a rough idea of the fix. An agent reads them differently. Every issue it opens costs it the issue, the linked issues, the repository rules and the code around the change, and a backlog of small issues about one area makes it read the same files again for each one. The expensive part of a ticket is not the change. It is everything around it.
+
+The numbers, from one day on one project. A typical pull request cost 150 to 250 thousand tokens to build, 100 to 150 thousand for the adversarial review, and 30 to 100 thousand per fix round. For a small ticket, the fixed part of that, reading, building, reviewing, merging, is most of it. The same day, a docs pass fixed 197 wrong or stale claims in about ten batched pull requests for roughly 8 thousand tokens a finding. As 197 tickets with their own agent, review and CI run each, it would have cost more than ten times as much. That was an extreme case, because the findings were tiny, but it is the mechanism.
+
+So the front half of the loop changes.
+
+**Refine before anyone starts.** Spend a few days asking and revising while the plan is still moving. A ticket started early gets overtaken, and a third of that docs pass was fixing claims that drifted because the work moved faster than the plan.
+
+**Consolidate when you file, not later.** Before filing anything, search the open issues for the same area or problem. If one fits, add the new item to its checklist with its own check. Merging later costs a whole triage pass; merging now costs one search.
+
+**One agent pass is one ticket.** Anything an agent can finish in a single focused pass, one pull request or a short stack in one repository, the same code area or the same kind of fix, reviewable together, is one ticket. One ticket per repository. Security fixes stay separate unless they are the same fix. Split only when a group is too big for one pass, because a review stays sharp only on a focused diff, and that is where the reviews found real defects.
+
+**Write it so the agent needs nothing else.**
+
+| Part | What goes in it |
+| --- | --- |
+| Goal | One sentence: what is true when it is done |
+| Where | The files and code areas, so the agent does not search |
+| Covers | The absorbed issues, as a checklist |
+| Done when | Runnable checks: tests that fail before the fix and pass after, the preflight command, docs to update |
+| Risks | The review's questions answered for this change, each with a check under Done when |
+| Constraints | The repository rules that apply: contract version, public API, migrations, style |
+| Out of scope | What not to touch |
+
+**Foresee the review.** Most of what the adversarial reviews found in a day fell into categories anyone could name before a line was written:
+
+- untrusted input reaching a URL, a header, CSS, HTML, SQL or a log, where the hostile inputs are known in advance: `//host`, `/\host`, quotes, `</style>`, `url(`, control characters;
+- a bound nobody stated, on rows, upstream calls, memory, time or a cache, and what happens past it, which must never be silent;
+- two writes that must commit together, and what a crash in between or a second run does;
+- two runs of the same thing overlapping;
+- whoever already depends on this: published packages, stored data, defaults, a contract version;
+- the real target environment, which a copy does not reproduce.
+
+The Risks row is that list, answered for the change in hand, and only the lines that apply. For a bigger ticket, one cheap agent reads the ticket and the code it touches and lists what could go wrong before anyone builds. That is one agent reading, not building, and a fraction of a code review. The review after the code still runs, because the finder and the judge have to stay separate and some defects only exist in the real diff. It just finds less, which means fewer fix rounds, and each fix round was one of the costs above.
 
 ## 1. Triage inline, no agents
 
@@ -20,7 +57,7 @@ Read the open issues once, yourself. Sort each into a tier and do the cheap ones
 | 1 | a feature inside one module, additive |
 | 2 | core, auth, tenancy, data shape, anything reachable without a login |
 
-Close duplicates and anything already solved by other means while you are in there. Do not file follow-ups. A review finding is fixed in the change or dropped. A backlog that grows while you work is the failure this whole method exists to prevent.
+Close duplicates and anything already solved by other means while you are in there. Do not file follow-ups. A review finding is fixed in the change or dropped. When one is real and cannot be fixed in the change, it goes on the checklist of the open issue that already owns that area, as section 0 says, never into a new issue of its own. A backlog that grows while you work is the failure this whole method exists to prevent.
 
 ## 2. The cascade
 
@@ -498,6 +535,43 @@ Three rules, in order of how much they buy:
 
 The harness will re-invoke an agent when tracked work finishes, so most of these loops should not
 exist at all. When one genuinely must, it gets a deadline.
+
+## 14d. Landing a stack of pull requests is its own job
+
+Seven pull requests, each built on the one before, all reviewed and green. Squash merging the bottom one broke the next in four different ways over one morning.
+
+- **A squash merge leaves the next branch holding commits the default branch no longer has**, so it shows as conflicting even though nothing conflicts. Merging the default branch in is safe only when the squashed tree is a state the next branch already passed through; then keeping the branch's own tree loses nothing and keeps exactly what was reviewed. Check it, do not assume it: compare the squash commit's tree with the trees in the branch's history.
+- **Deleting a base branch can close the pull request on top of it** rather than retarget it. Retarget the next pull request to the default branch first, then delete. A closed one can be reopened only after its base branch is pushed back.
+- **Required checks do not rerun when only the base changes.** One pull request sat blocked with every check it had run passing, because the one it lacked had never been triggered for its new base. Closing and reopening it ran it.
+- **`grep -q` under `set -o pipefail` can report a match as a failure** when the command feeding it has more to write: grep exits on the first match, the writer dies of a broken pipe, and the pipeline fails. The check meant to prove the stack was safe stopped it, twice, for no reason. Send grep's output to `/dev/null` instead of using `-q` in a pipefail script.
+
+Write the landing as a script with those checks and stop at the first surprise. Landing a stack by hand makes the same four mistakes, one at a time.
+
+## 14e. Test what you published, not what you built
+
+A release moved the types every module is compiled against into a new package. Namespaces were unchanged, so every module in the repository still built, every test passed, and the changelog said no module needed an edit. The modules already published, compiled against the old release, could not load, and a host that referenced any of them did not start at all. Nothing in the repository could see it, because the repository only ever built from source.
+
+It was found by installing the published packages into a fresh host, which is one CI job. The fix was type forwarders, which the project's own public API rule required; the missed step was never testing the thing users install.
+
+If a release changes where public types live, a job that installs the previous release's published packages against the new build is the only check that sees it.
+
+## 14f. A rehearsal proves only what it copies
+
+A production cutover was rehearsed five times on a copy of the production database, with the rollback proven three times. Two things still went wrong, and neither was in the copy.
+
+The production directory belonged to another user, so the script could change the files in it but not create one beside them. The rehearsal ran in directories the script owned. A reviewer found it by reading the live directory's permissions, before the real run, and the next rehearsal made its copy belong to another user on purpose.
+
+The script exported an address for its own calls to the API, the one a process on the host uses. A compose run later in the same shell inherited it, and compose fills a variable from the shell before the file beside it, so the renderer started pointed at its own container and every page answered 404 for a few minutes. The rehearsal never used the address the production file held, so it never met the collision. The fix is a wrapper that strips the script's own variables before calling compose, with a test that fails if one gets through.
+
+Copy the environment as well as the data: ownership, the variables in the shell, the network the containers share. A rehearsal that differs in any of them is a rehearsal of something else.
+
+## 14g. When the CI minutes run out, the workflow still decides
+
+A private repository ran out of free CI minutes in a month: 1,903 of 2,000, nearly all from one site's checks on every push. Turning its CI off was the right call, and it left the question of what counts as green.
+
+The answer was to keep the workflow file as the definition and run its jobs locally: each job in a clean checkout of the commit, every run step in order with the shell the hosted runner uses, stopping at the first failure. A pull request is green when that run passes at its head, and the output goes in the pull request. Turning hosted CI back on changes nothing, because the definition never moved.
+
+The first version was a script in the repository. It got three things wrong that a hosted runner gets right: pipefail on steps that do not ask for it, a missing runner temp directory, and not rewriting a port inside a step's environment. As a separate tool with its own tests it got all three right. A local runner needs its own tests for the same reason a check does: one that passes having checked nothing is worse than none.
 
 ## 15. What a reader should be able to observe, and the two goals that poison themselves
 
