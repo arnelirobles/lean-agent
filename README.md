@@ -116,6 +116,7 @@ Four scripts do what I used to write into every agent brief. They live in the re
 - `scripts/strip-asset-provenance.py` removes embedded provenance metadata from images, and fails the build in `--check` mode if any is left. Section 9 is why.
 - `interaction-surface.sh`, in this repository, prints what a diff touches that it did not write. Section 13 is why.
 - `agent-hygiene.sh`, in this repository, reports what parallel agents leave behind: stuck wait loops, orphaned servers, scratchpad collisions, worktrees on merged branches. Section 14a is why.
+- `retro-signals.sh`, in this repository, collects the facts a retro starts from. Section 16 is why.
 - `bump-version.sh`, in this repository, moves a Node package's version including the two lock file fields that belong to it and none that do not. Three bumps in one day went wrong in three different ways, which is one more than care can be expected to cover.
 
 They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `scripts/`. Copy the shape, replace the checks with your own.
@@ -144,6 +145,8 @@ flowchart LR
     V -- no --> F[Fix the script, not the run]
     F --> X
 ```
+
+**Where the script goes decides who benefits.** A script that works on any repository (landing a stack of pull requests, collecting retro signals, a wait with a deadline, the hygiene sweep) goes to this repository as a pull request, with its test and a line in section 4's list, and every project uses it from here. A script that knows one repository's layout or rules (its preflight, a site's cutover) goes to that repository's `scripts/`; if part of it is general, that part comes here too. Either way it arrives as a pull request, gets the same adversarial review as any change, and a person merges it. Nothing is pushed straight to the default branch of this repository or any other.
 
 Three rules keep it honest:
 
@@ -651,6 +654,51 @@ The last two rows are identical if you only count findings. That is the whole re
 **What can be claimed today, honestly.** Faster is the clearest: the same shape of task took thirty minutes on a cheaper model against one to eight hours. Cheaper is real but invisible in tokens, since the count barely moved and the saving is all in the rate. Less back and forth is partly true through grouping, nine pull requests carrying about twenty issues, and partly undone by two avoidable CI rounds and a port collision that were the coordinator's errors, not any agent's. Quality held, and is provable through the gates rather than asserted: tests proven red before the fix, a holdout check that binds each test to the hunk it covers, and a pixel comparison against a captured design that cannot be talked into passing.
 
 Fewer defects and fewer vulnerabilities are not yet claimable in either direction. The columns above are how that gets answered, and it takes batches, not a day.
+
+## 16. The method improves itself, on a schedule, from numbers
+
+Sections 7, 8 and 15 all say to measure and to attack the method. None of it ran by itself. On the day this section was written, more than twenty adversarial reviews ran and `log-review.sh` was called for none of them. A loop that depends on somebody remembering is not a loop.
+
+So the loop is a script and a routine, run after every batch, and it changes the method only through a pull request with evidence.
+
+```mermaid
+flowchart TD
+    B[A batch merges] --> S["retro-signals.sh collects facts<br/>fix rounds, failed checks, days to merge,<br/>escaped fixes, unlogged reviews"]
+    S --> R["A cheap agent runs the lean-retro routine<br/>against fixed triggers"]
+    R --> P["Proposed changes, each with<br/>the signal that caused it and<br/>the signal that would show it worked"]
+    P --> H{"You approve?"}
+    H -- yes --> M["Pull request to the method,<br/>plus memory and CLAUDE.md"]
+    H -- no --> X[Recorded as rejected, with the reason]
+    M --> N[Next batch]
+    N --> B
+    R --> C{"Did the last change help?"}
+    C -- no --> V[Propose reverting it]
+    V --> P
+```
+
+**Facts first, from a script.** `retro-signals.sh --since <date> <repos>` prints one row per merged pull request: commits pushed after it opened (fix rounds), failed checks, days to merge, later issues or pull requests that point back at it as the cause of a fix (a proxy for escaped defects), and whether its review was logged. It reasons about nothing, so the retro starts from the same numbers every time.
+
+The first run, on one repository for two days, already said something: a stack of four pull requests with no review of the tickets beforehand took 5, 7, 9 and 10 commits after opening; four smaller ones with a clear scope took 0 to 2.
+
+**Fixed triggers, not taste.** The retro checks the numbers against rules decided in advance:
+
+| Signal | Change it proposes |
+| --- | --- |
+| A finding category seen in two or more changes | A scripted check, a Risks line in section 0, or a critic question |
+| A check or critic question that found nothing for three batches | Drop it for that tier |
+| Something an agent reasoned through twice | A script, per section 4a |
+| A step that needed a person in two or more changes | Automate it, or script it with confirmations |
+| Fix rounds or cost per change rising | Name the step that grew |
+| An escaped defect | A check that would have caught it, tested against that defect |
+| Reviews ran but were not logged | Make logging a step of the review script, not a rule |
+
+**Every change carries its own test.** A proposed change names the signal that triggered it and the number that should move if it works. The next retro reads that number first. If it did not move, or moved the wrong way, the retro proposes reverting the change. That is section 8 on a timer.
+
+**One experiment running now: review the ticket before the code.** Section 0 predicts that answering the review's questions in the ticket, plus one cheap agent reading the ticket and the code before anyone builds, cuts fix rounds and findings per change. The baseline is the table above. The claim holds if fix rounds and findings fall while the review after the code still finds something and escaped defects stay at zero. If the review after the code drops to nothing and escaped defects rise, the review before has made everyone overconfident, and it comes out.
+
+**What it does not do.** It never changes the method, the scripts or anyone's instructions by itself. It proposes; a person decides. A method that rewrites itself unattended drifts toward whatever the numbers reward, which is section 15's warning about goals that poison themselves.
+
+The routine is `skills/lean-retro/SKILL.md` in this repository.
 
 ## What this does not fix
 
