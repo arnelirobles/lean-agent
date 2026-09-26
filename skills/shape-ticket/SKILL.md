@@ -9,7 +9,7 @@ A ticket is read by an agent that pays for every file it opens. Write it so the 
 
 ## 1. Search before filing
 
-Search the repository's open issues for the same code area or problem (`gh issue list --search`, by title words, paths and labels). If one fits, the new item joins that issue: add it to its Covers checklist with its own check under Done when. File new only when it is truly separate. Never file across repositories; one ticket per repository.
+Search the repository's open issues and open pull requests for the same code area or problem (`gh issue list --search` and `gh pr list --search`, by title words, paths and labels). A fix sitting in an open pull request has been filed again as a new issue; if a pull request already covers it, say so there instead of filing. If an issue fits, the new item joins that issue: add it to its Covers checklist with its own check under Done when. File new only when it is truly separate. Never file across repositories; one ticket per repository.
 
 ## 2. Size it to one agent pass
 
