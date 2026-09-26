@@ -18,7 +18,7 @@ flowchart TD
     B --> C["Cheap model drafts (2, 14)"]
     C --> D["Scripts run the mechanical checks (4)<br/>preflight, holdout, needs-review"]
     D --> E{"Diff fires a rule? (3)"}
-    E -- no --> H[Merge queue, four in flight at most (6)]
+    E -- no --> H["Merge queue, four in flight at most (6)"]
     E -- yes --> F["Cheap critic, six questions (2, 12)"]
     F -- closed --> H
     F -- a no not fixed in one round --> G["Back to the same drafter (5)<br/>expensive model only if it still fails"]
