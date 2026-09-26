@@ -9,12 +9,16 @@ call succeeded, so a recorded run is a passing one.
 Counted: dotnet test, npm/pnpm/yarn test (and `run test...`), go test, pytest
 (also python -m pytest), cargo test. Not counted: dotnet test --no-build and
 cargo test --no-run, because one passes against stale output and the other
-runs nothing.
+runs nothing. A test piped into something else (`npm test | tail`) is not
+counted either: the pipe's last command sets the exit code, so a failing run
+would look like a pass. Wrappers in front are fine: nice, timeout N,
+flock [-o] LOCK, env K=V, time.
 
 The record is <git dir>/lean-last-test-run (per worktree, never committed):
 its modification time is the run, its one line is the command.
 
   LEAN_SKIP_TEST_BEFORE_PUSH=1   turn off this hook and test-before-push.py
+                                 (environment, settings env, or inline)
   record-test-run.py --self-test
 """
 import os
@@ -46,7 +50,9 @@ def is_test_run(words):
 
 def test_runs(command, cwd):
     """(cwd, command words) for each counted test run in a shell command."""
-    return [(seg.cwd, seg.words) for seg in hookkit.segments(command, cwd) if is_test_run(seg.words)]
+    return [(seg.cwd, seg.words) for seg in hookkit.segments(command, cwd)
+            if is_test_run(seg.words) and not seg.piped
+            and not hookkit.disabled("LEAN_SKIP_TEST_BEFORE_PUSH", seg)]
 
 
 def record(command, cwd):
@@ -77,9 +83,11 @@ def self_test():
     failures = 0
     counted = ["dotnet test", "dotnet test Api.Tests/Api.Tests.csproj", "npm test", "npm run test:unit",
                "pnpm test", "yarn test", "go test ./...", "pytest -q", "python3 -m pytest tests",
-               "cargo test", "cd sub && npm t"]
+               "cargo test", "cd sub && npm t", "flock -o /tmp/lock nice dotnet test",
+               "timeout 300 go test ./...", "env CI=1 npm test", "time pytest", "npm test > out.log 2>&1"]
     ignored = ["dotnet test --no-build", "cargo test --no-run", "npm run build", "echo pytest",
-               "git commit -m 'go test'", "npm install", "dotnet build"]
+               "git commit -m 'go test'", "npm install", "dotnet build", "npm test 2>&1 | tail -5",
+               "flock -o /tmp/lock nice dotnet test --no-build", "LEAN_SKIP_TEST_BEFORE_PUSH=1 npm test"]
     for command in counted:
         if not test_runs(command, "/"):
             print(f"FAIL not counted: {command!r}")

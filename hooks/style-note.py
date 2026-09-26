@@ -12,7 +12,7 @@ Files it looks at: .md, .markdown, .txt, .rst, .adoc, git message files
 (COMMIT_EDITMSG, TAG_EDITMSG, MERGE_MSG) and names that look like a message or
 body (commit-msg, pr-body, release-notes and similar) with no extension or .msg.
 
-  LEAN_SKIP_STYLE_NOTE=1   turn it off
+  LEAN_SKIP_STYLE_NOTE=1   turn it off (environment or the settings env block)
   style-note.py --self-test
 """
 import os
@@ -65,7 +65,7 @@ def message(event):
         return None
     return (f"House style check on {path}: " + "; ".join(found)
             + ". Rewrite it plainly unless it is quoted outside text. "
-            "LEAN_SKIP_STYLE_NOTE=1 turns this note off.")
+            "LEAN_SKIP_STYLE_NOTE=1 in the env block of Claude Code settings turns this note off.")
 
 
 def main():

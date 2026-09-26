@@ -8,7 +8,7 @@ can crash startup when its caller swallows the error. Someone may act on the
 comment. It never blocks, and it stays quiet for a short body (under 30 words
 passed with --body/-b or --body-file/-F), since an acknowledgement makes no case.
 
-  LEAN_SKIP_VERIFY_CLAIM=1   turn it off
+  LEAN_SKIP_VERIFY_CLAIM=1   turn it off (environment, settings env, or inline)
   verify-claim.py --self-test
 """
 import os
@@ -22,7 +22,7 @@ NOTE = ("Before this posts: is every claim in it checked? If it says something f
         "is slow, find the caller (is it awaited, is the error swallowed?). If it recommends a "
         "change, read the config that governs it (auth, flags, defaults) first. Anything not "
         "checked gets \"I think\" and a line on what is unverified. "
-        "LEAN_SKIP_VERIFY_CLAIM=1 turns this note off.")
+        "LEAN_SKIP_VERIFY_CLAIM=1, inline or in settings env, turns this note off.")
 
 
 def body_text(args, cwd):
@@ -44,7 +44,7 @@ def body_text(args, cwd):
 def message(command, cwd):
     for seg in hookkit.segments(command, cwd):
         gh = hookkit.gh_call(seg)
-        if not gh:
+        if not gh or hookkit.disabled("LEAN_SKIP_VERIFY_CLAIM", seg):
             continue
         args = gh[0]
         if args[:2] not in (["issue", "comment"], ["pr", "comment"], ["pr", "review"]):
@@ -84,7 +84,7 @@ def self_test():
                  "gh pr comment 4 --body-file=long.md", "gh issue comment 9 --body-file missing.md"]
         quiet = ["gh pr comment 4 --body 'Thanks, merged.'", "gh issue comment 9 -F short.md",
                  "gh pr view 4 --comments", "gh issue list", "echo gh pr comment",
-                 "gh pr create --body 'x'"]
+                 "gh pr create --body 'x'", "LEAN_SKIP_VERIFY_CLAIM=1 gh pr review 4 --approve"]
         for command in noted:
             if not message(command, tmp):
                 print(f"FAIL no note: {command[:60]!r}")

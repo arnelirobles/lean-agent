@@ -9,7 +9,7 @@ it stays quiet unless every changed path (commits since the default branch,
 the index, the working tree and untracked files) is documentation: *.md,
 *.markdown, *.rst, *.txt, *.adoc, or anything under docs/.
 
-  LEAN_SKIP_DOCS_CONTAINERS=1   turn it off
+  LEAN_SKIP_DOCS_CONTAINERS=1   turn it off (environment, settings env, or inline)
   docs-containers.py --self-test
 """
 import os
@@ -67,7 +67,7 @@ def changed_paths(root):
 
 def message(command, cwd):
     for seg in hookkit.segments(command, cwd):
-        if not starts_containers(seg.words):
+        if not starts_containers(seg.words) or hookkit.disabled("LEAN_SKIP_DOCS_CONTAINERS", seg):
             continue
         root = hookkit.git(seg.cwd, "rev-parse", "--show-toplevel")
         if not root:
@@ -79,7 +79,8 @@ def message(command, cwd):
                 + (", ..." if len(changed) > 8 else "") + "). If the aim is to confirm a command "
                 "you are writing down, read the compose file or image docs instead of starting "
                 "containers. If it cannot be checked cheaply, document how to run it without "
-                "claiming what it prints. LEAN_SKIP_DOCS_CONTAINERS=1 turns this note off.")
+                "claiming what it prints. LEAN_SKIP_DOCS_CONTAINERS=1, inline or in settings env, "
+                "turns this note off.")
     return None
 
 
@@ -134,6 +135,7 @@ def self_test():
         write("docs/setup/run.sh")
         expect("docs only", "docker compose up -d", True)
         expect("not starting containers", "docker compose ps", False)
+        expect("inline off switch", "LEAN_SKIP_DOCS_CONTAINERS=1 docker compose up -d", False)
         write("new_module.py")
         expect("untracked source file", "docker run --rm img", False)
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")

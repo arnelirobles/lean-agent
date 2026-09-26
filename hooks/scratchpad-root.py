@@ -9,7 +9,7 @@ plan.md written directly into a directory named "scratchpad", or into the
 directory in $CLAUDE_SCRATCHPAD when that is set. The same names one level
 down (scratchpad/<task>/pr-body.md) pass.
 
-  LEAN_ALLOW_SCRATCHPAD_ROOT=1   turn it off
+  LEAN_ALLOW_SCRATCHPAD_ROOT=1   turn it off (environment or the settings env block)
   scratchpad-root.py --self-test
 """
 import fnmatch
@@ -48,7 +48,7 @@ def main():
     found = problem(path, event.get("cwd") or os.getcwd(), os.environ.get("CLAUDE_SCRATCHPAD"))
     if found:
         print("Blocked by lean-agent: " + found
-              + " LEAN_ALLOW_SCRATCHPAD_ROOT=1 turns this check off.", file=sys.stderr)
+              + " LEAN_ALLOW_SCRATCHPAD_ROOT=1 in the env block of Claude Code settings turns this check off.", file=sys.stderr)
         return 2
     return 0
 

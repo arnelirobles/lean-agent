@@ -11,7 +11,8 @@ not yet on the upstream or default branch) whose modification time is newer
 than the run record-test-run.py keeps, or says no run is recorded.
 It never blocks.
 
-  LEAN_SKIP_TEST_BEFORE_PUSH=1   turn it off (and record-test-run.py)
+  LEAN_SKIP_TEST_BEFORE_PUSH=1   turn it off (and record-test-run.py), in the
+                                 environment, settings env, or inline
   test-before-push.py --self-test
 """
 import os
@@ -50,7 +51,7 @@ def changed_source(root):
 
 def message(command, cwd):
     for seg in hookkit.segments(command, cwd):
-        if not is_push(seg):
+        if not is_push(seg) or hookkit.disabled("LEAN_SKIP_TEST_BEFORE_PUSH", seg):
             continue
         root = hookkit.git(seg.cwd, "rev-parse", "--show-toplevel")
         if not root:
@@ -62,7 +63,8 @@ def message(command, cwd):
         if not marker or not os.path.exists(marker):
             return ("No passing test run is recorded in this repository, and this pushes source "
                     "changes. Which test can observe this change? Run that one first (a --no-build "
-                    "run does not count). LEAN_SKIP_TEST_BEFORE_PUSH=1 turns this note off.")
+                    "run does not count). LEAN_SKIP_TEST_BEFORE_PUSH=1, inline or in settings env, "
+                    "turns this note off.")
         ran_at = os.path.getmtime(marker)
         stale = [n for n in changed if os.path.getmtime(os.path.join(root, n)) > ran_at]
         if not stale:
@@ -73,7 +75,7 @@ def message(command, cwd):
         return (f"These files changed after the last passing test run ({last}):\n  {listed}\n"
                 "A suite that passed before this edit is not evidence about it. Rerun the suite "
                 "that can observe the change, not only the fast one. "
-                "LEAN_SKIP_TEST_BEFORE_PUSH=1 turns this note off.")
+                "LEAN_SKIP_TEST_BEFORE_PUSH=1, inline or in settings env, turns this note off.")
     return None
 
 
@@ -135,6 +137,7 @@ def self_test():
         stale = message("gh pr merge 3 --squash", tmp)
         check("edit after the run warns", stale, True)
         check("stale file is named", stale and "app.py" in stale, True)
+        check("inline off switch", message("LEAN_SKIP_TEST_BEFORE_PUSH=1 git push", tmp), False)
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 
