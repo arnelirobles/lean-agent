@@ -17,8 +17,8 @@ import shlex
 import sys
 
 ATTRIBUTION = [
-    r"co-authored-by:[^\n]*(claude|anthropic|copilot|cursor|codex|gemini|\[bot\])",
-    r"claude-session:",
+    r"(^|[\"'])\s*co-authored-by:[^\n]*(claude|anthropic|copilot|cursor|codex|gemini|\[bot\])",
+    r"(^|[\"'])\s*claude-session:",
     r"claude\.ai/code/session_",
     r"generated with \[?claude code",
     r"noreply@anthropic\.com",
@@ -117,6 +117,7 @@ def self_test():
         'git commit -m "log the retry count and add it to the summary"',
         'echo "Claude-Session: x robust \u2014"',
         'git log --grep "Co-Authored-By: Claude"',
+        'gh pr create --body "the hook blocks a `Claude-Session:` trailer"',
     ]
     failures = 0
     for cmd in blocked:
