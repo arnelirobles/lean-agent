@@ -30,7 +30,7 @@ def local(tag):
 
 def count(path):
     raw = open(path, "rb").read()
-    text = raw.decode("utf-8", "replace").lstrip("﻿").strip()
+    text = raw.decode("utf-8", "replace").lstrip("\ufeff").strip()
     if not text:
         raise ValueError("empty file")
     if text.startswith("<"):

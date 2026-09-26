@@ -55,7 +55,7 @@ What you get:
   - `lesson-log.py` appends a commit whose subject says fix, revert, flaky, silent, gate or regress to `.lean/lessons.tsv` (format in the script header) for the retro, and adds `.lean/` to `.git/info/exclude` so it is not committed. Off: `LEAN_SKIP_LESSON_LOG=1`.
 - `style-scan` runs the same slop, attribution and U+2000 checks over the lines a branch adds, untracked files included, for a preflight or CI step.
 - With the plugin on, `"attribution": {"commit": "", "pr": ""}` in your Claude Code settings is no longer needed, since the hook blocks the trailer anyway. Setting it too is harmless.
-- `tests/run-all.sh` runs every `--self-test` in the repository.
+- `tests/run-all.sh` runs every `--self-test` in the repository, lists scripts that have none, and fails on a duplicate key in the plugin JSON.
 
 Everything else in this README still works without the plugin. The scripts at the root are links into `bin/`.
 
@@ -139,12 +139,12 @@ The patterns are specific to a codebase. The categories transfer: authentication
 
 ## 4. Scripts, not instructions
 
-Four scripts do what I used to write into every agent brief. They live in the repository and are public:
+These scripts do what I used to write into every agent brief. The two under `scripts/` are my API repository's own; the rest ship in this repository's `bin/`, each with a `--self-test`:
 
 - `scripts/preflight.sh` builds, runs the named test classes, checks the changelog and module versions, restores in locked mode before building so a stale lock file cannot pass, fails when a test filter matches zero tests, scans added lines including untracked files for house style, and parses any changed workflow file with a duplicate-key-rejecting parser.
 - `scripts/sync-master.sh` merges the default branch, regenerates lock files when a project file changed, and reports conflicts.
 - `needs-review.sh`, in this repository, prints the rules above, read from `.lean/needs-review.rules`. A missing rules file or merge base prints a line too, so a check that could not run never looks like a quiet diff.
-- `scripts/strip-asset-provenance.py` removes embedded provenance metadata from images, and fails the build in `--check` mode if any is left. Section 9 is why.
+- `asset-provenance.py`, in this repository, finds embedded provenance metadata in images and removes it with `--strip`. Section 9 is why.
 - `interaction-surface.sh`, in this repository, prints what a diff touches that it did not write. Section 13 is why.
 - `agent-hygiene.sh`, in this repository, reports what parallel agents leave behind: stuck wait loops, orphaned servers, scratchpad collisions, worktrees on merged branches. Section 14a is why.
 - `retro-signals.sh`, in this repository, collects the facts a retro starts from. Section 16 is why.
@@ -157,11 +157,10 @@ Four scripts do what I used to write into every agent brief. They live in the re
 - `sync-default.sh`, in this repository, refuses a dirty tree, merges the default branch, lists conflicts, then runs a locked restore for each lock file present so a stale lock file fails here instead of in CI. It never resets, stashes or checks out files.
 - `check-deployed-sha.sh <url> <sha>`, in this repository, proves a deploy by the commit sha the running build reports, not a 200 or a version string. Section 14e is why.
 - `check-runtime.sh`, in this repository, compares the Node, .NET and Go versions a repository declares with the binaries on PATH.
-- `self-test-all.sh`, in this repository, runs every script's `--self-test` and lists any script without one.
 
-They are in [BaryoDev/barakoCMS](https://github.com/BaryoDev/barakoCMS) under `scripts/`. Copy the shape, replace the checks with your own.
+The general parts of the two `scripts/` entries now ship here as `sync-default.sh`, `check-workflow-keys.py`, `assert-ran.sh` and `style-scan`. For the rest, copy the shape and replace the checks with your own.
 
-One trap worth inheriting along with the shape: `needs-review.sh` takes no arguments and diffs the working tree, folding untracked files in as new. That is deliberate, because a rule that only reads committed changes misses the file an agent has written and not yet added. It also means running it in a checkout full of other work walks all of that too. Run it inside a clean copy of the branch. I lost a few minutes to this before writing it down.
+One trap worth inheriting along with the shape: `needs-review.sh` diffs the working tree against the merge base, folding untracked files in as new. That is deliberate, because a rule that only reads committed changes misses the file an agent has written and not yet added. It also means running it in a checkout full of other work walks all of that too. Run it inside a clean copy of the branch. I lost a few minutes to this before writing it down.
 
 An instruction in a prompt is forgotten within a day. A script is not, and it costs no tokens to obey.
 

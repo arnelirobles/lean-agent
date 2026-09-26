@@ -1,1 +1,0 @@
-bin/self-test-all.sh
