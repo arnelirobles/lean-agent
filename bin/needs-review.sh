@@ -37,11 +37,11 @@ set -uo pipefail
 rules_py=$(cat <<'PY'
 import configparser, re, sys
 
-rules_path, diff_path = sys.argv[1], sys.argv[2]
+rules_path, diff_path, paths_path = sys.argv[1], sys.argv[2], sys.argv[3]
 cp = configparser.ConfigParser(interpolation=None, delimiters=("=",), comment_prefixes=("#", ";"), inline_comment_prefixes=None)
 cp.optionxform = str
 try:
-    cp.read(rules_path, encoding="utf-8")
+    cp.read_string(open(rules_path, encoding="utf-8", errors="replace").read(), source=rules_path)
 except configparser.Error as ex:
     print("needs-review: cannot parse %s (%s); nothing was checked" % (rules_path, str(ex).splitlines()[0]))
     sys.exit(0)
@@ -61,7 +61,11 @@ if not rules:
     print("needs-review: %s holds no rules; nothing was checked" % rules_path)
     sys.exit(0)
 
-added, removed, paths = {}, {}, []
+# The path list comes from git's name list, not the patch: a binary file or a pure rename has no
+# ---/+++ lines in a patch, and a path rule must still see it.
+paths = sorted({p for p in open(paths_path, encoding="utf-8", errors="replace").read().split("\0") if p})
+added = {p: [] for p in paths}
+removed = {p: [] for p in paths}
 cur = old = None
 for line in open(diff_path, encoding="utf-8", errors="replace").read().splitlines():
     if line.startswith("--- "):
@@ -72,8 +76,7 @@ for line in open(diff_path, encoding="utf-8", errors="replace").read().splitline
         p = line[4:]
         cur = old if p == "/dev/null" else (p[2:] if p.startswith("b/") else p)
         if cur and cur not in added:
-            paths.append(cur)
-            added[cur], removed[cur] = [], []
+            cur = None
         continue
     if cur is None or line.startswith("@@"):
         continue
@@ -110,7 +113,7 @@ default_base() {
 }
 
 run() { # $1 optional base; runs in the current repository
-  local top base mb rules diff_file
+  local top base mb rules diff_file paths_file rc
   top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "needs-review: not inside a git repository; nothing was checked"; return 0; }
   cd "$top" || return 0
   rules=".lean/needs-review.rules"
@@ -124,16 +127,26 @@ run() { # $1 optional base; runs in the current repository
     echo "needs-review: no merge base with '${base:-a default branch}'; nothing was checked. Pass the base branch as an argument."
     return 0
   fi
-  diff_file=$(mktemp)
+  diff_file=$(mktemp); paths_file=$(mktemp)
   {
-    git diff --no-color --no-ext-diff "$mb" -- . ":(exclude)$rules"
+    git diff --name-only --no-renames -z "$mb" -- . ":(exclude)$rules"
+    git ls-files --others --exclude-standard -z -- . ":(exclude)$rules"
+  } > "$paths_file"
+  {
+    git diff --no-color --no-ext-diff --no-renames "$mb" -- . ":(exclude)$rules"
     git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
       [ -f "$f" ] && [ "$f" != "$rules" ] || continue
       git diff --no-color --no-index -- /dev/null "$f" 2>/dev/null
     done
   } > "$diff_file"
-  python3 -c "$rules_py" "$rules" "$diff_file"
-  rm -f "$diff_file"
+  python3 -c "$rules_py" "$rules" "$diff_file" "$paths_file" 2>"$diff_file.err"
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "needs-review: the rule check crashed ($(tail -1 "$diff_file.err")); nothing was checked"
+  else
+    cat "$diff_file.err" >&2
+  fi
+  rm -f "$diff_file" "$diff_file.err" "$paths_file"
   return 0
 }
 
@@ -148,6 +161,8 @@ self_test() {
     printf 'def login(user):\n    return True\n' > src/auth/login.py
     printf 'def test_a():\n    assert 1 == 1\n    assert 2 == 2\n' > tests/test_a.py
     printf 'print("hello")\n' > src/app.py
+    printf 'def old():\n    pass\n' > src/auth/legacy.py
+    printf '\000\001\002' > src/auth/keystore.bin
     git add -A && git commit -qm base && git branch base
   ) || { echo "self-test failed: fixture setup"; return 1; }
   (cd "$t" && run base) > "$o/out0" 2>&1
@@ -164,6 +179,7 @@ self_test() {
     printf 'def test_a():\n    assert 1 == 1\n' > tests/test_a.py
     printf 'import threading\nt = threading.Thread(target=print)\n' > src/worker.py
     printf 'print("hello")\n# a plain change\n' > src/app.py
+    git mv src/auth/legacy.py src/legacy.py
   )
   out=$( (cd "$t/src" && run base) 2>"$o/err2")
   for want in 'authentication or permissions.*src/auth/login.py' 'secrets.*src/auth/login.py' \
@@ -171,7 +187,22 @@ self_test() {
     grep -qE "$want" <<<"$out" || { echo "self-test failed: want /$want/ in: $out"; fails=$((fails + 1)); }
   done
   grep -q 'src/app.py' <<<"$out" && { echo "self-test failed: a plain change fired a rule: $out"; fails=$((fails + 1)); }
-  grep -q '4 changed file' "$o/err2" || { echo "self-test failed: want 4 files examined: $(cat "$o/err2")"; fails=$((fails + 1)); }
+  grep -q 'authentication or permissions.*src/auth/legacy.py' <<<"$out" || { echo "self-test failed: a pure rename out of a watched path did not fire: $out"; fails=$((fails + 1)); }
+  grep -q '6 changed file' "$o/err2" || { echo "self-test failed: want 6 files examined: $(cat "$o/err2")"; fails=$((fails + 1)); }
+
+  (cd "$t" && git add -A && git commit -qm change && git branch -f base && printf '\003\004' > src/auth/keystore.bin)
+  out=$( (cd "$t" && run base) 2>/dev/null)
+  grep -q 'authentication or permissions.*src/auth/keystore.bin' <<<"$out" || { echo "self-test failed: a binary change under a watched path did not fire: $out"; fails=$((fails + 1)); }
+
+  printf '# r\xe9gles en Latin-1\n' | cat - "$t/.lean/needs-review.rules" > "$o/latin1" && cp "$o/latin1" "$t/.lean/needs-review.rules"
+  out=$( (cd "$t" && run base) 2>/dev/null)
+  grep -q 'keystore.bin' <<<"$out" || { echo "self-test failed: a Latin-1 rules file did not work: $out"; fails=$((fails + 1)); }
+  chmod 000 "$t/.lean/needs-review.rules"
+  if ! cat "$t/.lean/needs-review.rules" >/dev/null 2>&1; then
+    out=$( (cd "$t" && run base) 2>/dev/null)
+    grep -q 'the rule check crashed.*nothing was checked' <<<"$out" || { echo "self-test failed: a crash was silent: '$out'"; fails=$((fails + 1)); }
+  fi
+  chmod 644 "$t/.lean/needs-review.rules"
 
   printf '# nothing\n' > "$t/.lean/needs-review.rules"
   (cd "$t" && run base) | grep -q 'holds no rules' || { echo "self-test failed: empty rules file not reported"; fails=$((fails + 1)); }

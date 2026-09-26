@@ -73,6 +73,9 @@ files = []
 i = 0
 while i < len(args):
     if args[i] == "--min":
+        if i + 1 >= len(args) or not args[i + 1].isdigit():
+            print("usage: assert-ran.sh [--min N] <report> [<report> ...]  (--min needs a whole number)", file=sys.stderr)
+            sys.exit(2)
         minimum = int(args[i + 1]); i += 2; continue
     files.append(args[i]); i += 1
 if not files:
@@ -138,6 +141,8 @@ X
   want "one bad report of two"  1 "$t/v.json" "$t/garbage.txt"
   want "missing file"           1 "$t/nope.json"
   want "no report given"        2
+  want "--min with no value"    2 "$t/v.json" --min
+  want "--min not a number"     2 --min x "$t/v.json"
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
   return 1
 }

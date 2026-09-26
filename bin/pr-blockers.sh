@@ -54,6 +54,8 @@ if pr is None:
     sys.exit(2)
 
 base = pr.get("baseRefName", "?")
+if "UNKNOWN" in (pr.get("mergeable"), pr.get("mergeStateStatus")) and pr.get("state", "OPEN") == "OPEN":
+    errors.append("GitHub has not computed mergeability yet (still UNKNOWN after a retry); run this again in a minute")
 state = pr.get("state")
 if state and state != "OPEN":
     blockers.append("the pull request is %s" % state.lower())
@@ -196,6 +198,20 @@ if pr.get("mergeStateStatus") == "BEHIND" or (behind and strict):
 elif behind:
     notes.append("head is %d commit(s) behind %s (not required to be current)" % (behind, base))
 
+# Merge queue: rulesets show it as a rule, classic protection does not, so GraphQL decides too.
+mq = load("mq")
+if isinstance(mq, dict) and not mq.get("errors"):
+    try:
+        if mq["data"]["repository"]["mergeQueue"]:
+            merge_queue = True
+    except (KeyError, TypeError):
+        errors.append("merge queue response had an unexpected shape")
+elif not merge_queue:
+    if isinstance(mq, dict):
+        errors.append("GraphQL errors reading the merge queue: %s" % "; ".join(e.get("message", "?") for e in mq["errors"]))
+    elif not any(e.startswith("could not read mq") for e in errors):
+        errors.append("could not read mq: no data")
+
 # How to merge.
 repo = load("repo")
 if merge_queue:
@@ -251,6 +267,7 @@ J
   echo '{"author":{"login":"dev"},"commit":{"author":{"name":"Dev","email":"dev@example.com"}}}' > "$t/clean/commit.json"
   echo '{"behind_by":0}' > "$t/clean/compare.json"
   echo '{"allow_squash_merge":true,"allow_merge_commit":false}' > "$t/clean/repo.json"
+  echo '{"data":{"repository":{"mergeQueue":null}}}' > "$t/clean/mq.json"
   expect clean 0 'gh pr merge 7 --squash'
 
   cat > "$t/blocked/pr.json" <<'J'
@@ -280,6 +297,17 @@ J
   expect blocked 1 '4 commit.*behind main'
   expect blocked 1 'merge queue is on.*no strategy flag'
 
+  mkdir -p "$t/classicq" "$t/unknown" "$t/mqerr"
+  cp "$t/clean/"*.json "$t/classicq/"
+  echo '{"data":{"repository":{"mergeQueue":{"id":"MQ_1"}}}}' > "$t/classicq/mq.json"
+  expect classicq 0 'merge queue is on for main'
+  cp "$t/clean/"*.json "$t/unknown/"
+  sed -i 's/"MERGEABLE","mergeStateStatus":"CLEAN"/"UNKNOWN","mergeStateStatus":"UNKNOWN"/' "$t/unknown/pr.json"
+  expect unknown 2 'not computed mergeability'
+  cp "$t/clean/"*.json "$t/mqerr/"
+  rm "$t/mqerr/mq.json"; echo 'HTTP 502' > "$t/mqerr/mq.err"
+  expect mqerr 2 'could not read mq'
+
   cp "$t/clean/"*.json "$t/apierr/"
   rm "$t/apierr/threads.json"
   echo 'HTTP 502: Bad Gateway' > "$t/apierr/threads.err"
@@ -290,6 +318,8 @@ J
 
   mkdir -p "$t/nopr"; echo 'HTTP 404' > "$t/nopr/pr.err"
   expect nopr 2 'could not read pr'
+  timeout 10 bash "$(readlink -f "$0")" 9 -R >/dev/null 2>&1; rc=$?
+  [ "$rc" = 2 ] || { echo "self-test failed: -R with no value gave exit $rc, want 2"; fails=$((fails + 1)); }
 
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
   return 1
@@ -300,7 +330,7 @@ if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
 pr=""; repo=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -R|--repo) repo=${2:-}; shift 2 ;;
+    -R|--repo) [ $# -ge 2 ] || { echo "pr-blockers: $1 needs owner/repo" >&2; exit 2; }; repo=$2; shift 2 ;;
     -h|--help) sed -n '2,6p' "$0"; exit 0 ;;
     *) pr=$1; shift ;;
   esac
@@ -322,8 +352,15 @@ get() { # $1 file stem, rest: gh args
   gh "$@" > "$w/$stem.json" 2> "$w/$stem.err" || { [ -s "$w/$stem.err" ] || echo "gh exited nonzero" > "$w/$stem.err"; : > "$w/$stem.json"; rm -f "$w/$stem.json"; }
 }
 
-get pr pr view "$pr" -R "$repo" --json number,state,isDraft,mergeable,mergeStateStatus,reviewDecision,baseRefName,headRefOid,latestReviews,statusCheckRollup
+fields=number,state,isDraft,mergeable,mergeStateStatus,reviewDecision,baseRefName,headRefOid,latestReviews,statusCheckRollup
+get pr pr view "$pr" -R "$repo" --json "$fields"
 if [ ! -s "$w/pr.json" ]; then analyze "$w"; exit $?; fi
+# GitHub computes mergeability lazily; the first read after a push often says UNKNOWN. One retry.
+if python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(0 if p.get("state")=="OPEN" and "UNKNOWN" in (p.get("mergeable"), p.get("mergeStateStatus")) else 1)' "$w/pr.json"; then
+  sleep "${PR_BLOCKERS_RETRY_SLEEP:-5}"
+  get pr pr view "$pr" -R "$repo" --json "$fields"
+  if [ ! -s "$w/pr.json" ]; then analyze "$w"; exit $?; fi
+fi
 base=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$w/pr.json")
 sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$w/pr.json")
 
@@ -336,6 +373,9 @@ get repo    api "repos/$repo"
 get threads api graphql -F owner="$owner" -F name="$name" -F number="$pr" -f query='
 query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
   reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated path line comments(first:1){nodes{author{login}}}}}}}}'
+
+get mq api graphql -F owner="$owner" -F name="$name" -F branch="$base" -f query='
+query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){id}}}'
 
 # The branch endpoint 404s on an unprotected branch with no rules; that is an answer, not a failure.
 if [ -s "$w/branch.err" ] && grep -q 'HTTP 404' "$w/branch.err"; then rm -f "$w/branch.err"; fi

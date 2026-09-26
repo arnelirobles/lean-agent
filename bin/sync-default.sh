@@ -21,7 +21,8 @@
 # fails in CI, or worse, does not. A locked restore right after the merge fails loudly instead.
 # Restores run through heavy.sh (lanes node, dotnet, go, cargo) so parallel agents queue them.
 #
-# It never discards work: no reset, no checkout of files, no stash, no merge --abort. The dirty-tree
+# It never discards work: no reset, no checkout of files, no stash, no merge --abort, and the merge
+# refuses to overwrite ignored files. The dirty-tree
 # refusal is what makes that safe, because git refuses a merge over local changes anyway, and a
 # refusal that reads "dirty tree" is clearer than an empty conflict list.
 #
@@ -69,22 +70,34 @@ restore() {
     fi
     echo "== locked restore [$lane]: $cmd =="
     # shellcheck disable=SC2086
-    bash "$here/heavy.sh" "$lane" $cmd || fail "'$cmd' failed. If it says the lock file does not match, regenerate it with the unlocked command, check the diff, and commit it."
+    bash "$here/heavy.sh" "$lane" $cmd </dev/null || fail "'$cmd' failed. If it says the lock file does not match, regenerate it with the unlocked command, check the diff, and commit it."
   done <<< "$plan"
   echo "sync-default: $n locked restore(s) done"
 }
 
 sync() {
-  local no_restore=$1 top def conflicts
+  local no_restore=$1 top def conflicts clobber
   top=$(git rev-parse --show-toplevel 2>/dev/null) || fail "not inside a git repository"
   cd "$top" || fail "cannot enter $top"
-  [ -z "$(git status --porcelain)" ] || fail "working tree has uncommitted changes or untracked files; commit them first (this script never stashes or discards)"
+  [ -z "$(git status --porcelain --untracked-files=all)" ] || fail "working tree has uncommitted changes or untracked files; commit them first (this script never stashes or discards)"
   git fetch -q origin || fail "git fetch origin failed"
   def=$(default_branch)
   [ -n "$def" ] || fail "cannot tell the default branch; set it with: git remote set-head origin --auto"
   [ "$(git rev-parse --abbrev-ref HEAD)" != "$def" ] || echo "sync-default: note, you are on $def itself"
   echo "== merge origin/$def =="
-  if ! git merge --no-edit "origin/$def"; then
+  # A locally ignored file (a .env, say) that the default branch starts tracking is replaced by the
+  # merge without a word. --no-overwrite-ignore stops that only on a fast-forward; the ort strategy
+  # overwrites it anyway (git 2.52), so check first. The tree is clean including untracked files,
+  # so anything already on disk at an incoming path is an ignored file.
+  clobber=$(comm -13 <(git -c core.quotepath=off ls-tree -r --name-only HEAD | sort) \
+                     <(git -c core.quotepath=off ls-tree -r --name-only "origin/$def" | sort) |
+            while IFS= read -r f; do { [ -e "$f" ] || [ -L "$f" ]; } && printf '  %s\n' "$f"; done)
+  if [ -n "$clobber" ]; then
+    echo "sync-default: origin/$def now tracks files that exist here as ignored local files:"
+    printf '%s\n' "$clobber"
+    fail "move them aside (they may hold local secrets or config), then run this again. Nothing was merged."
+  fi
+  if ! git merge --no-overwrite-ignore --no-edit "origin/$def"; then
     conflicts=$(git diff --name-only --diff-filter=U)
     [ -n "$conflicts" ] || fail "merge failed without conflicts; read git's message above"
     echo "sync-default: merge conflicts in:"
@@ -123,6 +136,11 @@ self_test() {
   mkdir -p sub
   expect "clean merge from a subdirectory, restore planned" 0 'would run \[node\]: npm ci' sub
   [ -f g.txt ] || { echo "self-test failed: upstream commit not merged"; fails=$((fails + 1)); }
+  printf '.env\n' >> .git/info/exclude; printf 'LOCAL=1\n' > .env
+  ( cd "$t/seed" && printf 'UPSTREAM=1\n' > .env && git add .env && git commit -qm "track .env" && git push -q origin main )
+  expect "ignored local file not overwritten, real merge" 1 'exist here as ignored local files:'
+  [ "$(cat .env)" = "LOCAL=1" ] || { echo "self-test failed: the merge overwrote an ignored local file"; fails=$((fails + 1)); }
+  git merge --abort 2>/dev/null; rm .env
   ( cd "$t/seed" && printf 'theirs\n' > f.txt && git commit -qam theirs && git push -q origin main )
   printf 'ours\n' > f.txt && git commit -qam ours
   expect "conflict listed" 1 'merge conflicts in:.*'

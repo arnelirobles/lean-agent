@@ -34,18 +34,23 @@
 
 set -uo pipefail
 
-lock_holders() { # $1 lock path; prints "pid command" for every visible process with it open
-  local lock fd pid
+lock_holders() { # $1 lock path; prints each visible process with it open, and what that process runs
+  local lock fd pid kid
   lock=$(readlink -f "$1")
   for fd in /proc/[0-9]*/fd/*; do
     [ "$(readlink "$fd" 2>/dev/null)" = "$lock" ] || continue
     pid=${fd#/proc/}; pid=${pid%%/*}
     printf '  pid %s: %s\n' "$pid" "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-150)"
-  done 2>/dev/null | sort -u
+    # The holder is usually flock itself; the command it runs is its child, and that is the part
+    # that says whether the lane is doing real work.
+    for kid in $(cat /proc/"$pid"/task/*/children 2>/dev/null); do
+      printf '    running pid %s: %s\n' "$kid" "$(tr '\0' ' ' < "/proc/$kid/cmdline" 2>/dev/null | cut -c1-150)"
+    done
+  done 2>/dev/null | awk '!seen[$0]++'
 }
 
 run_lane() { # $1 lane, rest: command
-  local lane=$1 dir lock wait marker holders child rc
+  local lane=$1 dir lock wait marker holders rc
   shift
   case "$lane" in
     *[!A-Za-z0-9._-]*) echo "lane '$lane' must be letters, digits, dot, dash or underscore" >&2; return 2 ;;
@@ -69,14 +74,13 @@ run_lane() { # $1 lane, rest: command
   # building and every other agent waited on it. The lock still covers the whole command, because
   # flock keeps its own copy until the command exits.
   #
-  # The marker tells a timeout (flock's 75) from a command that itself exits 75.
+  # The marker tells a timeout (flock's 75) from a command that itself exits 75. flock runs in the
+  # foreground so stdin reaches the command and a Ctrl-C reaches both, never freeing the lock while
+  # the command runs on.
   marker=$(mktemp)
   rm -f "$marker"
-  flock -o -w "$wait" -E 75 "$lock" sh -c ': > "$0"; exec nice -n 19 "$@"' "$marker" "$@" &
-  child=$!
-  trap 'kill -TERM "$child" 2>/dev/null' TERM INT HUP
-  wait "$child"; rc=$?
-  trap - TERM INT HUP
+  flock -o -w "$wait" -E 75 "$lock" sh -c ': > "$0"; exec nice -n 19 "$@"' "$marker" "$@"
+  rc=$?
   if [ "$rc" = 75 ] && [ ! -e "$marker" ]; then
     holders=$(lock_holders "$lock")
     echo "heavy.sh: timed out after ${wait}s waiting for lane '$lane' ($lock). Held by:" >&2
@@ -99,21 +103,24 @@ self_test() {
   out=$( (run_lane l1 sh -c 'exit 75') 2>&1 ); rc=$?
   { [ "$rc" = 75 ] && ! grep -q 'timed out' <<<"$out"; } || { echo "self-test failed: a command exiting 75 read as a timeout: $out"; fails=$((fails + 1)); }
   out=$( (run_lane 'bad/lane' true) 2>&1 ); [ $? = 2 ] || { echo "self-test failed: bad lane name accepted"; fails=$((fails + 1)); }
+  # Through the script itself, as a caller runs it: a backgrounded flock in a script gets /dev/null.
+  out=$(printf 'through stdin\n' | bash "$(readlink -f "$0")" l1 cat 2>&1)
+  [ "$out" = "through stdin" ] || { echo "self-test failed: stdin did not reach the command: '$out'"; fails=$((fails + 1)); }
 
-  mkdir -p "$HEAVY_LOCK_DIR"
-  timeout 30 flock "$HEAVY_LOCK_DIR/l2.lock" sleep 25 &
+  # Hold the lane the way heavy.sh does, so the holder is flock and the work is its child.
+  (run_lane l2 sleep 7 </dev/null >/dev/null 2>&1) &
   holder=$!
   for i in $(seq 1 50); do flock -n "$HEAVY_LOCK_DIR/l2.lock" true 2>/dev/null || break; sleep 0.1; done
   out=$(lock_holders "$HEAVY_LOCK_DIR/l2.lock")
-  grep -q 'sleep 25' <<<"$out" || { echo "self-test failed: holder not listed: '$out'"; fails=$((fails + 1)); }
+  grep -q 'running pid [0-9]*: sleep 7' <<<"$out" || { echo "self-test failed: the holder's command not listed: '$out'"; fails=$((fails + 1)); }
   out=$( (HEAVY_WAIT=1 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
   [ "$rc" = 75 ] || { echo "self-test failed: timeout exit was $rc, want 75"; fails=$((fails + 1)); }
   grep -q "timed out after 1s waiting for lane 'l2'" <<<"$out" || { echo "self-test failed: no timeout message: $out"; fails=$((fails + 1)); }
-  [ "$(grep -c 'Held by' <<<"$out")" = 2 ] && grep -q 'pid [0-9]*: .*sleep 25' <<<"$out" || { echo "self-test failed: holders not printed once while waiting and once at timeout: $out"; fails=$((fails + 1)); }
+  { [ "$(grep -c 'Held by' <<<"$out")" = 2 ] && grep -q 'running pid [0-9]*: sleep 7' <<<"$out"; } || { echo "self-test failed: holders not printed once while waiting and once at timeout: $out"; fails=$((fails + 1)); }
   [ ! -e "$t/ran" ] || { echo "self-test failed: the command ran without the lock"; fails=$((fails + 1)); }
-  kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; holder=""
-  out=$( (HEAVY_WAIT=5 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
-  { [ "$rc" = 0 ] && [ -e "$t/ran" ]; } || { echo "self-test failed: free lane did not run: $rc $out"; fails=$((fails + 1)); }
+  out=$( (HEAVY_WAIT=15 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
+  { [ "$rc" = 0 ] && [ -e "$t/ran" ]; } || { echo "self-test failed: lane did not run once free: $rc $out"; fails=$((fails + 1)); }
+  wait "$holder" 2>/dev/null; holder=""
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
   return 1
 }

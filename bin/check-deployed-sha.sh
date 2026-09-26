@@ -82,6 +82,10 @@ self_test() {
   matches abc abcdef0123 && { echo "self-test failed: a 3 character prefix matched"; fails=$((fails + 1)); }
   matches abc1234 abc9999999 && { echo "self-test failed: a different sha matched"; fails=$((fails + 1)); }
   matches "" abc1234 && { echo "self-test failed: an empty sha matched"; fails=$((fails + 1)); }
+  for flag in --field --header; do
+    timeout 10 bash "$(readlink -f "$0")" http://127.0.0.1:9 abc1234 "$flag" >/dev/null 2>&1
+    got=$?; [ "$got" = 2 ] || { echo "self-test failed: $flag with no value gave exit $got, want 2"; fails=$((fails + 1)); }
+  done
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
   return 1
 }
@@ -94,8 +98,10 @@ shift 2
 field=""; header=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --field) field=${2:-}; shift 2 ;;
-    --header) header=${2:-}; shift 2 ;;
+    --field|--header)
+      [ $# -ge 2 ] || { echo "check-deployed-sha: $1 needs a value" >&2; exit 2; }
+      if [ "$1" = --field ]; then field=$2; else header=$2; fi
+      shift 2 ;;
     *) echo "check-deployed-sha: unknown argument $1" >&2; exit 2 ;;
   esac
 done
