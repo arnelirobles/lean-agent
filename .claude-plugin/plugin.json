@@ -1,6 +1,6 @@
 {
   "name": "lean-agent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Run coding agents over a backlog without burning a plan: agent-ready tickets, scripted gates, an adversarial critic, and a retro that improves the method from numbers.",
   "author": {
     "name": "Arnel Robles",
