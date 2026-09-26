@@ -1,6 +1,6 @@
 ---
 name: lean-retro
-description: Run the lean agent method's retro after a batch of changes merges. Collects facts with retro-signals.sh, checks them against fixed triggers, checks whether the last method change helped, and proposes changes to the method with evidence for a person to approve. Use it at the end of every batch, weekly at the latest, and whenever asked for a retro, a method review or "what should we change about how we work".
+description: Run lean agent's retro after a batch of changes merges. Collects facts with retro-signals.sh, checks them against fixed triggers, checks whether the last method change helped, and proposes changes to the method with evidence for a person to approve. Use it at the end of every batch, weekly at the latest, and whenever asked for a retro, a method review or "what should we change about how we work".
 ---
 
 # Lean retro
@@ -48,4 +48,4 @@ One short file, in the owner's style (plain, short, no em or en dashes, no arrow
 
 ## 5. After approval
 
-For each approved proposal, open one pull request to the method. A new script goes where its dependencies are: one that works on any repository is a pull request to lean-agent-method (with a test and a line in section 4's list); one tied to a repository goes to that repository's `scripts/`, with any general part also offered to the method. Then update memory and the CLAUDE.md layers that summarise the method, and append a line to `retro-log.md`: date, proposal, the number to watch. Rejected proposals are logged too, with the reason, so they are not proposed again without new evidence.
+For each approved proposal, open one pull request to the method. A new script goes where its dependencies are: one that works on any repository is a pull request to arnelirobles/lean-agent (with a test and a line in section 4's list); one tied to a repository goes to that repository's `scripts/`, with any general part also offered to the method. Then update memory and the CLAUDE.md layers that summarise the method, and append a line to `retro-log.md`: date, proposal, the number to watch. Rejected proposals are logged too, with the reason, so they are not proposed again without new evidence.

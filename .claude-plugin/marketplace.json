@@ -1,13 +1,13 @@
 {
-  "name": "lean-agent-method",
-  "description": "The lean agent method as a Claude Code plugin.",
+  "name": "lean-agent",
+  "description": "Lean agent as a Claude Code plugin.",
   "owner": {
     "name": "Arnel Robles",
     "url": "https://github.com/arnelirobles"
   },
   "plugins": [
     {
-      "name": "lean-agent-method",
+      "name": "lean-agent",
       "source": "./",
       "description": "Agent-ready tickets, scripted gates, an adversarial critic, and a retro that improves the method from numbers."
     }

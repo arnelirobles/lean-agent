@@ -1,7 +1,7 @@
 ---
 name: adversarial-review
 description: >
-  The lean agent method's critic as a skill. Reviews one change (a pull request, a branch, or an
+  Lean agent's critic as a skill. Reviews one change (a pull request, a branch, or an
   agent's working tree) as an adversary: gates on what the diff touches, has one fresh agent hunt
   for defects against fixed questions and the repository's own rules, has a second fresh agent try
   to disprove every finding, and reports only what survives, with proof. Routes findings back to

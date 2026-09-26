@@ -1,6 +1,6 @@
 ---
 name: shape-ticket
-description: Write or refine an issue in the lean agent method's agent-ready shape, after searching for an existing issue it belongs to. Use when filing an issue, turning review findings or a plan into tickets, consolidating related issues, or asked to make a ticket ready for an agent.
+description: Write or refine an issue in lean agent's agent-ready shape, after searching for an existing issue it belongs to. Use when filing an issue, turning review findings or a plan into tickets, consolidating related issues, or asked to make a ticket ready for an agent.
 ---
 
 # Shape a ticket for an agent

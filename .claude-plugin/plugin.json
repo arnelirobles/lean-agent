@@ -1,12 +1,12 @@
 {
-  "name": "lean-agent-method",
+  "name": "lean-agent",
   "version": "1.0.0",
   "description": "Run coding agents over a backlog without burning a plan: agent-ready tickets, scripted gates, an adversarial critic, and a retro that improves the method from numbers.",
   "author": {
     "name": "Arnel Robles",
     "url": "https://github.com/arnelirobles"
   },
-  "homepage": "https://github.com/arnelirobles/lean-agent-method",
-  "repository": "https://github.com/arnelirobles/lean-agent-method",
+  "homepage": "https://github.com/arnelirobles/lean-agent",
+  "repository": "https://github.com/arnelirobles/lean-agent",
   "license": "MIT"
 }
