@@ -617,7 +617,7 @@ I wrote here that the harness re-invokes an agent when tracked work finishes, so
 loops should not exist. That is true for the session I talk to. It is wrong for a subagent: a
 subagent is never told that background work finished, so it waits on something long done and
 stalls. So a subagent runs its commands in the foreground, and every piece of a gate is sized to
-finish under the tool timeout of 600 seconds. When a loop genuinely must exist, it gets a deadline.
+finish under the tool timeout of 600 seconds, counting any time spent waiting for a lock. When a loop genuinely must exist, it gets a deadline.
 
 ## 14d. Landing a stack of pull requests is its own job
 
@@ -630,7 +630,7 @@ Seven pull requests, each built on the one before, all reviewed and green. Squas
 
 Write the landing as a script with those checks and stop at the first surprise. Landing a stack by hand makes the same four mistakes, one at a time.
 
-One more thing keeps pull requests from landing, and nobody owns it. A fix lands on the default branch, and every open pull request that was red for the same reason stays red on its old base until somebody notices. [`templates/refresh-stale-prs.yml`](templates/refresh-stale-prs.yml) is a workflow for that: when the default branch moves, it updates the branch of every open pull request that is behind it and failing. It never retries a job, because a retry hides a flake, while a newer base rules out one cause and leaves a real failure visible. It never merges, skips forks and drafts, and leaves alone any pull request labelled `no-self-heal`.
+One more thing keeps pull requests from landing, and nobody owns it. A fix lands on the default branch, and every open pull request that was red for the same reason stays red on its old base until somebody notices. [`templates/refresh-stale-prs.yml`](templates/refresh-stale-prs.yml) is a workflow for that: when the default branch moves, it updates the branch of every open pull request that is behind it and failing. It never retries a job, because a retry hides a flake, while a newer base rules out one cause and leaves a real failure visible. It never merges, skips forks and drafts, and leaves alone any pull request labelled `no-self-heal`. Each pull request is refreshed once per failure: if its head is already a merge the workflow made and it is still red, the failure is its own, and it is left for a person.
 
 ## 14e. Test what you published, not what you built
 
@@ -743,7 +743,7 @@ The first run, on one repository for two days, already said something: a stack o
 
 **One experiment running now: review the ticket before the code.** Section 0 predicts that answering the review's questions in the ticket, plus one cheap agent reading the ticket and the code before anyone builds, cuts fix rounds and findings per change. The baseline is the table above. The claim holds if fix rounds and findings fall while the review after the code still finds something and escaped defects stay at zero. If the review after the code drops to nothing and escaped defects rise, the review before has made everyone overconfident, and it comes out.
 
-**After each milestone, a lean pass over what shipped.** No number triggers this one. Agent-written code and comments over-explain, and none of the gates asks whether the result is lean, so the pass deletes comments that restate the code and shortens what a newer language feature says more plainly, without touching code it is not otherwise changing.
+**After each milestone, a lean pass over what shipped.** No number triggers this one. Agent-written code and comments over-explain, and none of the gates asks whether the result is lean, so the pass deletes comments that restate the code and shortens what a newer language feature says more plainly, without changing behaviour, as its own pull request.
 
 **What it does not do.** It never changes the method, the scripts or anyone's instructions by itself. It proposes; a person decides. A method that rewrites itself unattended drifts toward whatever the numbers reward, which is section 15's warning about goals that poison themselves.
 

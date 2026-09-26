@@ -22,7 +22,7 @@ Full text: ${CLAUDE_PLUGIN_ROOT}/README.md
 - A script that works on any repository goes to the method as a pull request; one tied to a repository goes to its `scripts/`. Always a pull request, merged by a person.
 - Every change the diff gates gets the `adversarial-review` skill; findings go back to the agent that wrote the change.
 - At most four changes in flight. Heavy commands under a shared lock (`${CLAUDE_PLUGIN_ROOT}/bin/heavy.sh`), every wait loop has a deadline, every agent writes under its own scratchpad subdirectory.
-- Subagents run commands in the foreground; they are never told when background work finishes and stall. Size every gate piece to finish under the 600 second tool timeout.
+- Subagents run commands in the foreground; they are never told when background work finishes and stall. Size every gate piece to finish under the 600 second tool timeout, including any time spent waiting for a lock.
 - A worktree-isolated agent runs git as plain single commands from the worktree root: no `cd x &&`, no pipes. The harness refuses what it cannot verify.
 - Parallel changes never append to one shared file such as a changelog: one fragment file per change.
 - Verify content and identity, not status codes or ratios: a page baked empty still answers 200, a small pixel ratio can hide wrong dates, and the deployed commit sha proves a deploy where a version string does not.
@@ -33,4 +33,4 @@ Full text: ${CLAUDE_PLUGIN_ROOT}/README.md
 - Log every review with `${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh`.
 - No agent attribution and no slop in commits, pull requests, issues or releases. The plugin hook blocks both; rewrite the text, do not turn the hook off.
 - Sweep with `${CLAUDE_PLUGIN_ROOT}/bin/agent-hygiene.sh` for what parallel agents left behind.
-- After each milestone, a lean pass over what shipped: agent-written code and comments over-explain, so cut commentary that restates the code and verbose code a newer language feature says more plainly.
+- After each milestone, a lean pass over what shipped: agent-written code and comments over-explain, so cut commentary that restates the code and verbose code a newer language feature says more plainly. No behaviour change, and its own pull request.

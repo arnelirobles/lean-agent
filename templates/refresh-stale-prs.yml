@@ -16,6 +16,10 @@ name: Refresh stale pull requests
 #
 # To use it: copy to .github/workflows/, set the branch under `push` to your default branch, and
 # label a pull request `no-self-heal` to keep it on its current base.
+#
+# Each pull request is refreshed once per failure. If its head is already a merge this workflow made
+# and it is still red, the failure is its own, and updating it again on every push would only spend
+# CI minutes rebuilding the same failure.
 
 on:
   push:
@@ -56,7 +60,9 @@ jobs:
           BASE=$(gh api "repos/$REPO" --jq '.default_branch')
           printf '| PR | behind | checks | action |\n|---|---|---|---|\n' > summary.md
           acted=0
+          errors=0
 
+          # Bounded at 100 open pull requests; past that, the rest wait for a later run.
           gh pr list --repo "$REPO" --state open --base "$BASE" --limit 100 \
             --json number,isDraft,isCrossRepository,headRefOid,labels,statusCheckRollup \
             > prs.json
@@ -86,13 +92,35 @@ jobs:
             # A check run reports `conclusion`, a commit status reports `state`; the rollup mixes both.
             # A cancelled required check blocks a pull request just as a failed one does.
             FAILING=$(jq -r '[.statusCheckRollup[]? | (.conclusion // .state) | select(. == "FAILURE" or . == "TIMED_OUT" or . == "CANCELLED" or . == "ERROR" or . == "STARTUP_FAILURE")] | length' pr.json)
-            BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA" --jq '.behind_by' 2>/dev/null || echo 0)
+            # An API error must not read as "up to date": report it, and fail the job at the end.
+            if ! BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA" --jq '.behind_by' 2>err.txt); then
+              errors=$((errors + 1))
+              printf '| #%s | - | - | could not compare: %s |\n' "$N" "$(tail -n 1 err.txt | tr '|' '/')" >> summary.md; continue
+            fi
 
             if [ "$BEHIND" -eq 0 ]; then
               printf '| #%s | 0 | %s failing | up to date |\n' "$N" "$FAILING" >> summary.md; continue
             fi
             if [ "$FAILING" -eq 0 ]; then
               printf '| #%s | %s | green | left alone, green |\n' "$N" "$BEHIND" >> summary.md; continue
+            fi
+            # Still red on a merge this workflow made, whose second parent is on the default branch:
+            # the base was already ruled out, so the failure is the branch's own.
+            if ! HEAD=$(gh api "repos/$REPO/commits/$SHA" --jq '[.author.login // "", .parents[1].sha // ""] | @tsv' 2>err.txt); then
+              errors=$((errors + 1))
+              printf '| #%s | - | - | could not read head commit: %s |\n' "$N" "$(tail -n 1 err.txt | tr '|' '/')" >> summary.md; continue
+            fi
+            HEAD_AUTHOR=$(cut -f1 <<<"$HEAD")
+            SECOND_PARENT=$(cut -f2 <<<"$HEAD")
+            if [ "$HEAD_AUTHOR" = "github-actions[bot]" ] && [ -n "$SECOND_PARENT" ]; then
+              case "$SECOND_PARENT" in
+                *[!0-9a-f]*) ;;
+                *)
+                  ON_BASE=$(gh api "repos/$REPO/compare/$BASE...$SECOND_PARENT" --jq '.status' 2>/dev/null || echo unknown)
+                  if [ "$ON_BASE" = "behind" ] || [ "$ON_BASE" = "identical" ]; then
+                    printf '| #%s | %s | %s failing | skipped, already refreshed, still red |\n' "$N" "$BEHIND" "$FAILING" >> summary.md; continue
+                  fi ;;
+              esac
             fi
             if [ "$acted" -ge "$MAX" ]; then
               printf '| #%s | %s | %s failing | deferred, hit the ceiling of %s |\n' "$N" "$BEHIND" "$FAILING" "$MAX" >> summary.md; continue
@@ -117,3 +145,8 @@ jobs:
             echo
             cat summary.md
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$errors" -gt 0 ]; then
+            echo "$errors pull request(s) could not be checked; see the summary."
+            exit 1
+          fi
