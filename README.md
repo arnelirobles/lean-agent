@@ -193,6 +193,8 @@ Three rules keep it honest:
 - **Fix the script, not the run.** When a script is wrong, correcting its output by hand this once means the next agent meets the same bug. Change the script and run it again.
 - **It stops at the first surprise and says so.** A script cannot judge what it was not written for, so it checks its assumptions, stops when one fails, and names the failure. Deciding what to do then is the part that stays with a person or an agent.
 
+**A rule about the code's shape becomes a test.** The same goes for the rules in a repository's agent instructions. Any rule that can be stated about types, namespaces or references (the core never references a module, endpoints stay internal, every list endpoint takes a page size, no controllers) can be an architecture test: reflection over the built assembly, or a library such as NetArchTest or ArchUnit. The agent does not have to remember it, the build fails when it is broken, and the instructions file names the test instead of restating the rule. Like any check, it first asserts it found something to check, because a scan of the wrong assembly passes every rule.
+
 This is what site reliability engineering calls eliminating toil, and what operations people call a runbook written as code. With agents it matters more, because the reasoning is the expensive part, and it is exactly the part a script lets you skip.
 
 Examples from one day: landing a stack of seven pull requests (14d), a production cutover with backups, confirmations and a tested rollback (14f), running a repository's workflow locally when its CI minutes ran out (14g), and the holdout and preflight checks that run on every change (2, 4).

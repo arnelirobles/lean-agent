@@ -19,6 +19,7 @@ Full text: ${CLAUDE_PLUGIN_ROOT}/README.md
 ## While working
 - Scripts, not instructions: run the repository's full gate script, not the one gate that seems relevant.
 - The second time something is reasoned through, it becomes a script with a test. Fix the script, not the run. Scripts stop at the first surprise and say so.
+- A rule in the agent instructions that can be stated about types, namespaces or references becomes an architecture test, and the instructions name the test.
 - A script that works on any repository goes to the method as a pull request; one tied to a repository goes to its `scripts/`. Always a pull request, merged by a person.
 - Every change the diff gates gets the `adversarial-review` skill; findings go back to the agent that wrote the change.
 - At most four changes in flight. Heavy commands under a shared lock (`${CLAUDE_PLUGIN_ROOT}/bin/heavy.sh`), every wait loop has a deadline, every agent writes under its own scratchpad subdirectory.
