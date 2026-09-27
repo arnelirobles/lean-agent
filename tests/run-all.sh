@@ -12,13 +12,24 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || exit 2
 
-mapfile -t scripts < <(grep -l -- '--self-test' bin/* hooks/*.py lib/*.py skills/*/*.sh skills/*/*.py 2>/dev/null | sort -u)
+# A while-read loop rather than mapfile, which macOS's bash 3.2 does not have.
+scripts=()
+while IFS= read -r s; do scripts+=("$s"); done < <(grep -l -- '--self-test' bin/* hooks/*.py lib/*.py skills/*/*.sh skills/*/*.py 2>/dev/null | sort -u)
 if [ "${#scripts[@]}" -eq 0 ]; then
   echo "run-all: found no scripts with a --self-test" >&2
   exit 1
 fi
 
+# macOS has no timeout unless coreutils is installed, as gtimeout. Without either the self-tests
+# still run, only without the 300 second cap.
+limit() {
+  if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout 300 "$@"
+  else "$@"; fi
+}
+
 failed=0
+skipped=0
 if out=$(python3 - .claude-plugin/*.json hooks/hooks.json 2>&1 <<'PY'
 import json, sys
 def no_dupes(pairs):
@@ -64,8 +75,13 @@ for script in "${scripts[@]}"; do
     *.sh) runner=(bash "$script") ;;
     *) runner=("./$script") ;;
   esac
-  if out=$(timeout 300 "${runner[@]}" --self-test 2>&1); then
+  out=$(limit "${runner[@]}" --self-test 2>&1); rc=$?
+  if [ "$rc" = 0 ]; then
     echo "ok   $script"
+  elif [ "$rc" = 77 ]; then
+    # 77 is a self-test saying this machine cannot run it, such as a Linux-only script on macOS.
+    echo "skip $script: $(printf '%s\n' "$out" | tail -1)"
+    skipped=$((skipped + 1))
   else
     echo "FAIL $script"
     printf '%s\n' "$out" | sed 's/^/     /'
@@ -73,5 +89,5 @@ for script in "${scripts[@]}"; do
   fi
 done
 
-echo "run-all: ${#scripts[@]} self-tests, $failed failed"
+echo "run-all: ${#scripts[@]} self-tests, $failed failed, $skipped skipped"
 [ "$failed" -eq 0 ]

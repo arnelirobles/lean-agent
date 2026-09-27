@@ -31,6 +31,9 @@
 # a compiler server that inherited the lock looked exactly like a slow build for ten minutes.
 #
 #   heavy.sh --self-test
+#
+# Linux only. It needs util-linux flock (for -o and -E) and /proc to name the holders, and macOS has
+# neither, so there it stops before running anything rather than running the command unqueued.
 
 set -uo pipefail
 
@@ -94,6 +97,10 @@ run_lane() { # $1 lane, rest: command
 
 self_test() {
   local fails=0 holder out rc i
+  # 77 tells tests/run-all.sh this machine cannot run the test, rather than that it failed.
+  if ! command -v flock >/dev/null 2>&1 || [ ! -d /proc/self ]; then
+    echo "needs Linux (flock and /proc)"; return 77
+  fi
   t=$(mktemp -d)
   holder=""
   trap 'rm -rf "$t"; [ -n "${holder:-}" ] && kill "$holder" 2>/dev/null' EXIT
@@ -110,8 +117,13 @@ self_test() {
   # Hold the lane the way heavy.sh does, so the holder is flock and the work is its child.
   (run_lane l2 sleep 7 </dev/null >/dev/null 2>&1) &
   holder=$!
-  for i in $(seq 1 50); do flock -n "$HEAVY_LOCK_DIR/l2.lock" true 2>/dev/null || break; sleep 0.1; done
-  out=$(lock_holders "$HEAVY_LOCK_DIR/l2.lock")
+  # Poll for the holder itself, not just a busy lock: run_lane's own `flock -n` probe holds the lock
+  # for an instant before the real flock starts, and a check that landed there found no holder (CI).
+  for i in $(seq 1 50); do
+    out=$(lock_holders "$HEAVY_LOCK_DIR/l2.lock")
+    grep -q 'running pid [0-9]*: sleep 7' <<<"$out" && break
+    sleep 0.1
+  done
   grep -q 'running pid [0-9]*: sleep 7' <<<"$out" || { echo "self-test failed: the holder's command not listed: '$out'"; fails=$((fails + 1)); }
   out=$( (HEAVY_WAIT=1 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
   [ "$rc" = 75 ] || { echo "self-test failed: timeout exit was $rc, want 75"; fails=$((fails + 1)); }
@@ -126,6 +138,12 @@ self_test() {
 }
 
 if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "heavy.sh: flock not found, so there is no lane to queue in and nothing ran." >&2
+  echo "  heavy.sh needs Linux (util-linux flock). On macOS run the command directly, one at a time." >&2
+  exit 69
+fi
 
 if [ $# -lt 2 ]; then
   echo "usage: heavy.sh <lane> <command> [args...]" >&2

@@ -56,6 +56,7 @@ What you get:
 - `style-scan` runs the same slop, attribution and U+2000 checks over the lines a branch adds, untracked files included, for a preflight or CI step.
 - With the plugin on, `"attribution": {"commit": "", "pr": ""}` in your Claude Code settings is no longer needed, since the hook blocks the trailer anyway. Setting it too is harmless.
 - `tests/run-all.sh` runs every `--self-test` in the repository, lists scripts that have none, and fails on a duplicate key in the plugin JSON.
+- The hooks and scripts run on Linux and on macOS's stock bash 3.2, except `heavy.sh`, which needs util-linux `flock` and `/proc` and refuses to run without them. `tests/run-all.sh` reports its self-test as skipped on macOS; CI runs every self-test on Ubuntu for each pull request.
 
 Everything else in this README still works without the plugin. The scripts at the root are links into `bin/`.
 

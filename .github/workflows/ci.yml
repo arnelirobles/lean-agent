@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  self-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # run-all.sh compares against the current version's tag, so it needs the tags.
+          fetch-depth: 0
+      - run: git config --global user.email ci@example.com && git config --global user.name ci
+      - run: bash tests/run-all.sh

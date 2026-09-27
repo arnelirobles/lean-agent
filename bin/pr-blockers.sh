@@ -246,6 +246,9 @@ PY
 analyze() { python3 -c "$analyze_py" "$1"; }
 
 self_test() {
+  # timeout caps a hang; macOS has it only as coreutils' gtimeout, and without either the call runs uncapped.
+  local to=""
+  if command -v timeout >/dev/null 2>&1; then to="timeout 10"; elif command -v gtimeout >/dev/null 2>&1; then to="gtimeout 10"; fi
   local rc out fails=0
   t=$(mktemp -d)
   trap 'rm -rf "$t"' EXIT
@@ -302,7 +305,7 @@ J
   echo '{"data":{"repository":{"mergeQueue":{"id":"MQ_1"}}}}' > "$t/classicq/mq.json"
   expect classicq 0 'merge queue is on for main'
   cp "$t/clean/"*.json "$t/unknown/"
-  sed -i 's/"MERGEABLE","mergeStateStatus":"CLEAN"/"UNKNOWN","mergeStateStatus":"UNKNOWN"/' "$t/unknown/pr.json"
+  sed 's/"MERGEABLE","mergeStateStatus":"CLEAN"/"UNKNOWN","mergeStateStatus":"UNKNOWN"/' "$t/unknown/pr.json" > "$t/unknown/pr.json.new" && mv "$t/unknown/pr.json.new" "$t/unknown/pr.json"
   expect unknown 2 'not computed mergeability'
   cp "$t/clean/"*.json "$t/mqerr/"
   rm "$t/mqerr/mq.json"; echo 'HTTP 502' > "$t/mqerr/mq.err"
@@ -318,7 +321,7 @@ J
 
   mkdir -p "$t/nopr"; echo 'HTTP 404' > "$t/nopr/pr.err"
   expect nopr 2 'could not read pr'
-  timeout 10 bash "$(readlink -f "$0")" 9 -R >/dev/null 2>&1; rc=$?
+  $to bash "$(readlink -f "$0")" 9 -R >/dev/null 2>&1; rc=$?
   [ "$rc" = 2 ] || { echo "self-test failed: -R with no value gave exit $rc, want 2"; fails=$((fails + 1)); }
 
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
