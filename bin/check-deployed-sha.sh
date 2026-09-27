@@ -54,7 +54,9 @@ PY
 )
 
 matches() { # $1 actual, $2 expected
-  local a=${1,,} e=${2,,}
+  local a e
+  a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  e=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
   [ -n "$a" ] && [ -n "$e" ] || return 1
   [ "$a" = "$e" ] && return 0
   [ ${#a} -ge 7 ] && [ ${#e} -ge 7 ] || return 1
@@ -64,6 +66,9 @@ matches() { # $1 actual, $2 expected
 }
 
 self_test() {
+  # timeout caps a hang; macOS has it only as coreutils' gtimeout, and without either the call runs uncapped.
+  local to=""
+  if command -v timeout >/dev/null 2>&1; then to="timeout 10"; elif command -v gtimeout >/dev/null 2>&1; then to="gtimeout 10"; fi
   local fails=0 got
   t=$(mktemp -d)
   trap 'rm -rf "$t"' EXIT
@@ -83,7 +88,7 @@ self_test() {
   matches abc1234 abc9999999 && { echo "self-test failed: a different sha matched"; fails=$((fails + 1)); }
   matches "" abc1234 && { echo "self-test failed: an empty sha matched"; fails=$((fails + 1)); }
   for flag in --field --header; do
-    timeout 10 bash "$(readlink -f "$0")" http://127.0.0.1:9 abc1234 "$flag" >/dev/null 2>&1
+    $to bash "$(readlink -f "$0")" http://127.0.0.1:9 abc1234 "$flag" >/dev/null 2>&1
     got=$?; [ "$got" = 2 ] || { echo "self-test failed: $flag with no value gave exit $got, want 2"; fails=$((fails + 1)); }
   done
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
