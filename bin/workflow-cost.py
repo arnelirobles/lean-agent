@@ -2,6 +2,7 @@
 """Sum token usage per agent and per model for one or more workflow runs.
 
 usage: workflow-cost.py <run-dir-or-run-id> [...] [--prs N] [--baseline-per-pr USD]
+       workflow-cost.py --self-test
 
 A run dir is .../subagents/workflows/wf_<id>; a bare id is looked up under every
 project dir in ~/.claude/projects. Prices are notional list prices per million
@@ -122,5 +123,52 @@ def main(argv):
             print(f"saving vs baseline {baseline:.2f}/PR: {100 * (1 - per_pr / baseline):.0f}%")
 
 
+def self_test():
+    import contextlib
+    import io
+    import tempfile
+
+    def line(model, usage=None):
+        m = {"model": model}
+        if usage:
+            m["usage"] = usage
+        return json.dumps({"message": m}) + "\n"
+
+    fails = []
+    with tempfile.TemporaryDirectory() as d:
+        run = os.path.join(d, "wf_selftest")
+        os.mkdir(run)
+        # sonnet: 1M in + 1M out = 3 + 15 = 18.00; opus: 1M cache write = 18.75
+        with open(os.path.join(run, "agent-a1.jsonl"), "w") as fh:
+            fh.write(line("claude-sonnet-5", {"input_tokens": 400000, "output_tokens": 1000000}))
+            fh.write("not json\n")
+            fh.write(line("claude-sonnet-5"))
+            fh.write(line("claude-sonnet-5", {"input_tokens": 600000}))
+        with open(os.path.join(run, "agent-a2.jsonl"), "w") as fh:
+            fh.write(line("claude-opus-5-5", {"cache_creation_input_tokens": 1000000}))
+        with open(os.path.join(run, "agent-a1.meta.json"), "w") as fh:
+            json.dump({"label": "review:bugs"}, fh)
+        with open(os.path.join(run, "agent-a2.meta.json"), "w") as fh:
+            json.dump({"description": "verify finding"}, fh)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main([run, "--prs", "3", "--baseline-per-pr", "24.5"])
+        out = buf.getvalue()
+        for want in ("review:bugs", "verify finding", "sonnet  agents=  1", "usd=18.00",
+                     "opus    agents=  1", "usd=18.75", "total usd=36.75", "per PR usd=12.25 over 3 PRs",
+                     "saving vs baseline 24.50/PR: 50%"):
+            if want not in out:
+                fails.append("missing %r in output:\n%s" % (want, out))
+    if family("claude-haiku-4-5") != "haiku" or family("something-new") != "opus":
+        fails.append("family() mapping wrong")
+    if fails:
+        print("self-test failed:\n  " + "\n  ".join(fails))
+        return 1
+    print("self-test passed")
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
     main(sys.argv[1:])
