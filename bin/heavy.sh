@@ -117,8 +117,13 @@ self_test() {
   # Hold the lane the way heavy.sh does, so the holder is flock and the work is its child.
   (run_lane l2 sleep 7 </dev/null >/dev/null 2>&1) &
   holder=$!
-  for i in $(seq 1 50); do flock -n "$HEAVY_LOCK_DIR/l2.lock" true 2>/dev/null || break; sleep 0.1; done
-  out=$(lock_holders "$HEAVY_LOCK_DIR/l2.lock")
+  # Poll for the holder itself, not just a busy lock: run_lane's own `flock -n` probe holds the lock
+  # for an instant before the real flock starts, and a check that landed there found no holder (CI).
+  for i in $(seq 1 50); do
+    out=$(lock_holders "$HEAVY_LOCK_DIR/l2.lock")
+    grep -q 'running pid [0-9]*: sleep 7' <<<"$out" && break
+    sleep 0.1
+  done
   grep -q 'running pid [0-9]*: sleep 7' <<<"$out" || { echo "self-test failed: the holder's command not listed: '$out'"; fails=$((fails + 1)); }
   out=$( (HEAVY_WAIT=1 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
   [ "$rc" = 75 ] || { echo "self-test failed: timeout exit was $rc, want 75"; fails=$((fails + 1)); }
