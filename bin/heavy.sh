@@ -31,6 +31,9 @@
 # a compiler server that inherited the lock looked exactly like a slow build for ten minutes.
 #
 #   heavy.sh --self-test
+#
+# Linux only. It needs util-linux flock (for -o and -E) and /proc to name the holders, and macOS has
+# neither, so there it stops before running anything rather than running the command unqueued.
 
 set -uo pipefail
 
@@ -94,6 +97,10 @@ run_lane() { # $1 lane, rest: command
 
 self_test() {
   local fails=0 holder out rc i
+  # 77 tells tests/run-all.sh this machine cannot run the test, rather than that it failed.
+  if ! command -v flock >/dev/null 2>&1 || [ ! -d /proc/self ]; then
+    echo "needs Linux (flock and /proc)"; return 77
+  fi
   t=$(mktemp -d)
   holder=""
   trap 'rm -rf "$t"; [ -n "${holder:-}" ] && kill "$holder" 2>/dev/null' EXIT
@@ -126,6 +133,12 @@ self_test() {
 }
 
 if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "heavy.sh: flock not found, so there is no lane to queue in and nothing ran." >&2
+  echo "  heavy.sh needs Linux (util-linux flock). On macOS run the command directly, one at a time." >&2
+  exit 69
+fi
 
 if [ $# -lt 2 ]; then
   echo "usage: heavy.sh <lane> <command> [args...]" >&2
