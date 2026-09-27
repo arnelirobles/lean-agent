@@ -15,7 +15,8 @@ set -euo pipefail
 
 row() { # repo pr opened merged first_review_at commits_after failed_checks
   local days
-  days=$(( ( $(date -d "$4" +%s) - $(date -d "$3" +%s) ) / 86400 ))
+  # jq rather than `date -d`, which BSD date on macOS does not have.
+  days=$(jq -n --arg a "$3" --arg b "$4" '(($b | fromdateiso8601) - ($a | fromdateiso8601)) / 86400 | floor')
   printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$6" "$7" "$days"
 }
 
