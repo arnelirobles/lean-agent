@@ -24,6 +24,10 @@ Three rules shape everything below.
    it is now, and the wrong result. If a runnable check would settle it in a minute, it is run.
 3. **The repository's rules beat general taste.** Read the rules file before looking at code.
 
+With `LEAN_AGENTS=one` there are no fresh agents. Steps 3 and 4 run as two passes in this session:
+write the hunt's candidates down first, then refute each one from the code and a check, not from
+the hunt's reasoning. The report says the finder and the judge shared a context.
+
 ## Inputs
 
 - A target: a PR number or URL, a branch, or `--wip` for an agent's uncommitted work.

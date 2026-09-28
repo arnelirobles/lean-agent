@@ -1,6 +1,17 @@
 {
-  "description": "Generic lean-agent hooks: public-text and commit-author checks that block, and notes on house style, stale test runs, unverified claims, containers for docs-only diffs and lessons.",
+  "description": "Generic lean-agent hooks: a note on the working mode at session start, public-text and commit-author checks that block, and notes on house style, stale test runs, unverified claims, containers for docs-only diffs and lessons.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/mode.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",

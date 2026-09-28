@@ -53,6 +53,9 @@ What you get:
   - `verify-claim.py` asks, before a `gh` comment or review of 30 words or more, whether each claim was checked or should say "I think". Off: `LEAN_SKIP_VERIFY_CLAIM=1`.
   - `docs-containers.py` notes `docker compose up/run` or `docker run` when every changed file is documentation. Off: `LEAN_SKIP_DOCS_CONTAINERS=1`.
   - `lesson-log.py` appends a commit whose subject says fix, revert, flaky, silent, gate or regress to `.lean/lessons.tsv` (format in the script header) for the retro, and adds `.lean/` to `.git/info/exclude` so it is not committed. Off: `LEAN_SKIP_LESSON_LOG=1`.
+- Two mode settings, also in the `env` block, for when a single strong model makes the split below not worth it. `mode.py` reads them at session start and tells the agent what changes; the defaults print nothing.
+  - `LEAN_AGENTS=one` runs everything in the one session: no subagents or workflows, one ticket at a time, and the critic's hunt and refute as two passes in the same context, which the report then says. The default, `many`, is the method as written.
+  - `LEAN_MODELS=one` keeps every step on the session's model: no cheap drafter, no escalation, a finding not fixed in one round gets one more round and then goes to you. The default, `mixed`, is the cascade in section 2.
 - `style-scan` runs the same slop, attribution and U+2000 checks over the lines a branch adds, untracked files included, for a preflight or CI step.
 - With the plugin on, `"attribution": {"commit": "", "pr": ""}` in your Claude Code settings is no longer needed, since the hook blocks the trailer anyway. Setting it too is harmless.
 - `tests/run-all.sh` runs every `--self-test` in the repository, lists scripts that have none, and fails on a duplicate key in the plugin JSON.
