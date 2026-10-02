@@ -6,31 +6,17 @@ usage: workflow-cost.py <run-dir-or-run-id> [...] [--prs N] [--baseline-per-pr U
 
 A run dir is .../subagents/workflows/wf_<id>; a bare id is looked up under every
 project dir in ~/.claude/projects. Prices are notional list prices per million
-tokens, set in PRICES; Fable is priced as Opus until a real number exists.
+tokens, set in PRICES in lib/leanstats.py; Fable is priced as Opus until a real
+number exists. Usage is counted once per message id (rows repeat it per content block).
 """
 import glob
 import json
 import os
 import sys
 
-PRICES = {  # input, cache write, cache read, output; USD per million tokens
-    "opus": (15.0, 18.75, 1.50, 75.0),
-    "fable": (15.0, 18.75, 1.50, 75.0),
-    "sonnet": (3.0, 3.75, 0.30, 15.0),
-    "haiku": (1.0, 1.25, 0.10, 5.0),
-}
-
-
-def family(model):
-    for name in PRICES:
-        if name in model:
-            return name
-    return "opus"
-
-
-def cost(fam, u):
-    pi, pw, pr, po = PRICES[fam]
-    return (u["in"] * pi + u["cw"] * pw + u["cr"] * pr + u["out"] * po) / 1e6
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import leanstats  # noqa: E402
+from leanstats import cost, family  # noqa: E402
 
 
 def find_run(arg):
@@ -45,24 +31,10 @@ def find_run(arg):
 def read_agent(path):
     usage = {"in": 0, "cw": 0, "cr": 0, "out": 0}
     model = None
-    with open(path, errors="replace") as fh:
-        for line in fh:
-            try:
-                o = json.loads(line)
-            except ValueError:
-                continue
-            m = o.get("message") if isinstance(o.get("message"), dict) else None
-            if not m:
-                continue
-            if m.get("model"):
-                model = m["model"]
-            u = m.get("usage")
-            if not u:
-                continue
-            usage["in"] += u.get("input_tokens", 0)
-            usage["cw"] += u.get("cache_creation_input_tokens", 0)
-            usage["cr"] += u.get("cache_read_input_tokens", 0)
-            usage["out"] += u.get("output_tokens", 0)
+    for message in leanstats.read_usage(path):
+        model = message["model"] or model
+        for key in usage:
+            usage[key] += message[key]
     return model or "unknown", usage
 
 
@@ -159,6 +131,14 @@ def self_test():
                      "saving vs baseline 24.50/PR: 50%"):
             if want not in out:
                 fails.append("missing %r in output:\n%s" % (want, out))
+        repeated = os.path.join(d, "repeated.jsonl")
+        with open(repeated, "w") as fh:
+            for _ in range(3):
+                fh.write(json.dumps({"message": {"id": "m1", "model": "claude-sonnet-5-5",
+                                                 "usage": {"input_tokens": 1000}}}) + "\n")
+        model, usage = read_agent(repeated)
+        if (model, usage["in"]) != ("claude-sonnet-5-5", 1000):
+            fails.append("a message id repeated on three rows must count once, got %r %r" % (model, usage))
     if family("claude-haiku-4-5") != "haiku" or family("something-new") != "opus":
         fails.append("family() mapping wrong")
     if fails:
