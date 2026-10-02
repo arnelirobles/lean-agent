@@ -60,7 +60,10 @@ def cmd_log_review(conn, args):
         print("usage: lean-stats log-review <repo> <pr> <confirmed> <refuted> <blockers> "
               "\"<categories>\" \"<caught elsewhere first>\" [pre_push] [ci] [review] [escaped]", file=sys.stderr)
         return 2
-    cells = [time.strftime("%Y-%m-%d", time.gmtime())] + list(args) + ["0"] * (11 - len(args))
+    first = conn.execute("SELECT date FROM reviews WHERE repo = ? AND pr = ?", (args[0], pr_number(args[1]))).fetchone()
+    # a later log amends the review, so the row stays in the window it was reviewed in
+    date = first[0] if first else time.strftime("%Y-%m-%d", time.gmtime())
+    cells = [date] + list(args) + ["0"] * (11 - len(args))
     if put_review(conn, cells):
         print(f"stored {args[0]}#{pr_number(args[1])}")
     else:
@@ -432,15 +435,23 @@ def measures(conn, since=""):
               if any(run["role"] == "hunt" and leanstats.family(run["model"]) == cheap for run in hits)]
     if hunted:
         review_of = {(review["repo"], review["pr"]): review for review in conn.execute("SELECT * FROM reviews")}
-        refs_of = {(change["repo"], change["pr"]): change["escaped_refs"] or 0 for change in changes}
+        refs_of = {(change["repo"], change["pr"]): change["escaped_refs"] for change in changes}
+        checked = [key for key in hunted if key in review_of or refs_of.get(key) is not None]
         missed = 0
-        for key in hunted:
+        for key in checked:
             review = review_of.get(key)
             later = review["ci"] + review["review"] + review["escaped"] if review else 0
             if later or refs_of.get(key):
                 missed += 1
-        out.append(("Critic misses", str(missed),
-                    f"of {len(hunted)} changes hunted on {cheap}, with a finding caught in CI, in review or after merge"))
+        unchecked = len(hunted) - len(checked)
+        if checked:
+            basis = f"of {len(checked)} changes hunted on {cheap}, with a finding caught in CI, in review or after merge"
+            if unchecked:
+                basis += f"; {unchecked} more had no review and no signals"
+            out.append(("Critic misses", str(missed), basis))
+        else:
+            out.append(("Critic misses", NO_DATA,
+                        f"{len(hunted)} changes hunted on {cheap}, none with a review logged or signals collected"))
     else:
         out.append(("Critic misses", NO_DATA, ""))
 
@@ -511,6 +522,11 @@ def test_reviews(check, tmp):
     check("a second log for the same pull request replaces the row", rows, [("o/r", 7, 3, 1, 2, 0, 1, 0)])
     check("a word for a pull request exits 0", cmd_log_review(conn, ["o/r", "local", "1", "0", "0", "x", "none"]), 0)
     check("and stores nothing", conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 1)
+    conn.execute("UPDATE reviews SET date = '2026-09-01' WHERE repo = 'o/r' AND pr = 7")
+    cmd_log_review(conn, ["o/r", "7", "3", "1", "0", "races", "none", "2", "0", "1", "1"])
+    check("a second log keeps the date of the first",
+          tuple(conn.execute("SELECT date, escaped FROM reviews WHERE repo = 'o/r' AND pr = 7").fetchone()),
+          ("2026-09-01", 1))
     check("too few arguments", cmd_log_review(conn, ["o/r", "7"]), 2)
 
     old = os.path.join(tmp, "old.tsv")
@@ -778,6 +794,22 @@ def test_report(check, tmp):
 
     with leanstats.temp_env(LEAN_MODEL_CHEAP="opus"):
         check("the cheap model comes from the setting", dict((label, value) for label, value, _ in measures(conn))["Critic misses"], "no data")
+    with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "unchecked.db")):
+        bare = leanstats.connect()
+        bare.execute("INSERT INTO changes VALUES ('o/u', 1, 'a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', NULL, NULL, NULL)")
+        bare.execute("INSERT INTO agent_runs VALUES ('u1', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 1, '', "
+                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p')")
+        unchecked = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
+        check("a hunted change with no review and no signals is no data, not zero", unchecked,
+              ("no data", "1 changes hunted on sonnet, none with a review logged or signals collected"))
+        bare.execute("INSERT INTO changes VALUES ('o/u', 2, 'b', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 0, 0, 0)")
+        bare.execute("INSERT INTO agent_runs VALUES ('u2', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 2, '', "
+                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p')")
+        partly = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
+        check("only checked changes are counted", partly[0], "0")
+        check("and the unchecked ones are named", partly[1].startswith("of 1 changes hunted on sonnet") and
+              partly[1].endswith("1 more had no review and no signals"), True)
+        bare.close()
     check("since is inclusive", dict((label, value) for label, value, _ in measures(conn, "2026-10-01"))["Changes merged"], "2")
     later = dict((label, value) for label, value, _ in measures(conn, "2026-10-02"))
     check("a later window has no changes", later["Changes merged"], "no data")
