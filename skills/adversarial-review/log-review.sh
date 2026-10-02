@@ -59,3 +59,9 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$(date -u +%Y-%m-%d)" "$(clean "$1")" "$(clean "$2")" "$3" "$4" "$5" \
   "$(clean "$6")" "$(clean "$7")" "$PRE_PUSH" "$IN_CI" "$IN_REVIEW" "$ESCAPED" >> "$log"
 echo "logged to $log"
+
+# The same row goes to the lean-stats database. The TSV is the record, so nothing here may fail the log.
+stats="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/bin/lean-stats"
+if [ "${LEAN_STATS:-}" != "off" ] && [ -f "$stats" ] && command -v python3 >/dev/null 2>&1; then
+  python3 "$stats" log-review "$@" >/dev/null 2>&1 || true
+fi
