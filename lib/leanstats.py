@@ -12,12 +12,19 @@ import sqlite3
 import sys
 import time
 
-PRICES = {  # input, cache write, cache read, output; USD per million tokens
-    "opus": (15.0, 18.75, 1.50, 75.0),
-    "fable": (15.0, 18.75, 1.50, 75.0),
-    "sonnet": (3.0, 3.75, 0.30, 15.0),
+# input, 5 minute cache write, cache read, output; USD per million tokens, list prices on 2026-10-02.
+# The first name found in the model id wins, so a version sits above its family.
+PRICES = {
+    "fable-5-1": (10.0, 12.50, 0.25, 50.0),
+    "fable": (10.0, 12.50, 1.00, 50.0),
+    "opus-5-5": (4.0, 5.0, 0.20, 20.0),
+    "opus": (5.0, 6.25, 0.50, 25.0),
+    "sonnet-4": (3.0, 3.75, 0.30, 15.0),
+    "sonnet": (2.0, 2.50, 0.20, 10.0),
     "haiku": (1.0, 1.25, 0.10, 5.0),
 }
+FAMILIES = ("opus", "fable", "sonnet", "haiku")
+HOUR_WRITE = 2.0  # a 1 hour cache write costs this many times the input price
 
 MIGRATIONS = [  # one entry per schema version, applied in order; never edit an entry that shipped
     """
@@ -35,6 +42,7 @@ MIGRATIONS = [  # one entry per schema version, applied in order; never edit an 
         ended_at TEXT NOT NULL DEFAULT '',
         tokens_in INTEGER NOT NULL DEFAULT 0,
         tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+        tokens_cache_write_1h INTEGER NOT NULL DEFAULT 0,
         tokens_cache_read INTEGER NOT NULL DEFAULT 0,
         tokens_out INTEGER NOT NULL DEFAULT 0,
         source_path TEXT NOT NULL
@@ -79,15 +87,17 @@ MIGRATIONS = [  # one entry per schema version, applied in order; never edit an 
 
 
 def family(model):
-    for name in PRICES:
+    for name in FAMILIES:
         if name in model:
             return name
     return "opus"
 
 
-def cost(fam, u):
-    pi, pw, pr, po = PRICES[fam]
-    return (u["in"] * pi + u["cw"] * pw + u["cr"] * pr + u["out"] * po) / 1e6
+def cost(model, u):
+    """List price of a usage dict. cw is every cache write, cw1h the part of it written for 1 hour."""
+    pi, pw, pr, po = next((price for name, price in PRICES.items() if name in model), PRICES["opus"])
+    hour = u.get("cw1h", 0)
+    return (u["in"] * pi + (u["cw"] - hour) * pw + hour * pi * HOUR_WRITE + u["cr"] * pr + u["out"] * po) / 1e6
 
 
 class NewerSchema(Exception):
@@ -179,7 +189,7 @@ def connect(path=None, timeout=5.0):
 
 
 def read_usage(path):
-    """One dict per assistant message in a transcript: model, cwd, ts, session and four token counts.
+    """One dict per assistant message in a transcript: model, cwd, ts, session and five token counts.
 
     Claude Code writes one row per content block and repeats the message's usage
     on each, so usage is counted once per message id and the last row wins. A row
@@ -201,6 +211,9 @@ def read_usage(path):
             if not isinstance(usage, dict):
                 continue
             key = message.get("id") or f"row-{number}"
+            split = usage.get("cache_creation")
+            split = split if isinstance(split, dict) else {}
+            written = int(usage.get("cache_creation_input_tokens") or 0)
             if key not in seen:
                 order.append(key)
             seen[key] = {
@@ -209,7 +222,8 @@ def read_usage(path):
                 "ts": row.get("timestamp") or "",
                 "session": row.get("sessionId") or "",
                 "in": int(usage.get("input_tokens") or 0),
-                "cw": int(usage.get("cache_creation_input_tokens") or 0),
+                "cw": written,
+                "cw1h": min(written, int(split.get("ephemeral_1h_input_tokens") or 0)),
                 "cr": int(usage.get("cache_read_input_tokens") or 0),
                 "out": int(usage.get("output_tokens") or 0),
             }
@@ -252,7 +266,22 @@ def self_test():
 
     check("family by name", family("claude-haiku-4-5"), "haiku")
     check("unknown family is opus", family("something-new"), "opus")
-    check("cost", cost("sonnet", {"in": 1000000, "cw": 0, "cr": 0, "out": 1000000}), 18.0)
+    check("family of a versioned id", family("claude-fable-5-1"), "fable")
+    million = 1000000
+
+    def priced(model, **tokens):
+        return cost(model, dict({"in": 0, "cw": 0, "cr": 0, "out": 0}, **tokens))
+
+    check("cost", priced("claude-sonnet-5-5", **{"in": million, "out": million}), 12.0)
+    check("opus 5.5 input", priced("claude-opus-5-5", **{"in": million}), 4.0)
+    check("opus before 5.5 input", priced("claude-opus-5", **{"in": million}), 5.0)
+    check("opus 5.5 cache read", priced("claude-opus-5-5", cr=million), 0.2)
+    check("fable 5.1 cache read", priced("claude-fable-5-1", cr=million), 0.25)
+    check("fable 5 cache read", priced("claude-fable-5", cr=million), 1.0)
+    check("sonnet 4 input", priced("claude-sonnet-4-6", **{"in": million}), 3.0)
+    check("an unknown model prices as opus", priced("something-new", **{"in": million}), 5.0)
+    check("a 5 minute cache write", priced("claude-opus-5-5", cw=million), 5.0)
+    check("a 1 hour cache write is twice input", priced("claude-opus-5-5", cw=million, cw1h=million), 8.0)
 
     with tempfile.TemporaryDirectory() as tmp:
         db = os.path.join(tmp, "nested", "dir", "lean.db")
@@ -284,16 +313,24 @@ def self_test():
             fh.write("not json\n")
             fh.write(json.dumps({"message": {"model": "claude-sonnet-5-5"}}) + "\n")
             fh.write(row("", {"input_tokens": 5}))
-            fh.write(row("", {"input_tokens": 5, "cache_read_input_tokens": 7, "cache_creation_input_tokens": 3}))
+            fh.write(row("", {"input_tokens": 5, "cache_read_input_tokens": 7, "cache_creation_input_tokens": 3,
+                              "cache_creation": {"ephemeral_5m_input_tokens": 1, "ephemeral_1h_input_tokens": 2}}))
             fh.write('{"message": {"id": "m9", "usage": {"input_tok')
         usage = read_usage(transcript)
         check("one entry per message id, id-less rows alone", len(usage), 3)
         check("repeated id counted once, last row wins", (usage[0]["in"], usage[0]["out"]), (100, 40))
         check("fields", (usage[0]["model"], usage[0]["cwd"], usage[0]["session"], usage[0]["ts"]),
               ("claude-sonnet-5-5", "/w", "s1", "2026-10-02T01:00:00.000Z"))
-        check("cache tokens", (usage[2]["cr"], usage[2]["cw"]), (7, 3))
+        check("cache tokens", (usage[2]["cr"], usage[2]["cw"], usage[2]["cw1h"]), (7, 3, 2))
+        check("no 1 hour part when the row has none", usage[0]["cw1h"], 0)
         check("total input", sum(u["in"] for u in usage), 110)
         check("missing file is empty", read_usage(os.path.join(tmp, "absent.jsonl")), [])
+        with open(transcript, "w") as fh:
+            fh.write(row("m1", {"cache_creation_input_tokens": 0, "cache_creation": {"ephemeral_1h_input_tokens": 9}}))
+            fh.write(row("m2", {"cache_creation_input_tokens": 4, "cache_creation": "odd"}))
+        usage = read_usage(transcript)
+        check("the 1 hour part is never more than the total", (usage[0]["cw"], usage[0]["cw1h"]), (0, 0))
+        check("a split that is not an object is ignored", (usage[1]["cw"], usage[1]["cw1h"]), (4, 0))
 
         fires = os.path.join(tmp, "fires.db")
         with temp_env(LEAN_DB=fires, LEAN_STATS=None):
