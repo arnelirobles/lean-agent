@@ -338,6 +338,165 @@ def cmd_collect(conn, args):
     return 0
 
 
+NO_DATA = "no data"
+SILENT_HOOKS = {"record-test-run.py"}  # writes a marker file and never notes or blocks, so it has no fire to count
+
+
+def registered_hooks():
+    """The hook scripts named in hooks/hooks.json, without the ones that never fire by design."""
+    try:
+        with open(os.path.join(ROOT, "hooks", "hooks.json")) as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    return sorted(set(re.findall(r"/hooks/([\w.-]+\.py)", text)) - SILENT_HOOKS)
+
+
+def run_cost(run):
+    return leanstats.cost(leanstats.family(run["model"]), {
+        "in": run["tokens_in"], "cw": run["tokens_cache_write"],
+        "cr": run["tokens_cache_read"], "out": run["tokens_out"]})
+
+
+def run_tokens(run):
+    return run["tokens_in"] + run["tokens_cache_write"] + run["tokens_cache_read"] + run["tokens_out"]
+
+
+def share(part, whole):
+    return f"{100 * part / whole:.0f}%"
+
+
+def measures(conn, since=""):
+    """The report as (label, value, basis) rows. A row with nothing behind it says no data, not zero."""
+    out = []
+    changes = conn.execute("SELECT * FROM changes WHERE merged_at >= ? ORDER BY repo, pr", (since,)).fetchall()
+    runs = conn.execute("SELECT * FROM agent_runs WHERE ended_at >= ?", (since,)).fetchall()
+    reviews = conn.execute("SELECT * FROM reviews WHERE date >= ?", (since,)).fetchall()
+    cheap = leanstats.family(os.environ.get("LEAN_MODEL_CHEAP") or "sonnet")
+
+    linked = {}
+    for change in changes:
+        hits = conn.execute(
+            "SELECT * FROM agent_runs WHERE repo = ? AND (pr = ? OR (branch <> '' AND branch = ?))",
+            (change["repo"], change["pr"], change["branch"])).fetchall()
+        if hits:
+            linked[(change["repo"], change["pr"])] = hits
+
+    total = len(changes)
+    out.append(("Changes merged", str(total) if total else NO_DATA,
+                f"{len(linked)} linked to agent runs" if total else ""))
+
+    repos = {change["repo"] for change in changes}
+    spend = [run for run in runs if run["repo"] in repos]
+    if total and spend:
+        dollars = sum(run_cost(run) for run in spend)
+        out.append(("Cost per change", f"{dollars / total:.2f} USD",
+                    f"{dollars:.2f} USD over {total} changes, list prices"))
+        for label, key in (("Cost per change by model", lambda run: leanstats.family(run["model"])),
+                           ("Cost per change by role", lambda run: run["role"])):
+            parts = {}
+            for run in spend:
+                parts[key(run)] = parts.get(key(run), 0.0) + run_cost(run)
+            ranked = sorted(parts.items(), key=lambda item: (-item[1], item[0]))
+            out.append((label, ", ".join(f"{name} {value / total:.2f}" for name, value in ranked), "USD per change"))
+    else:
+        out.append(("Cost per change", NO_DATA, ""))
+
+    if linked:
+        escalated = sum(1 for hits in linked.values() if any(run["role"] == "escalate" for run in hits))
+        out.append(("Escalation rate", share(escalated, len(linked)), f"{escalated} of {len(linked)} linked changes"))
+    else:
+        out.append(("Escalation rate", NO_DATA, ""))
+
+    if reviews:
+        summed = {key: sum(review[key] for review in reviews)
+                  for key in ("pre_push", "ci", "review", "escaped", "confirmed", "refuted")}
+        out.append(("Findings by where caught",
+                    f"pre-push {summed['pre_push']}, CI {summed['ci']}, review {summed['review']}, "
+                    f"escaped {summed['escaped']}", f"{len(reviews)} reviews"))
+        candidates = summed["confirmed"] + summed["refuted"]
+        if candidates:
+            out.append(("Refuted share", share(summed["refuted"], candidates),
+                        f"{summed['refuted']} of {candidates} candidates"))
+        else:
+            out.append(("Refuted share", NO_DATA, ""))
+    else:
+        out.append(("Findings by where caught", NO_DATA, ""))
+        out.append(("Refuted share", NO_DATA, ""))
+
+    refs = [change["escaped_refs"] for change in changes if change["escaped_refs"] is not None]
+    out.append(("Escaped after merge", str(sum(refs)) if refs else NO_DATA,
+                f"later issues or pull requests pointing back, over {len(refs)} changes" if refs else ""))
+
+    hunted = [key for key, hits in linked.items()
+              if any(run["role"] == "hunt" and leanstats.family(run["model"]) == cheap for run in hits)]
+    if hunted:
+        review_of = {(review["repo"], review["pr"]): review for review in conn.execute("SELECT * FROM reviews")}
+        refs_of = {(change["repo"], change["pr"]): change["escaped_refs"] or 0 for change in changes}
+        missed = 0
+        for key in hunted:
+            review = review_of.get(key)
+            later = review["ci"] + review["review"] + review["escaped"] if review else 0
+            if later or refs_of.get(key):
+                missed += 1
+        out.append(("Critic misses", str(missed),
+                    f"of {len(hunted)} changes hunted on {cheap}, with a finding caught in CI, in review or after merge"))
+    else:
+        out.append(("Critic misses", NO_DATA, ""))
+
+    rounds = [change["fix_rounds"] for change in changes if change["fix_rounds"] is not None]
+    if rounds:
+        out.append(("Fix rounds per change", f"{sum(rounds) / len(rounds):.1f}",
+                    f"max {max(rounds)}, over {len(rounds)} changes"))
+    else:
+        out.append(("Fix rounds per change", NO_DATA, ""))
+
+    fires = conn.execute("SELECT hook, outcome, COUNT(*) AS n FROM hook_fires WHERE ts >= ? "
+                         "GROUP BY hook, outcome ORDER BY hook, outcome", (since,)).fetchall()
+    if fires:
+        per_hook = {}
+        for fire in fires:
+            per_hook.setdefault(fire["hook"], []).append(f"{fire['outcome']} {fire['n']}")
+        out.append(("Hook fires", "; ".join(f"{hook} {', '.join(parts)}" for hook, parts in sorted(per_hook.items())),
+                    f"{sum(fire['n'] for fire in fires)} fires"))
+        registered = registered_hooks()
+        quiet = [hook for hook in registered if hook not in per_hook]
+        out.append(("Hooks with no fire", ", ".join(quiet) if quiet else "none", f"of {len(registered)} registered"))
+    else:
+        out.append(("Hook fires", NO_DATA, ""))
+        out.append(("Hooks with no fire", NO_DATA, ""))
+
+    tokens = sum(run_tokens(run) for run in runs)
+    if tokens:
+        other = sum(run_tokens(run) for run in runs if run["role"] == "other")
+        no_repo = sum(run_tokens(run) for run in runs if not run["repo"])
+        out.append(("Unattributed", f"role other {share(other, tokens)}, no repo {share(no_repo, tokens)}",
+                    f"of tokens in {len(runs)} runs"))
+    else:
+        out.append(("Unattributed", NO_DATA, ""))
+    return out
+
+
+def render(rows, since, markdown, today):
+    window = f"{since} to {today}" if since else "all time"
+    if markdown:
+        lines = [f"Window: {window}. Changes: {rows[0][1]}.", "", "| Measure | Value | Basis |", "| --- | --- | --- |"]
+        lines += [f"| {label} | {value} | {basis} |" for label, value, basis in rows]
+    else:
+        lines = [f"lean-stats report, {window}"]
+        lines += [f"{label}: {value}" + (f" ({basis})" if basis else "") for label, value, basis in rows]
+    return "\n".join(lines)
+
+
+def cmd_report(conn, args):
+    """Print the numbers for the window, as text or as one Markdown table."""
+    since, markdown, rest = options(args)
+    if rest:
+        raise ValueError(f"report takes --since and --markdown, not {rest[0]}")
+    print(render(measures(conn, since), since, markdown, time.strftime("%Y-%m-%d", time.gmtime())))
+    return 0
+
+
 def test_reviews(check, tmp):
     conn = leanstats.connect()
     check("pr number plain", pr_number("12"), 12)
@@ -566,12 +725,79 @@ def test_changes(check, tmp):
     conn.close()
 
 
+def test_report(check, tmp):
+    conn = leanstats.connect()
+    empty = measures(conn)
+    check("an empty database says no data on every line", {value for _, value, _ in empty}, {"no data"})
+    check("and has every line", [label for label, _, _ in empty], [
+        "Changes merged", "Cost per change", "Escalation rate", "Findings by where caught", "Refuted share",
+        "Escaped after merge", "Critic misses", "Fix rounds per change", "Hook fires", "Hooks with no fire",
+        "Unattributed"])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("report on an empty database exits 0", cmd_report(conn, []), 0)
+    check("and prints no data", out.getvalue().count("no data"), 11)
+
+    million = 1000000
+
+    def run(run_id, role, model, repo, pr, branch, tokens_in, ended="2026-10-01T05:00:00.000Z"):
+        conn.execute("INSERT INTO agent_runs VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'p')",
+                     (run_id, role, model, repo, pr, branch, ended, ended, tokens_in))
+
+    conn.execute("INSERT INTO changes VALUES ('o/r', 7, 'fix-a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 2, 0, 0)")
+    conn.execute("INSERT INTO changes VALUES ('o/r', 8, 'fix-b', '2026-09-30T00:00:00Z', '2026-10-01T09:00:00Z', 0, 0, 0)")
+    run("h", "hunt", "claude-sonnet-5-5", "o/r", 7, "", million)             # 3 USD
+    run("e", "escalate", "claude-opus-5-5", "o/r", None, "fix-b", million)   # 15 USD
+    run("c", "coordinator", "claude-opus-5-5", "o/r", None, "", 2 * million)  # 30 USD
+    run("x", "other", "claude-sonnet-5-5", "", None, "", million)            # not in a repo with a change
+    conn.execute("INSERT INTO reviews VALUES ('2026-10-01', 'o/r', 7, 2, 2, 0, 'races', 'none', 1, 1, 0, 0)")
+    for hook, outcome in (("public-text.py", "block"), ("public-text.py", "block"), ("style-note.py", "note")):
+        conn.execute("INSERT INTO hook_fires VALUES ('2026-10-01T03:00:00Z', ?, ?, 's', '/w')", (hook, outcome))
+
+    got = {label: (value, basis) for label, value, basis in measures(conn)}
+    check("changes", got["Changes merged"], ("2", "2 linked to agent runs"))
+    check("cost per change", got["Cost per change"], ("24.00 USD", "48.00 USD over 2 changes, list prices"))
+    check("by model", got["Cost per change by model"][0], "opus 22.50, sonnet 1.50")
+    check("by role", got["Cost per change by role"][0], "coordinator 15.00, escalate 7.50, hunt 1.50")
+    check("escalation rate", got["Escalation rate"], ("50%", "1 of 2 linked changes"))
+    check("findings", got["Findings by where caught"], ("pre-push 1, CI 1, review 0, escaped 0", "1 reviews"))
+    check("refuted share", got["Refuted share"], ("50%", "2 of 4 candidates"))
+    check("escaped after merge", got["Escaped after merge"][0], "0")
+    check("critic misses", got["Critic misses"][0], "1")
+    check("critic misses basis names the model", "of 1 changes hunted on sonnet" in got["Critic misses"][1], True)
+    check("fix rounds", got["Fix rounds per change"], ("1.0", "max 2, over 2 changes"))
+    check("hook fires", got["Hook fires"], ("public-text.py block 2; style-note.py note 1", "3 fires"))
+    quiet = got["Hooks with no fire"][0]
+    check("a registered hook that did not fire is listed", "commit-author.py" in quiet, True)
+    check("a hook that fired is not", "public-text.py" in quiet, False)
+    check("the hook that never fires by design is not", "record-test-run.py" in quiet, False)
+    check("unattributed", got["Unattributed"], ("role other 20%, no repo 20%", "of tokens in 4 runs"))
+
+    with leanstats.temp_env(LEAN_MODEL_CHEAP="opus"):
+        check("the cheap model comes from the setting", dict((label, value) for label, value, _ in measures(conn))["Critic misses"], "no data")
+    check("since is inclusive", dict((label, value) for label, value, _ in measures(conn, "2026-10-01"))["Changes merged"], "2")
+    later = dict((label, value) for label, value, _ in measures(conn, "2026-10-02"))
+    check("a later window has no changes", later["Changes merged"], "no data")
+    check("and no cost", later["Cost per change"], "no data")
+
+    text = render(measures(conn), "2026-10-01", False, "2026-10-02")
+    check("text header", text.splitlines()[0], "lean-stats report, 2026-10-01 to 2026-10-02")
+    check("text line", "Cost per change: 24.00 USD (48.00 USD over 2 changes, list prices)" in text, True)
+    table = render(measures(conn), "2026-10-01", True, "2026-10-02")
+    check("markdown header", table.splitlines()[0], "Window: 2026-10-01 to 2026-10-02. Changes: 2.")
+    check("markdown row", "| Cost per change | 24.00 USD | 48.00 USD over 2 changes, list prices |" in table, True)
+    check("all time header", render(empty, "", False, "2026-10-02").splitlines()[0], "lean-stats report, all time")
+    check("registered hooks come from hooks.json", "pr-merge-blocked.py" in registered_hooks(), True)
+    conn.close()
+
+
 COMMANDS = {
     "log-review": cmd_log_review,
     "import-reviews": cmd_import_reviews,
     "collect": cmd_collect,
+    "report": cmd_report,
 }
-TESTS = [test_reviews, test_transcripts, test_changes]
+TESTS = [test_reviews, test_transcripts, test_changes, test_report]
 
 
 def main(argv):
