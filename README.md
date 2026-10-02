@@ -8,7 +8,7 @@ The numbers here are mine, at list prices, on one .NET codebase. Treat them as a
 
 Shape the ticket for the agent before anyone starts: one ticket is one agent pass, written so the agent needs nothing else, with the review's questions answered in advance. A cheaper model drafts every change. Scripts, not instructions, run the mechanical checks. A cheap critic reviews every change against six fixed questions. The expensive model only sees what the critic cannot close. At most four changes in flight.
 
-That took me from about 66 dollars of model use per change to about 25, with no drop in what got caught.
+That took me from about 13 dollars of model use per change to about 9, with no drop in what got caught. Until 1.4.0 this line said 66 and 25: the cost script counted each message's usage once per transcript row, and its prices were those of older models. Section 7 has the correction.
 
 The whole loop, with the section that covers each step:
 
@@ -238,7 +238,7 @@ The merge queue takes one change at a time and re-tests each against everything 
 `workflow-cost.py` reads the per-agent transcripts a Claude Code workflow leaves behind, sums tokens by model, prices them, and prints cost per change against a baseline.
 
 ```
-python3 workflow-cost.py <run-id> --prs 4 --baseline-per-pr 66
+python3 workflow-cost.py <run-id> --prs 4 --baseline-per-pr 13
 ```
 
 Point it at a run directory or a bare run id. Prices are list prices in the `PRICES` table in `lib/leanstats.py`; edit them to whatever you actually pay. It imports the price table and the transcript reader from `lib/leanstats.py`, so copy both. `asset-provenance.py` stands alone.
@@ -252,7 +252,7 @@ lean-stats report --since 2026-10-01
 
 `collect` imports transcripts and merged pull requests. `report` prints the numbers the retro starts from. An agent is counted by role only when it carries a label, `lean:<role> <owner/repo>#<pr>`, as its Agent description or as the first line of a workflow prompt. The `method` and `adversarial-review` skills write that label. Without one the agent is counted as `other`, and the report's last line says what share of tokens that was.
 
-Both tools count a message's usage once. Claude Code writes one transcript row per content block and repeats the message's usage on each. Until 1.4.0 `workflow-cost.py` summed every row, which overstated each of the 17 runs it was rechecked on by 65% to 277%.
+Both tools count a message's usage once. Claude Code writes one transcript row per content block and repeats the message's usage on each. Until 1.4.0 `workflow-cost.py` summed every row, which overstated each of the 17 runs it was rechecked on by 65% to 304%. Its price table was also out of date: Fable was priced as Opus, and Opus and Sonnet at the prices of their version 4 models. Counted once, at the list prices of 2026-10-02, the three baseline runs come to 225 dollars over 18 changes, 13 per change, and the first lean run to 17 dollars over 2 changes, 9 per change: 31% under, where the old figures said 61%.
 
 After each batch, compare two things: cost per change, and what the critic caught versus what got past it. When the critic misses something, the fix is a new scripted check, not a more expensive critic. When a critic finds nothing on a tier for three batches, drop it from that tier.
 
