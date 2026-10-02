@@ -13,6 +13,7 @@ write. Nothing leaves the machine. No prompt text, code or command line is
 stored: tokens, model, role, repository and change only.
 """
 import contextlib
+import glob
 import io
 import json
 import os
@@ -96,6 +97,186 @@ def cmd_import_reviews(conn, args):
     return 0
 
 
+ROLES = ("draft", "spec", "hunt", "refute", "escalate")
+LABEL = re.compile(r"^lean:([a-z]+)(?:\s+([\w.-]+/[\w.-]+)(?:#(\d+)|@(\S+))?)?")
+REMOTE = re.compile(r"[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
+
+
+def parse_label(text):
+    """(role, repo, pr, branch) from `lean:<role> <owner/repo>#<pr>` or `...@<branch>`. No prefix is role other."""
+    found = LABEL.match((text or "").strip())
+    if not found:
+        return "other", "", None, ""
+    role = found.group(1) if found.group(1) in ROLES else "other"
+    return role, found.group(2) or "", int(found.group(3)) if found.group(3) else None, found.group(4) or ""
+
+
+def first_prompt_line(path):
+    """The first line of the prompt an agent was started with, where a workflow script puts the label."""
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return ""
+    with fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("type") != "user":
+                continue
+            message = row.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                content = next((b.get("text") for b in content
+                                if isinstance(b, dict) and b.get("type") == "text"), "")
+            text = content.strip() if isinstance(content, str) else ""
+            return text.splitlines()[0] if text else ""
+    return ""
+
+
+def read_label(path):
+    """The lean: label of an agent transcript: its metadata description, else its first prompt line."""
+    candidates = []
+    try:
+        with open(path[:-len(".jsonl")] + ".meta.json") as fh:
+            meta = json.load(fh)
+        if isinstance(meta, dict):
+            candidates = [meta.get("label"), meta.get("description")]
+    except (OSError, ValueError):
+        pass
+    candidates.append(first_prompt_line(path))
+    for text in candidates:
+        if isinstance(text, str) and text.strip().startswith("lean:"):
+            return text.strip()
+    return ""
+
+
+def repo_from_remote(url):
+    found = REMOTE.search((url or "").strip())
+    return found.group(1) if found else ""
+
+
+def git_repo(cwd):
+    """owner/name of the origin remote of a directory, or empty when it is gone or not a repository."""
+    if not cwd or not os.path.isdir(cwd):
+        return ""
+    try:
+        result = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return repo_from_remote(result.stdout) if result.returncode == 0 else ""
+
+
+def make_repo_of(lookup=git_repo):
+    """A cached cwd-to-repo function, so each directory costs one git call."""
+    cache = {}
+
+    def repo_of(cwd):
+        if cwd not in cache:
+            cache[cwd] = lookup(cwd) or ""
+        return cache[cwd]
+
+    return repo_of
+
+
+def options(args):
+    """Split arguments into (since, markdown, the rest)."""
+    since, markdown, rest = "", False, []
+    i = 0
+    while i < len(args):
+        if args[i] == "--since":
+            if i + 1 >= len(args) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[i + 1]):
+                raise ValueError("--since takes a date as YYYY-MM-DD")
+            since = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--markdown":
+            markdown = True
+        else:
+            rest.append(args[i])
+        i += 1
+    return since, markdown, rest
+
+
+def projects_root():
+    return os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"), "projects")
+
+
+def transcript_files(root):
+    """(path, kind) for every transcript under a Claude Code projects directory."""
+    found = [(p, "main") for p in glob.glob(os.path.join(root, "*", "*.jsonl"))]
+    found += [(p, "subagent") for p in glob.glob(os.path.join(root, "*", "*", "subagents", "agent-*.jsonl"))]
+    found += [(p, "workflow") for p in glob.glob(
+        os.path.join(root, "*", "*", "subagents", "workflows", "*", "agent-*.jsonl"))]
+    return sorted(found)
+
+
+def run_row(run_id, kind, role, model, repo, pr, branch, messages, path):
+    stamps = sorted(m["ts"] for m in messages if m["ts"])
+    return (run_id, next((m["session"] for m in messages if m["session"]), ""), kind, role, model, repo, pr, branch,
+            stamps[0] if stamps else "", stamps[-1] if stamps else "",
+            sum(m["in"] for m in messages), sum(m["cw"] for m in messages),
+            sum(m["cr"] for m in messages), sum(m["out"] for m in messages), path)
+
+
+def agent_rows(path, kind, messages, repo_of):
+    """The agent_runs rows for one transcript: one per agent, or one per repo and model of a main session."""
+    messages = [m for m in messages if m["model"] != "<synthetic>"]
+    if not messages:
+        return []
+    if kind == "main":
+        session = os.path.basename(path)[:-len(".jsonl")]
+        groups = {}
+        for m in messages:
+            groups.setdefault((repo_of(m["cwd"]), m["model"]), []).append(m)
+        return [run_row(f"{session}:{repo}:{model}", "main", "coordinator", model, repo, None, "", group, path)
+                for (repo, model), group in sorted(groups.items())]
+    role, repo, pr, branch = parse_label(read_label(path))
+    output = {}
+    for m in messages:
+        output[m["model"]] = output.get(m["model"], 0) + m["out"]
+    model = max(sorted(output), key=output.get)
+    if not repo:
+        repo = repo_of(next((m["cwd"] for m in messages if m["cwd"]), ""))
+    agent_id = os.path.basename(path)[len("agent-"):-len(".jsonl")]
+    return [run_row(agent_id, kind, role, model, repo, pr, branch, messages, path)]
+
+
+def collect_transcripts(conn, root, since, repo_of):
+    """Import every changed transcript under root. Returns (imported, unchanged)."""
+    cutoff = time.mktime(time.strptime(since, "%Y-%m-%d")) if since else 0
+    imported = unchanged = 0
+    for path, kind in transcript_files(root):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if stat.st_mtime < cutoff:
+            continue
+        known = conn.execute("SELECT size, mtime FROM imports WHERE path = ?", (path,)).fetchone()
+        if known and known["size"] == stat.st_size and known["mtime"] == stat.st_mtime:
+            unchanged += 1
+            continue
+        rows = agent_rows(path, kind, leanstats.read_usage(path), repo_of)
+        with leanstats.tx(conn):
+            conn.execute("DELETE FROM agent_runs WHERE source_path = ?", (path,))
+            conn.executemany("INSERT OR REPLACE INTO agent_runs VALUES (%s)" % ", ".join("?" * 15), rows)
+            conn.execute("INSERT OR REPLACE INTO imports (path, size, mtime) VALUES (?, ?, ?)",
+                         (path, stat.st_size, stat.st_mtime))
+        imported += 1
+    return imported, unchanged
+
+
+def cmd_collect(conn, args):
+    """Import transcripts, and merged pull requests for any repositories named."""
+    since, _, repos = options(args)
+    imported, unchanged = collect_transcripts(conn, projects_root(), since, make_repo_of())
+    print(f"transcripts: {imported} imported, {unchanged} unchanged")
+    return 0
+
+
 def test_reviews(check, tmp):
     conn = leanstats.connect()
     check("pr number plain", pr_number("12"), 12)
@@ -169,11 +350,124 @@ def test_reviews(check, tmp):
     check("an unknown command", main(["nonsense"]), 2)
 
 
+def test_transcripts(check, tmp):
+    check("label with a pull request", parse_label("lean:hunt o/r#7"), ("hunt", "o/r", 7, ""))
+    check("label with a branch", parse_label("lean:refute o/r@fix/thing"), ("refute", "o/r", None, "fix/thing"))
+    check("label with a repo only", parse_label("lean:draft BaryoDev/barako.CMS"), ("draft", "BaryoDev/barako.CMS", None, ""))
+    check("label with a role only", parse_label("lean:spec"), ("spec", "", None, ""))
+    check("no prefix", parse_label("Research the API"), ("other", "", None, ""))
+    check("a role outside the five", parse_label("lean:polish o/r#7"), ("other", "o/r", 7, ""))
+    check("role is not guessed from wording", parse_label("hunt for bugs in o/r#7"), ("other", "", None, ""))
+    check("empty", parse_label(None), ("other", "", None, ""))
+    check("https remote", repo_from_remote("https://github.com/o/r.git\n"), "o/r")
+    check("ssh remote", repo_from_remote("git@github.com:o/r.git"), "o/r")
+    check("remote without .git", repo_from_remote("https://github.com/o/r"), "o/r")
+    check("missing directory", git_repo(os.path.join(tmp, "gone")), "")
+    check("not a repository", git_repo(tmp), "")
+    check("options", options(["--since", "2026-10-01", "o/r", "--markdown"]), ("2026-10-01", True, ["o/r"]))
+    try:
+        options(["--since", "yesterday"])
+        check("a bad date is refused", "accepted", "refused")
+    except ValueError:
+        pass
+
+    def row(mid, usage, cwd="/a", model="claude-opus-5-5", ts="2026-10-02T01:00:00.000Z"):
+        return json.dumps({"type": "assistant", "cwd": cwd, "sessionId": "sess1", "timestamp": ts,
+                           "message": {"id": mid, "model": model, "usage": usage}}) + "\n"
+
+    def prompt(text):
+        return json.dumps({"type": "user", "cwd": "/a", "sessionId": "sess1",
+                           "message": {"role": "user", "content": text}}) + "\n"
+
+    def write(path, lines, meta=None):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("".join(lines))
+        if meta is not None:
+            with open(path[:-len(".jsonl")] + ".meta.json", "w") as fh:
+                json.dump(meta, fh)
+
+    root = os.path.join(tmp, "projects")
+    sess = os.path.join(root, "proj", "sess1")
+    sub = os.path.join(sess, "subagents")
+    write(sess + ".jsonl", [
+        row("m1", {"input_tokens": 100}, ts="2026-10-02T01:00:00.000Z"),
+        row("m1", {"input_tokens": 100}),
+        row("m1", {"input_tokens": 100}),
+        "not json\n",
+        row("m2", {"input_tokens": 20}, cwd="/b", ts="2026-10-02T02:00:00.000Z"),
+        json.dumps({"message": {"id": "m3", "model": "<synthetic>", "usage": {"input_tokens": 0}}}) + "\n",
+    ])
+    write(os.path.join(root, "proj", "sess2.jsonl"), [
+        row("m1", {"input_tokens": 1}, model="claude-opus-5-5"),
+        row("m2", {"input_tokens": 2}, model="claude-sonnet-5-5"),
+    ])
+    write(os.path.join(sub, "agent-a1.jsonl"),
+          [prompt("Find defects in this diff"), row("m1", {"input_tokens": 10, "output_tokens": 5}, model="claude-sonnet-5-5")],
+          {"agentType": "general-purpose", "description": "lean:hunt o/r#7"})
+    write(os.path.join(sub, "agent-a2.jsonl"), [row("m1", {"output_tokens": 3}, cwd="/b")],
+          {"description": "Research something"})
+    write(os.path.join(sub, "workflows", "wf_x", "agent-a3.jsonl"),
+          [prompt("lean:refute o/r@fix-thing\nRefute this finding."), row("m1", {"output_tokens": 4})],
+          {"agentType": "workflow-subagent", "spawnDepth": 1})
+    write(os.path.join(sub, "agent-a4.jsonl"), [prompt("no label"), json.dumps({"type": "assistant"}) + "\n"],
+          {"description": "lean:hunt o/r#8"})
+    write(os.path.join(sub, "agent-a5.jsonl"),
+          [row("m1", {"output_tokens": 1}, model="claude-sonnet-5-5"), row("m2", {"output_tokens": 9}),
+           '{"message": {"id": "m3", "usage": {"output_tok'],
+          {"description": "lean:escalate o/r#7"})
+    old = os.path.join(sub, "agent-a6.jsonl")
+    write(old, [row("m1", {"output_tokens": 1})], {"description": "lean:draft o/r#1"})
+    os.utime(old, (1577836800, 1577836800))  # 2020-01-01
+
+    repo_of = make_repo_of({"/a": "o/a", "/b": "o/b"}.get)
+    conn = leanstats.connect()
+    check("first collect", collect_transcripts(conn, root, "2026-01-01", repo_of), (7, 0))
+
+    def runs(where="1=1"):
+        return [tuple(r) for r in conn.execute(
+            "SELECT run_id, kind, role, model, repo, pr, branch, tokens_in, tokens_out FROM agent_runs "
+            "WHERE %s ORDER BY run_id" % where)]
+
+    check("a main session in two repositories gives two rows, usage counted once", runs("run_id LIKE 'sess1:%'"), [
+        ("sess1:o/a:claude-opus-5-5", "main", "coordinator", "claude-opus-5-5", "o/a", None, "", 100, 0),
+        ("sess1:o/b:claude-opus-5-5", "main", "coordinator", "claude-opus-5-5", "o/b", None, "", 20, 0),
+    ])
+    check("a main session on two models gives two rows", [r[3] for r in runs("run_id LIKE 'sess2:%'")],
+          ["claude-opus-5-5", "claude-sonnet-5-5"])
+    check("labelled subagent", runs("run_id='a1'"), [("a1", "subagent", "hunt", "claude-sonnet-5-5", "o/r", 7, "", 10, 5)])
+    check("unlabelled subagent takes its repo from the directory", runs("run_id='a2'"),
+          [("a2", "subagent", "other", "claude-opus-5-5", "o/b", None, "", 0, 3)])
+    check("workflow agent labelled on its first prompt line", runs("run_id='a3'"),
+          [("a3", "workflow", "refute", "claude-opus-5-5", "o/r", None, "fix-thing", 0, 4)])
+    check("a transcript with no usage gives no row", runs("run_id='a4'"), [])
+    check("cut last line skipped, model is the one with most output", runs("run_id='a5'"),
+          [("a5", "subagent", "escalate", "claude-opus-5-5", "o/r", 7, "", 0, 10)])
+    check("a file older than --since is not read", runs("run_id='a6'"), [])
+    check("timestamps", [tuple(r) for r in conn.execute(
+        "SELECT started_at, ended_at FROM agent_runs WHERE run_id='sess1:o/b:claude-opus-5-5'")],
+        [("2026-10-02T02:00:00.000Z", "2026-10-02T02:00:00.000Z")])
+    stored = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+    kept = " ".join(str(value) for r in conn.execute("SELECT * FROM agent_runs") for value in tuple(r))
+    check("no prompt or description text is stored", [w for w in ("finding", "defects", "Research") if w in kept], [])
+
+    check("collect twice reads nothing new", collect_transcripts(conn, root, "2026-01-01", repo_of), (0, 7))
+    check("and gives the same rows", conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0], stored)
+    with open(os.path.join(sub, "agent-a1.jsonl"), "a") as fh:
+        fh.write(row("m2", {"output_tokens": 7}, model="claude-sonnet-5-5"))
+    check("a changed transcript is read again", collect_transcripts(conn, root, "2026-01-01", repo_of), (1, 6))
+    check("and replaces its row", runs("run_id='a1'"), [("a1", "subagent", "hunt", "claude-sonnet-5-5", "o/r", 7, "", 10, 12)])
+    check("row count unchanged", conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0], stored)
+    check("no --since reads the old file too", collect_transcripts(conn, root, "", repo_of), (1, 7))
+    conn.close()
+
+
 COMMANDS = {
     "log-review": cmd_log_review,
     "import-reviews": cmd_import_reviews,
+    "collect": cmd_collect,
 }
-TESTS = [test_reviews]
+TESTS = [test_reviews, test_transcripts]
 
 
 def main(argv):
