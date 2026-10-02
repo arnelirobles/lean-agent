@@ -173,6 +173,19 @@ def migrate(conn, path=""):
             conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)", (str(number),))
 
 
+def set_wal(conn, timeout):
+    """Switch to WAL. SQLite does not wait on a lock for this, so wait here, up to the timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005)
+
+
 def connect(path=None, timeout=5.0):
     """Open the database, creating and migrating it as needed. Raises NewerSchema."""
     path = path or db_path()
@@ -180,7 +193,7 @@ def connect(path=None, timeout=5.0):
     conn = sqlite3.connect(path, timeout=timeout, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        set_wal(conn, timeout)
         migrate(conn, path)
     except BaseException:
         conn.close()
@@ -371,7 +384,7 @@ def self_test():
             record_fire("race.py", "note")
             after = conn.execute("SELECT COUNT(*) FROM hook_fires").fetchone()[0]
             conn.close()
-            check("at most one row per racing hook", before <= 8, True)
+            check("every racing fire is stored", before, 8)
             check("the next fire is stored", after, before + 1)
 
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
