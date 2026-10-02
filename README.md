@@ -134,6 +134,8 @@ A second cheap agent, fresh context, reviews every change in a checked-out copy 
 5. Does anything from an exception, a request or a user string reach a log or a response unexamined?
 6. Does any read-then-write on a shared row, or any outbound call to a URL that is not a constant, name its lock or its bound?
 
+One more question is asked of every change, outside the six: for each rule in the diff that branches on a type or a value, which kinds can it meet (value type, string, class, interface, abstract class, nullable, a member with a non-null initializer), and was each one checked? It was added after three defects of one shape reached the review bots in two of three changes: a rule tested with one kind of type and broken on another.
+
 The expensive model takes the branch and the critic's list only when a no is not fixed in one round, or when a tier 2 answer is unsure. It does not start over.
 
 Which model is which is a setting, so the cascade outlives any one model release:
