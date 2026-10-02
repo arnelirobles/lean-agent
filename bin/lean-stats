@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Collect and report what the lean-agent loop did, from one SQLite file.
+
+  lean-stats collect [--since YYYY-MM-DD] [owner/repo ...]
+  lean-stats report  [--since YYYY-MM-DD] [--markdown]
+  lean-stats import-reviews <review-log.tsv>
+  lean-stats log-review <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" \\
+                        "<caught elsewhere first>" [pre_push] [ci] [review] [escaped]
+  lean-stats --self-test
+
+The file is ~/.lean/lean.db. LEAN_DB moves it and LEAN_STATS=off stops every
+write. Nothing leaves the machine. No prompt text, code or command line is
+stored: tokens, model, role, repository and change only.
+"""
+import contextlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import leanstats  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+LOG_REVIEW = os.path.join(ROOT, "skills", "adversarial-review", "log-review.sh")
+REVIEW_COLUMNS = ("date", "repo", "pr", "confirmed", "refuted", "blockers", "categories",
+                  "caught_elsewhere_first", "pre_push", "ci", "review", "escaped")
+
+
+def pr_number(text):
+    """The pull request number in `12`, `#12` or a pull request URL, else None."""
+    found = re.search(r"(?:^#?|/pull/)(\d+)/?$", (text or "").strip())
+    return int(found.group(1)) if found else None
+
+
+def count(text):
+    text = str(text).strip()
+    return int(text) if text.isdigit() else 0
+
+
+def put_review(conn, cells):
+    """Store one review row from twelve cells in REVIEW_COLUMNS order. False when it has no pull request number."""
+    number = pr_number(cells[2])
+    if number is None:
+        return False
+    values = [cells[0], cells[1], number] + [count(c) for c in cells[3:6]] + list(cells[6:8]) + [count(c) for c in cells[8:12]]
+    conn.execute("INSERT OR REPLACE INTO reviews (%s) VALUES (%s)"
+                 % (", ".join(REVIEW_COLUMNS), ", ".join("?" * len(REVIEW_COLUMNS))), values)
+    return True
+
+
+def cmd_log_review(conn, args):
+    """Store one review outcome. Takes the arguments of log-review.sh."""
+    if not 7 <= len(args) <= 11:
+        print("usage: lean-stats log-review <repo> <pr> <confirmed> <refuted> <blockers> "
+              "\"<categories>\" \"<caught elsewhere first>\" [pre_push] [ci] [review] [escaped]", file=sys.stderr)
+        return 2
+    cells = [time.strftime("%Y-%m-%d", time.gmtime())] + list(args) + ["0"] * (11 - len(args))
+    if put_review(conn, cells):
+        print(f"stored {args[0]}#{pr_number(args[1])}")
+    else:
+        print(f"lean-stats: no pull request number in {args[1]!r}, not stored")
+    return 0
+
+
+def cmd_import_reviews(conn, args):
+    """Load a review-log.tsv, eight or twelve columns. Safe to run again: a row replaces its earlier self."""
+    if len(args) != 1:
+        print("usage: lean-stats import-reviews <review-log.tsv>", file=sys.stderr)
+        return 2
+    try:
+        with open(args[0], errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        print(f"lean-stats: cannot read {args[0]}: {exc.strerror}", file=sys.stderr)
+        return 1
+    imported = skipped = 0
+    with leanstats.tx(conn):
+        for line in lines:
+            cells = line.split("\t")
+            if cells[0] == "date" or not line.strip():
+                continue
+            if len(cells) < 8:
+                skipped += 1
+                continue
+            cells = (cells + ["0"] * 4)[:12]
+            if put_review(conn, cells):
+                imported += 1
+            else:
+                skipped += 1
+    print(f"reviews: {imported} imported, {skipped} skipped (no pull request number or too few columns)")
+    return 0
+
+
+def test_reviews(check, tmp):
+    conn = leanstats.connect()
+    check("pr number plain", pr_number("12"), 12)
+    check("pr number with hash", pr_number("#12"), 12)
+    check("pr number from a url", pr_number("https://github.com/o/r/pull/12"), 12)
+    check("pr number from a word", pr_number("local"), None)
+
+    check("log-review stores", cmd_log_review(conn, ["o/r", "7", "2", "1", "0", "races", "none", "1", "1"]), 0)
+    cmd_log_review(conn, ["o/r", "#7", "3", "1", "0", "races", "none", "2", "0", "1", "0"])
+    rows = [tuple(r) for r in conn.execute(
+        "SELECT repo, pr, confirmed, refuted, pre_push, ci, review, escaped FROM reviews")]
+    check("a second log for the same pull request replaces the row", rows, [("o/r", 7, 3, 1, 2, 0, 1, 0)])
+    check("a word for a pull request exits 0", cmd_log_review(conn, ["o/r", "local", "1", "0", "0", "x", "none"]), 0)
+    check("and stores nothing", conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 1)
+    check("too few arguments", cmd_log_review(conn, ["o/r", "7"]), 2)
+
+    old = os.path.join(tmp, "old.tsv")
+    with open(old, "w") as fh:
+        fh.write("date\trepo\tpr\tconfirmed\trefuted\tblockers\tcategories\tcaught_elsewhere_first\n")
+        fh.write("2026-09-20\to/a\t1\t1\t0\t0\tcat\tnone\n")
+    new = os.path.join(tmp, "new.tsv")
+    with open(new, "w") as fh:
+        fh.write("\t".join(REVIEW_COLUMNS) + "\n")
+        fh.write("2026-10-01\to/b\t2\t1\t1\t0\tcat\tnone\t1\t0\t1\t0\n")
+        fh.write("2026-10-01\to/b\tlocal\t1\t0\t0\tcat\tnone\t0\t0\t0\t0\n")
+        fh.write("2026-10-01\to/b\n")
+        fh.write("\n")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("import an eight column log", cmd_import_reviews(conn, [old]), 0)
+        check("import a twelve column log", cmd_import_reviews(conn, [new]), 0)
+        check("import again", cmd_import_reviews(conn, [new]), 0)
+    check("skipped rows are counted", "1 imported, 2 skipped" in out.getvalue(), True)
+    rows = [tuple(r) for r in conn.execute(
+        "SELECT date, repo, pr, confirmed, pre_push, ci, review, escaped FROM reviews "
+        "WHERE repo IN ('o/a', 'o/b') ORDER BY repo")]
+    check("imported rows", rows, [("2026-09-20", "o/a", 1, 1, 0, 0, 0, 0),
+                                  ("2026-10-01", "o/b", 2, 1, 1, 0, 1, 0)])
+    check("the logged row is still there", conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 3)
+    check("a missing file", cmd_import_reviews(conn, [os.path.join(tmp, "absent.tsv")]), 1)
+
+    log = os.path.join(tmp, "review-log.tsv")
+    env = dict(os.environ, REVIEW_LOG=log)
+    proc = subprocess.run(["bash", LOG_REVIEW, "o/c", "9", "1", "0", "0", "cat", "none", "1"],
+                          capture_output=True, text=True, env=env, timeout=60)
+    check("log-review.sh exits 0", proc.returncode, 0)
+    check("log-review.sh still writes the tsv", len(open(log).read().splitlines()), 2)
+    check("log-review.sh stores the row", [tuple(r) for r in conn.execute(
+        "SELECT pr, confirmed, pre_push FROM reviews WHERE repo='o/c'")], [(9, 1, 1)])
+    proc = subprocess.run(["bash", LOG_REVIEW, "o/d", "local", "1", "0", "0", "cat", "none"],
+                          capture_output=True, text=True, env=env, timeout=60)
+    check("log-review.sh with a word for the pull request exits 0", proc.returncode, 0)
+    proc = subprocess.run(["bash", LOG_REVIEW, "o/e", "10", "1", "0", "0", "cat", "none"],
+                          capture_output=True, text=True, env=dict(env, LEAN_STATS="off"), timeout=60)
+    check("off: log-review.sh exits 0", proc.returncode, 0)
+    check("off: the tsv row is written", len(open(log).read().splitlines()), 4)
+    check("off: nothing stored", conn.execute("SELECT COUNT(*) FROM reviews WHERE repo='o/e'").fetchone()[0], 0)
+    conn.close()
+
+    with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "off.db"), LEAN_STATS="off"):
+        check("off: a command exits 0", main(["log-review", "o/r", "7", "1", "0", "0", "x", "none"]), 0)
+        check("off: no file", os.path.exists(os.path.join(tmp, "off.db")), False)
+    newer = os.path.join(tmp, "newer.db")
+    with leanstats.temp_env(LEAN_DB=newer):
+        conn = leanstats.connect()
+        conn.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+        conn.close()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            check("a newer database is refused", main(["import-reviews", old]), 1)
+        check("the message names the version", "99" in err.getvalue(), True)
+    check("an unknown command", main(["nonsense"]), 2)
+
+
+COMMANDS = {
+    "log-review": cmd_log_review,
+    "import-reviews": cmd_import_reviews,
+}
+TESTS = [test_reviews]
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
+    if not argv or argv[0] not in COMMANDS:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if leanstats.off():
+        print("lean-stats: LEAN_STATS=off, nothing read or written")
+        return 0
+    try:
+        conn = leanstats.connect()
+    except leanstats.NewerSchema as exc:
+        print(f"lean-stats: {exc}", file=sys.stderr)
+        return 1
+    try:
+        return COMMANDS[argv[0]](conn, argv[1:])
+    except ValueError as exc:
+        print(f"lean-stats: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
+def self_test():
+    import tempfile
+
+    failures = []
+
+    def check(name, got, want):
+        if got != want:
+            failures.append(f"{name}: got {got!r}, want {want!r}")
+
+    for test in TESTS:
+        with tempfile.TemporaryDirectory() as tmp:
+            with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "lean.db"), LEAN_STATS=None, LEAN_MODEL_CHEAP=None):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    test(check, tmp)
+    if failures:
+        print("self-test failed:\n  " + "\n  ".join(failures))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
