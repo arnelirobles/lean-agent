@@ -13,6 +13,8 @@ Two settings change how the rules below apply: `LEAN_AGENTS` (`many` or `one`) a
 
 With mixed models, two more settings name the models: `LEAN_MODEL_CHEAP` (default `sonnet`) and `LEAN_MODEL_STRONG` (default `opus`), each a Claude Code model alias. Start the drafter, the spec review and the critic's hunter and refuter with the cheap model. The strong model takes the branch and the critic's list only when a finding is not fixed in one round or a tier 2 answer is unsure. No note means `sonnet` and `opus`.
 
+Label every agent you start, so `lean-stats` can count it by role. The Agent description is `lean:<role> <owner/repo>#<pr>`, or `lean:<role> <owner/repo>@<branch>` before the pull request exists. The roles are `draft`, `spec`, `hunt`, `refute` and `escalate` (the strong model taking what the cheap one did not close). In a workflow script the same label is the first line of the agent's prompt, because a workflow agent has no description. An agent with no label is counted as `other` and its cost cannot be tied to a change.
+
 ## Before work starts
 - Refine and revise while the plan moves; start a ticket only when it is one agent's worth.
 - Before filing an issue, search the open issues and open pull requests for the same area or problem (a fix can already sit in an open pull request) and add to the one that fits (its Covers checklist, with its own check). File new only when it is truly separate.
@@ -35,7 +37,7 @@ With mixed models, two more settings name the models: `LEAN_MODEL_CHEAP` (defaul
 - A task is not done until the pull request URL exists.
 
 ## After a batch
-- Run the `lean-retro` skill: facts from `${CLAUDE_PLUGIN_ROOT}/bin/retro-signals.sh`, fixed triggers, check whether the last method change helped, propose changes with evidence. Nothing changes without the owner's approval.
+- Run the `lean-retro` skill: facts from `${CLAUDE_PLUGIN_ROOT}/bin/lean-stats`, fixed triggers, check whether the last method change helped, propose changes with evidence. Nothing changes without the owner's approval.
 - Log every review with `${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh`.
 - No agent attribution and no slop in commits, pull requests, issues or releases. The plugin hook blocks both; rewrite the text, do not turn the hook off.
 - Sweep with `${CLAUDE_PLUGIN_ROOT}/bin/agent-hygiene.sh` for what parallel agents left behind.
