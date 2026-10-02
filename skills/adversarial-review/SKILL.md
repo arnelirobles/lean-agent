@@ -81,6 +81,12 @@ file names moved, and does every consumer's accepted range, listed in the rules 
 the new version? A change that is correct in isolation and locks out a released consumer is a
 blocker.
 
+**The kinds question (always):** for each rule in the diff that branches on a type or a value,
+list the kinds it can meet (value type, string, class, interface, abstract class, nullable, a
+member with a non-null initializer) and run the smallest check for every kind the tests do not
+cover. A rule tested with one kind and shipped for all of them is the usual way a correct-looking
+change breaks.
+
 **The rules file (always):** every rule in it, answered yes or no with a line.
 
 **Broad passes (full review):** use the general reviewer skill if one is installed. Otherwise run
