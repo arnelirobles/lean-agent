@@ -11,6 +11,8 @@ Full text: ${CLAUDE_PLUGIN_ROOT}/README.md
 ## Mode
 Two settings change how the rules below apply: `LEAN_AGENTS` (`many` or `one`) and `LEAN_MODELS` (`mixed` or `one`), in the `env` block of Claude Code settings. At session start the plugin notes any setting that is not the default and what it changes. No note means many agents and mixed models, as written here.
 
+With mixed models, two more settings name the models: `LEAN_MODEL_CHEAP` (default `sonnet`) and `LEAN_MODEL_STRONG` (default `opus`), each a Claude Code model alias. Start the drafter, the spec review and the critic's hunter and refuter with the cheap model. The strong model takes the branch and the critic's list only when a finding is not fixed in one round or a tier 2 answer is unsure. No note means `sonnet` and `opus`.
+
 ## Before work starts
 - Refine and revise while the plan moves; start a ticket only when it is one agent's worth.
 - Before filing an issue, search the open issues and open pull requests for the same area or problem (a fix can already sit in an open pull request) and add to the one that fits (its Covers checklist, with its own check). File new only when it is truly separate.

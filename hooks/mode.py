@@ -11,7 +11,12 @@ env block of Claude Code settings. The defaults print nothing.
   LEAN_AGENTS=one    everything in this session, no subagents or workflows
   LEAN_MODELS=mixed  default: cheap model drafts, expensive model escalates
   LEAN_MODELS=one    every step on the session's model, no switching
+  LEAN_MODEL_CHEAP   default sonnet: drafts, spec review, the critic's hunt and refute
+  LEAN_MODEL_STRONG  default opus: takes what the cheap model did not close in one round
   mode.py --self-test
+
+The two role settings take a Claude Code model alias (sonnet, opus, haiku, fable)
+and apply only with LEAN_MODELS=mixed.
 """
 import os
 import sys
@@ -20,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import hookkit  # noqa: E402
 
 CHOICES = {"LEAN_AGENTS": ("many", "one"), "LEAN_MODELS": ("mixed", "one")}
+ALIASES = ("sonnet", "opus", "haiku", "fable")
+ROLES = {"LEAN_MODEL_CHEAP": "sonnet", "LEAN_MODEL_STRONG": "opus"}
 
 ONE_AGENT = (
     "Lean agent mode, LEAN_AGENTS=one: do the work in this session. Do not start subagents or "
@@ -38,8 +45,19 @@ ONE_MODEL = (
 
 MIXED_IN_ONE = (
     "LEAN_AGENTS=one with LEAN_MODELS=mixed: a session cannot change its own model, so the "
-    "cheap draft and the expensive escalation happen only when the person switches with /model. "
-    "Say when a step wants the other model, and carry on if they do not switch.")
+    "cheap draft on {cheap} and the expensive escalation on {strong} happen only when the person "
+    "switches with /model. Say when a step wants the other model, and carry on if they do not "
+    "switch.")
+
+ROLES_CHANGED = (
+    "Lean agent models: the cheap model is {cheap} and the strong model is {strong}. Start the "
+    "drafter, the spec review and the critic's hunter and refuter with model {cheap}. Use "
+    "{strong} only for a finding not fixed in one round or an unsure tier 2 answer.")
+
+SAME_ROLES = (
+    "LEAN_MODEL_CHEAP and LEAN_MODEL_STRONG are both {cheap}, so there is no cheaper drafter and "
+    "no stronger model to escalate to: a finding not fixed in one round gets one more round, "
+    "then goes to the person.")
 
 
 def setting(env, name):
@@ -53,6 +71,15 @@ def setting(env, name):
     return allowed[0], f"{name}={raw} is not one of {', '.join(allowed)}; using {allowed[0]}."
 
 
+def role(env, name):
+    """The model alias for the role NAME, and a warning when it is not an alias."""
+    default = ROLES[name]
+    raw = (env.get(name) or "").strip().lower()
+    if not raw or raw in ALIASES:
+        return raw or default, None
+    return default, f"{name}={raw} is not one of {', '.join(ALIASES)}; using {default}."
+
+
 def message(env):
     agents, bad_agents = setting(env, "LEAN_AGENTS")
     models, bad_models = setting(env, "LEAN_MODELS")
@@ -61,8 +88,17 @@ def message(env):
         parts.append(ONE_AGENT)
     if models == "one":
         parts.append(ONE_MODEL)
+        return " ".join(parts)
+    cheap, bad_cheap = role(env, "LEAN_MODEL_CHEAP")
+    strong, bad_strong = role(env, "LEAN_MODEL_STRONG")
+    parts += [w for w in (bad_cheap, bad_strong) if w]
+    names = {"cheap": cheap, "strong": strong}
+    if cheap == strong:
+        parts.append(SAME_ROLES.format(**names))
     elif agents == "one":
-        parts.append(MIXED_IN_ONE)
+        parts.append(MIXED_IN_ONE.format(**names))
+    elif (cheap, strong) != (ROLES["LEAN_MODEL_CHEAP"], ROLES["LEAN_MODEL_STRONG"]):
+        parts.append(ROLES_CHANGED.format(**names))
     return " ".join(parts) or None
 
 
@@ -92,13 +128,28 @@ def self_test():
     if message({}) is not None or message({"LEAN_AGENTS": "many", "LEAN_MODELS": "mixed"}) is not None:
         print("FAIL defaults should print nothing")
         failures += 1
-    expect("one agent", {"LEAN_AGENTS": "one"}, ("LEAN_AGENTS=one", "/model"), ("LEAN_MODELS=one:",))
+    expect("one agent", {"LEAN_AGENTS": "one"},
+           ("LEAN_AGENTS=one", "/model", "draft on sonnet", "escalation on opus"), ("LEAN_MODELS=one:",))
     expect("one model", {"LEAN_MODELS": "one"}, ("LEAN_MODELS=one",), ("LEAN_AGENTS=one", "/model"))
     expect("both", {"LEAN_AGENTS": "one", "LEAN_MODELS": "one"},
            ("LEAN_AGENTS=one:", "LEAN_MODELS=one:"), ("/model",))
     expect("case and spaces", {"LEAN_AGENTS": " One "}, ("LEAN_AGENTS=one:",))
     expect("unknown value", {"LEAN_AGENTS": "single"}, ("LEAN_AGENTS=single is not one of many, one",),
            ("LEAN_AGENTS=one:",))
+    if message({"LEAN_MODEL_CHEAP": "sonnet", "LEAN_MODEL_STRONG": "opus"}) is not None:
+        print("FAIL default roles should print nothing")
+        failures += 1
+    expect("roles changed", {"LEAN_MODEL_CHEAP": "Haiku", "LEAN_MODEL_STRONG": "fable"},
+           ("cheap model is haiku", "strong model is fable", "with model haiku"), ("/model",))
+    expect("roles in one session", {"LEAN_AGENTS": "one", "LEAN_MODEL_CHEAP": "haiku"},
+           ("draft on haiku", "escalation on opus"), ("Lean agent models:",))
+    expect("roles ignored with one model", {"LEAN_MODELS": "one", "LEAN_MODEL_CHEAP": "nope"},
+           ("LEAN_MODELS=one:",), ("LEAN_MODEL_CHEAP", "haiku"))
+    expect("unknown role", {"LEAN_MODEL_STRONG": "claude-opus-5-5"},
+           ("LEAN_MODEL_STRONG=claude-opus-5-5 is not one of sonnet, opus, haiku, fable; using opus.",),
+           ("Lean agent models:",))
+    expect("same model in both roles", {"LEAN_MODEL_CHEAP": "opus"},
+           ("are both opus", "goes to the person"), ("Lean agent models:",))
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

@@ -53,9 +53,10 @@ What you get:
   - `verify-claim.py` asks, before a `gh` comment or review of 30 words or more, whether each claim was checked or should say "I think". Off: `LEAN_SKIP_VERIFY_CLAIM=1`.
   - `docs-containers.py` notes `docker compose up/run` or `docker run` when every changed file is documentation. Off: `LEAN_SKIP_DOCS_CONTAINERS=1`.
   - `lesson-log.py` appends a commit whose subject says fix, revert, flaky, silent, gate or regress to `.lean/lessons.tsv` (format in the script header) for the retro, and adds `.lean/` to `.git/info/exclude` so it is not committed. Off: `LEAN_SKIP_LESSON_LOG=1`.
-- Two mode settings, also in the `env` block, for when a single strong model makes the split below not worth it. `mode.py` reads them at session start and tells the agent what changes; the defaults print nothing.
+- Four mode settings, also in the `env` block. The first two are for when a single strong model makes the split below not worth it. `mode.py` reads them at session start and tells the agent what changes; the defaults print nothing.
   - `LEAN_AGENTS=one` runs everything in the one session: no subagents or workflows, one ticket at a time, and the critic's hunt and refute as two passes in the same context, which the report then says. The default, `many`, is the method as written.
   - `LEAN_MODELS=one` keeps every step on the session's model: no cheap drafter, no escalation, a finding not fixed in one round gets one more round and then goes to you. The default, `mixed`, is the cascade in section 2.
+  - `LEAN_MODEL_CHEAP` and `LEAN_MODEL_STRONG` say which model plays which part in that cascade. Each takes a Claude Code model alias (`sonnet`, `opus`, `haiku`, `fable`); the defaults are `sonnet` and `opus`. Section 2 lists the steps each one runs. They are ignored with `LEAN_MODELS=one`, and setting both to the same model leaves no escalation step, which the note says.
 - `style-scan` runs the same slop, attribution and U+2000 checks over the lines a branch adds, untracked files included, for a preflight or CI step.
 - With the plugin on, `"attribution": {"commit": "", "pr": ""}` in your Claude Code settings is no longer needed, since the hook blocks the trailer anyway. Setting it too is harmless.
 - `tests/run-all.sh` runs every `--self-test` in the repository, lists scripts that have none, and fails on a duplicate key in the plugin JSON.
@@ -134,6 +135,18 @@ A second cheap agent, fresh context, reviews every change in a checked-out copy 
 6. Does any read-then-write on a shared row, or any outbound call to a URL that is not a constant, name its lock or its bound?
 
 The expensive model takes the branch and the critic's list only when a no is not fixed in one round, or when a tier 2 answer is unsure. It does not start over.
+
+Which model is which is a setting, so the cascade outlives any one model release:
+
+| Step | Model |
+| --- | --- |
+| Spec review of a bigger ticket (0) | cheap |
+| Draft, every tier | cheap |
+| Critic: hunt, then refute | cheap, two fresh agents |
+| First fix round (5) | cheap, the same drafter resumed |
+| A no not fixed in one round, or an unsure tier 2 answer | strong |
+
+`LEAN_MODEL_CHEAP` defaults to `sonnet` and `LEAN_MODEL_STRONG` to `opus`, which Claude Code resolves to its current Sonnet and Opus. Swap or replace them in the `env` block of your settings. They cover the agents a session starts; the session itself runs on whatever `/model` says.
 
 Your continuous integration and whatever code review bot you use still run. They confirm. They do not decide.
 
