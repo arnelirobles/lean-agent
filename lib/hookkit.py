@@ -19,26 +19,46 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
 HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([^\s;&|()<>]+))")
 HEREDOC_MARK = re.compile(r"__lean_heredoc_(\d+)__")
 GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+_EVENT = {}  # the last event read, for the session id and cwd of a recorded fire
+_RECORD = "--self-test" not in sys.argv[1:]  # a hook's own self-test must not write to the real database
+
+
+def _fire(outcome):
+    """Record this hook's fire for lean-stats. Any failure is dropped: statistics never touch the tool call."""
+    if not _RECORD:
+        return
+    try:
+        import leanstats
+        leanstats.record_fire(os.path.basename(sys.argv[0]), outcome,
+                              str(_EVENT.get("session_id") or ""), str(_EVENT.get("cwd") or ""))
+    except Exception:
+        pass
 
 
 def run(main):
     """Run a hook's main and exit with its code; an internal error exits 0."""
     try:
         code = main()
-    except SystemExit:
+    except SystemExit as exc:
+        if exc.code == 2:
+            _fire("block")
         raise
     except Exception as exc:  # a broken hook must not block the tool call
         print(f"lean-agent hook error ignored: {exc!r}", file=sys.stderr)
         code = 0
+    if code == 2:
+        _fire("block")
     sys.exit(code or 0)
 
 
 def read_event():
+    global _EVENT
     try:
         event = json.load(sys.stdin)
     except ValueError:
-        return {}
-    return event if isinstance(event, dict) else {}
+        event = {}
+    _EVENT = event if isinstance(event, dict) else {}
+    return _EVENT
 
 
 def tool_input(event):
@@ -50,6 +70,7 @@ def note(event_name, text):
     """Print a non-blocking note that Claude reads with the tool result."""
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event_name, "additionalContext": text}}))
+    _fire("note")
 
 
 def disabled(name, seg=None):
@@ -279,7 +300,13 @@ def gh_call(seg):
 
 
 def self_test():
+    import contextlib
+    import io
     import tempfile
+
+    import leanstats
+
+    global _RECORD, _EVENT
 
     failures = 0
 
@@ -329,6 +356,55 @@ def self_test():
     check("time wrapper", git_call(segments("time git commit -m x")[0])[0], "commit")
     check("inline off switch", disabled("LEAN_NOT_SET_ANYWHERE", segments("LEAN_NOT_SET_ANYWHERE=1 git commit")[0]), True)
     check("off switch not set", disabled("LEAN_NOT_SET_ANYWHERE", segments("git commit")[0]), False)
+    want_note = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "hello"}}
+
+    def noted():
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            note("PreToolUse", "hello")
+        return json.loads(out.getvalue())
+
+    def exit_code(main):
+        try:
+            run(main)
+        except SystemExit as exc:
+            return exc.code
+        return "no exit"
+
+    def bail():
+        sys.exit(2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "lean.db")
+        _RECORD, _EVENT = True, {"session_id": "s1", "cwd": "/w"}
+        try:
+            with leanstats.temp_env(LEAN_DB=db, LEAN_STATS=None):
+                check("note output", noted(), want_note)
+                check("exit 2 kept", exit_code(lambda: 2), 2)
+                check("exit 0 kept", exit_code(lambda: 0), 0)
+                check("exit 1 kept", exit_code(lambda: 1), 1)
+                check("sys.exit(2) inside main kept", exit_code(bail), 2)
+                conn = leanstats.connect()
+                fires = [tuple(r) for r in conn.execute(
+                    "SELECT hook, outcome, session_id, cwd FROM hook_fires ORDER BY rowid")]
+                conn.close()
+                check("a note is one note row, an exit 2 is one block row", fires, [
+                    ("hookkit.py", "note", "s1", "/w"),
+                    ("hookkit.py", "block", "s1", "/w"),
+                    ("hookkit.py", "block", "s1", "/w"),
+                ])
+            blocker = os.path.join(tmp, "file")
+            open(blocker, "w").close()
+            with leanstats.temp_env(LEAN_DB=os.path.join(blocker, "lean.db"), LEAN_STATS=None):
+                check("unwritable database, same note output", noted(), want_note)
+                check("unwritable database, same exit code", exit_code(lambda: 2), 2)
+            _RECORD = False
+            quiet = os.path.join(tmp, "quiet.db")
+            with leanstats.temp_env(LEAN_DB=quiet, LEAN_STATS=None):
+                noted()
+                check("a self-test run records nothing", os.path.exists(quiet), False)
+        finally:
+            _RECORD, _EVENT = False, {}
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 
