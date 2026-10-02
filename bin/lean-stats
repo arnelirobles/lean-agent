@@ -217,7 +217,7 @@ def run_row(run_id, kind, role, model, repo, pr, branch, messages, path):
     stamps = sorted(m["ts"] for m in messages if m["ts"])
     return (run_id, next((m["session"] for m in messages if m["session"]), ""), kind, role, model, repo, pr, branch,
             stamps[0] if stamps else "", stamps[-1] if stamps else "",
-            sum(m["in"] for m in messages), sum(m["cw"] for m in messages),
+            sum(m["in"] for m in messages), sum(m["cw"] for m in messages), sum(m["cw1h"] for m in messages),
             sum(m["cr"] for m in messages), sum(m["out"] for m in messages), path)
 
 
@@ -262,7 +262,7 @@ def collect_transcripts(conn, root, since, repo_of):
         rows = agent_rows(path, kind, leanstats.read_usage(path), repo_of)
         with leanstats.tx(conn):
             conn.execute("DELETE FROM agent_runs WHERE source_path = ?", (path,))
-            conn.executemany("INSERT OR REPLACE INTO agent_runs VALUES (%s)" % ", ".join("?" * 15), rows)
+            conn.executemany("INSERT OR REPLACE INTO agent_runs VALUES (%s)" % ", ".join("?" * 16), rows)
             conn.execute("INSERT OR REPLACE INTO imports (path, size, mtime) VALUES (?, ?, ?)",
                          (path, stat.st_size, stat.st_mtime))
         imported += 1
@@ -353,8 +353,8 @@ def registered_hooks():
 
 
 def run_cost(run):
-    return leanstats.cost(leanstats.family(run["model"]), {
-        "in": run["tokens_in"], "cw": run["tokens_cache_write"],
+    return leanstats.cost(run["model"], {
+        "in": run["tokens_in"], "cw": run["tokens_cache_write"], "cw1h": run["tokens_cache_write_1h"],
         "cr": run["tokens_cache_read"], "out": run["tokens_out"]})
 
 
@@ -577,6 +577,9 @@ def test_transcripts(check, tmp):
     check("label with a role only", parse_label("lean:spec"), ("spec", "", None, ""))
     check("no prefix", parse_label("Research the API"), ("other", "", None, ""))
     check("a role outside the five", parse_label("lean:polish o/r#7"), ("other", "o/r", 7, ""))
+    written = [{"ts": "", "session": "", "in": 1, "cw": 5, "cw1h": 3, "cr": 0, "out": 0}] * 2
+    check("the 1 hour part of cache writes is kept",
+          run_row("r", "main", "coordinator", "m", "", None, "", written, "p")[10:15], (2, 10, 6, 0, 0))
     check("role is not guessed from wording", parse_label("hunt for bugs in o/r#7"), ("other", "", None, ""))
     check("empty", parse_label(None), ("other", "", None, ""))
     check("https remote", repo_from_remote("https://github.com/o/r.git\n"), "o/r")
@@ -741,14 +744,14 @@ def test_report(check, tmp):
     million = 1000000
 
     def run(run_id, role, model, repo, pr, branch, tokens_in, ended="2026-10-01T05:00:00.000Z"):
-        conn.execute("INSERT INTO agent_runs VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'p')",
+        conn.execute("INSERT INTO agent_runs VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'p')",
                      (run_id, role, model, repo, pr, branch, ended, ended, tokens_in))
 
     conn.execute("INSERT INTO changes VALUES ('o/r', 7, 'fix-a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 2, 0, 0)")
     conn.execute("INSERT INTO changes VALUES ('o/r', 8, 'fix-b', '2026-09-30T00:00:00Z', '2026-10-01T09:00:00Z', 0, 0, 0)")
-    run("h", "hunt", "claude-sonnet-5-5", "o/r", 7, "", million)             # 3 USD
-    run("e", "escalate", "claude-opus-5-5", "o/r", None, "fix-b", million)   # 15 USD
-    run("c", "coordinator", "claude-opus-5-5", "o/r", None, "", 2 * million)  # 30 USD
+    run("h", "hunt", "claude-sonnet-5-5", "o/r", 7, "", million)             # 2 USD
+    run("e", "escalate", "claude-opus-5-5", "o/r", None, "fix-b", million)   # 4 USD
+    run("c", "coordinator", "claude-opus-5-5", "o/r", None, "", 2 * million)  # 8 USD
     run("x", "other", "claude-sonnet-5-5", "", None, "", million)            # not in a repo with a change
     conn.execute("INSERT INTO reviews VALUES ('2026-10-01', 'o/r', 7, 2, 2, 0, 'races', 'none', 1, 1, 0, 0)")
     for hook, outcome in (("public-text.py", "block"), ("public-text.py", "block"), ("style-note.py", "note")):
@@ -756,9 +759,9 @@ def test_report(check, tmp):
 
     got = {label: (value, basis) for label, value, basis in measures(conn)}
     check("changes", got["Changes merged"], ("2", "2 linked to agent runs"))
-    check("cost per change", got["Cost per change"], ("24.00 USD", "48.00 USD over 2 changes, list prices"))
-    check("by model", got["Cost per change by model"][0], "opus 22.50, sonnet 1.50")
-    check("by role", got["Cost per change by role"][0], "coordinator 15.00, escalate 7.50, hunt 1.50")
+    check("cost per change", got["Cost per change"], ("7.00 USD", "14.00 USD over 2 changes, list prices"))
+    check("by model", got["Cost per change by model"][0], "opus 6.00, sonnet 1.00")
+    check("by role", got["Cost per change by role"][0], "coordinator 4.00, escalate 2.00, hunt 1.00")
     check("escalation rate", got["Escalation rate"], ("50%", "1 of 2 linked changes"))
     check("findings", got["Findings by where caught"], ("pre-push 1, CI 1, review 0, escaped 0", "1 reviews"))
     check("refuted share", got["Refuted share"], ("50%", "2 of 4 candidates"))
@@ -782,10 +785,10 @@ def test_report(check, tmp):
 
     text = render(measures(conn), "2026-10-01", False, "2026-10-02")
     check("text header", text.splitlines()[0], "lean-stats report, 2026-10-01 to 2026-10-02")
-    check("text line", "Cost per change: 24.00 USD (48.00 USD over 2 changes, list prices)" in text, True)
+    check("text line", "Cost per change: 7.00 USD (14.00 USD over 2 changes, list prices)" in text, True)
     table = render(measures(conn), "2026-10-01", True, "2026-10-02")
     check("markdown header", table.splitlines()[0], "Window: 2026-10-01 to 2026-10-02. Changes: 2.")
-    check("markdown row", "| Cost per change | 24.00 USD | 48.00 USD over 2 changes, list prices |" in table, True)
+    check("markdown row", "| Cost per change | 7.00 USD | 14.00 USD over 2 changes, list prices |" in table, True)
     check("all time header", render(empty, "", False, "2026-10-02").splitlines()[0], "lean-stats report, all time")
     check("registered hooks come from hooks.json", "pr-merge-blocked.py" in registered_hooks(), True)
     conn.close()
