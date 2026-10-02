@@ -269,11 +269,72 @@ def collect_transcripts(conn, root, since, repo_of):
     return imported, unchanged
 
 
+RETRO = os.path.join(ROOT, "bin", "retro-signals.sh")
+
+
+def run_command(cmd, timeout=600):
+    """stdout of a command, or None when it is missing, fails or runs too long."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def fetch_changes(repo, since, run=run_command):
+    """Rows for the changes table for one repository, or None when gh fails."""
+    listing = run(["gh", "pr", "list", "-R", repo, "--state", "merged", "--search", f"merged:>={since}",
+                   "--limit", "200", "--json", "number,headRefName,createdAt,mergedAt"])
+    if listing is None:
+        return None
+    try:
+        merged = json.loads(listing)
+    except ValueError:
+        return None
+    signals = {}
+    for line in (run(["bash", RETRO, "--since", since, repo]) or "").splitlines()[1:]:
+        cells = line.split("\t")
+        if len(cells) >= 6 and cells[1].isdigit():
+            signals[int(cells[1])] = [int(c) if c.isdigit() else None for c in (cells[2], cells[3], cells[5])]
+    rows = []
+    for pr in merged:
+        fix_rounds, failed_checks, escaped_refs = signals.get(pr["number"], [None, None, None])
+        rows.append((repo, pr["number"], pr.get("headRefName") or "", pr.get("createdAt") or "",
+                     pr.get("mergedAt") or "", fix_rounds, failed_checks, escaped_refs))
+    return rows
+
+
+def collect_changes(conn, repos, since, run=run_command, which=shutil.which):
+    """Store the merged pull requests of each repository. Returns how many were stored."""
+    missing = [tool for tool in ("gh", "jq") if not which(tool)]
+    if missing:
+        print(f"changes: skipped, {' and '.join(missing)} not found")
+        return 0
+    stored = 0
+    for repo in repos:
+        rows = fetch_changes(repo, since, run)
+        if rows is None:
+            print(f"changes: skipped {repo}, the gh call failed")
+            continue
+        with leanstats.tx(conn):
+            conn.executemany("INSERT OR REPLACE INTO changes VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        stored += len(rows)
+    print(f"changes: {stored} stored from {len(repos)} repositories")
+    return stored
+
+
 def cmd_collect(conn, args):
     """Import transcripts, and merged pull requests for any repositories named."""
     since, _, repos = options(args)
+    bad = [r for r in repos if not re.fullmatch(r"[\w.-]+/[\w.-]+", r)]
+    if bad:
+        raise ValueError(f"not an owner/repo: {bad[0]}")
+    if repos and not since:
+        raise ValueError("naming repositories needs --since YYYY-MM-DD, the start of the batch")
     imported, unchanged = collect_transcripts(conn, projects_root(), since, make_repo_of())
     print(f"transcripts: {imported} imported, {unchanged} unchanged")
+    if repos:
+        collect_changes(conn, repos, since)
     return 0
 
 
@@ -462,12 +523,55 @@ def test_transcripts(check, tmp):
     conn.close()
 
 
+def test_changes(check, tmp):
+    listing = json.dumps([
+        {"number": 7, "headRefName": "fix-a", "createdAt": "2026-09-30T01:00:00Z", "mergedAt": "2026-10-01T01:00:00Z"},
+        {"number": 8, "headRefName": "fix-b", "createdAt": "2026-09-30T02:00:00Z", "mergedAt": "2026-10-01T02:00:00Z"},
+    ])
+    signals = ("repo\tpr\tfix_rounds\tfailed_checks\tdays_to_merge\tescaped_refs\tlogged_review\n"
+               "o/r\t7\t2\t1\t1\t0\tunknown\n")
+    calls = []
+
+    def fake(cmd, timeout=600):
+        calls.append(cmd)
+        if cmd[0] == "gh":
+            return None if "o/broken" in cmd else listing
+        return signals
+
+    def present(tool):
+        return "/usr/bin/" + tool
+
+    conn = leanstats.connect()
+    check("two changes stored", collect_changes(conn, ["o/r"], "2026-10-01", fake, present), 2)
+    check("the gh query", calls[0][:8], ["gh", "pr", "list", "-R", "o/r", "--state", "merged", "--search"])
+    check("the window", calls[0][8], "merged:>=2026-10-01")
+    rows = [tuple(r) for r in conn.execute("SELECT * FROM changes ORDER BY pr")]
+    check("signals joined by pull request, missing ones left empty", rows, [
+        ("o/r", 7, "fix-a", "2026-09-30T01:00:00Z", "2026-10-01T01:00:00Z", 2, 1, 0),
+        ("o/r", 8, "fix-b", "2026-09-30T02:00:00Z", "2026-10-01T02:00:00Z", None, None, None),
+    ])
+    check("collect again replaces", collect_changes(conn, ["o/r"], "2026-10-01", fake, present), 2)
+    check("still two rows", conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0], 2)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("a failing gh call stores nothing", collect_changes(conn, ["o/broken"], "2026-10-01", fake, present), 0)
+        check("no gh stores nothing", collect_changes(conn, ["o/r"], "2026-10-01", fake, lambda tool: None), 0)
+    check("says which repository failed", "skipped o/broken" in out.getvalue(), True)
+    check("says which tool is missing", "gh and jq not found" in out.getvalue(), True)
+    check("retro-signals failing still stores the changes",
+          len(fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else None)), 2)
+    with contextlib.redirect_stderr(io.StringIO()):
+        check("repositories need a window", main(["collect", "o/r"]), 2)
+        check("a repository is owner/name", main(["collect", "--since", "2026-10-01", "nonsense"]), 2)
+    conn.close()
+
+
 COMMANDS = {
     "log-review": cmd_log_review,
     "import-reviews": cmd_import_reviews,
     "collect": cmd_collect,
 }
-TESTS = [test_reviews, test_transcripts]
+TESTS = [test_reviews, test_transcripts, test_changes]
 
 
 def main(argv):
