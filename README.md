@@ -134,6 +134,8 @@ A second cheap agent, fresh context, reviews every change in a checked-out copy 
 5. Does anything from an exception, a request or a user string reach a log or a response unexamined?
 6. Does any read-then-write on a shared row, or any outbound call to a URL that is not a constant, name its lock or its bound?
 
+One more question is asked of every change, outside the six: for each rule in the diff that branches on a type or a value, which kinds can it meet (value type, string, class, interface, abstract class, nullable, a member with a non-null initializer), and was each one checked? It was added after three defects of one shape reached the review bots in two of three changes: a rule tested with one kind of type and broken on another.
+
 The expensive model takes the branch and the critic's list only when a no is not fixed in one round, or when a tier 2 answer is unsure. It does not start over.
 
 Which model is which is a setting, so the cascade outlives any one model release:
@@ -452,7 +454,7 @@ The critic in section 2 is now a Claude Code skill: [`skills/adversarial-review`
 
 Two changes made it better than the brief I used to paste.
 
-**The finder is never the judge.** One fresh agent hunts for defects against the six questions, a contract question and the repository's own rules file. A second fresh agent, which never sees the first one's reasoning, tries to prove each finding wrong: it looks for the guard elsewhere, confirms the change caused it, and runs the smallest check that settles it. Only survivors are reported. A reviewer that scores its own findings keeps the confident ones, and confident is not the same as right.
+**The finder is never the judge.** One fresh agent hunts for defects against the six questions, a contract question, a kinds question and the repository's own rules file. A second fresh agent, which never sees the first one's reasoning, tries to prove each finding wrong: it looks for the guard elsewhere, confirms the change caused it, and runs the smallest check that settles it. Only survivors are reported. A reviewer that scores its own findings keeps the confident ones, and confident is not the same as right.
 
 **The repository's rules come first.** A review bot does not know that a stricter validation is a breaking change here, that a console refuses an API whose contract version it does not list, or that nothing hashed from a secret may sit in a publicly readable record. On one night in September 2026 a bot caught a stale cache timestamp, a webhook replay check in the wrong order and a missing timeout, and missed two pull requests that would have locked every released console out of the next API. The critic caught those two because the rules file lists each consumer and the version range it accepts. Keep a `docs/review-rules.md` per repository; `review-rules.example.md` shows the shape.
 
