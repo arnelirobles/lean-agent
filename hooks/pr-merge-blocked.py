@@ -17,6 +17,9 @@ import re
 import shlex
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import hookkit  # noqa: E402
+
 REFUSAL = re.compile(
     r"not mergeable|base branch policy|protected branch|required status check|GH006|GH013"
     r"|merge strategy for .* is set by the merge queue|review is required|changes requested"
@@ -158,6 +161,30 @@ def self_test():
     case("after cd", ev("cd repo && gh pr merge 2", None, "PostToolUseFailure"), "pr-blockers.sh 2")
     case("env prefix", ev("GH_REPO=o/r gh pr merge 2", None, "PostToolUseFailure"), "pr-blockers.sh 2")
     case("skip env", ev("gh pr merge 1", None, "PostToolUseFailure"), None, {"LEAN_SKIP_PR_MERGE_BLOCKED": "1"})
+    import sqlite3
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "lean.db")
+        event = ev("gh pr merge 12 --squash", None, "PostToolUseFailure", error="Exit code 1",
+                   session_id="s1", cwd="/w")
+        env = dict(os.environ, LEAN_DB=db)
+        env.pop("LEAN_STATS", None)
+        env.pop("LEAN_SKIP_PR_MERGE_BLOCKED", None)
+        proc = subprocess.run([sys.executable, os.path.realpath(__file__)], input=json.dumps(event),
+                              capture_output=True, text=True, env=env, timeout=30)
+        if proc.returncode != 0 or "pr-blockers.sh 12" not in proc.stdout:
+            fails.append("hook run: exit %r, stdout %r" % (proc.returncode, proc.stdout[:200]))
+        rows = []
+        if os.path.exists(db):
+            rows = sqlite3.connect(db).execute("SELECT hook, outcome, session_id, cwd FROM hook_fires").fetchall()
+        if rows != [("pr-merge-blocked.py", "note", "s1", "/w")]:
+            fails.append("fire not recorded: %r" % (rows,))
+        proc = subprocess.run([sys.executable, os.path.realpath(__file__)], input="not json",
+                              capture_output=True, text=True, env=env, timeout=30)
+        if proc.returncode != 0 or proc.stdout:
+            fails.append("bad stdin: exit %r, stdout %r" % (proc.returncode, proc.stdout[:200]))
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
@@ -166,17 +193,13 @@ def self_test():
 
 
 def main():
-    if sys.argv[1:] == ["--self-test"]:
-        return self_test()
-    try:
-        event = json.load(sys.stdin)
-    except Exception:
-        return 0
-    out = note_for(event)
+    out = note_for(hookkit.read_event())
     if out:
-        print(json.dumps(out))
+        hookkit.note(out["hookSpecificOutput"]["hookEventName"], out["hookSpecificOutput"]["additionalContext"])
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    hookkit.run(main)

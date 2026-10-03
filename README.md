@@ -8,7 +8,7 @@ The numbers here are mine, at list prices, on one .NET codebase. Treat them as a
 
 Shape the ticket for the agent before anyone starts: one ticket is one agent pass, written so the agent needs nothing else, with the review's questions answered in advance. A cheaper model drafts every change. Scripts, not instructions, run the mechanical checks. A cheap critic reviews every change against six fixed questions. The expensive model only sees what the critic cannot close. At most four changes in flight.
 
-That took me from about 66 dollars of model use per change to about 25, with no drop in what got caught.
+That took me from about 13 dollars of model use per change to about 9, with no drop in what got caught. Until 1.4.0 this line said 66 and 25: the cost script counted each message's usage once per transcript row, and its prices were those of older models. Section 7 has the correction.
 
 The whole loop, with the section that covers each step:
 
@@ -58,6 +58,7 @@ What you get:
   - `LEAN_MODELS=one` keeps every step on the session's model: no cheap drafter, no escalation, a finding not fixed in one round gets one more round and then goes to you. The default, `mixed`, is the cascade in section 2.
   - `LEAN_MODEL_CHEAP` and `LEAN_MODEL_STRONG` say which model plays which part in that cascade. Each takes a Claude Code model alias (`sonnet`, `opus`, `haiku`, `fable`); the defaults are `sonnet` and `opus`. Section 2 lists the steps each one runs. They are ignored with `LEAN_MODELS=one`, and setting both to the same model leaves no escalation step, which the note says.
 - `style-scan` runs the same slop, attribution and U+2000 checks over the lines a branch adds, untracked files included, for a preflight or CI step.
+- `lean-stats` keeps one SQLite file, `~/.lean/lean.db`, of what the loop did: tokens per agent by model and role, review outcomes, merged changes and hook fires. `lean-stats report` prints cost per change, the escalation rate, what the cheap critic missed and which hooks fired. `LEAN_DB` moves the file and `LEAN_STATS=off` stops every write. Nothing leaves the machine, and no prompt text, code or command line is stored.
 - With the plugin on, `"attribution": {"commit": "", "pr": ""}` in your Claude Code settings is no longer needed, since the hook blocks the trailer anyway. Setting it too is harmless.
 - `tests/run-all.sh` runs every `--self-test` in the repository, lists scripts that have none, and fails on a duplicate key in the plugin JSON.
 - The hooks and scripts run on Linux and on macOS's stock bash 3.2, except `heavy.sh`, which needs util-linux `flock` and `/proc` and refuses to run without them. `tests/run-all.sh` reports its self-test as skipped on macOS; CI runs every self-test on Ubuntu for each pull request.
@@ -237,10 +238,21 @@ The merge queue takes one change at a time and re-tests each against everything 
 `workflow-cost.py` reads the per-agent transcripts a Claude Code workflow leaves behind, sums tokens by model, prices them, and prints cost per change against a baseline.
 
 ```
-python3 workflow-cost.py <run-id> --prs 4 --baseline-per-pr 66
+python3 workflow-cost.py <run-id> --prs 4 --baseline-per-pr 13
 ```
 
-Point it at a run directory or a bare run id. Prices are list prices in the `PRICES` table at the top; edit them to whatever you actually pay. This and `asset-provenance.py` are the two files here you can use unmodified.
+Point it at a run directory or a bare run id. Prices are list prices in the `PRICES` table in `lib/leanstats.py`; edit them to whatever you actually pay. It imports the price table and the transcript reader from `lib/leanstats.py`, so copy both. `asset-provenance.py` stands alone.
+
+`lean-stats` covers what `workflow-cost.py` does not: agents started with the Agent tool, and the main session.
+
+```
+lean-stats collect --since 2026-10-01 owner/repo
+lean-stats report --since 2026-10-01
+```
+
+`collect` imports transcripts and merged pull requests. `report` prints the numbers the retro starts from. An agent is counted by role only when it carries a label, `lean:<role> <owner/repo>#<pr>`, as its Agent description or as the first line of a workflow prompt. The `method` and `adversarial-review` skills write that label. Without one the agent is counted as `other`, and the report's last line says what share of tokens that was.
+
+Both tools count a message's usage once. Claude Code writes one transcript row per content block and repeats the message's usage on each. Until 1.4.0 `workflow-cost.py` summed every row, which overstated each of the 17 runs it was rechecked on by 65% to 304%. Its price table was also out of date: Fable was priced as Opus, and Opus and Sonnet at the prices of their version 4 models. Counted once, at the list prices of 2026-10-02, the three baseline runs come to 225 dollars over 18 changes, 13 per change, and the first lean run to 17 dollars over 2 changes, 9 per change: 31% under, where the old figures said 61%.
 
 After each batch, compare two things: cost per change, and what the critic caught versus what got past it. When the critic misses something, the fix is a new scripted check, not a more expensive critic. When a critic finds nothing on a tier for three batches, drop it from that tier.
 
