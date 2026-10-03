@@ -6,7 +6,7 @@ user-invocable: false
 
 # Lean agent, condensed
 
-Full text: ${CLAUDE_PLUGIN_ROOT}/README.md
+Full text: ${CLAUDE_PLUGIN_ROOT}/skills/method/full-text.md
 
 ## Mode
 Two settings change how the rules below apply: `LEAN_AGENTS` (`many` or `one`) and `LEAN_MODELS` (`mixed` or `one`), in the `env` block of Claude Code settings. At session start the plugin notes any setting that is not the default and what it changes. No note means many agents and mixed models, as written here.
