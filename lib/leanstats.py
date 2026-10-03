@@ -18,6 +18,8 @@ PRICES = {
     "fable-5-1": (10.0, 12.50, 0.25, 50.0),
     "fable": (10.0, 12.50, 1.00, 50.0),
     "opus-5-5": (4.0, 5.0, 0.20, 20.0),
+    "opus-4-1": (15.0, 18.75, 1.50, 75.0),
+    "opus-4-2025": (15.0, 18.75, 1.50, 75.0),  # Opus 4; Opus 4.5 and later fall through to "opus"
     "opus": (5.0, 6.25, 0.50, 25.0),
     "sonnet-4": (3.0, 3.75, 0.30, 15.0),
     "sonnet": (2.0, 2.50, 0.20, 10.0),
@@ -288,6 +290,9 @@ def self_test():
     check("cost", priced("claude-sonnet-5-5", **{"in": million, "out": million}), 12.0)
     check("opus 5.5 input", priced("claude-opus-5-5", **{"in": million}), 4.0)
     check("opus before 5.5 input", priced("claude-opus-5", **{"in": million}), 5.0)
+    check("opus 4.1 input", priced("claude-opus-4-1-20250805", **{"in": million}), 15.0)
+    check("opus 4 output", priced("claude-opus-4-20250514", out=million), 75.0)
+    check("opus 4.5 input", priced("claude-opus-4-5-20251101", **{"in": million}), 5.0)
     check("opus 5.5 cache read", priced("claude-opus-5-5", cr=million), 0.2)
     check("fable 5.1 cache read", priced("claude-fable-5-1", cr=million), 0.25)
     check("fable 5 cache read", priced("claude-fable-5", cr=million), 1.0)
