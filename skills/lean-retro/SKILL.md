@@ -12,12 +12,19 @@ The method improves only through this routine, and only with a person's approval
 Run, for the batch's window and every repository it touched:
 
 ```bash
-REVIEW_LOG=<path to review-log.tsv, if there is one> ${CLAUDE_PLUGIN_ROOT}/bin/retro-signals.sh --since <YYYY-MM-DD> owner/repo ...
+${CLAUDE_PLUGIN_ROOT}/bin/lean-stats collect --since <YYYY-MM-DD> owner/repo ...
+${CLAUDE_PLUGIN_ROOT}/bin/lean-stats report --since <YYYY-MM-DD>
 ```
+
+`collect` reads the session transcripts and the merged pull requests into `~/.lean/lean.db`. `report`
+prints cost per change by model and by role, the escalation rate, findings by where they were caught,
+critic misses, fix rounds and hook fires, each with the count behind it. A line that says `no data`
+is a gap in what was recorded, not a zero: say so in the retro and do not reason from it. For the raw
+row per pull request, run
+`REVIEW_LOG=<path to review-log.tsv> ${CLAUDE_PLUGIN_ROOT}/bin/retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
 
 Also gather, from the session or the coordinator's notes:
 - the adversarial review findings of the batch, by category (the review reports, or `review-log.tsv`);
-- tokens or cost per change if known (`workflow-cost.py` for workflow runs, agent usage lines otherwise);
 - every step that needed a person (an approval, a production apply, a permission change);
 - anything an agent worked out by reasoning that an earlier agent had also worked out;
 - `.lean/lessons.tsv` in each repository, if it exists: one line per lesson (date, commit sha, subject), written by the lessons commit hook. Take the lines in the batch's window as facts, the same as the script's rows.

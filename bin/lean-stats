@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""Collect and report what the lean-agent loop did, from one SQLite file.
+
+  lean-stats collect [--since YYYY-MM-DD] [owner/repo ...]
+  lean-stats report  [--since YYYY-MM-DD] [--markdown]
+  lean-stats import-reviews <review-log.tsv>
+  lean-stats log-review <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" \\
+                        "<caught elsewhere first>" [pre_push] [ci] [review] [escaped]
+  lean-stats --self-test
+
+The file is ~/.lean/lean.db. LEAN_DB moves it and LEAN_STATS=off stops every
+write. Nothing leaves the machine. No prompt text, code or command line is
+stored: tokens, model, role, repository and change only.
+"""
+import contextlib
+import glob
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import leanstats  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+LOG_REVIEW = os.path.join(ROOT, "skills", "adversarial-review", "log-review.sh")
+REVIEW_COLUMNS = ("date", "repo", "pr", "confirmed", "refuted", "blockers", "categories",
+                  "caught_elsewhere_first", "pre_push", "ci", "review", "escaped")
+
+
+def pr_number(text):
+    """The pull request number in `12`, `#12` or a pull request URL, else None."""
+    found = re.search(r"(?:^#?|/pull/)(\d+)/?$", (text or "").strip())
+    return int(found.group(1)) if found else None
+
+
+def count(text):
+    text = str(text).strip()
+    return int(text) if text.isdigit() else 0
+
+
+def put_review(conn, cells):
+    """Store one review row from twelve cells in REVIEW_COLUMNS order. False when it has no pull request number."""
+    number = pr_number(cells[2])
+    if number is None:
+        return False
+    values = [cells[0], cells[1], number] + [count(c) for c in cells[3:6]] + list(cells[6:8]) + [count(c) for c in cells[8:12]]
+    conn.execute("INSERT OR REPLACE INTO reviews (%s) VALUES (%s)"
+                 % (", ".join(REVIEW_COLUMNS), ", ".join("?" * len(REVIEW_COLUMNS))), values)
+    return True
+
+
+def cmd_log_review(conn, args):
+    """Store one review outcome. Takes the arguments of log-review.sh."""
+    if not 7 <= len(args) <= 11:
+        print("usage: lean-stats log-review <repo> <pr> <confirmed> <refuted> <blockers> "
+              "\"<categories>\" \"<caught elsewhere first>\" [pre_push] [ci] [review] [escaped]", file=sys.stderr)
+        return 2
+    first = conn.execute("SELECT date FROM reviews WHERE repo = ? AND pr = ?", (args[0], pr_number(args[1]))).fetchone()
+    # a later log amends the review, so the row stays in the window it was reviewed in
+    date = first[0] if first else time.strftime("%Y-%m-%d", time.gmtime())
+    cells = [date] + list(args) + ["0"] * (11 - len(args))
+    if put_review(conn, cells):
+        print(f"stored {args[0]}#{pr_number(args[1])}")
+    else:
+        print(f"lean-stats: no pull request number in {args[1]!r}, not stored")
+    return 0
+
+
+def cmd_import_reviews(conn, args):
+    """Load a review-log.tsv, eight or twelve columns. Safe to run again: a row replaces its earlier self."""
+    if len(args) != 1:
+        print("usage: lean-stats import-reviews <review-log.tsv>", file=sys.stderr)
+        return 2
+    try:
+        with open(args[0], errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        print(f"lean-stats: cannot read {args[0]}: {exc.strerror}", file=sys.stderr)
+        return 1
+    imported = skipped = 0
+    with leanstats.tx(conn):
+        for line in lines:
+            cells = line.split("\t")
+            if cells[0] == "date" or not line.strip():
+                continue
+            if len(cells) < 8:
+                skipped += 1
+                continue
+            cells = (cells + ["0"] * 4)[:12]
+            if put_review(conn, cells):
+                imported += 1
+            else:
+                skipped += 1
+    print(f"reviews: {imported} imported, {skipped} skipped (no pull request number or too few columns)")
+    return 0
+
+
+ROLES = ("draft", "spec", "hunt", "refute", "escalate")
+LABEL = re.compile(r"^lean:([a-z]+)(?:\s+([\w.-]+/[\w.-]+)(?:#(\d+)|@(\S+))?)?")
+REMOTE = re.compile(r"[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
+
+
+def parse_label(text):
+    """(role, repo, pr, branch) from `lean:<role> <owner/repo>#<pr>` or `...@<branch>`. No prefix is role other."""
+    found = LABEL.match((text or "").strip())
+    if not found:
+        return "other", "", None, ""
+    role = found.group(1) if found.group(1) in ROLES else "other"
+    return role, found.group(2) or "", int(found.group(3)) if found.group(3) else None, found.group(4) or ""
+
+
+def first_prompt_line(path):
+    """The first line of the prompt an agent was started with, where a workflow script puts the label."""
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return ""
+    with fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("type") != "user":
+                continue
+            message = row.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                content = next((b.get("text") for b in content
+                                if isinstance(b, dict) and b.get("type") == "text"), "")
+            text = content.strip() if isinstance(content, str) else ""
+            return text.splitlines()[0] if text else ""
+    return ""
+
+
+def read_label(path):
+    """The lean: label of an agent transcript: its metadata description, else its first prompt line."""
+    candidates = []
+    try:
+        with open(path[:-len(".jsonl")] + ".meta.json") as fh:
+            meta = json.load(fh)
+        if isinstance(meta, dict):
+            candidates = [meta.get("label"), meta.get("description")]
+    except (OSError, ValueError):
+        pass
+    candidates.append(first_prompt_line(path))
+    for text in candidates:
+        if isinstance(text, str) and text.strip().startswith("lean:"):
+            return text.strip()
+    return ""
+
+
+def repo_from_remote(url):
+    found = REMOTE.search((url or "").strip())
+    return found.group(1) if found else ""
+
+
+def git_repo(cwd):
+    """owner/name of the origin remote of a directory, or empty when it is gone or not a repository."""
+    if not cwd or not os.path.isdir(cwd):
+        return ""
+    try:
+        result = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return repo_from_remote(result.stdout) if result.returncode == 0 else ""
+
+
+def make_repo_of(lookup=git_repo):
+    """A cached cwd-to-repo function, so each directory costs one git call."""
+    cache = {}
+
+    def repo_of(cwd):
+        if cwd not in cache:
+            cache[cwd] = lookup(cwd) or ""
+        return cache[cwd]
+
+    return repo_of
+
+
+def options(args):
+    """Split arguments into (since, markdown, the rest)."""
+    since, markdown, rest = "", False, []
+    i = 0
+    while i < len(args):
+        if args[i] == "--since":
+            if i + 1 >= len(args) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[i + 1]):
+                raise ValueError("--since takes a date as YYYY-MM-DD")
+            since = args[i + 1]
+            i += 2
+            continue
+        if args[i] == "--markdown":
+            markdown = True
+        else:
+            rest.append(args[i])
+        i += 1
+    return since, markdown, rest
+
+
+def projects_root():
+    return os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"), "projects")
+
+
+def transcript_files(root):
+    """(path, kind) for every transcript under a Claude Code projects directory."""
+    found = [(p, "main") for p in glob.glob(os.path.join(root, "*", "*.jsonl"))]
+    found += [(p, "subagent") for p in glob.glob(os.path.join(root, "*", "*", "subagents", "agent-*.jsonl"))]
+    found += [(p, "workflow") for p in glob.glob(
+        os.path.join(root, "*", "*", "subagents", "workflows", "*", "agent-*.jsonl"))]
+    return sorted(found)
+
+
+def run_row(run_id, kind, role, model, repo, pr, branch, messages, path):
+    stamps = sorted(m["ts"] for m in messages if m["ts"])
+    return (run_id, next((m["session"] for m in messages if m["session"]), ""), kind, role, model, repo, pr, branch,
+            stamps[0] if stamps else "", stamps[-1] if stamps else "",
+            sum(m["in"] for m in messages), sum(m["cw"] for m in messages), sum(m["cw1h"] for m in messages),
+            sum(m["cr"] for m in messages), sum(m["out"] for m in messages), path)
+
+
+def agent_rows(path, kind, messages, repo_of):
+    """The agent_runs rows for one transcript: one per agent, or one per repo and model of a main session."""
+    messages = [m for m in messages if m["model"] != "<synthetic>"]
+    if not messages:
+        return []
+    if kind == "main":
+        session = os.path.basename(path)[:-len(".jsonl")]
+        groups = {}
+        for m in messages:
+            groups.setdefault((repo_of(m["cwd"]), m["model"]), []).append(m)
+        return [run_row(f"{session}:{repo}:{model}", "main", "coordinator", model, repo, None, "", group, path)
+                for (repo, model), group in sorted(groups.items())]
+    role, repo, pr, branch = parse_label(read_label(path))
+    output = {}
+    for m in messages:
+        output[m["model"]] = output.get(m["model"], 0) + m["out"]
+    model = max(sorted(output), key=output.get)
+    if not repo:
+        repo = repo_of(next((m["cwd"] for m in messages if m["cwd"]), ""))
+    agent_id = os.path.basename(path)[len("agent-"):-len(".jsonl")]
+    return [run_row(agent_id, kind, role, model, repo, pr, branch, messages, path)]
+
+
+def collect_transcripts(conn, root, since, repo_of):
+    """Import every changed transcript under root. Returns (imported, unchanged)."""
+    cutoff = time.mktime(time.strptime(since, "%Y-%m-%d")) if since else 0
+    imported = unchanged = 0
+    for path, kind in transcript_files(root):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if stat.st_mtime < cutoff:
+            continue
+        known = conn.execute("SELECT size, mtime FROM imports WHERE path = ?", (path,)).fetchone()
+        if known and known["size"] == stat.st_size and known["mtime"] == stat.st_mtime:
+            unchanged += 1
+            continue
+        rows = agent_rows(path, kind, leanstats.read_usage(path), repo_of)
+        with leanstats.tx(conn):
+            conn.execute("DELETE FROM agent_runs WHERE source_path = ?", (path,))
+            conn.executemany("INSERT OR REPLACE INTO agent_runs VALUES (%s)" % ", ".join("?" * 16), rows)
+            conn.execute("INSERT OR REPLACE INTO imports (path, size, mtime) VALUES (?, ?, ?)",
+                         (path, stat.st_size, stat.st_mtime))
+        imported += 1
+    return imported, unchanged
+
+
+RETRO = os.path.join(ROOT, "bin", "retro-signals.sh")
+
+
+def run_command(cmd, timeout=600):
+    """stdout of a command, or None when it is missing, fails or runs too long."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def fetch_changes(repo, since, run=run_command):
+    """Rows for the changes table for one repository, or None when gh fails."""
+    listing = run(["gh", "pr", "list", "-R", repo, "--state", "merged", "--search", f"merged:>={since}",
+                   "--limit", "200", "--json", "number,headRefName,createdAt,mergedAt"])
+    if listing is None:
+        return None
+    try:
+        merged = json.loads(listing)
+    except ValueError:
+        return None
+    signals = {}
+    for line in (run(["bash", RETRO, "--since", since, repo]) or "").splitlines()[1:]:
+        cells = line.split("\t")
+        if len(cells) >= 6 and cells[1].isdigit():
+            signals[int(cells[1])] = [int(c) if c.isdigit() else None for c in (cells[2], cells[3], cells[5])]
+    rows = []
+    for pr in merged:
+        fix_rounds, failed_checks, escaped_refs = signals.get(pr["number"], [None, None, None])
+        rows.append((repo, pr["number"], pr.get("headRefName") or "", pr.get("createdAt") or "",
+                     pr.get("mergedAt") or "", fix_rounds, failed_checks, escaped_refs))
+    return rows
+
+
+def collect_changes(conn, repos, since, run=run_command, which=shutil.which):
+    """Store the merged pull requests of each repository. Returns how many were stored."""
+    missing = [tool for tool in ("gh", "jq") if not which(tool)]
+    if missing:
+        print(f"changes: skipped, {' and '.join(missing)} not found")
+        return 0
+    stored = 0
+    for repo in repos:
+        rows = fetch_changes(repo, since, run)
+        if rows is None:
+            print(f"changes: skipped {repo}, the gh call failed")
+            continue
+        with leanstats.tx(conn):
+            conn.executemany("INSERT OR REPLACE INTO changes VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        stored += len(rows)
+    print(f"changes: {stored} stored from {len(repos)} repositories")
+    return stored
+
+
+def cmd_collect(conn, args):
+    """Import transcripts, and merged pull requests for any repositories named."""
+    since, _, repos = options(args)
+    bad = [r for r in repos if not re.fullmatch(r"[\w.-]+/[\w.-]+", r)]
+    if bad:
+        raise ValueError(f"not an owner/repo: {bad[0]}")
+    if repos and not since:
+        raise ValueError("naming repositories needs --since YYYY-MM-DD, the start of the batch")
+    imported, unchanged = collect_transcripts(conn, projects_root(), since, make_repo_of())
+    print(f"transcripts: {imported} imported, {unchanged} unchanged")
+    if repos:
+        collect_changes(conn, repos, since)
+    return 0
+
+
+NO_DATA = "no data"
+SILENT_HOOKS = {"record-test-run.py"}  # writes a marker file and never notes or blocks, so it has no fire to count
+
+
+def registered_hooks():
+    """The hook scripts named in hooks/hooks.json, without the ones that never fire by design."""
+    try:
+        with open(os.path.join(ROOT, "hooks", "hooks.json")) as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    return sorted(set(re.findall(r"/hooks/([\w.-]+\.py)", text)) - SILENT_HOOKS)
+
+
+def run_cost(run):
+    return leanstats.cost(run["model"], {
+        "in": run["tokens_in"], "cw": run["tokens_cache_write"], "cw1h": run["tokens_cache_write_1h"],
+        "cr": run["tokens_cache_read"], "out": run["tokens_out"]})
+
+
+def run_tokens(run):
+    return run["tokens_in"] + run["tokens_cache_write"] + run["tokens_cache_read"] + run["tokens_out"]
+
+
+def share(part, whole):
+    return f"{100 * part / whole:.0f}%"
+
+
+def measures(conn, since=""):
+    """The report as (label, value, basis) rows. A row with nothing behind it says no data, not zero."""
+    out = []
+    changes = conn.execute("SELECT * FROM changes WHERE merged_at >= ? ORDER BY repo, pr", (since,)).fetchall()
+    runs = conn.execute("SELECT * FROM agent_runs WHERE ended_at >= ?", (since,)).fetchall()
+    reviews = conn.execute("SELECT * FROM reviews WHERE date >= ?", (since,)).fetchall()
+    cheap = leanstats.family(os.environ.get("LEAN_MODEL_CHEAP") or "sonnet")
+
+    linked = {}
+    for change in changes:
+        hits = conn.execute(
+            "SELECT * FROM agent_runs WHERE repo = ? AND (pr = ? OR (branch <> '' AND branch = ?))",
+            (change["repo"], change["pr"], change["branch"])).fetchall()
+        if hits:
+            linked[(change["repo"], change["pr"])] = hits
+
+    total = len(changes)
+    out.append(("Changes merged", str(total) if total else NO_DATA,
+                f"{len(linked)} linked to agent runs" if total else ""))
+
+    repos = {change["repo"] for change in changes}
+    spend = [run for run in runs if run["repo"] in repos]
+    if total and spend:
+        dollars = sum(run_cost(run) for run in spend)
+        out.append(("Cost per change", f"{dollars / total:.2f} USD",
+                    f"{dollars:.2f} USD over {total} changes, list prices"))
+        for label, key in (("Cost per change by model", lambda run: leanstats.family(run["model"])),
+                           ("Cost per change by role", lambda run: run["role"])):
+            parts = {}
+            for run in spend:
+                parts[key(run)] = parts.get(key(run), 0.0) + run_cost(run)
+            ranked = sorted(parts.items(), key=lambda item: (-item[1], item[0]))
+            out.append((label, ", ".join(f"{name} {value / total:.2f}" for name, value in ranked), "USD per change"))
+    else:
+        out.append(("Cost per change", NO_DATA, ""))
+
+    if linked:
+        escalated = sum(1 for hits in linked.values() if any(run["role"] == "escalate" for run in hits))
+        out.append(("Escalation rate", share(escalated, len(linked)), f"{escalated} of {len(linked)} linked changes"))
+    else:
+        out.append(("Escalation rate", NO_DATA, ""))
+
+    if reviews:
+        summed = {key: sum(review[key] for review in reviews)
+                  for key in ("pre_push", "ci", "review", "escaped", "confirmed", "refuted")}
+        out.append(("Findings by where caught",
+                    f"pre-push {summed['pre_push']}, CI {summed['ci']}, review {summed['review']}, "
+                    f"escaped {summed['escaped']}", f"{len(reviews)} reviews"))
+        candidates = summed["confirmed"] + summed["refuted"]
+        if candidates:
+            out.append(("Refuted share", share(summed["refuted"], candidates),
+                        f"{summed['refuted']} of {candidates} candidates"))
+        else:
+            out.append(("Refuted share", NO_DATA, ""))
+    else:
+        out.append(("Findings by where caught", NO_DATA, ""))
+        out.append(("Refuted share", NO_DATA, ""))
+
+    refs = [change["escaped_refs"] for change in changes if change["escaped_refs"] is not None]
+    out.append(("Escaped after merge", str(sum(refs)) if refs else NO_DATA,
+                f"later issues or pull requests pointing back, over {len(refs)} changes" if refs else ""))
+
+    hunted = [key for key, hits in linked.items()
+              if any(run["role"] == "hunt" and leanstats.family(run["model"]) == cheap for run in hits)]
+    if hunted:
+        review_of = {(review["repo"], review["pr"]): review for review in conn.execute("SELECT * FROM reviews")}
+        refs_of = {(change["repo"], change["pr"]): change["escaped_refs"] for change in changes}
+        checked = [key for key in hunted if key in review_of or refs_of.get(key) is not None]
+        missed = 0
+        for key in checked:
+            review = review_of.get(key)
+            later = review["ci"] + review["review"] + review["escaped"] if review else 0
+            if later or refs_of.get(key):
+                missed += 1
+        unchecked = len(hunted) - len(checked)
+        if checked:
+            basis = f"of {len(checked)} changes hunted on {cheap}, with a finding caught in CI, in review or after merge"
+            if unchecked:
+                basis += f"; {unchecked} more had no review and no signals"
+            out.append(("Critic misses", str(missed), basis))
+        else:
+            out.append(("Critic misses", NO_DATA,
+                        f"{len(hunted)} changes hunted on {cheap}, none with a review logged or signals collected"))
+    else:
+        out.append(("Critic misses", NO_DATA, ""))
+
+    rounds = [change["fix_rounds"] for change in changes if change["fix_rounds"] is not None]
+    if rounds:
+        out.append(("Fix rounds per change", f"{sum(rounds) / len(rounds):.1f}",
+                    f"max {max(rounds)}, over {len(rounds)} changes"))
+    else:
+        out.append(("Fix rounds per change", NO_DATA, ""))
+
+    fires = conn.execute("SELECT hook, outcome, COUNT(*) AS n FROM hook_fires WHERE ts >= ? "
+                         "GROUP BY hook, outcome ORDER BY hook, outcome", (since,)).fetchall()
+    if fires:
+        per_hook = {}
+        for fire in fires:
+            per_hook.setdefault(fire["hook"], []).append(f"{fire['outcome']} {fire['n']}")
+        out.append(("Hook fires", "; ".join(f"{hook} {', '.join(parts)}" for hook, parts in sorted(per_hook.items())),
+                    f"{sum(fire['n'] for fire in fires)} fires"))
+        registered = registered_hooks()
+        quiet = [hook for hook in registered if hook not in per_hook]
+        out.append(("Hooks with no fire", ", ".join(quiet) if quiet else "none", f"of {len(registered)} registered"))
+    else:
+        out.append(("Hook fires", NO_DATA, ""))
+        out.append(("Hooks with no fire", NO_DATA, ""))
+
+    tokens = sum(run_tokens(run) for run in runs)
+    if tokens:
+        other = sum(run_tokens(run) for run in runs if run["role"] == "other")
+        no_repo = sum(run_tokens(run) for run in runs if not run["repo"])
+        out.append(("Unattributed", f"role other {share(other, tokens)}, no repo {share(no_repo, tokens)}",
+                    f"of tokens in {len(runs)} runs"))
+    else:
+        out.append(("Unattributed", NO_DATA, ""))
+    return out
+
+
+def render(rows, since, markdown, today):
+    window = f"{since} to {today}" if since else "all time"
+    if markdown:
+        lines = [f"Window: {window}. Changes: {rows[0][1]}.", "", "| Measure | Value | Basis |", "| --- | --- | --- |"]
+        lines += [f"| {label} | {value} | {basis} |" for label, value, basis in rows]
+    else:
+        lines = [f"lean-stats report, {window}"]
+        lines += [f"{label}: {value}" + (f" ({basis})" if basis else "") for label, value, basis in rows]
+    return "\n".join(lines)
+
+
+def cmd_report(conn, args):
+    """Print the numbers for the window, as text or as one Markdown table."""
+    since, markdown, rest = options(args)
+    if rest:
+        raise ValueError(f"report takes --since and --markdown, not {rest[0]}")
+    print(render(measures(conn, since), since, markdown, time.strftime("%Y-%m-%d", time.gmtime())))
+    return 0
+
+
+def test_reviews(check, tmp):
+    conn = leanstats.connect()
+    check("pr number plain", pr_number("12"), 12)
+    check("pr number with hash", pr_number("#12"), 12)
+    check("pr number from a url", pr_number("https://github.com/o/r/pull/12"), 12)
+    check("pr number from a word", pr_number("local"), None)
+
+    check("log-review stores", cmd_log_review(conn, ["o/r", "7", "2", "1", "0", "races", "none", "1", "1"]), 0)
+    cmd_log_review(conn, ["o/r", "#7", "3", "1", "0", "races", "none", "2", "0", "1", "0"])
+    rows = [tuple(r) for r in conn.execute(
+        "SELECT repo, pr, confirmed, refuted, pre_push, ci, review, escaped FROM reviews")]
+    check("a second log for the same pull request replaces the row", rows, [("o/r", 7, 3, 1, 2, 0, 1, 0)])
+    check("a word for a pull request exits 0", cmd_log_review(conn, ["o/r", "local", "1", "0", "0", "x", "none"]), 0)
+    check("and stores nothing", conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 1)
+    conn.execute("UPDATE reviews SET date = '2026-09-01' WHERE repo = 'o/r' AND pr = 7")
+    cmd_log_review(conn, ["o/r", "7", "3", "1", "0", "races", "none", "2", "0", "1", "1"])
+    check("a second log keeps the date of the first",
+          tuple(conn.execute("SELECT date, escaped FROM reviews WHERE repo = 'o/r' AND pr = 7").fetchone()),
+          ("2026-09-01", 1))
+    check("too few arguments", cmd_log_review(conn, ["o/r", "7"]), 2)
+
+    old = os.path.join(tmp, "old.tsv")
+    with open(old, "w") as fh:
+        fh.write("date\trepo\tpr\tconfirmed\trefuted\tblockers\tcategories\tcaught_elsewhere_first\n")
+        fh.write("2026-09-20\to/a\t1\t1\t0\t0\tcat\tnone\n")
+    new = os.path.join(tmp, "new.tsv")
+    with open(new, "w") as fh:
+        fh.write("\t".join(REVIEW_COLUMNS) + "\n")
+        fh.write("2026-10-01\to/b\t2\t1\t1\t0\tcat\tnone\t1\t0\t1\t0\n")
+        fh.write("2026-10-01\to/b\tlocal\t1\t0\t0\tcat\tnone\t0\t0\t0\t0\n")
+        fh.write("2026-10-01\to/b\n")
+        fh.write("\n")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("import an eight column log", cmd_import_reviews(conn, [old]), 0)
+        check("import a twelve column log", cmd_import_reviews(conn, [new]), 0)
+        check("import again", cmd_import_reviews(conn, [new]), 0)
+    check("skipped rows are counted", "1 imported, 2 skipped" in out.getvalue(), True)
+    rows = [tuple(r) for r in conn.execute(
+        "SELECT date, repo, pr, confirmed, pre_push, ci, review, escaped FROM reviews "
+        "WHERE repo IN ('o/a', 'o/b') ORDER BY repo")]
+    check("imported rows", rows, [("2026-09-20", "o/a", 1, 1, 0, 0, 0, 0),
+                                  ("2026-10-01", "o/b", 2, 1, 1, 0, 1, 0)])
+    check("the logged row is still there", conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0], 3)
+    check("a missing file", cmd_import_reviews(conn, [os.path.join(tmp, "absent.tsv")]), 1)
+
+    log = os.path.join(tmp, "review-log.tsv")
+    env = dict(os.environ, REVIEW_LOG=log)
+    proc = subprocess.run(["bash", LOG_REVIEW, "o/c", "9", "1", "0", "0", "cat", "none", "1"],
+                          capture_output=True, text=True, env=env, timeout=60)
+    check("log-review.sh exits 0", proc.returncode, 0)
+    check("log-review.sh still writes the tsv", len(open(log).read().splitlines()), 2)
+    check("log-review.sh stores the row", [tuple(r) for r in conn.execute(
+        "SELECT pr, confirmed, pre_push FROM reviews WHERE repo='o/c'")], [(9, 1, 1)])
+    proc = subprocess.run(["bash", LOG_REVIEW, "o/d", "local", "1", "0", "0", "cat", "none"],
+                          capture_output=True, text=True, env=env, timeout=60)
+    check("log-review.sh with a word for the pull request exits 0", proc.returncode, 0)
+    proc = subprocess.run(["bash", LOG_REVIEW, "o/e", "10", "1", "0", "0", "cat", "none"],
+                          capture_output=True, text=True, env=dict(env, LEAN_STATS="off"), timeout=60)
+    check("off: log-review.sh exits 0", proc.returncode, 0)
+    check("off: the tsv row is written", len(open(log).read().splitlines()), 4)
+    check("off: nothing stored", conn.execute("SELECT COUNT(*) FROM reviews WHERE repo='o/e'").fetchone()[0], 0)
+    conn.close()
+
+    with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "off.db"), LEAN_STATS="off"):
+        check("off: a command exits 0", main(["log-review", "o/r", "7", "1", "0", "0", "x", "none"]), 0)
+        check("off: no file", os.path.exists(os.path.join(tmp, "off.db")), False)
+    newer = os.path.join(tmp, "newer.db")
+    with leanstats.temp_env(LEAN_DB=newer):
+        conn = leanstats.connect()
+        conn.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+        conn.close()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            check("a newer database is refused", main(["import-reviews", old]), 1)
+        check("the message names the version", "99" in err.getvalue(), True)
+    check("an unknown command", main(["nonsense"]), 2)
+
+
+def test_transcripts(check, tmp):
+    check("label with a pull request", parse_label("lean:hunt o/r#7"), ("hunt", "o/r", 7, ""))
+    check("label with a branch", parse_label("lean:refute o/r@fix/thing"), ("refute", "o/r", None, "fix/thing"))
+    check("label with a repo only", parse_label("lean:draft BaryoDev/barako.CMS"), ("draft", "BaryoDev/barako.CMS", None, ""))
+    check("label with a role only", parse_label("lean:spec"), ("spec", "", None, ""))
+    check("no prefix", parse_label("Research the API"), ("other", "", None, ""))
+    check("a role outside the five", parse_label("lean:polish o/r#7"), ("other", "o/r", 7, ""))
+    written = [{"ts": "", "session": "", "in": 1, "cw": 5, "cw1h": 3, "cr": 0, "out": 0}] * 2
+    check("the 1 hour part of cache writes is kept",
+          run_row("r", "main", "coordinator", "m", "", None, "", written, "p")[10:15], (2, 10, 6, 0, 0))
+    check("role is not guessed from wording", parse_label("hunt for bugs in o/r#7"), ("other", "", None, ""))
+    check("empty", parse_label(None), ("other", "", None, ""))
+    check("https remote", repo_from_remote("https://github.com/o/r.git\n"), "o/r")
+    check("ssh remote", repo_from_remote("git@github.com:o/r.git"), "o/r")
+    check("remote without .git", repo_from_remote("https://github.com/o/r"), "o/r")
+    check("missing directory", git_repo(os.path.join(tmp, "gone")), "")
+    check("not a repository", git_repo(tmp), "")
+    check("options", options(["--since", "2026-10-01", "o/r", "--markdown"]), ("2026-10-01", True, ["o/r"]))
+    try:
+        options(["--since", "yesterday"])
+        check("a bad date is refused", "accepted", "refused")
+    except ValueError:
+        pass
+
+    def row(mid, usage, cwd="/a", model="claude-opus-5-5", ts="2026-10-02T01:00:00.000Z"):
+        return json.dumps({"type": "assistant", "cwd": cwd, "sessionId": "sess1", "timestamp": ts,
+                           "message": {"id": mid, "model": model, "usage": usage}}) + "\n"
+
+    def prompt(text):
+        return json.dumps({"type": "user", "cwd": "/a", "sessionId": "sess1",
+                           "message": {"role": "user", "content": text}}) + "\n"
+
+    def write(path, lines, meta=None):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("".join(lines))
+        if meta is not None:
+            with open(path[:-len(".jsonl")] + ".meta.json", "w") as fh:
+                json.dump(meta, fh)
+
+    root = os.path.join(tmp, "projects")
+    sess = os.path.join(root, "proj", "sess1")
+    sub = os.path.join(sess, "subagents")
+    write(sess + ".jsonl", [
+        row("m1", {"input_tokens": 100}, ts="2026-10-02T01:00:00.000Z"),
+        row("m1", {"input_tokens": 100}),
+        row("m1", {"input_tokens": 100}),
+        "not json\n",
+        row("m2", {"input_tokens": 20}, cwd="/b", ts="2026-10-02T02:00:00.000Z"),
+        json.dumps({"message": {"id": "m3", "model": "<synthetic>", "usage": {"input_tokens": 0}}}) + "\n",
+    ])
+    write(os.path.join(root, "proj", "sess2.jsonl"), [
+        row("m1", {"input_tokens": 1}, model="claude-opus-5-5"),
+        row("m2", {"input_tokens": 2}, model="claude-sonnet-5-5"),
+    ])
+    write(os.path.join(sub, "agent-a1.jsonl"),
+          [prompt("Find defects in this diff"), row("m1", {"input_tokens": 10, "output_tokens": 5}, model="claude-sonnet-5-5")],
+          {"agentType": "general-purpose", "description": "lean:hunt o/r#7"})
+    write(os.path.join(sub, "agent-a2.jsonl"), [row("m1", {"output_tokens": 3}, cwd="/b")],
+          {"description": "Research something"})
+    write(os.path.join(sub, "workflows", "wf_x", "agent-a3.jsonl"),
+          [prompt("lean:refute o/r@fix-thing\nRefute this finding."), row("m1", {"output_tokens": 4})],
+          {"agentType": "workflow-subagent", "spawnDepth": 1})
+    write(os.path.join(sub, "agent-a4.jsonl"), [prompt("no label"), json.dumps({"type": "assistant"}) + "\n"],
+          {"description": "lean:hunt o/r#8"})
+    write(os.path.join(sub, "agent-a5.jsonl"),
+          [row("m1", {"output_tokens": 1}, model="claude-sonnet-5-5"), row("m2", {"output_tokens": 9}),
+           '{"message": {"id": "m3", "usage": {"output_tok'],
+          {"description": "lean:escalate o/r#7"})
+    old = os.path.join(sub, "agent-a6.jsonl")
+    write(old, [row("m1", {"output_tokens": 1})], {"description": "lean:draft o/r#1"})
+    os.utime(old, (1577836800, 1577836800))  # 2020-01-01
+
+    repo_of = make_repo_of({"/a": "o/a", "/b": "o/b"}.get)
+    conn = leanstats.connect()
+    check("first collect", collect_transcripts(conn, root, "2026-01-01", repo_of), (7, 0))
+
+    def runs(where="1=1"):
+        return [tuple(r) for r in conn.execute(
+            "SELECT run_id, kind, role, model, repo, pr, branch, tokens_in, tokens_out FROM agent_runs "
+            "WHERE %s ORDER BY run_id" % where)]
+
+    check("a main session in two repositories gives two rows, usage counted once", runs("run_id LIKE 'sess1:%'"), [
+        ("sess1:o/a:claude-opus-5-5", "main", "coordinator", "claude-opus-5-5", "o/a", None, "", 100, 0),
+        ("sess1:o/b:claude-opus-5-5", "main", "coordinator", "claude-opus-5-5", "o/b", None, "", 20, 0),
+    ])
+    check("a main session on two models gives two rows", [r[3] for r in runs("run_id LIKE 'sess2:%'")],
+          ["claude-opus-5-5", "claude-sonnet-5-5"])
+    check("labelled subagent", runs("run_id='a1'"), [("a1", "subagent", "hunt", "claude-sonnet-5-5", "o/r", 7, "", 10, 5)])
+    check("unlabelled subagent takes its repo from the directory", runs("run_id='a2'"),
+          [("a2", "subagent", "other", "claude-opus-5-5", "o/b", None, "", 0, 3)])
+    check("workflow agent labelled on its first prompt line", runs("run_id='a3'"),
+          [("a3", "workflow", "refute", "claude-opus-5-5", "o/r", None, "fix-thing", 0, 4)])
+    check("a transcript with no usage gives no row", runs("run_id='a4'"), [])
+    check("cut last line skipped, model is the one with most output", runs("run_id='a5'"),
+          [("a5", "subagent", "escalate", "claude-opus-5-5", "o/r", 7, "", 0, 10)])
+    check("a file older than --since is not read", runs("run_id='a6'"), [])
+    check("timestamps", [tuple(r) for r in conn.execute(
+        "SELECT started_at, ended_at FROM agent_runs WHERE run_id='sess1:o/b:claude-opus-5-5'")],
+        [("2026-10-02T02:00:00.000Z", "2026-10-02T02:00:00.000Z")])
+    stored = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+    kept = " ".join(str(value) for r in conn.execute("SELECT * FROM agent_runs") for value in tuple(r))
+    check("no prompt or description text is stored", [w for w in ("finding", "defects", "Research") if w in kept], [])
+
+    check("collect twice reads nothing new", collect_transcripts(conn, root, "2026-01-01", repo_of), (0, 7))
+    check("and gives the same rows", conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0], stored)
+    with open(os.path.join(sub, "agent-a1.jsonl"), "a") as fh:
+        fh.write(row("m2", {"output_tokens": 7}, model="claude-sonnet-5-5"))
+    check("a changed transcript is read again", collect_transcripts(conn, root, "2026-01-01", repo_of), (1, 6))
+    check("and replaces its row", runs("run_id='a1'"), [("a1", "subagent", "hunt", "claude-sonnet-5-5", "o/r", 7, "", 10, 12)])
+    check("row count unchanged", conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0], stored)
+    check("no --since reads the old file too", collect_transcripts(conn, root, "", repo_of), (1, 7))
+    conn.close()
+
+
+def test_changes(check, tmp):
+    listing = json.dumps([
+        {"number": 7, "headRefName": "fix-a", "createdAt": "2026-09-30T01:00:00Z", "mergedAt": "2026-10-01T01:00:00Z"},
+        {"number": 8, "headRefName": "fix-b", "createdAt": "2026-09-30T02:00:00Z", "mergedAt": "2026-10-01T02:00:00Z"},
+    ])
+    signals = ("repo\tpr\tfix_rounds\tfailed_checks\tdays_to_merge\tescaped_refs\tlogged_review\n"
+               "o/r\t7\t2\t1\t1\t0\tunknown\n")
+    calls = []
+
+    def fake(cmd, timeout=600):
+        calls.append(cmd)
+        if cmd[0] == "gh":
+            return None if "o/broken" in cmd else listing
+        return signals
+
+    def present(tool):
+        return "/usr/bin/" + tool
+
+    conn = leanstats.connect()
+    check("two changes stored", collect_changes(conn, ["o/r"], "2026-10-01", fake, present), 2)
+    check("the gh query", calls[0][:8], ["gh", "pr", "list", "-R", "o/r", "--state", "merged", "--search"])
+    check("the window", calls[0][8], "merged:>=2026-10-01")
+    rows = [tuple(r) for r in conn.execute("SELECT * FROM changes ORDER BY pr")]
+    check("signals joined by pull request, missing ones left empty", rows, [
+        ("o/r", 7, "fix-a", "2026-09-30T01:00:00Z", "2026-10-01T01:00:00Z", 2, 1, 0),
+        ("o/r", 8, "fix-b", "2026-09-30T02:00:00Z", "2026-10-01T02:00:00Z", None, None, None),
+    ])
+    check("collect again replaces", collect_changes(conn, ["o/r"], "2026-10-01", fake, present), 2)
+    check("still two rows", conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0], 2)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("a failing gh call stores nothing", collect_changes(conn, ["o/broken"], "2026-10-01", fake, present), 0)
+        check("no gh stores nothing", collect_changes(conn, ["o/r"], "2026-10-01", fake, lambda tool: None), 0)
+    check("says which repository failed", "skipped o/broken" in out.getvalue(), True)
+    check("says which tool is missing", "gh and jq not found" in out.getvalue(), True)
+    check("retro-signals failing still stores the changes",
+          len(fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else None)), 2)
+    with contextlib.redirect_stderr(io.StringIO()):
+        check("repositories need a window", main(["collect", "o/r"]), 2)
+        check("a repository is owner/name", main(["collect", "--since", "2026-10-01", "nonsense"]), 2)
+    conn.close()
+
+
+def test_report(check, tmp):
+    conn = leanstats.connect()
+    empty = measures(conn)
+    check("an empty database says no data on every line", {value for _, value, _ in empty}, {"no data"})
+    check("and has every line", [label for label, _, _ in empty], [
+        "Changes merged", "Cost per change", "Escalation rate", "Findings by where caught", "Refuted share",
+        "Escaped after merge", "Critic misses", "Fix rounds per change", "Hook fires", "Hooks with no fire",
+        "Unattributed"])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("report on an empty database exits 0", cmd_report(conn, []), 0)
+    check("and prints no data", out.getvalue().count("no data"), 11)
+
+    million = 1000000
+
+    def run(run_id, role, model, repo, pr, branch, tokens_in, ended="2026-10-01T05:00:00.000Z"):
+        conn.execute("INSERT INTO agent_runs VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'p')",
+                     (run_id, role, model, repo, pr, branch, ended, ended, tokens_in))
+
+    conn.execute("INSERT INTO changes VALUES ('o/r', 7, 'fix-a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 2, 0, 0)")
+    conn.execute("INSERT INTO changes VALUES ('o/r', 8, 'fix-b', '2026-09-30T00:00:00Z', '2026-10-01T09:00:00Z', 0, 0, 0)")
+    run("h", "hunt", "claude-sonnet-5-5", "o/r", 7, "", million)             # 2 USD
+    run("e", "escalate", "claude-opus-5-5", "o/r", None, "fix-b", million)   # 4 USD
+    run("c", "coordinator", "claude-opus-5-5", "o/r", None, "", 2 * million)  # 8 USD
+    run("x", "other", "claude-sonnet-5-5", "", None, "", million)            # not in a repo with a change
+    conn.execute("INSERT INTO reviews VALUES ('2026-10-01', 'o/r', 7, 2, 2, 0, 'races', 'none', 1, 1, 0, 0)")
+    for hook, outcome in (("public-text.py", "block"), ("public-text.py", "block"), ("style-note.py", "note")):
+        conn.execute("INSERT INTO hook_fires VALUES ('2026-10-01T03:00:00Z', ?, ?, 's', '/w')", (hook, outcome))
+
+    got = {label: (value, basis) for label, value, basis in measures(conn)}
+    check("changes", got["Changes merged"], ("2", "2 linked to agent runs"))
+    check("cost per change", got["Cost per change"], ("7.00 USD", "14.00 USD over 2 changes, list prices"))
+    check("by model", got["Cost per change by model"][0], "opus 6.00, sonnet 1.00")
+    check("by role", got["Cost per change by role"][0], "coordinator 4.00, escalate 2.00, hunt 1.00")
+    check("escalation rate", got["Escalation rate"], ("50%", "1 of 2 linked changes"))
+    check("findings", got["Findings by where caught"], ("pre-push 1, CI 1, review 0, escaped 0", "1 reviews"))
+    check("refuted share", got["Refuted share"], ("50%", "2 of 4 candidates"))
+    check("escaped after merge", got["Escaped after merge"][0], "0")
+    check("critic misses", got["Critic misses"][0], "1")
+    check("critic misses basis names the model", "of 1 changes hunted on sonnet" in got["Critic misses"][1], True)
+    check("fix rounds", got["Fix rounds per change"], ("1.0", "max 2, over 2 changes"))
+    check("hook fires", got["Hook fires"], ("public-text.py block 2; style-note.py note 1", "3 fires"))
+    quiet = got["Hooks with no fire"][0]
+    check("a registered hook that did not fire is listed", "commit-author.py" in quiet, True)
+    check("a hook that fired is not", "public-text.py" in quiet, False)
+    check("the hook that never fires by design is not", "record-test-run.py" in quiet, False)
+    check("unattributed", got["Unattributed"], ("role other 20%, no repo 20%", "of tokens in 4 runs"))
+
+    with leanstats.temp_env(LEAN_MODEL_CHEAP="opus"):
+        check("the cheap model comes from the setting", dict((label, value) for label, value, _ in measures(conn))["Critic misses"], "no data")
+    with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "unchecked.db")):
+        bare = leanstats.connect()
+        bare.execute("INSERT INTO changes VALUES ('o/u', 1, 'a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', NULL, NULL, NULL)")
+        bare.execute("INSERT INTO agent_runs VALUES ('u1', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 1, '', "
+                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p')")
+        unchecked = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
+        check("a hunted change with no review and no signals is no data, not zero", unchecked,
+              ("no data", "1 changes hunted on sonnet, none with a review logged or signals collected"))
+        bare.execute("INSERT INTO changes VALUES ('o/u', 2, 'b', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 0, 0, 0)")
+        bare.execute("INSERT INTO agent_runs VALUES ('u2', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 2, '', "
+                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p')")
+        partly = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
+        check("only checked changes are counted", partly[0], "0")
+        check("and the unchecked ones are named", partly[1].startswith("of 1 changes hunted on sonnet") and
+              partly[1].endswith("1 more had no review and no signals"), True)
+        bare.close()
+    check("since is inclusive", dict((label, value) for label, value, _ in measures(conn, "2026-10-01"))["Changes merged"], "2")
+    later = dict((label, value) for label, value, _ in measures(conn, "2026-10-02"))
+    check("a later window has no changes", later["Changes merged"], "no data")
+    check("and no cost", later["Cost per change"], "no data")
+
+    text = render(measures(conn), "2026-10-01", False, "2026-10-02")
+    check("text header", text.splitlines()[0], "lean-stats report, 2026-10-01 to 2026-10-02")
+    check("text line", "Cost per change: 7.00 USD (14.00 USD over 2 changes, list prices)" in text, True)
+    table = render(measures(conn), "2026-10-01", True, "2026-10-02")
+    check("markdown header", table.splitlines()[0], "Window: 2026-10-01 to 2026-10-02. Changes: 2.")
+    check("markdown row", "| Cost per change | 7.00 USD | 14.00 USD over 2 changes, list prices |" in table, True)
+    check("all time header", render(empty, "", False, "2026-10-02").splitlines()[0], "lean-stats report, all time")
+    check("registered hooks come from hooks.json", "pr-merge-blocked.py" in registered_hooks(), True)
+    conn.close()
+
+
+COMMANDS = {
+    "log-review": cmd_log_review,
+    "import-reviews": cmd_import_reviews,
+    "collect": cmd_collect,
+    "report": cmd_report,
+}
+TESTS = [test_reviews, test_transcripts, test_changes, test_report]
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
+    if not argv or argv[0] not in COMMANDS:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if leanstats.off():
+        print("lean-stats: LEAN_STATS=off, nothing read or written")
+        return 0
+    try:
+        conn = leanstats.connect()
+    except leanstats.NewerSchema as exc:
+        print(f"lean-stats: {exc}", file=sys.stderr)
+        return 1
+    try:
+        return COMMANDS[argv[0]](conn, argv[1:])
+    except ValueError as exc:
+        print(f"lean-stats: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
+def self_test():
+    import tempfile
+
+    failures = []
+
+    def check(name, got, want):
+        if got != want:
+            failures.append(f"{name}: got {got!r}, want {want!r}")
+
+    for test in TESTS:
+        with tempfile.TemporaryDirectory() as tmp:
+            with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "lean.db"), LEAN_STATS=None, LEAN_MODEL_CHEAP=None):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    test(check, tmp)
+    if failures:
+        print("self-test failed:\n  " + "\n  ".join(failures))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

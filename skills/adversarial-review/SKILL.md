@@ -63,6 +63,9 @@ test that loses assertions.
 
 ## 3. Hunt (agent one, fresh context)
 
+Start the hunter with the description `lean:hunt <owner/repo>#<pr>` (or `@<branch>` before the pull
+request exists), so `lean-stats` can tie its cost and its misses to the change.
+
 Give the hunter the diff, the PR description and linked issue, the rules file, and a checkout it
 can build and test. It reads whole files around each hunk and every caller of a changed symbol,
 then answers, each with the line that proves it:
@@ -101,6 +104,8 @@ The hunter writes candidates as `category | severity | file:line | input | path 
 proposed fix`, and states what it did not check.
 
 ## 4. Refute (agent two, fresh context)
+
+Start the refuter with the description `lean:refute <owner/repo>#<pr>`.
 
 Give the refuter each candidate alone, with the checkout and the rules file, and no view of the
 hunter's reasoning. Its job is to make the finding go away:
@@ -144,6 +149,10 @@ CI and any review bot:
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" "<caught elsewhere first>"
 ```
+
+The same row goes into the `lean-stats` database (`~/.lean/lean.db`), where `lean-stats report` joins
+it to the agents that worked on the change. Logging the same pull request again replaces its row
+there, which is how `escaped` gets filled in later.
 
 When a category keeps surviving refutation, turn it into a scripted check. When a tier has
 produced nothing for three batches, stop running the full review on it.
