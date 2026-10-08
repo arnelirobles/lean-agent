@@ -79,12 +79,17 @@ Which model is which is a setting, so the cascade outlives any one model release
 | Step | Model |
 | --- | --- |
 | Spec review of a bigger ticket (0) | cheap |
+| Locate the code a draft or spec review needs | fast |
 | Draft, every tier | cheap |
 | Critic: hunt, then refute | cheap, two fresh agents |
 | First fix round (5) | cheap, the same drafter resumed |
+| Run the gates and paste their output (preflight, holdout, tests, a CI log) | fast |
+| Retro fact collection (`lean-stats collect` and `report`, `retro-signals.sh`) | fast |
 | A no not fixed in one round, or an unsure tier 2 answer | strong |
 
-`LEAN_MODEL_CHEAP` defaults to `sonnet` and `LEAN_MODEL_STRONG` to `opus`, which Claude Code resolves to its current Sonnet and Opus. Swap or replace them in the `env` block of your settings. They cover the agents a session starts; the session itself runs on whatever `/model` says.
+`LEAN_MODEL_CHEAP` defaults to `sonnet`, `LEAN_MODEL_STRONG` to `opus` and `LEAN_MODEL_FAST` to `haiku`, which Claude Code resolves to its current Sonnet, Opus and Haiku. Swap or replace them in the `env` block of your settings. They cover the agents a session starts; the session itself runs on whatever `/model` says.
+
+The fast model only reads and reports. A gate agent pastes what the script printed, and a pass or fail is whatever the script said. A small model that wrongly refutes a finding drops a real defect with no trace, so nothing that answers a yes or no about code runs on it. Anything a fast agent cannot answer by quoting output goes to the cheap model.
 
 Your continuous integration and whatever code review bot you use still run. They confirm. They do not decide.
 

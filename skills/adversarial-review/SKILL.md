@@ -29,7 +29,7 @@ write the hunt's candidates down first, then refute each one from the code and a
 the hunt's reasoning. The report says the finder and the judge shared a context.
 
 With mixed models, the hunter and the refuter both start on the cheap model: `sonnet`, or the
-model the session-start note names. The strong model is not a second critic. It gets the branch
+model the session-start note names. The hunter and the refuter never run on the fast model (`LEAN_MODEL_FAST`): a small model that wrongly refutes a finding drops a real defect with no trace. The strong model is not a second critic. It gets the branch
 and the surviving list only when a finding is not fixed in one round, or a tier 2 answer is unsure.
 
 ## Inputs
