@@ -106,7 +106,7 @@ def message(env):
         parts.append(MIXED_IN_ONE.format(**names))
     elif (cheap, strong, fast) != tuple(ROLES[name] for name in ("LEAN_MODEL_CHEAP", "LEAN_MODEL_STRONG", "LEAN_MODEL_FAST")):
         parts.append(ROLES_CHANGED.format(**names))
-    if fast == strong and agents == "many":
+    if fast == strong and cheap != strong and agents == "many":
         parts.append(FAST_IS_STRONG.format(**names))
     return " ".join(parts) or None
 
@@ -172,6 +172,8 @@ def self_test():
            ("LEAN_MODELS=one:",), ("LEAN_MODEL_FAST", "fable", "cost the most"))
     expect("fast equal to strong", {"LEAN_MODEL_FAST": "opus"},
            ("fast model is opus", "LEAN_MODEL_FAST is opus", "cost the most"))
+    expect("every role the same model", {"LEAN_MODEL_CHEAP": "opus", "LEAN_MODEL_FAST": "opus"},
+           ("are both opus",), ("cost the most",))
     expect("fast steps in one session", {"LEAN_AGENTS": "one"}, ("fast steps", "run in the session itself"))
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
