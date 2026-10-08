@@ -100,7 +100,7 @@ def cmd_import_reviews(conn, args):
     return 0
 
 
-ROLES = ("draft", "spec", "hunt", "refute", "escalate")
+ROLES = ("draft", "spec", "hunt", "refute", "escalate", "search", "gate", "retro")
 LABEL = re.compile(r"^lean:([a-z]+)(?:\s+([\w.-]+/[\w.-]+)(?:#(\d+)|@(\S+))?)?")
 REMOTE = re.compile(r"[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 
@@ -221,7 +221,8 @@ def run_row(run_id, kind, role, model, repo, pr, branch, messages, path):
     return (run_id, next((m["session"] for m in messages if m["session"]), ""), kind, role, model, repo, pr, branch,
             stamps[0] if stamps else "", stamps[-1] if stamps else "",
             sum(m["in"] for m in messages), sum(m["cw"] for m in messages), sum(m["cw1h"] for m in messages),
-            sum(m["cr"] for m in messages), sum(m["out"] for m in messages), path)
+            sum(m["cr"] for m in messages), sum(m["out"] for m in messages), path,
+            sum(leanstats.message_cost(m) for m in messages))
 
 
 def agent_rows(path, kind, messages, repo_of):
@@ -265,7 +266,7 @@ def collect_transcripts(conn, root, since, repo_of):
         rows = agent_rows(path, kind, leanstats.read_usage(path), repo_of)
         with leanstats.tx(conn):
             conn.execute("DELETE FROM agent_runs WHERE source_path = ?", (path,))
-            conn.executemany("INSERT OR REPLACE INTO agent_runs VALUES (%s)" % ", ".join("?" * 16), rows)
+            conn.executemany("INSERT OR REPLACE INTO agent_runs VALUES (%s)" % ", ".join("?" * 17), rows)
             conn.execute("INSERT OR REPLACE INTO imports (path, size, mtime) VALUES (?, ?, ?)",
                          (path, stat.st_size, stat.st_mtime))
         imported += 1
@@ -356,6 +357,8 @@ def registered_hooks():
 
 
 def run_cost(run):
+    if run["usd"] is not None:
+        return run["usd"]
     return leanstats.cost(run["model"], {
         "in": run["tokens_in"], "cw": run["tokens_cache_write"], "cw1h": run["tokens_cache_write_1h"],
         "cr": run["tokens_cache_read"], "out": run["tokens_out"]})
@@ -592,8 +595,11 @@ def test_transcripts(check, tmp):
     check("label with a repo only", parse_label("lean:draft BaryoDev/barako.CMS"), ("draft", "BaryoDev/barako.CMS", None, ""))
     check("label with a role only", parse_label("lean:spec"), ("spec", "", None, ""))
     check("no prefix", parse_label("Research the API"), ("other", "", None, ""))
-    check("a role outside the five", parse_label("lean:polish o/r#7"), ("other", "o/r", 7, ""))
-    written = [{"ts": "", "session": "", "in": 1, "cw": 5, "cw1h": 3, "cr": 0, "out": 0}] * 2
+    check("a role outside the list", parse_label("lean:polish o/r#7"), ("other", "o/r", 7, ""))
+    check("the fast roles", [parse_label("lean:%s o/r#3" % name)[0] for name in ("search", "gate", "retro")],
+          ["search", "gate", "retro"])
+    check("a gate label", parse_label("lean:gate o/r#3"), ("gate", "o/r", 3, ""))
+    written = [{"model": "m", "ts": "", "session": "", "in": 1, "cw": 5, "cw1h": 3, "cr": 0, "out": 0}] * 2
     check("the 1 hour part of cache writes is kept",
           run_row("r", "main", "coordinator", "m", "", None, "", written, "p")[10:15], (2, 10, 6, 0, 0))
     check("role is not guessed from wording", parse_label("hunt for bugs in o/r#7"), ("other", "", None, ""))
@@ -698,6 +704,19 @@ def test_transcripts(check, tmp):
     check("and replaces its row", runs("run_id='a1'"), [("a1", "subagent", "hunt", "claude-sonnet-5-5", "o/r", 7, "", 10, 12)])
     check("row count unchanged", conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0], stored)
     check("no --since reads the old file too", collect_transcripts(conn, root, "", repo_of), (1, 7))
+    check("usd is stored from the model's list price", conn.execute(
+        "SELECT usd FROM agent_runs WHERE run_id='a1'").fetchone()[0], leanstats.cost("claude-sonnet-5-5", {
+            "in": 10, "cw": 0, "cw1h": 0, "cr": 0, "out": 12}))
+    write(os.path.join(sub, "agent-a7.jsonl"),
+          [row("m1", {"input_tokens": 150000}, model="claude-haiku-5-5"),
+           row("m2", {"input_tokens": 1000}, model="claude-haiku-5-5")],
+          {"description": "lean:gate o/r#9"})
+    collect_transcripts(conn, root, "", repo_of)
+    found = conn.execute("SELECT role, tokens_in, usd FROM agent_runs WHERE run_id='a7'").fetchone()
+    check("a long haiku 5.5 prompt is priced per message, not on the total",
+          (found["role"], found["tokens_in"], round(found["usd"], 6)), ("gate", 151000, 0.0751))
+    check("the total would have been lower", round(leanstats.cost("claude-haiku-5-5", {
+        "in": 151000, "cw": 0, "cr": 0, "out": 0}), 6), 0.0151)
     conn.close()
 
 
@@ -760,7 +779,7 @@ def test_report(check, tmp):
     million = 1000000
 
     def run(run_id, role, model, repo, pr, branch, tokens_in, ended="2026-10-01T05:00:00.000Z"):
-        conn.execute("INSERT INTO agent_runs VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'p')",
+        conn.execute("INSERT INTO agent_runs VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'p', NULL)",
                      (run_id, role, model, repo, pr, branch, ended, ended, tokens_in))
 
     conn.execute("INSERT INTO changes VALUES ('o/r', 7, 'fix-a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 2, 0, 0)")
@@ -778,6 +797,12 @@ def test_report(check, tmp):
     check("cost per change", got["Cost per change"], ("7.00 USD", "14.00 USD over 2 changes, list prices"))
     check("by model", got["Cost per change by model"][0], "opus 6.00, sonnet 1.00")
     check("by role", got["Cost per change by role"][0], "coordinator 4.00, escalate 2.00, hunt 1.00")
+    check("a run with no stored usd falls back to its token totals",
+          run_cost(conn.execute("SELECT * FROM agent_runs WHERE run_id='h'").fetchone()), 2.0)
+    conn.execute("UPDATE agent_runs SET usd = 0.5 WHERE run_id='h'")
+    check("a stored usd is used when there is one",
+          run_cost(conn.execute("SELECT * FROM agent_runs WHERE run_id='h'").fetchone()), 0.5)
+    conn.execute("UPDATE agent_runs SET usd = NULL WHERE run_id='h'")
     check("escalation rate", got["Escalation rate"], ("50%", "1 of 2 linked changes"))
     check("findings", got["Findings by where caught"], ("pre-push 1, CI 1, review 0, escaped 0", "1 reviews"))
     check("refuted share", got["Refuted share"], ("50%", "2 of 4 candidates"))
@@ -798,13 +823,13 @@ def test_report(check, tmp):
         bare = leanstats.connect()
         bare.execute("INSERT INTO changes VALUES ('o/u', 1, 'a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', NULL, NULL, NULL)")
         bare.execute("INSERT INTO agent_runs VALUES ('u1', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 1, '', "
-                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p')")
+                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p', NULL)")
         unchecked = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
         check("a hunted change with no review and no signals is no data, not zero", unchecked,
               ("no data", "1 changes hunted on sonnet, none with a review logged or signals collected"))
         bare.execute("INSERT INTO changes VALUES ('o/u', 2, 'b', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 0, 0, 0)")
         bare.execute("INSERT INTO agent_runs VALUES ('u2', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 2, '', "
-                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p')")
+                     "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p', NULL)")
         partly = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
         check("only checked changes are counted", partly[0], "0")
         check("and the unchecked ones are named", partly[1].startswith("of 1 changes hunted on sonnet") and

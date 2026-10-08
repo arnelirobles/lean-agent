@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import leanstats  # noqa: E402
-from leanstats import cost, family  # noqa: E402
+from leanstats import family, message_cost  # noqa: E402
 
 
 def find_run(arg):
@@ -31,13 +31,15 @@ def find_run(arg):
 def read_agent(path):
     usage = {"in": 0, "cw": 0, "cw1h": 0, "cr": 0, "out": 0}
     model = None
+    usd = 0.0
     for message in leanstats.read_usage(path):
         if message["model"] == "<synthetic>":
             continue
         model = message["model"] or model
+        usd += message_cost(message)  # per message: a long prompt has its own rate
         for key in usage:
             usage[key] += message[key]
-    return model or "unknown", usage
+    return model or "unknown", usage, usd
 
 
 def label_for(run, agent_id):
@@ -71,9 +73,8 @@ def main(argv):
     for run in runs:
         for path in sorted(glob.glob(os.path.join(run, "agent-*.jsonl"))):
             agent_id = os.path.basename(path)[6:-6]
-            model, u = read_agent(path)
+            model, u, c = read_agent(path)
             fam = family(model)
-            c = cost(model, u)
             rows.append((os.path.basename(run), label_for(run, agent_id) or agent_id, fam, u, c))
             pm = per_model.setdefault(fam, {"agents": 0, "in": 0, "cw": 0, "cr": 0, "out": 0, "usd": 0.0})
             pm["agents"] += 1
@@ -141,9 +142,21 @@ def self_test():
             for _ in range(3):
                 fh.write(json.dumps({"message": {"id": "m1", "model": "claude-sonnet-5-5",
                                                  "usage": {"input_tokens": 1000}}}) + "\n")
-        model, usage = read_agent(repeated)
+        model, usage, _ = read_agent(repeated)
         if (model, usage["in"]) != ("claude-sonnet-5-5", 1000):
             fails.append("a message id repeated on three rows must count once, got %r %r" % (model, usage))
+        # haiku 5.5: a 150,000 token prompt is 0.075 at the long rate, two 60,000 token prompts are 0.012 together
+        # at the short rate (their 120,000 total must not trip the long rate)
+        long_run = os.path.join(d, "wf_long")
+        os.mkdir(long_run)
+        with open(os.path.join(long_run, "agent-h1.jsonl"), "w") as fh:
+            fh.write(line("claude-haiku-5-5", {"input_tokens": 150000}))
+        with open(os.path.join(long_run, "agent-h2.jsonl"), "w") as fh:
+            fh.write(json.dumps({"message": {"id": "a", "model": "claude-haiku-5-5", "usage": {"input_tokens": 60000}}}) + "\n")
+            fh.write(json.dumps({"message": {"id": "b", "model": "claude-haiku-5-5", "usage": {"input_tokens": 60000}}}) + "\n")
+        got = [round(read_agent(os.path.join(long_run, name))[2], 6) for name in ("agent-h1.jsonl", "agent-h2.jsonl")]
+        if got != [0.075, 0.012]:
+            fails.append("haiku 5.5 must be priced per message, got %r" % (got,))
     if family("claude-haiku-4-5") != "haiku" or family("something-new") != "opus":
         fails.append("family() mapping wrong")
     if fails:

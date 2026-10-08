@@ -3,7 +3,7 @@
 
 SessionStart hook. The method assumes many agents (a drafter, a fresh critic, a
 refuter, up to four changes in flight) and a mix of models (a cheap one drafts,
-an expensive one takes what the critic cannot close). A strong enough model can
+an expensive one takes what the critic cannot close, a fast one reads and reports). A strong enough model can
 make one or both of those not worth it, so each is a setting. Set them in the
 env block of Claude Code settings. The defaults print nothing.
 
@@ -13,9 +13,10 @@ env block of Claude Code settings. The defaults print nothing.
   LEAN_MODELS=one    every step on the session's model, no switching
   LEAN_MODEL_CHEAP   default sonnet: drafts, spec review, the critic's hunt and refute
   LEAN_MODEL_STRONG  default opus: takes what the cheap model did not close in one round
+  LEAN_MODEL_FAST    default haiku: search, gate and retro agents, which read and report
   mode.py --self-test
 
-The two role settings take a Claude Code model alias (sonnet, opus, haiku, fable)
+The three role settings take a Claude Code model alias (sonnet, opus, haiku, fable)
 and apply only with LEAN_MODELS=mixed.
 """
 import os
@@ -26,7 +27,7 @@ import hookkit  # noqa: E402
 
 CHOICES = {"LEAN_AGENTS": ("many", "one"), "LEAN_MODELS": ("mixed", "one")}
 ALIASES = ("sonnet", "opus", "haiku", "fable")
-ROLES = {"LEAN_MODEL_CHEAP": "sonnet", "LEAN_MODEL_STRONG": "opus"}
+ROLES = {"LEAN_MODEL_CHEAP": "sonnet", "LEAN_MODEL_STRONG": "opus", "LEAN_MODEL_FAST": "haiku"}
 
 ONE_AGENT = (
     "Lean agent mode, LEAN_AGENTS=one: do the work in this session. Do not start subagents or "
@@ -47,12 +48,17 @@ MIXED_IN_ONE = (
     "LEAN_AGENTS=one with LEAN_MODELS=mixed: a session cannot change its own model, so the "
     "cheap draft on {cheap} and the expensive escalation on {strong} happen only when the person "
     "switches with /model. Say when a step wants the other model, and carry on if they do not "
-    "switch.")
+    "switch. The fast steps (search, gate, retro) run in the session itself, no switch needed.")
 
 ROLES_CHANGED = (
-    "Lean agent models: the cheap model is {cheap} and the strong model is {strong}. Start the "
-    "drafter, the spec review and the critic's hunter and refuter with model {cheap}. Use "
-    "{strong} only for a finding not fixed in one round or an unsure tier 2 answer.")
+    "Lean agent models: the cheap model is {cheap}, the strong model is {strong} and the fast model "
+    "is {fast}. Start the drafter, the spec review and the critic's hunter and refuter with model "
+    "{cheap}. Start the search, gate and retro agents (they read and report, never judge code) with "
+    "model {fast}. Use {strong} only for a finding not fixed in one round or an unsure tier 2 answer.")
+
+FAST_IS_STRONG = (
+    "LEAN_MODEL_FAST is {strong}, the strong model, so the read-and-report agents (search, gate, "
+    "retro) now cost the most.")
 
 SAME_ROLES = (
     "LEAN_MODEL_CHEAP and LEAN_MODEL_STRONG are both {cheap}, so there is no cheaper drafter and "
@@ -91,14 +97,17 @@ def message(env):
         return " ".join(parts)
     cheap, bad_cheap = role(env, "LEAN_MODEL_CHEAP")
     strong, bad_strong = role(env, "LEAN_MODEL_STRONG")
-    parts += [w for w in (bad_cheap, bad_strong) if w]
-    names = {"cheap": cheap, "strong": strong}
+    fast, bad_fast = role(env, "LEAN_MODEL_FAST")
+    parts += [w for w in (bad_cheap, bad_strong, bad_fast) if w]
+    names = {"cheap": cheap, "strong": strong, "fast": fast}
     if cheap == strong:
         parts.append(SAME_ROLES.format(**names))
     elif agents == "one":
         parts.append(MIXED_IN_ONE.format(**names))
-    elif (cheap, strong) != (ROLES["LEAN_MODEL_CHEAP"], ROLES["LEAN_MODEL_STRONG"]):
+    elif (cheap, strong, fast) != tuple(ROLES[name] for name in ("LEAN_MODEL_CHEAP", "LEAN_MODEL_STRONG", "LEAN_MODEL_FAST")):
         parts.append(ROLES_CHANGED.format(**names))
+    if fast == strong and cheap != strong and agents == "many":
+        parts.append(FAST_IS_STRONG.format(**names))
     return " ".join(parts) or None
 
 
@@ -150,6 +159,22 @@ def self_test():
            ("Lean agent models:",))
     expect("same model in both roles", {"LEAN_MODEL_CHEAP": "opus"},
            ("are both opus", "goes to the person"), ("Lean agent models:",))
+    if message({"LEAN_MODEL_FAST": "haiku"}) is not None:
+        print("FAIL default fast model should print nothing")
+        failures += 1
+    expect("fast model changed", {"LEAN_MODEL_FAST": "sonnet"},
+           ("fast model is sonnet", "search, gate and retro", "with model sonnet"), ("warn", "cost the most"))
+    expect("fast equal to cheap is fine", {"LEAN_MODEL_FAST": "sonnet"}, (), ("are both", "cost the most"))
+    expect("unknown fast model", {"LEAN_MODEL_FAST": "haiku-5"},
+           ("LEAN_MODEL_FAST=haiku-5 is not one of sonnet, opus, haiku, fable; using haiku.",),
+           ("Lean agent models:",))
+    expect("fast ignored with one model", {"LEAN_MODELS": "one", "LEAN_MODEL_FAST": "fable"},
+           ("LEAN_MODELS=one:",), ("LEAN_MODEL_FAST", "fable", "cost the most"))
+    expect("fast equal to strong", {"LEAN_MODEL_FAST": "opus"},
+           ("fast model is opus", "LEAN_MODEL_FAST is opus", "cost the most"))
+    expect("every role the same model", {"LEAN_MODEL_CHEAP": "opus", "LEAN_MODEL_FAST": "opus"},
+           ("are both opus",), ("cost the most",))
+    expect("fast steps in one session", {"LEAN_AGENTS": "one"}, ("fast steps", "run in the session itself"))
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

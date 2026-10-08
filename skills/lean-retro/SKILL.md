@@ -16,6 +16,8 @@ ${CLAUDE_PLUGIN_ROOT}/bin/lean-stats collect --since <YYYY-MM-DD> owner/repo ...
 ${CLAUDE_PLUGIN_ROOT}/bin/lean-stats report --since <YYYY-MM-DD>
 ```
 
+The collection step can run as a `lean:retro` agent on the fast model (`LEAN_MODEL_FAST`, default `haiku`), which runs the commands and returns the rows. The reasoning in sections 2 to 4 stays with the session.
+
 `collect` reads the session transcripts and the merged pull requests into `~/.lean/lean.db`. `report`
 prints cost per change by model and by role, the escalation rate, findings by where they were caught,
 critic misses, fix rounds and hook fires, each with the count behind it. A line that says `no data`

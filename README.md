@@ -15,7 +15,7 @@ The numbers here are mine, at list prices, on one .NET codebase. Treat them as a
 
 ## The short version
 
-Shape the ticket for the agent before anyone starts: one ticket is one agent pass, written so the agent needs nothing else, with the review's questions answered in advance. A cheaper model drafts every change. Scripts, not instructions, run the mechanical checks. A cheap critic reviews every change against six fixed questions. The expensive model only sees what the critic cannot close. At most four changes in flight.
+Shape the ticket for the agent before anyone starts: one ticket is one agent pass, written so the agent needs nothing else, with the review's questions answered in advance. A cheaper model drafts every change, and a fast one finds code and runs the gates. Scripts, not instructions, run the mechanical checks. A cheap critic reviews every change against six fixed questions. The expensive model only sees what the critic cannot close. At most four changes in flight.
 
 That took me from about 13 dollars of model use per change to about 9, with no drop in what got caught. Until 1.4.0 this line said 66 and 25: the cost script counted each message's usage once per transcript row, and its prices were those of older models. [Section 7](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) has the correction.
 
@@ -70,6 +70,7 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_MODELS` | `mixed` | `one` keeps every step on the session's model: no cheap drafter, no escalation. |
 | `LEAN_MODEL_CHEAP` | `sonnet` | The model that drafts and critiques. |
 | `LEAN_MODEL_STRONG` | `opus` | The model that takes what the cheap steps could not close. |
+| `LEAN_MODEL_FAST` | `haiku` | The model for agents that read and report: code search, running the gates, the retro's fact collection. It never judges code. |
 | `LEAN_STATS` | on | `off` stops every `lean-stats` write. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
