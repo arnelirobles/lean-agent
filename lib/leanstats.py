@@ -326,6 +326,8 @@ def self_test():
         return message_cost(dict({"model": model, "in": 0, "cw": 0, "cw1h": 0, "cr": 0, "out": 0}, **tokens))
 
     check("a short haiku 5.5 message", round(message_usd("claude-haiku-5-5", **{"in": 100000}), 6), 0.01)
+    check("one token over the limit prices at the long rate",
+          round(message_usd("claude-haiku-5-5", **{"in": 100001}), 6), round(100001 * 0.50 / 1e6, 6))
     check("a long haiku 5.5 message prices at the long rate",
           round(message_usd("claude-haiku-5-5", **{"in": 150000}), 6), 0.075)
     check("the prompt counts cache reads and writes", round(message_usd("claude-haiku-5-5", cr=60000, cw=50000), 6),
