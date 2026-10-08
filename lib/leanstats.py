@@ -12,7 +12,7 @@ import sqlite3
 import sys
 import time
 
-# input, 5 minute cache write, cache read, output; USD per million tokens, list prices on 2026-10-02.
+# input, 5 minute cache write, cache read, output; USD per million tokens, list prices on 2026-10-08.
 # The first name found in the model id wins, so a version sits above its family.
 PRICES = {
     "fable-5-1": (10.0, 12.50, 0.25, 50.0),
@@ -23,8 +23,12 @@ PRICES = {
     "opus": (5.0, 6.25, 0.50, 25.0),
     "sonnet-4": (3.0, 3.75, 0.30, 15.0),
     "sonnet": (2.0, 2.50, 0.20, 10.0),
-    "haiku": (1.0, 1.25, 0.10, 5.0),
+    "haiku-5-5": (0.10, 0.125, 0.01, 0.50),
+    "haiku": (1.0, 1.25, 0.10, 5.0),  # Haiku 4.5 and earlier
 }
+# A model that charges a second rate when one request's prompt (in + cw + cr) is over the limit:
+# name in PRICES, then (limit in tokens, the prices above it).
+LONG_PROMPT = {"haiku-5-5": (100000, (0.50, 0.625, 0.05, 2.50))}
 FAMILIES = ("opus", "fable", "sonnet", "haiku")
 HOUR_WRITE = 2.0  # a 1 hour cache write costs this many times the input price
 
@@ -85,6 +89,7 @@ MIGRATIONS = [  # one entry per schema version, applied in order; never edit an 
     );
     CREATE TABLE imports (path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL)
     """,
+    "ALTER TABLE agent_runs ADD COLUMN usd REAL",  # the run's list price summed per message; NULL on older rows
 ]
 
 
@@ -97,9 +102,23 @@ def family(model):
 
 def cost(model, u):
     """List price of a usage dict. cw is every cache write, cw1h the part of it written for 1 hour."""
-    pi, pw, pr, po = next((price for name, price in PRICES.items() if name in model), PRICES["opus"])
+    name = next((name for name in PRICES if name in model), "opus")
+    return price_usage(PRICES[name], u)
+
+
+def price_usage(price, u):
+    pi, pw, pr, po = price
     hour = u.get("cw1h", 0)
     return (u["in"] * pi + (u["cw"] - hour) * pw + hour * pi * HOUR_WRITE + u["cr"] * pr + u["out"] * po) / 1e6
+
+
+def message_cost(m):
+    """List price of one message. A model with a long-prompt rate is priced at it per request, not per total."""
+    name = next((name for name in PRICES if name in m["model"]), "opus")
+    limit, long_price = LONG_PROMPT.get(name, (None, None))
+    if limit is not None and m["in"] + m["cw"] + m["cr"] > limit:
+        return price_usage(long_price, m)
+    return price_usage(PRICES[name], m)
 
 
 class NewerSchema(Exception):
@@ -300,6 +319,21 @@ def self_test():
     check("an unknown model prices as opus", priced("something-new", **{"in": million}), 5.0)
     check("a 5 minute cache write", priced("claude-opus-5-5", cw=million), 5.0)
     check("a 1 hour cache write is twice input", priced("claude-opus-5-5", cw=million, cw1h=million), 8.0)
+    check("haiku 5.5 input", priced("claude-haiku-5-5", **{"in": million}), 0.10)
+    check("haiku 4.5 input", priced("claude-haiku-4-5", **{"in": million}), 1.0)
+
+    def message_usd(model, **tokens):
+        return message_cost(dict({"model": model, "in": 0, "cw": 0, "cw1h": 0, "cr": 0, "out": 0}, **tokens))
+
+    check("a short haiku 5.5 message", round(message_usd("claude-haiku-5-5", **{"in": 100000}), 6), 0.01)
+    check("a long haiku 5.5 message prices at the long rate",
+          round(message_usd("claude-haiku-5-5", **{"in": 150000}), 6), 0.075)
+    check("the prompt counts cache reads and writes", round(message_usd("claude-haiku-5-5", cr=60000, cw=50000), 6),
+          round((60000 * 0.05 + 50000 * 0.625) / 1e6, 6))
+    check("a long prompt does not touch other models", message_usd("claude-sonnet-5-5", **{"in": 150000}),
+          cost("claude-sonnet-5-5", {"in": 150000, "cw": 0, "cr": 0, "out": 0}))
+    check("haiku 5.5 1 hour write is twice the long input price",
+          round(message_usd("claude-haiku-5-5", cw=150000, cw1h=150000), 6), 0.15)
 
     with tempfile.TemporaryDirectory() as tmp:
         db = os.path.join(tmp, "nested", "dir", "lean.db")
