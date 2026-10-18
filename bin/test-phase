@@ -134,6 +134,10 @@ class Dotnet:
         m = re.search(r"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+)", text)
         if m:
             return int(m.group(2)), int(m.group(1)), int(m.group(3))
+        blk = {k.lower(): int(v) for k, v in re.findall(r"^\s*(Total tests|Passed|Failed|Skipped):\s*(\d+)\s*$", text, re.M)}
+        if "total tests" in blk:  # the detailed VSTest logger leaves out the lines that are zero
+            failed, skipped = blk.get("failed", 0), blk.get("skipped", 0)
+            return blk.get("passed", blk["total tests"] - failed - skipped), failed, skipped
         got = {k.lower(): int(v) for k, v in re.findall(r"^\s*(total|failed|succeeded|skipped):\s*(\d+)", text, re.M)}
         if got:
             return got.get("succeeded", 0), got.get("failed", 0), got.get("skipped", 0)
@@ -449,6 +453,12 @@ def self_test():
 
     def fixture(name):
         return open(os.path.join(fix, name), errors="replace").read()
+
+    for name, want in (("vstest-detailed-summary.log", (7, 0, 0)), ("vstest-detailed-failed.log", (6, 3, 1))):
+        if Dotnet.counts(fixture(name)) != want:
+            fails.append(f"detailed VSTest summary {name}: {Dotnet.counts(fixture(name))}, want {want}")
+    if Dotnet.counts("Failed!  - Failed:     2, Passed:     1, Skipped:     0, Total:     3\n") != (1, 2, 0):
+        fails.append("the one-line summary must still parse")
 
     # Secrets in test output are masked, and the body travels by stdin.
     probe = ("Server=db;Password=hunter2;User=x\nPwd=\"p w\" Authorization: Bearer abc.DEF-123/x=\n"
