@@ -180,8 +180,23 @@ def load1():
         return None
 
 
-def brain(args):
-    r = subprocess.run([sys.executable, BRAIN] + args, capture_output=True, text=True)
+SECRETS = [
+    (re.compile(r"(?i)\b(password|pwd)(\s*=\s*)(?:\"[^\"]*\"|'[^']*'|[^;\s\"']+)"), r"\1\2***"),
+    (re.compile(r"(?i)\b(api[-_ ]?key)(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^;\s\"',]+)"), r"\1\2***"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer ***"),
+    (re.compile(r"\beyJ[A-Za-z0-9_=-]*(?:\.[A-Za-z0-9_=-]*)*"), "***"),
+]
+
+
+def mask(text):
+    """Test output can carry connection strings and tokens; none of it goes into brain."""
+    for pattern, repl in SECRETS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def brain(args, stdin=None):
+    r = subprocess.run([sys.executable, BRAIN] + args, capture_output=True, text=True, input=stdin)
     if r.returncode != 0:
         sys.stderr.write("test-phase: brain failed: " + r.stderr.strip() + "\n")
         return None
@@ -189,14 +204,15 @@ def brain(args):
 
 
 def add_item(row, kind, ref, severity, body, run_id, ctx):
+    ref = mask(ref)
     args = ["add", "--project", row["project"], "--repo", ctx["repo"], "--kind", kind, "--ref", ref,
-            "--title", ref, "--body", body, "--severity", severity, "--phase", "test", "--source", "test-phase",
+            "--title", ref, "--body-file", "-", "--severity", severity, "--phase", "test", "--source", "test-phase",
             "--cycle", ctx["cycle"]]
     if ctx["branch"]:
         args += ["--branch", ctx["branch"]]
     if run_id:
         args += ["--run-id", str(run_id)]
-    brain(args)
+    brain(args, stdin=mask(body))  # the body goes by stdin, not argv, where any user's ps could read it
 
 
 def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start, project):
@@ -433,6 +449,27 @@ def self_test():
 
     def fixture(name):
         return open(os.path.join(fix, name), errors="replace").read()
+
+    # Secrets in test output are masked, and the body travels by stdin.
+    probe = ("Server=db;Password=hunter2;User=x\nPwd=\"p w\" Authorization: Bearer abc.DEF-123/x=\n"
+             "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig_nature apikey=sk-123 api_key: 'k k'\n")
+    masked = mask(probe)
+    for leak in ("hunter2", "p w", "abc.DEF", "eyJhbGci", "eyJzdWIi", "sig_nature", "sk-123", "k k"):
+        if leak in masked:
+            fails.append(f"secret {leak!r} survived masking: {masked!r}")
+    if "Server=db" not in masked or "User=x" not in masked:
+        fails.append(f"masking removed more than the secret: {masked!r}")
+    seen = {}
+    real_brain = globals()["brain"]
+    globals()["brain"] = lambda args, stdin=None: seen.update(args=args, stdin=stdin)
+    try:
+        add_item({"project": "p"}, "test-fail", "T.a", "important", probe, None,
+                 {"repo": "r", "cycle": "c", "branch": ""})
+    finally:
+        globals()["brain"] = real_brain
+    if "hunter2" in " ".join(seen.get("args", [])) or "hunter2" in (seen.get("stdin") or "") \
+            or "-" not in seen.get("args", []) or "--body" in seen.get("args", []):
+        fails.append(f"item body must be masked and sent by stdin, not argv: {seen}")
 
     # Names come out stable and only real test lines count.
     got = [n for n, _ in Dotnet.failures(fixture("mtp-failure.log"))]
