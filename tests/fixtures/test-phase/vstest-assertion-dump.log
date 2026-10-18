@@ -1,0 +1,21 @@
+  Failed MedXpress.Client.ContractTests.Appointments.AppointmentServerTests.ReminderCounts_are_18_23_1 [778 ms]
+  Error Message:
+   Expected (Appointments.ReminderCountsAsync()) to be MedXpress.Client.Core.Appointments.ReminderCounts
+{
+    Failed = 1,
+    ScheduledTomorrow = 23,
+    SentToday = 18
+}, but found MedXpress.Client.Core.Appointments.ReminderCounts
+{
+    Failed = 0,
+    ScheduledTomorrow = 2,
+    SentToday = 0
+}.
+  Stack Trace:
+     at FluentAssertions.Execution.LateBoundTestFramework.Throw(String message)
+   at FluentAssertions.Execution.DefaultAssertionStrategy.HandleFailure(String message)
+   at FluentAssertions.Execution.AssertionChain.FailWith(Func`1 getFailureReason)
+   Expected Seen() to be True, but found False.
+  Stack Trace:
+     at FluentAssertions.Execution.LateBoundTestFramework.Throw(String message)
+Failed!  - Failed:    29, Passed:   757, Skipped:     0, Total:   786, Duration: 25 m 44 s - MedXpress.Client.ContractTests.dll (net10.0)
