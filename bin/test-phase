@@ -18,7 +18,8 @@ starting with # are skipped:
     <repo-dir> <test project path> [fast-filter]
 
 The project path is relative to repo-dir. Quote a field that holds spaces. A fast filter is a class
-name or a fragment of one; with it the line becomes two jobs, the fast slice and then the whole project.
+name or a fragment of one (for MTP the fast tier passes *fragment* to --filter-class, and a rerun passes
+the exact class); with it the line becomes two jobs, the fast slice and then the whole project.
 
 For each job: run it, list the failing tests, run each failing class alone, and label the test flaky if
 it passes alone (exit 0, or passed tests and the name absent) or real if it fails again. It is unverified
@@ -88,12 +89,13 @@ class Dotnet:
             d = os.path.dirname(d)
 
     @classmethod
-    def command(cls, mode, project, cls_filter=None):
+    def command(cls, mode, project, cls_filter=None, fast=False):
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
             cmd = ["dotnet", "test", "--project", project, "--"]
             if cls_filter:
-                cmd += ["--filter-class", cls_filter]
+                # --filter-class matches the full class name; the fast tier takes a fragment, hence the wildcards.
+                cmd += ["--filter-class", f"*{cls_filter}*" if fast else cls_filter]
             return cmd + ["--output", "Detailed"]
         cmd = ["dotnet", "test", project, "--logger", "console;verbosity=normal"]
         if cls_filter:
@@ -246,7 +248,8 @@ def run_job(job, a, run_dir, runner):
 
     def tier(name, cls_filter, log):
         before = load1()
-        rc, text, started, ended, wait = heavy(a.lane, runner.command(mode, project, cls_filter), repo, log, a.stall)
+        rc, text, started, ended, wait = heavy(a.lane, runner.command(mode, project, cls_filter, name == "fast"),
+                                               repo, log, a.stall)
         return rc, text, record_run(row, ctx, name, mode, rc, text, started, ended, wait, before, project)
 
     rc, text, run_id = tier(job["tier"], job["filter"] or None, stem + ".log")
@@ -533,6 +536,10 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"mtp class rerun wrong: {calls}")
         if "Acme.MtpTests.Bad" not in brain_list("--open") or rc != 1:
             fails.append(f"mtp failure not in brain or exit not 1 ({rc})")
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj Mtp\n")
+        if calls[0] != "test --project tests/T/T.csproj -- --filter-class *Mtp* --output Detailed" or \
+           "test --project tests/T/T.csproj -- --filter-class Acme.MtpTests --output Detailed" not in calls:
+            fails.append(f"mtp fast tier needs wildcards, reruns the exact class: {calls}")
 
         # A build error: nonzero exit, no failing test named. It must not look like a pass.
         os.remove(os.path.join(d, "class-Acme.MtpTests"))
