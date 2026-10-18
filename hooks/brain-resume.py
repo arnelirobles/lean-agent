@@ -28,7 +28,10 @@ def digest(cwd):
         return ""
     if not os.path.isdir(cwd or ""):
         cwd = os.getcwd()
-    r = subprocess.run([sys.executable, BRAIN, "resume"], cwd=cwd, capture_output=True, text=True, timeout=5)
+    try:
+        r = subprocess.run([sys.executable, BRAIN, "resume"], cwd=cwd, capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):  # a locked database makes brain wait past the timeout
+        return ""
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
@@ -67,6 +70,15 @@ def self_test():
             fails.append("nothing open must be silent")
         if hook("not json")[0] != 0:
             fails.append("a bad event must not fail")
+        # A database locked by another writer: brain waits past the hook's timeout, the hook prints nothing.
+        import sqlite3
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "none", "brain.db")
+        locker = sqlite3.connect(env["LEAN_BRAIN_DB"], isolation_level=None)
+        locker.execute("BEGIN EXCLUSIVE")
+        if hook() != (0, "", ""):
+            fails.append(f"a locked database must print nothing and exit 0: {hook()}")
+        locker.execute("ROLLBACK")
+        locker.close()
         env["LEAN_BRAIN_DB"] = d  # a directory, not a database: brain errors, the hook still exits 0
         if hook()[0] != 0:
             fails.append("a broken database must not fail the session")
