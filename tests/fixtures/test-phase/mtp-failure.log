@@ -1,0 +1,13 @@
+[+0/x0/?0] BarakoCMS.Tests.dll (net10.0|arm64)(1m 57s)
+
+[+0/x0/?0] BarakoCMS.Tests.dll (net10.0|arm64)(2m 00s)
+
+failed BarakoCMS.Tests.ModuleCapabilityGrantTests.Every_module_grants_its_own_capabilities_to_admin (1s 184ms)
+  from /home/dev/repos/barakoCMS/.claude/worktrees/wf_667ec303-270-10/BarakoCMS.Tests/bin/Debug/net10.0/BarakoCMS.Tests.dll (net10.0|arm64)
+  Xunit.MicrosoftTestingPlatform.XunitException: System.Exception : DIAG ContextSeed 18bee25e-e85d-4efb-8bad-8d34fe70fc4e:staged:
+  ---- JasperFx.DocumentAlreadyExistsException : Document already exists barakoCMS.Models.Role: 18bee25e-e85d-4efb-8bad-8d34fe70fc4e
+  -------- Npgsql.PostgresException : 23505: duplicate key value violates unique constraint "mt_doc_roles_uidx_tenant_slug_name"
+  
+  DETAIL: Detail redacted as it may contain sensitive data. Specify 'Include Error Detail' in the connection string to include this information.
+    at BarakoCMS.Tests.ModuleCapabilityGrantTests.Every_module_grants_its_own_capabilities_to_admin() in /home/dev/repos/barakoCMS/.claude/worktrees/wf_667ec303-270-10/BarakoCMS.Tests/ModuleCapabilityGrantTests
+    --- End of stack trace from previous location ---

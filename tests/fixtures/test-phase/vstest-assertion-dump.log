@@ -1,0 +1,21 @@
+  Failed Shop.Client.ContractTests.Orders.OrderServerTests.ShippingCounts_are_18_23_1 [778 ms]
+  Error Message:
+   Expected (Orders.ShippingCountsAsync()) to be Shop.Client.Core.Orders.ShippingCounts
+{
+    Failed = 1,
+    DueTomorrow = 23,
+    ShippedToday = 18
+}, but found Shop.Client.Core.Orders.ShippingCounts
+{
+    Failed = 0,
+    DueTomorrow = 2,
+    ShippedToday = 0
+}.
+  Stack Trace:
+     at FluentAssertions.Execution.LateBoundTestFramework.Throw(String message)
+   at FluentAssertions.Execution.DefaultAssertionStrategy.HandleFailure(String message)
+   at FluentAssertions.Execution.AssertionChain.FailWith(Func`1 getFailureReason)
+   Expected Seen() to be True, but found False.
+  Stack Trace:
+     at FluentAssertions.Execution.LateBoundTestFramework.Throw(String message)
+Failed!  - Failed:    29, Passed:   757, Skipped:     0, Total:   786, Duration: 25 m 44 s - Shop.Client.ContractTests.dll (net10.0)

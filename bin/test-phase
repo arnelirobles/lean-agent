@@ -58,7 +58,11 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 HEAVY = os.path.join(HERE, "heavy.sh")
 BRAIN = os.path.join(HERE, "brain")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-FAILED = re.compile(r"^\s*(?:failed|Failed)\s+(\S.*?)(?:\s+\(\d+(?:\.\d+)?\s*m?s\)|\s+\[[^\]]*\])?\s*$")
+# MTP prints "failed Name (1s 184ms)" at column 0. The VSTest console logger prints "  Failed Name [3 ms]"
+# with exactly two spaces; a deeper indent is an assertion dump ("    Failed = 1,") and is not a test.
+FAILED = re.compile(r"^(?:failed|  Failed)\s+(\S.*?)\s*$")
+DURATION = re.compile(r"\s+\((?:\d+(?:\.\d+)?\s*(?:ms|s|m|h)\s*)+\)$|\s+\[[^\]]*\]$")
+TEST_NAME = re.compile(r"[A-Za-z_][\w`<>+]*(?:\.[\w`<>+]+)+(?:\(.*\))?")
 
 
 class Dotnet:
@@ -104,8 +108,8 @@ class Dotnet:
             m = FAILED.match(l)
             if not m:
                 continue
-            name = m.group(1)
-            if name.endswith(":") or name.startswith("to ") or name in seen:
+            name = DURATION.sub("", m.group(1))
+            if not TEST_NAME.fullmatch(name) or name in seen:
                 continue
             seen.add(name)
             out.append((name, "\n".join(lines[i:i + 12])))
@@ -383,6 +387,28 @@ def main(argv):
 
 def self_test():
     fails = []
+    fix = os.path.join(HERE, "..", "tests", "fixtures", "test-phase")
+
+    def fixture(name):
+        return open(os.path.join(fix, name), errors="replace").read()
+
+    # Names come out stable and only real test lines count.
+    got = [n for n, _ in Dotnet.failures(fixture("mtp-failure.log"))]
+    if got != ["BarakoCMS.Tests.ModuleCapabilityGrantTests.Every_module_grants_its_own_capabilities_to_admin"]:
+        fails.append(f"mtp duration suffix must not be part of the name: {got}")
+    for tail in ("(12ms)", "(1.5s)", "(1s 184ms)", "(1m 02s 100ms)", "(2h 1m 3s)"):
+        got = [n for n, _ in Dotnet.failures(f"failed A.B.C.D {tail}\n")]
+        if got != ["A.B.C.D"]:
+            fails.append(f"duration {tail} not stripped: {got}")
+    got = [n for n, _ in Dotnet.failures("failed A.B.C.D(x: 1.5) (3ms)\n")]
+    if got != ["A.B.C.D(x: 1.5)"]:
+        fails.append(f"argument list lost: {got}")
+    got = [n for n, _ in Dotnet.failures(fixture("vstest-assertion-dump.log"))]
+    if got != ["Shop.Client.ContractTests.Orders.OrderServerTests.ShippingCounts_are_18_23_1"]:
+        fails.append(f"an assertion dump must not parse as tests: {got}")
+    got = [n for n, _ in Dotnet.failures('  Failed A.B.T(code: "1 2", e: True) [10 s]\n    Failed = 1,\nFailed!  - Failed: 2\n')]
+    if got != ['A.B.T(code: "1 2", e: True)']:
+        fails.append(f"vstest line with arguments: {got}")
     with tempfile.TemporaryDirectory() as d:
         bin_dir = os.path.join(d, "shims")
         os.mkdir(bin_dir)
