@@ -15,11 +15,19 @@ of loading the database together; ask whether the lane is free with `heavy.sh st
 PLAN is optional. When given, its lines are enqueued first. One project per line, blank lines and lines
 starting with # are skipped:
 
-    <repo-dir> <test project path> [fast-filter]
+    <repo-dir> <test project path> [fast-filter] [args=EXTRA]
 
 The project path is relative to repo-dir. Quote a field that holds spaces. A fast filter is a class
 name or a fragment of one (for MTP the fast tier passes *fragment* to --filter-class, and a rerun passes
 the exact class); with it the line becomes two jobs, the fast slice and then the whole project.
+
+Extra dotnet arguments, such as MSBuild properties, go on every command of a job: set TEST_PHASE_DOTNET_ARGS
+(split like a shell line) for all jobs, and "args=EXTRA" on a plan line or `brain queue add --args=EXTRA` for
+one job. They come after the project and before the logger, or before `--` in MTP mode. Example for the
+Mac Catalyst desktop tests, which need Xcode checks off:
+
+    TEST_PHASE_DOTNET_ARGS="-p:ValidateXcodeVersion=false" test-phase plan.txt
+    ~/app tests/Desktop.Tests/Desktop.Tests.csproj "args=-p:ValidateXcodeVersion=false"
 
 For each job: run it, list the failing tests, run each failing class alone, and label the test flaky if
 it passes alone (exit 0, or passed tests and the name absent) or real if it fails again. It is unverified
@@ -90,15 +98,15 @@ class Dotnet:
             d = os.path.dirname(d)
 
     @classmethod
-    def command(cls, mode, project, cls_filter=None, fast=False):
+    def command(cls, mode, project, cls_filter=None, fast=False, extra=()):
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
-            cmd = ["dotnet", "test", "--project", project, "--"]
+            cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
             if cls_filter:
                 # --filter-class matches the full class name; the fast tier takes a fragment, hence the wildcards.
                 cmd += ["--filter-class", f"*{cls_filter}*" if fast else cls_filter]
             return cmd + ["--output", "Detailed"]
-        cmd = ["dotnet", "test", project, "--logger", "console;verbosity=normal"]
+        cmd = ["dotnet", "test", project] + list(extra) + ["--logger", "console;verbosity=normal"]
         if cls_filter:
             cmd += ["--filter", "FullyQualifiedName~" + cls_filter]
         return cmd
@@ -216,9 +224,11 @@ def parse_plan(path):
         if not raw or raw.startswith("#"):
             continue
         parts = shlex.split(raw)
-        if len(parts) not in (2, 3):
-            sys.exit(f"test-phase: {path} line {n}: want <repo-dir> <test project path> [fast-filter]")
-        entries.append(parts + [None] * (3 - len(parts)))
+        extra = [x[len("args="):] for x in parts[2:] if x.startswith("args=")]
+        parts = parts[:2] + [x for x in parts[2:] if not x.startswith("args=")]
+        if len(parts) not in (2, 3) or len(extra) > 1:
+            sys.exit(f"test-phase: {path} line {n}: want <repo-dir> <test project path> [fast-filter] [args=EXTRA]")
+        entries.append(parts + [None] * (3 - len(parts)) + [extra[0] if extra else ""])
     if not entries:
         sys.exit(f"test-phase: {path} lists no projects, so nothing would run")
     return entries
@@ -247,9 +257,16 @@ def run_job(job, a, run_dir, runner):
     stem = os.path.join(run_dir, f"job{job['id']:03d}-{safe(os.path.basename(project))}-{job['tier']}")
     failing = {}  # test name to its detail
 
+    try:
+        extra = shlex.split(os.environ.get("TEST_PHASE_DOTNET_ARGS", "")) + shlex.split(job.get("args") or "")
+    except ValueError as e:
+        row["result"] = "error"
+        row["notes"].append(f"bad extra arguments: {e}")
+        return row
+
     def tier(name, cls_filter, log):
         before = load1()
-        rc, text, started, ended, wait = heavy(a.lane, runner.command(mode, project, cls_filter, name == "fast"),
+        rc, text, started, ended, wait = heavy(a.lane, runner.command(mode, project, cls_filter, name == "fast", extra),
                                                repo, log, a.stall)
         return rc, text, record_run(row, ctx, name, mode, rc, text, started, ended, wait, before, project)
 
@@ -299,8 +316,10 @@ def run_job(job, a, run_dir, runner):
 
 
 def enqueue(entries, a, cycle):
-    for repo, project, fast in entries:
+    for repo, project, fast, extra in entries:
         base = ["queue", "add", repo, project, "--cycle", cycle, "--by", "test-phase"]
+        if extra:
+            base.append("--args=" + extra)
         if a.project:
             base += ["--project", a.project]
         if fast:
@@ -554,6 +573,14 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"mtp class rerun wrong: {calls}")
         if "Acme.MtpTests.Bad" not in brain_list("--open") or rc != 1:
             fails.append(f"mtp failure not in brain or exit not 1 ({rc})")
+        env["TEST_PHASE_DOTNET_ARGS"] = "-p:ValidateXcodeVersion=false"
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj \"args=-p:Job=1 -p:Two='a b'\"\n")
+        env.pop("TEST_PHASE_DOTNET_ARGS")
+        if calls[0] != "test --project tests/T/T.csproj -p:ValidateXcodeVersion=false -p:Job=1 -p:Two=a b -- --output Detailed":
+            fails.append(f"extra args go before -- in mtp mode, env first then the job's: {calls}")
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj args=-p:V=1\n")
+        if calls[0] != "test tests/T/T.csproj -p:V=1 --logger console;verbosity=normal":
+            fails.append(f"extra args in vstest mode: {calls}")
         rc, out, calls = run(f"{repo_m} tests/T/T.csproj Mtp\n")
         if calls[0] != "test --project tests/T/T.csproj -- --filter-class *Mtp* --output Detailed" or \
            "test --project tests/T/T.csproj -- --filter-class Acme.MtpTests --output Detailed" not in calls:
