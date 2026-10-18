@@ -13,7 +13,15 @@ HEAVY_STALL (seconds) turns on the watchdog. The command then runs in its own pr
 its output piped through. A progress line is one that matches HEAVY_PROGRESS and whose matched text
 differs from the last progress line, so a repeating "[+12/x0/?0]" line counts only while the counts
 move. After HEAVY_STALL seconds without progress the group gets SIGTERM, then SIGKILL, and this
-exits 76. Only the command heavy.sh started is stopped.
+exits 76. Only the command heavy.sh started is stopped. After the SIGTERM the group always gets a
+SIGKILL too, because a child that ignores SIGTERM would otherwise outlive the lock.
+
+The watchdog's process group is recorded in <lockfile>.pgid while the command runs and removed when it
+ends. If this process is itself killed with SIGKILL, the group is orphaned in its own session; the next
+run that gets the lock finds the record, and a group still alive is killed (one line on stderr) before
+the new command starts.
+
+  heavy_lock.py --self-test
 """
 import fcntl
 import os
@@ -103,7 +111,31 @@ def pump(fd, out, watch):
         watch.line(buf.decode("utf-8", "replace"))
 
 
-def run(argv, stall, pattern):
+def reap_orphan(record):
+    """Kill the process group a dead earlier run left behind. Call only while holding the lock."""
+    try:
+        pgid = int(open(record).read().strip())
+    except (OSError, ValueError):
+        pgid = 0
+    try:
+        os.remove(record)
+    except OSError:
+        pass
+    if pgid <= 1:
+        return
+    try:
+        os.killpg(pgid, 0)
+    except OSError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        return
+    sys.stderr.write(f"heavy.sh: killed process group {pgid} left by an earlier run that was killed\n")
+    sys.stderr.flush()
+
+
+def run(argv, stall, pattern, record=None):
     cmd = ["nice", "-n", "19"] + argv
     if not stall:
         proc = subprocess.Popen(cmd)
@@ -124,6 +156,12 @@ def run(argv, stall, pattern):
                 continue
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    if record:
+        try:
+            with open(record, "w") as fh:
+                fh.write(f"{proc.pid}\n")
+        except OSError:
+            pass
 
     def killgroup(sig):
         try:
@@ -150,8 +188,9 @@ def run(argv, stall, pattern):
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                killgroup(signal.SIGKILL)
-                proc.wait()
+                pass
+            killgroup(signal.SIGKILL)  # a child that ignored SIGTERM must not outlive the lock
+            proc.wait()
             break
         time.sleep(0.1)
     for t in threads:  # a leftover child can hold the pipe open; do not wait on it for long
@@ -163,7 +202,75 @@ def run(argv, stall, pattern):
     return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
 
 
+def self_test():
+    import tempfile
+    fails = []
+    me = os.path.realpath(__file__)
+    with tempfile.TemporaryDirectory() as d:
+        lock, marker = os.path.join(d, "lane.lock"), os.path.join(d, "marker")
+        env = dict(os.environ, HEAVY_STALL="1")
+
+        def alive(pidfile):
+            try:
+                os.kill(int(open(pidfile).read().strip()), 0)
+                return True
+            except (OSError, ValueError):
+                return False
+
+        def wait_for(pred, secs=10):
+            end = time.monotonic() + secs
+            while time.monotonic() < end:
+                if pred():
+                    return True
+                time.sleep(0.1)
+            return False
+
+        def cleanup(pidfile):
+            try:
+                os.kill(int(open(pidfile).read().strip()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+
+        # 1. A child that ignores SIGTERM is killed after the stall, before the lock is released.
+        pid1 = os.path.join(d, "ignore.pid")
+        r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "sh", "-c",
+                            '(trap "" TERM; exec sleep 60) & echo $! > "$0"; wait', pid1],
+                           env=env, capture_output=True, text=True, timeout=60)
+        if r.returncode != 76:
+            fails.append(f"a stall must exit 76, got {r.returncode}: {r.stderr}")
+        if wait_for(lambda: not alive(pid1), 3) is False:
+            fails.append("a child that ignored SIGTERM survived the stall")
+            cleanup(pid1)
+
+        # 2. SIGKILL of the caller orphans the group; the next run kills it and says so.
+        pid2 = os.path.join(d, "orphan.pid")
+        env2 = dict(os.environ, HEAVY_STALL="60")
+        p = subprocess.Popen([sys.executable, me, "run", lock, "5", marker, "sh", "-c",
+                              'sleep 60 & echo $! > "$0"; wait', pid2], env=env2,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not wait_for(lambda: os.path.exists(lock + ".pgid") and os.path.exists(pid2)
+                        and open(pid2).read().strip() != ""):
+            fails.append("the child's process group was not recorded next to the lock")
+        p.kill()
+        p.wait()
+        if not alive(pid2):
+            fails.append("test setup: the orphan should outlive its caller")
+        r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "true"], env=env2,
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 or "killed process group" not in r.stderr:
+            fails.append(f"the orphaned group must be killed with one line on stderr ({r.returncode}): {r.stderr!r}")
+        if wait_for(lambda: not alive(pid2), 3) is False:
+            fails.append("the orphaned group was still alive after the next run got the lock")
+            cleanup(pid2)
+        if os.path.exists(lock + ".pgid"):
+            fails.append("the record must be cleared on a normal exit")
+    print("self-test: ok" if not fails else "self-test failed:\n  " + "\n  ".join(fails))
+    return 1 if fails else 0
+
+
 def main(args):
+    if args == ["--self-test"]:
+        return self_test()
     if len(args) == 2 and args[0] == "probe":
         return probe(args[1])
     if len(args) >= 5 and args[0] == "run":
@@ -179,12 +286,18 @@ def main(args):
         if fd is None:
             return 75
         open(marker, "w").close()
+        record = path + ".pgid"
+        reap_orphan(record)
         try:
-            return run(argv, stall, pattern)
+            return run(argv, stall, pattern, record)
         except FileNotFoundError as e:
             sys.stderr.write(f"heavy.sh: {e}\n")
             return 127
         finally:
+            try:
+                os.remove(record)
+            except OSError:
+                pass
             os.close(fd)
     sys.stderr.write("usage: heavy_lock.py probe <lock> | run <lock> <wait> <marker> <cmd...>\n")
     return 2
