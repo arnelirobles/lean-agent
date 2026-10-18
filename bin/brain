@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""A local list of what went wrong and is not fixed yet, shared by every session on the machine.
+
+  brain add --project P --branch B --kind K --ref R [--detail D]
+  brain list [--open] [--project P] [--kind K]
+  brain show ID
+  brain close ID [--note N]
+  brain reopen ID
+  brain --self-test
+
+Kinds: test-failure, flaky, finding, note. The file is ${LEAN_BRAIN_DB:-~/.local/share/lean/brain.db}.
+Adding an open entry with the same project, kind and ref does not make a new row: it raises the seen
+count and moves the last-seen time, so a failure that shows up in ten runs is one line. Output is
+plain text, one line per entry. Nothing leaves the machine.
+"""
+import argparse
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+KINDS = ("test-failure", "flaky", "finding", "note")
+
+
+def db_path():
+    return os.environ.get("LEAN_BRAIN_DB") or os.path.expanduser("~/.local/share/lean/brain.db")
+
+
+def connect():
+    path = db_path()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    con = sqlite3.connect(path, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("""CREATE TABLE IF NOT EXISTS entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project TEXT NOT NULL, branch TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, ref TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
+        seen INTEGER NOT NULL DEFAULT 1, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+        closed_at TEXT, note TEXT NOT NULL DEFAULT '')""")
+    return con
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def line(r):
+    where = r["project"] + ("@" + r["branch"] if r["branch"] else "")
+    return f"#{r['id']} {r['status']} {r['kind']} {where} {r['ref']} seen={r['seen']} last={r['last_seen']}"
+
+
+def one_line(text):
+    return " ".join(text.split())
+
+
+def cmd_add(a):
+    con = connect()
+    with con:
+        row = con.execute("SELECT * FROM entries WHERE status='open' AND project=? AND kind=? AND ref=?",
+                          (a.project, a.kind, a.ref)).fetchone()
+        t = now()
+        if row:
+            con.execute("UPDATE entries SET seen=seen+1, last_seen=?, branch=COALESCE(NULLIF(?, ''), branch),"
+                        " detail=COALESCE(NULLIF(?, ''), detail) WHERE id=?", (t, a.branch, a.detail, row["id"]))
+            got = con.execute("SELECT * FROM entries WHERE id=?", (row["id"],)).fetchone()
+            print("seen again: " + line(got))
+        else:
+            cur = con.execute("INSERT INTO entries (project, branch, kind, ref, detail, first_seen, last_seen)"
+                              " VALUES (?,?,?,?,?,?,?)", (a.project, a.branch, a.kind, a.ref, a.detail, t, t))
+            got = con.execute("SELECT * FROM entries WHERE id=?", (cur.lastrowid,)).fetchone()
+            print("added: " + line(got))
+    return 0
+
+
+def cmd_list(a):
+    q, args = "SELECT * FROM entries WHERE 1=1", []
+    if a.open:
+        q += " AND status='open'"
+    if a.project:
+        q += " AND project=?"; args.append(a.project)
+    if a.kind:
+        q += " AND kind=?"; args.append(a.kind)
+    for r in connect().execute(q + " ORDER BY id", args):
+        print(line(r))
+    return 0
+
+
+def get(con, ident):
+    r = con.execute("SELECT * FROM entries WHERE id=?", (ident,)).fetchone()
+    if not r:
+        sys.exit(f"brain: no entry #{ident}")
+    return r
+
+
+def cmd_show(a):
+    r = get(connect(), a.id)
+    print(line(r))
+    print(f"first seen: {r['first_seen']}")
+    if r["closed_at"]:
+        print(f"closed: {r['closed_at']}" + (f" ({one_line(r['note'])})" if r["note"] else ""))
+    if r["detail"]:
+        print("detail: " + r["detail"])
+    return 0
+
+
+def cmd_close(a):
+    con = connect()
+    with con:
+        r = get(con, a.id)
+        if r["status"] == "closed":
+            sys.exit(f"brain: #{a.id} is already closed")
+        con.execute("UPDATE entries SET status='closed', closed_at=?, note=? WHERE id=?", (now(), a.note, a.id))
+        print("closed: " + line(get(con, a.id)))
+    return 0
+
+
+def cmd_reopen(a):
+    con = connect()
+    with con:
+        r = get(con, a.id)
+        if r["status"] == "open":
+            sys.exit(f"brain: #{a.id} is already open")
+        dupe = con.execute("SELECT id FROM entries WHERE status='open' AND project=? AND kind=? AND ref=?",
+                           (r["project"], r["kind"], r["ref"])).fetchone()
+        if dupe:
+            sys.exit(f"brain: #{dupe['id']} is the same entry and still open")
+        con.execute("UPDATE entries SET status='open', closed_at=NULL WHERE id=?", (a.id,))
+        print("reopened: " + line(get(con, a.id)))
+    return 0
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="brain", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("add")
+    s.add_argument("--project", required=True)
+    s.add_argument("--branch", default="")
+    s.add_argument("--kind", required=True, choices=KINDS)
+    s.add_argument("--ref", required=True)
+    s.add_argument("--detail", default="")
+    s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("list")
+    s.add_argument("--open", action="store_true")
+    s.add_argument("--project")
+    s.add_argument("--kind", choices=KINDS)
+    s.set_defaults(fn=cmd_list)
+    for name, fn in (("show", cmd_show), ("close", cmd_close), ("reopen", cmd_reopen)):
+        s = sub.add_parser(name)
+        s.add_argument("id", type=int)
+        if name == "close":
+            s.add_argument("--note", default="")
+        s.set_defaults(fn=fn)
+    return p
+
+
+def self_test():
+    fails = []
+    me = os.path.realpath(__file__)
+    with tempfile.TemporaryDirectory() as d:
+        env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "sub", "brain.db"))
+
+        def run(*args):
+            r = subprocess.run([sys.executable, me, *args], env=env, capture_output=True, text=True)
+            return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+        rc, out, _ = run("add", "--project", "core", "--branch", "main", "--kind", "test-failure",
+                         "--ref", "Foo.Bar", "--detail", "boom")
+        if rc != 0 or not out.startswith("added: #1 open test-failure core@main Foo.Bar seen=1"):
+            fails.append(f"add: {rc} {out!r}")
+        rc, out, _ = run("add", "--project", "core", "--kind", "test-failure", "--ref", "Foo.Bar")
+        if "seen again: #1" not in out or "seen=2" not in out:
+            fails.append(f"dedupe did not bump seen: {out!r}")
+        rc, out, _ = run("show", "1")
+        if "detail: boom" not in out or "core@main" not in out:
+            fails.append(f"a repeat without detail or branch lost them: {out!r}")
+        run("add", "--project", "core", "--kind", "flaky", "--ref", "Foo.Bar")
+        run("add", "--project", "web", "--kind", "finding", "--ref", "x")
+        rc, out, _ = run("list")
+        if len(out.splitlines()) != 3:
+            fails.append(f"kind is part of the dedupe key, want 3 rows: {out!r}")
+        rc, out, _ = run("list", "--project", "core", "--kind", "flaky")
+        if len(out.splitlines()) != 1 or "flaky" not in out:
+            fails.append(f"list filters: {out!r}")
+        rc, out, _ = run("close", "1", "--note", "fixed in abc")
+        if rc != 0 or "closed: #1 closed" not in out:
+            fails.append(f"close: {rc} {out!r}")
+        rc, out, _ = run("list", "--open")
+        if "#1 " in out or len(out.splitlines()) != 2:
+            fails.append(f"--open still lists a closed entry: {out!r}")
+        rc, out, _ = run("show", "1")
+        if "fixed in abc" not in out:
+            fails.append(f"close note missing from show: {out!r}")
+        run("add", "--project", "core", "--kind", "test-failure", "--ref", "Foo.Bar")
+        rc, out, _ = run("list", "--project", "core", "--kind", "test-failure")
+        if len(out.splitlines()) != 2:
+            fails.append(f"a closed entry must not absorb a new sighting: {out!r}")
+        rc, out, err = run("reopen", "1")
+        if rc == 0:
+            fails.append("reopen made a second open copy of the same entry")
+        rc, out, _ = run("close", "4", "--note", "x")
+        rc, out, _ = run("reopen", "4")
+        if rc != 0 or "reopened: #4 open" not in out:
+            fails.append(f"reopen: {rc} {out!r}")
+        rc, out, err = run("close", "99")
+        if rc == 0 or "no entry #99" not in err:
+            fails.append(f"close of a missing id: {rc} {err!r}")
+        rc, out, err = run("add", "--project", "p", "--kind", "bogus", "--ref", "r")
+        if rc == 0:
+            fails.append("unknown kind accepted")
+        rc, out, err = run("add", "--project", "p", "--kind", "note")
+        if rc == 0:
+            fails.append("add without --ref accepted")
+    if fails:
+        print("self-test failed:\n  " + "\n  ".join(fails))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    args = parser().parse_args()
+    sys.exit(args.fn(args))
