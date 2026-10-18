@@ -56,6 +56,7 @@ import argparse
 import calendar
 import json
 import os
+import re
 import sqlite3
 import statistics
 import subprocess
@@ -319,6 +320,18 @@ JOB_STATUS = ("queued", "running", "done", "failed", "cancelled")
 JOB_TIERS = ("fast", "full")
 
 
+def project_of(path):
+    """The main repository's name, so a worktree and its repository are one project."""
+    path = os.path.abspath(path)
+    r = subprocess.run(["git", "-C", path if os.path.isdir(path) else os.path.dirname(path), "rev-parse",
+                        "--git-common-dir"], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        common = os.path.abspath(os.path.join(path, r.stdout.strip()))
+        name = os.path.basename(common)
+        return os.path.basename(os.path.dirname(common)) if name == ".git" else re.sub(r"\.git$", "", name)
+    return os.path.basename(path.rstrip("/"))
+
+
 def cancel_dependents(con, job_id, reason):
     for r in con.execute("SELECT id FROM jobs WHERE status='queued' AND after_id=?", (job_id,)).fetchall():
         con.execute("UPDATE jobs SET status='cancelled', reason=?, ended_at=? WHERE id=?", (reason, now(), r["id"]))
@@ -357,7 +370,7 @@ def cmd_queue(a):
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
                 " enqueued_at, status, reason, ended_at, args) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (a.cycle, a.project or os.path.basename(repo), repo, a.test_project, a.filter, a.tier, a.after,
+                (a.cycle, a.project or project_of(repo), repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
                  f"dependency #{a.after} {dep['status']}" if dead else "", now() if dead else None, a.args))
         print(cur.lastrowid)
@@ -412,9 +425,7 @@ RESUME_ORDER = ("blocker", "agent", "pending", "question")
 
 
 def default_project():
-    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-    top = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else os.getcwd()
-    return os.path.basename(top.rstrip("/"))
+    return project_of(os.getcwd())
 
 
 def cmd_resume(a):
@@ -828,6 +839,21 @@ def self_test():
         if f"job #{k4} queued full r E.csproj" not in out or "queued or running" not in out:
             fails.append(f"resume must list queued jobs: {out!r}")
         run("queue", "cancel", k4)
+
+        # A worktree shares its repository's project name.
+        main_repo = os.path.join(d, "mainrepo")
+        wt = os.path.join(d, "a-worktree")
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", main_repo]
+        subprocess.run(["git", "init", "-q", main_repo], check=True)
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        subprocess.run(git + ["worktree", "add", "-q", wt, "-b", "side"], check=True, capture_output=True)
+        jw = run("queue", "add", wt, "W.csproj")[1]
+        jm = run("queue", "add", main_repo, "W.csproj")[1]
+        ql = run("queue", "list")[1]
+        if f"job #{jw} queued full mainrepo W.csproj" not in ql or f"job #{jm} queued full mainrepo W.csproj" not in ql:
+            fails.append(f"a worktree must share the main repository's project name: {ql!r}")
+        if project_of(os.path.join(wt, ".")) != "mainrepo" or project_of(os.path.join(d, "nogit")) != "nogit":
+            fails.append("project_of for a worktree or a plain directory")
 
         # Migration: a database from the flat first layout moves forward and keeps its rows.
         import sqlite3 as sq
