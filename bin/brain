@@ -328,15 +328,19 @@ def cmd_queue(a):
     if a.qcmd == "add":
         if a.tier == "fast" and not a.filter:
             sys.exit("brain: a fast job needs --filter")
-        if a.after and not con.execute("SELECT 1 FROM jobs WHERE id=?", (a.after,)).fetchone():
+        dep = con.execute("SELECT status FROM jobs WHERE id=?", (a.after,)).fetchone() if a.after else None
+        if a.after and not dep:
             sys.exit(f"brain: no job #{a.after} to run after")
         repo = os.path.abspath(a.repo_dir)
+        # A job behind one that already failed or was cancelled can never run; record that at once.
+        dead = dep and dep["status"] in ("failed", "cancelled")
         with con:
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
-                " enqueued_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                " enqueued_at, status, reason, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.cycle, a.project or os.path.basename(repo), repo, a.test_project, a.filter, a.tier, a.after,
-                 a.by, now()))
+                 a.by, now(), "cancelled" if dead else "queued",
+                 f"dependency #{a.after} {dep['status']}" if dead else "", now() if dead else None))
         print(cur.lastrowid)
         return 0
     if a.qcmd == "list":
@@ -786,6 +790,14 @@ def self_test():
         rc, out, err = run("queue", "cancel", j1)
         if rc == 0:
             fails.append("a finished job was cancelled")
+        late = run("queue", "add", "/tmp/r", "F.csproj", "--after", j2)[1]
+        late2 = run("queue", "add", "/tmp/r", "F.csproj", "--after", k1)[1]
+        out = run("queue", "list", "--status", "cancelled")[1]
+        if f"job #{late} cancelled" not in out or f"dependency #{j2} failed" not in out \
+                or f"job #{late2} cancelled" not in out or f"dependency #{k1} cancelled" not in out:
+            fails.append(f"a job added after a failed or cancelled job must be cancelled with the reason: {out!r}")
+        if nxt("--peek") is not None:
+            fails.append("a job added behind a dead dependency became ready")
         k4 = run("queue", "add", "/tmp/r", "E.csproj", "--cycle", "q2")[1]
         out = run("resume", "--project", "r")[1]
         if f"job #{k4} queued full r E.csproj" not in out or "queued or running" not in out:
