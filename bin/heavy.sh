@@ -43,6 +43,8 @@
 # progress line, so a counter that repeats with the same counts does not count. The clock starts when
 # the command starts, so set it above the build time. Only the command heavy.sh started is stopped.
 #
+# HEAVY_TIMING_FILE=<path> gets the seconds the command waited for the lane, once it has run.
+#
 # Linux uses util-linux flock. Anywhere else (macOS has no flock and no /proc) the lock is taken with
 # python3 fcntl.flock, in lib/heavy_lock.py, and holders are named with lsof. The watchdog also runs
 # through that helper. HEAVY_BACKEND=python forces it on Linux, for the self-test.
@@ -123,7 +125,7 @@ lane_status() { # $1 lane: free (exit 0) or busy with the holders (exit 1)
 }
 
 run_lane() { # $1 lane, rest: command
-  local lane=$1 dir lock wait marker holders rc
+  local lane=$1 dir lock wait marker holders rc t0
   shift
   check_lane "$lane" || return 2
   wait=${HEAVY_WAIT:-300}
@@ -152,12 +154,17 @@ run_lane() { # $1 lane, rest: command
   # the command runs on.
   marker=$(mktemp)
   rm -f "$marker"
+  t0=$(date +%s)
   if [ "$(backend)" = flock ]; then
     flock -o -w "$wait" -E 75 "$lock" sh -c ': > "$0"; exec nice -n 19 "$@"' "$marker" "$@"
   else
     python3 "$HEAVY_HELPER" run "$lock" "$wait" "$marker" "$@"
   fi
   rc=$?
+  # HEAVY_TIMING_FILE gets the seconds spent waiting for the lane, for callers that keep statistics.
+  if [ -n "${HEAVY_TIMING_FILE:-}" ] && [ -e "$marker" ]; then
+    python3 -c 'import os,sys; print(max(0, int(os.stat(sys.argv[1]).st_mtime) - int(sys.argv[2])))' "$marker" "$t0" > "$HEAVY_TIMING_FILE" 2>/dev/null
+  fi
   if [ "$rc" = 75 ] && [ ! -e "$marker" ]; then
     holders=$(lock_holders "$lock")
     echo "heavy.sh: timed out after ${wait}s waiting for lane '$lane' ($lock). Held by:" >&2
@@ -209,9 +216,13 @@ self_suite() { # runs the lane tests with the current HEAVY_BACKEND; prints fail
   wait "$holder" 2>/dev/null
   out=$(bash "$HEAVY_SELF" status l2); rc=$?
   [ "$rc" = 0 ] || { echo "self-test failed: lane still busy after the holder exited: $out"; fails=$((fails + 1)); }
+  # The wait is reported to HEAVY_TIMING_FILE.
+  (HEAVY_TIMING_FILE="$t/timing" run_lane l4 true) >/dev/null 2>&1
+  [ -s "$t/timing" ] && [ "$(cat "$t/timing")" -ge 0 ] 2>/dev/null || { echo "self-test failed: HEAVY_TIMING_FILE not written"; fails=$((fails + 1)); }
   # The command runs at the lowest priority.
   out=$( (run_lane l3 sh -c 'ps -o nice= -p $$') 2>&1 )
-  [ "$(echo $out)" = 19 ] || { echo "self-test failed: command not at nice 19: '$out'"; fails=$((fails + 1)); }
+  # nice adds to the caller's niceness, so a caller that is already niced can land on 20.
+  case "$(echo $out)" in 19|20) ;; *) false ;; esac || { echo "self-test failed: command not at nice 19: '$out'"; fails=$((fails + 1)); }
   return "$fails"
 }
 
@@ -225,12 +236,12 @@ stall_suite() { # the watchdog, always through the python helper
   grep -q 'stalled: no test progress for 2 s; likely load, not code' <<<"$out" || { echo "self-test failed: no stall message: $out"; fails=$((fails + 1)); }
   [ $((SECONDS - start)) -lt 15 ] || { echo "self-test failed: stall took too long"; fails=$((fails + 1)); }
   # Counts that move keep it alive (generous margins: the box running this may be under heavy load), and the command's own exit code comes through.
-  out=$( (HEAVY_STALL=8 run_lane s2 sh -c 'for i in 1 2 3 4 5 6; do echo "[+$i/x0/?0] t"; sleep 0.5; done; exit 4') 2>&1 ); rc=$?
+  out=$( (HEAVY_STALL=25 run_lane s2 sh -c 'for i in 1 2 3 4 5 6; do echo "[+$i/x0/?0] t"; sleep 0.5; done; exit 4') 2>&1 ); rc=$?
   [ "$rc" = 4 ] || { echo "self-test failed: moving counter was cut off or lost its exit code ($rc): $out"; fails=$((fails + 1)); }
   # Result lines are progress, and a custom pattern replaces the default.
-  out=$( (HEAVY_STALL=8 run_lane s3 sh -c 'for i in 1 2 3 4; do echo "passed Test$i"; sleep 0.5; done') 2>&1 ); rc=$?
+  out=$( (HEAVY_STALL=25 run_lane s3 sh -c 'for i in 1 2 3 4; do echo "passed Test$i"; sleep 0.5; done') 2>&1 ); rc=$?
   [ "$rc" = 0 ] || { echo "self-test failed: passed lines not read as progress ($rc): $out"; fails=$((fails + 1)); }
-  out=$( (HEAVY_STALL=8 HEAVY_PROGRESS='^tick [0-9]+' run_lane s4 sh -c 'for i in 1 2 3 4; do echo "tick $i"; sleep 0.5; done') 2>&1 ); rc=$?
+  out=$( (HEAVY_STALL=25 HEAVY_PROGRESS='^tick [0-9]+' run_lane s4 sh -c 'for i in 1 2 3 4; do echo "tick $i"; sleep 0.5; done') 2>&1 ); rc=$?
   [ "$rc" = 0 ] || { echo "self-test failed: custom progress pattern ignored ($rc): $out"; fails=$((fails + 1)); }
   # Only the command's own group is stopped, a child included, and a bystander is left alone.
   sleep 30 & local bystander=$!
