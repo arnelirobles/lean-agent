@@ -21,7 +21,8 @@ The project path is relative to repo-dir. Quote a field that holds spaces. A fas
 name or a fragment of one; with it the line becomes two jobs, the fast slice and then the whole project.
 
 For each job: run it, list the failing tests, run each failing class alone, and label the test flaky if
-it passes alone or real if it fails again (unverified when the rerun was cut off). Real and unverified
+it passes alone (exit 0, or passed tests and the name absent) or real if it fails again. It is unverified
+when the rerun was cut off or failed without naming the test or passing anything. Real and unverified
 go to brain as test-fail, flaky as flaky. A job that fails without naming a failing test (a build error)
 goes in as test-fail too. A stall is only a note, because the watchdog says it is likely load, not code.
 Logs are under the run directory: ${LEAN_TEST_PHASE_DIR:-~/.local/share/lean/test-phase}/<timestamp>.
@@ -272,11 +273,15 @@ def run_job(job, a, run_dir, runner):
         log = f"{stem}-class-{safe(cls)}.log"
         rrc, rtext, _ = tier("rerun", cls, log)
         again = {n for n, _ in runner.failures(rtext)}
+        rpassed = runner.counts(rtext)[0]
         for name in names:
+            # A rerun that named no failure is not proof: a crash or build error names none either.
             if rrc in (75, 76):
                 label = "unverified"
-            elif rrc == 0 or name not in again:
+            elif rrc == 0 or (rpassed > 0 and name not in again):
                 label = "flaky"
+            elif name not in again:
+                label = "unverified"
             else:
                 label = "real"
             body = f"{label}; alone: {tier_note(rrc)}. Log: {log}\n{failing[name]}"
@@ -536,6 +541,22 @@ echo "Passed!  - Failed: 0"; exit 0
         if rc != 1 or "run-failed: tests/T/T.csproj" not in subprocess.run(
                 [sys.executable, BRAIN, "show", "4"], env=env, capture_output=True, text=True).stdout + brain_list():
             fails.append(f"build error not reported ({rc}): {out}")
+
+        # A rerun that names no failure proves nothing: only exit 0, or passed tests with the name absent, is flaky.
+        put("full", "  Failed Un.UnverTests.A [1 ms]\n  Failed Pa.PartTests.A [1 ms]\nFailed!  - Failed: 2, Passed: 0, Skipped: 0, Total: 2\n", 1)
+        put("class-Un.UnverTests", "Unhandled exception. The host crashed\n", 1)
+        put("class-Pa.PartTests", "Failed!  - Failed: 1, Passed: 4, Skipped: 0, Total: 5\n  Failed Pa.PartTests.Other [1 ms]\n", 1)
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj\n")
+        lst = brain_list()
+        if "flaky vrepo Un.UnverTests.A" in lst or "test-fail vrepo Un.UnverTests.A" not in lst:
+            fails.append(f"a rerun with no named failure and a nonzero exit must not be flaky: {lst!r}")
+        if "flaky vrepo Pa.PartTests.A" not in lst:
+            fails.append(f"a rerun with passed tests and the name absent is flaky: {lst!r}")
+        un = subprocess.run([sys.executable, BRAIN, "show", re.search(r"#(\d+) \S+ test-fail vrepo Un\.UnverTests\.A", lst).group(1)],
+                            env=env, capture_output=True, text=True).stdout if "test-fail vrepo Un.UnverTests.A" in lst else ""
+        if "unverified" not in un:
+            fails.append(f"an unproven rerun must be labelled unverified: {un!r}")
+        put("full", "error CS1002: ; expected\n", 1)
 
         # The queue. Job A fails to build, B waits on A, C is independent, D waits on B (a chain).
         # Drain order is by id among ready jobs; B and D are cancelled with the reason.
