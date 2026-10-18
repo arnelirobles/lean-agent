@@ -102,6 +102,8 @@ Known limits:
 
 - The watchdog's orphan cleanup records a process group only when `HEAVY_STALL` is on, so a killed caller without the watchdog leaves its command running.
 - A rerun runs a whole class, so one flaky test in a large class costs the class's runtime.
+- The drainer's options (`--stall`, `--lane`, `--cycle`) apply to every job it drains, including jobs queued by others.
+- A job left `running` by a drainer that died is only cleaned up when the next drainer starts.
 
 What goes where:
 
