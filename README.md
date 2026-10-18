@@ -115,7 +115,7 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 
 - Claude Code with plugin support.
 - `python3`, `git` and `gh` on PATH.
-- Linux, or macOS with its stock bash 3.2. `heavy.sh` needs util-linux `flock` and `/proc` and refuses to run without them.
+- Linux, or macOS with its stock bash 3.2. `heavy.sh` uses util-linux `flock` on Linux. On macOS it takes the lock with python3 and names holders with `lsof`.
 
 ## Contributing
 
