@@ -40,7 +40,7 @@ Logs are under the run directory: ${LEAN_TEST_PHASE_DIR:-~/.local/share/lean/tes
   --lane       heavy.sh lane (default dotnet)
   --stall      seconds without test progress before a command is stopped (default 600, 0 is off);
                it starts when the command starts, so keep it above the build time
-  --project    brain project name for a plan's jobs (default: the repo directory's name)
+  --project    brain project name for a plan's jobs (default: the main repository's name, so worktrees share it)
   --branch     brain branch (default: the repo's current branch)
 
 Every command is also recorded as a row in brain's runs table (tier fast, full or rerun, duration, time
