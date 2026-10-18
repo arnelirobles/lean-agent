@@ -238,6 +238,12 @@ stall_suite() { # the watchdog, always through the python helper
   # Counts that move keep it alive (generous margins: the box running this may be under heavy load), and the command's own exit code comes through.
   out=$( (HEAVY_STALL=25 run_lane s2 sh -c 'for i in 1 2 3 4 5 6; do echo "[+$i/x0/?0] t"; sleep 0.5; done; exit 4') 2>&1 ); rc=$?
   [ "$rc" = 4 ] || { echo "self-test failed: moving counter was cut off or lost its exit code ($rc): $out"; fails=$((fails + 1)); }
+  # The real Microsoft Testing Platform line: blank lines between, a time that changes every few seconds, counts that do not.
+  out=$( (HEAVY_STALL=2 run_lane s8 sh -c 'i=0; while :; do i=$((i + 3)); printf "\n[+6683/x36/?1] BarakoCMS.Tests.dll (net10.0|arm64)(2h 37m %02ds)\n" $i; sleep 0.3; done') 2>&1 ); rc=$?
+  { [ "$rc" = 76 ] && grep -q 'stalled: no test progress for 2 s' <<<"$out"; } || { echo "self-test failed: MTP line with only the time changing was not a stall ($rc): $out"; fails=$((fails + 1)); }
+  # The same line with the passed count moving is progress.
+  out=$( (HEAVY_STALL=25 run_lane s9 sh -c 'for i in 1 2 3 4 5 6; do printf "\n[+%d/x0/?1] BarakoCMS.Tests.dll (net10.0|arm64)(%ds)\n" $((6680 + i)) $((i * 3)); sleep 0.5; done; exit 4') 2>&1 ); rc=$?
+  [ "$rc" = 4 ] || { echo "self-test failed: MTP line with moving counts was cut off ($rc): $out"; fails=$((fails + 1)); }
   # Result lines are progress, and a custom pattern replaces the default.
   out=$( (HEAVY_STALL=25 run_lane s3 sh -c 'for i in 1 2 3 4; do echo "passed Test$i"; sleep 0.5; done') 2>&1 ); rc=$?
   [ "$rc" = 0 ] || { echo "self-test failed: passed lines not read as progress ($rc): $out"; fails=$((fails + 1)); }
