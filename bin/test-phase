@@ -40,7 +40,8 @@ spent waiting for the lane, load average at start and end, passed, failed, skipp
 and each item points at the run that showed it. `brain stats` reads them.
 
 TEST_PHASE_RUNNER=mtp or vstest overrides detection. The wait for a busy lane is HEAVY_WAIT, here
-defaulting to 3600 seconds. Exit 0 when nothing real failed, 1 otherwise.
+defaulting to 3600 seconds. Exit 0 when nothing real failed and no job was cancelled during the drain, 1 otherwise. A job whose
+failures were all flaky finishes done, so the jobs after it still run.
 
 Runner support is a class with mode, command, failures, counts and class_of. Dotnet is the one that
 exists; another runner is another class in RUNNERS.
@@ -307,7 +308,18 @@ def enqueue(entries, a, cycle):
         brain(base + ["--tier", "full"])
 
 
+def cancelled_ids():
+    return set(re.findall(r"^job #(\d+) cancelled", brain(["queue", "list", "--status", "cancelled"]) or "", re.M))
+
+
+def only_flaky(row):
+    """The job failed, every failing test passed alone, and nothing else went wrong."""
+    return row["result"] == "fail" and row["failing"] > 0 and row["real"] == 0 and row["flaky"] == row["failing"]
+
+
 def drain(a, run_dir, runner):
+    """(rows, how many jobs were cancelled while draining)."""
+    before = cancelled_ids()
     # Jobs left running by a drainer that died cannot finish; fail them so their dependents are cancelled.
     for line in (brain(["queue", "list", "--status", "running"]) or "").splitlines():
         m = re.match(r"job #(\d+) ", line)
@@ -317,13 +329,13 @@ def drain(a, run_dir, runner):
     while True:
         out = brain(["queue", "next"])
         if not out:
-            return rows
+            return rows, len(cancelled_ids() - before)
         job = json.loads(out)
         print(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})", flush=True)
         row = run_job(job, a, run_dir, runner)
         rows.append(row)
         reason = "; ".join(row["notes"])
-        brain(["queue", "finish", str(job["id"]), "--status", "done" if row["rc"] == 0 else "failed"]
+        brain(["queue", "finish", str(job["id"]), "--status", "done" if row["rc"] == 0 or only_flaky(row) else "failed"]
               + (["--run-id", str(row["run_id"])] if row["run_id"] else [])
               + (["--reason", reason] if reason else []))
 
@@ -364,6 +376,7 @@ def main(argv):
     os.makedirs(base, exist_ok=True)
     lock = open(os.path.join(base, "drainer.lock"), "w")
     rows = []
+    cancelled = 0
     runs = 0
     while True:
         try:
@@ -377,7 +390,9 @@ def main(argv):
         os.makedirs(run_dir, exist_ok=True)
         if runs == 1:
             print(f"test-phase: logs in {run_dir}", flush=True)
-        rows += drain(a, run_dir, RUNNERS[0])
+        got, dropped = drain(a, run_dir, RUNNERS[0])
+        rows += got
+        cancelled += dropped
         fcntl.flock(lock, fcntl.LOCK_UN)
         # A job enqueued just as the drain ended would wait for the next drainer; look once more.
         if not (brain(["queue", "next", "--peek"]) or "").strip():
@@ -385,12 +400,12 @@ def main(argv):
     if not rows:
         if runs:
             print("test-phase: nothing queued")
-        return 0
+        return 1 if cancelled else 0
     print()
     print(table(rows))
     print(f"\ntest-phase: {len(rows)} jobs, {sum(r['real'] for r in rows)} real, "
-          f"{sum(r['flaky'] for r in rows)} flaky. `brain list --open` has the entries.")
-    return 1 if any(is_bad(r) for r in rows) else 0
+          f"{sum(r['flaky'] for r in rows)} flaky, {cancelled} cancelled. `brain list --open` has the entries.")
+    return 1 if cancelled or any(is_bad(r) for r in rows) else 0
 
 
 def self_test():
@@ -426,6 +441,9 @@ def self_test():
             fh.write('''#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
 case "$*" in
+  *Canceller.csproj*) python3 "$FAKE_BRAIN" queue cancel "$FAKE_CANCEL" >/dev/null ;;
+esac
+case "$*" in
   *"--filter-class "*|*"FullyQualifiedName~"*)
     all="$*"; cls=${all##*--filter-class }; [ "$cls" = "$all" ] && cls=${all##*FullyQualifiedName~}
     cls=${cls%% *}
@@ -437,7 +455,7 @@ if [ -f "$FAKE_DIR/full" ]; then cat "$FAKE_DIR/full"; exit "$(cat "$FAKE_DIR/fu
 echo "Passed!  - Failed: 0"; exit 0
 ''')
         os.chmod(shim, 0o755)
-        env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d,
+        env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=BRAIN,
                    FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"),
                    HEAVY_LOCK_DIR=os.path.join(d, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"),
                    HEAVY_WAIT="20")
@@ -596,6 +614,29 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"dependents not cancelled with a reason: {ql}")
         if rc != 1:
             fails.append(f"a failed job must exit 1, got {rc}")
+
+        # A job whose failures are all flaky is done: its dependent runs and the exit is 0.
+        put("full", "  Failed Fl.FlakyOnly.A [1 ms]\nFailed!  - Failed: 1, Passed: 2, Skipped: 0, Total: 3\n", 1)
+        put("class-Fl.FlakyOnly", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        jf1 = qadd(repo_v, "tests/T/F1.csproj", "--cycle", "qf")
+        jf2 = qadd(repo_v, "tests/T/F2.csproj", "--after", jf1, "--cycle", "qf")
+        rc, out, calls = drain()
+        ql = qlist("--cycle", "qf")
+        if f"job #{jf1} done" not in ql or f"job #{jf2} done" not in ql or rc != 0:
+            fails.append(f"an all-flaky job must finish done and run its dependents, exit 0 ({rc}): {ql} {out}")
+        put("full", "error CS1002: ; expected\n", 1)
+
+        # A job cancelled while the drain runs makes the exit 1, even though nothing failed.
+        os.remove(os.path.join(d, "full"))
+        os.remove(os.path.join(d, "full.rc"))
+        jx = qadd(repo_v, "tests/T/Canceller.csproj", "--cycle", "qx")
+        jy = qadd(repo_v, "tests/T/Victim.csproj", "--cycle", "qx")
+        env["FAKE_CANCEL"] = jy
+        rc, out, calls = drain()
+        env.pop("FAKE_CANCEL")
+        if rc != 1 or f"job #{jy} cancelled" not in qlist("--cycle", "qx"):
+            fails.append(f"a job cancelled during the drain must exit 1 ({rc}): {out}")
+        put("full", "error CS1002: ; expected\n", 1)
 
         # Nothing ready: a drain says so, exits 0, runs nothing.
         rc, out, calls = drain()
