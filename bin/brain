@@ -137,20 +137,32 @@ MIGRATIONS = [migrate_1, migrate_2, migrate_3]
 def connect():
     path = db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    con = sqlite3.connect(path, timeout=30)
+    con = sqlite3.connect(path, timeout=30, isolation_level=None)
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    version = int(row["value"]) if row else 0
-    if not row and con.execute("SELECT name FROM sqlite_master WHERE name='entries'").fetchone():
-        version = 1  # the flat layout was written before the version table existed
-    if version > len(MIGRATIONS):
-        sys.exit(f"brain: {path} has schema version {version}, newer than this brain knows")
-    if version < len(MIGRATIONS):
-        with con:
-            for n in range(version, len(MIGRATIONS)):
+
+    def current():
+        row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        version = int(row["value"]) if row else 0
+        if not row and con.execute("SELECT name FROM sqlite_master WHERE name='entries'").fetchone():
+            version = 1  # the flat layout was written before the version table existed
+        if version > len(MIGRATIONS):
+            sys.exit(f"brain: {path} has schema version {version}, newer than this brain knows")
+        return version
+
+    if current() < len(MIGRATIONS):
+        # One writer migrates; a second opener waits for the lock, then sees the new version and does nothing.
+        # SQLite DDL is transactional, so a migration that fails leaves the old version and no half-built tables.
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            for n in range(current(), len(MIGRATIONS)):
                 MIGRATIONS[n](con)
                 con.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)", (str(n + 1),))
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+    con.isolation_level = ""  # the rest of brain relies on `with con:` opening and committing a transaction
     return con
 
 
@@ -827,6 +839,69 @@ def self_test():
         run("add", "--project", "core", "--kind", "note", "--ref", "n")
         if run("list")[1].count("\n") != 1:
             fails.append("a migrated database did not take a new item")
+
+        # Two openers racing to migrate a fresh database: one migrates, the other waits and finds it done.
+        import threading
+        saved = os.environ.get("LEAN_BRAIN_DB")
+        os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "race.db")
+
+        def slow(con):
+            time.sleep(1.0)
+            con.execute("CREATE TABLE slow_t (x)")
+
+        MIGRATIONS.append(slow)
+        errors = []
+
+        def opener(delay):
+            time.sleep(delay)
+            try:
+                connect().close()
+            except BaseException as e:  # noqa: BLE001
+                errors.append(repr(e))
+
+        threads = [threading.Thread(target=opener, args=(x,)) for x in (0, 0.3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            fails.append(f"concurrent openers must not collide on a migration: {errors}")
+        con = sq.connect(os.environ["LEAN_BRAIN_DB"])
+        v = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        con.close()
+        if v != str(len(MIGRATIONS)):
+            fails.append(f"schema version after the race: {v}")
+
+        # A migration that fails halfway leaves the old version and nothing half-built; the next open finishes it.
+        os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "partial.db")
+        MIGRATIONS.pop()
+
+        def broken(con):
+            con.execute("CREATE TABLE half (x)")
+            raise RuntimeError("boom")
+
+        MIGRATIONS.append(broken)
+        try:
+            connect()
+            fails.append("a failing migration did not raise")
+        except RuntimeError:
+            pass
+        con = sq.connect(os.environ["LEAN_BRAIN_DB"])
+        v = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        half = con.execute("SELECT name FROM sqlite_master WHERE name IN ('half', 'items')").fetchall()
+        con.close()
+        if v is not None and v[0] != "0" or half:
+            fails.append(f"a failed migration must roll back completely: version {v}, tables {half}")
+        MIGRATIONS.pop()
+        try:
+            connect().close()
+        except BaseException as e:  # noqa: BLE001
+            fails.append(f"recovery after a failed migration: {e!r}")
+        MIGRATIONS[:] = MIGRATIONS[:3]
+        if saved is None:
+            os.environ.pop("LEAN_BRAIN_DB")
+        else:
+            os.environ["LEAN_BRAIN_DB"] = saved
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
