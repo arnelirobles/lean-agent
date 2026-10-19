@@ -31,3 +31,14 @@ describe("charts", () => {
     expect(trendTone([10])).toBe("blue");
   });
 });
+
+describe("narrow panels", () => {
+  it("wraps the hero, scrolls wide tables and has a small-screen layout", async () => {
+    const { STYLE } = await import("../src/dashboard/page");
+    const rule = (sel: string) => STYLE.match(new RegExp(`\\n\\s*${sel.replace(/\./g, "\\.")} \\{([^}]*)\\}`))?.[1] ?? "";
+    expect(rule(".hero")).toContain("flex-wrap: wrap");
+    expect(rule(".hero .grow")).toMatch(/flex: 1 1 \d+px/);
+    expect(rule(".card")).toContain("overflow-x: auto");
+    expect(STYLE).toMatch(/@media \(max-width: \d+px\)/);
+  });
+});
