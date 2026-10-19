@@ -1,0 +1,76 @@
+import * as vscode from "vscode";
+import type { Database } from "sql.js";
+import * as db from "../db";
+import { dashboardHtml } from "../dashboard/dashboardHtml";
+import { itemHtml } from "../dashboard/itemHtml";
+import { makeNonce } from "../dashboard/page";
+import type { DashboardData } from "../types";
+
+interface Msg { type: string; text?: string; id?: number }
+
+function wire(panel: vscode.WebviewPanel, openItem: (id: number) => void, refresh: () => void): void {
+  panel.webview.onDidReceiveMessage((m: Msg) => {
+    if (m.type === "copy" && typeof m.text === "string") {
+      void vscode.env.clipboard.writeText(m.text);
+      void vscode.window.setStatusBarMessage("Copied to clipboard", 2000);
+    } else if (m.type === "open" && typeof m.id === "number") openItem(m.id);
+    else if (m.type === "refresh") refresh();
+  });
+}
+
+function emptyData(): DashboardData {
+  return {
+    schemaVersion: null, waiting: [], headline: { realOpen: 0, flakyOpen: 0, closed7d: 0, runs7d: 0, testSeconds7d: 0 },
+    cycles: [], suites: [], flakiest: [], load: [], stale: [], generatedAt: Math.floor(Date.now() / 1000),
+  };
+}
+
+export class DashboardPanel {
+  private panel?: vscode.WebviewPanel;
+  constructor(private readonly openItem: (id: number) => void, private readonly refresh: () => void) {}
+
+  show(database: Database | undefined, note: string): void {
+    if (!this.panel) {
+      this.panel = vscode.window.createWebviewPanel("leanBrain.dashboard", "Lean Brain", vscode.ViewColumn.Active,
+        { enableScripts: true, localResourceRoots: [] });
+      this.panel.onDidDispose(() => (this.panel = undefined));
+      wire(this.panel, this.openItem, this.refresh);
+    } else this.panel.reveal();
+    this.render(database, note);
+  }
+
+  render(database: Database | undefined, note: string): void {
+    if (!this.panel) return;
+    const nonce = makeNonce();
+    const data = database ? db.dashboard(database, Math.floor(Date.now() / 1000)) : emptyData();
+    this.panel.webview.html = dashboardHtml(data, nonce, this.panel.webview.cspSource, database ? note : note || "No data.");
+  }
+}
+
+export class ItemPanel {
+  private panel?: vscode.WebviewPanel;
+  private current?: number;
+  constructor(private readonly refresh: () => void) {}
+
+  show(database: Database | undefined, id: number): void {
+    if (!database) return;
+    this.current = id;
+    if (!this.panel) {
+      this.panel = vscode.window.createWebviewPanel("leanBrain.item", `Item ${id}`, vscode.ViewColumn.Beside,
+        { enableScripts: true, localResourceRoots: [] });
+      this.panel.onDidDispose(() => (this.panel = undefined));
+      wire(this.panel, () => undefined, this.refresh);
+    } else this.panel.reveal(undefined, true);
+    this.render(database);
+  }
+
+  render(database: Database | undefined): void {
+    if (!this.panel || !database || this.current === undefined) return;
+    const item = db.getItem(database, this.current);
+    this.panel.title = `Item ${this.current}`;
+    const nonce = makeNonce();
+    this.panel.webview.html = item
+      ? itemHtml(item, Math.floor(Date.now() / 1000), nonce, this.panel.webview.cspSource)
+      : `<p>Item ${this.current} is gone.</p>`;
+  }
+}
