@@ -6,7 +6,7 @@ next to this script as a subprocess with an argument list (never a shell), so th
 stay in one place. A nonzero exit becomes a tool result with isError true and the stderr text.
 
 Tools: brain_list, brain_show, brain_add, brain_close, brain_queue_list, brain_queue_add,
-brain_queue_cancel, brain_queue_bump, brain_stats. `queue next` and `queue finish` are not exposed:
+brain_queue_cancel, brain_queue_bump, brain_queue_route, brain_stats. `queue next` and `queue finish` are not exposed:
 only the drainer (bin/test-phase) claims and finishes jobs.
 
 A body goes to brain on stdin (--body-file -), never on the command line.
@@ -165,6 +165,13 @@ def t_queue_bump(a):
     return ["queue", "bump", need_int(a, "id")], None
 
 
+def t_queue_route(a):
+    to = need_str(a, "to")
+    if to not in ("remote", "local", "any"):
+        raise Bad("to must be remote, local or any")
+    return ["queue", "route", need_int(a, "id"), "--to=" + to], None
+
+
 def t_stats(a):
     return ["stats", "--json"], None
 
@@ -192,6 +199,9 @@ TOOLS = [
      schema({"id": I("job id")}, ["id"])),
     ("brain_queue_bump", "Move a queued job, and the jobs chained after it, ahead of the rest.", t_queue_bump,
      schema({"id": I("job id")}, ["id"])),
+    ("brain_queue_route", "Choose which lanes may run a queued job: remote (only a remote host such as the VM), "
+     "local (only this machine) or any.", t_queue_route,
+     schema({"id": I("job id"), "to": S("remote, local or any")}, ["id", "to"])),
     ("brain_stats", "Run counts, flaky rate and durations as JSON.", t_stats, schema({})),
 ]
 BY_NAME = {n: f for n, _, f, _ in TOOLS}
@@ -323,7 +333,7 @@ def self_test():
                 fails.append("ping must return {}")
             names = {t["name"] for t in rpc("tools/list").get("result", {}).get("tools", [])}
             want = {"brain_list", "brain_show", "brain_add", "brain_close", "brain_queue_list", "brain_queue_add",
-                    "brain_queue_cancel", "brain_queue_bump", "brain_stats"}
+                    "brain_queue_cancel", "brain_queue_bump", "brain_queue_route", "brain_stats"}
             if names != want:
                 fails.append(f"tools/list: missing {sorted(want - names)} extra {sorted(names - want)}")
             err, text = call("brain_add", project="demo", kind="question", ref="q1", title="a title",
@@ -360,6 +370,13 @@ def self_test():
                     fails.append(f"brain_queue_add must refuse {bad}: {text!r}")
             if "--args" in open(argv_log).read():
                 fails.append("brain_queue_add must never pass --args")
+            err, text = call("brain_queue_route", id=1, to="remote")
+            if err or "platform=remote" not in text:
+                fails.append(f"brain_queue_route must send a queued job to a remote lane: {err} {text!r}")
+            for bad in ({"id": 1, "to": "vm"}, {"id": 1, "to": "--help"}, {"id": 1}):
+                err, text = call("brain_queue_route", **bad)
+                if not err:
+                    fails.append(f"brain_queue_route must refuse {bad}: {text!r}")
             err, text = call("brain_queue_list")
             if err or "tests/A.csproj" not in text:
                 fails.append(f"brain_queue_list must show the job: {err} {text!r}")

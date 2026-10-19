@@ -18,6 +18,8 @@
             or -macos; a remote lane never claims an apple job
   brain queue list [--cycle C] [--status S]
   brain queue cancel ID                    a queued job; jobs waiting on it are cancelled too
+  brain queue route ID --to remote|local|any   remote: only a remote lane claims it; local: only this
+            machine (platform=apple); any: whichever lane is free
   brain queue next [--peek] [--where local|remote] [--host NAME]   (what test-phase uses to drain)
   brain queue finish ID --status done|failed | requeue ID --reason R   (requeue puts a running job back)
   brain resume [--project P] [--max N]
@@ -560,7 +562,7 @@ def cmd_queue(a):
     if a.qcmd == "next":  # claims the oldest ready job; prints it as one line of JSON, or nothing
         con.isolation_level = None
         con.execute("BEGIN IMMEDIATE")
-        skip = " AND j.platform != 'apple'" if a.where == "remote" else ""
+        skip = " AND j.platform != 'apple'" if a.where == "remote" else " AND j.platform != 'remote'"
         r = con.execute(
             "SELECT j.* FROM jobs j WHERE j.status='queued' AND (j.after_id IS NULL OR "
             "(SELECT status FROM jobs d WHERE d.id=j.after_id)='done')" + skip
@@ -574,6 +576,20 @@ def cmd_queue(a):
             if not a.peek:
                 row["host"] = a.host
             print(json.dumps(row))
+        return 0
+    if a.qcmd == "route":  # which lanes may claim a queued job
+        with con:
+            r = con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()
+            if not r:
+                sys.exit(f"brain: no job #{a.id}")
+            if r["status"] != "queued":
+                sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be routed")
+            con.execute("UPDATE jobs SET platform=? WHERE id=?",
+                        ({"remote": "remote", "local": "apple", "any": ""}[a.to], a.id))
+        if a.to == "remote" and detect_platform(r["repo_dir"], r["test_project"]) == "apple":
+            print(f"brain: job #{a.id} may need an Apple platform; it can fail to build on a remote host",
+                  file=sys.stderr)
+        print(job_line(con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()))
         return 0
     if a.qcmd == "requeue":  # a running job goes back to the queue, for a lane problem
         with con:
@@ -824,6 +840,9 @@ def parser():
     q.add_argument("--peek", action="store_true")
     q.add_argument("--where", choices=("local", "remote"), default="local")
     q.add_argument("--host", default="")
+    q = qs.add_parser("route")
+    q.add_argument("id", type=int)
+    q.add_argument("--to", choices=("remote", "local", "any"), required=True)
     q = qs.add_parser("requeue")
     q.add_argument("id", type=int)
     q.add_argument("--reason", required=True)
@@ -1128,6 +1147,31 @@ def self_test():
                           ("Two", "apple"), ("Plain.Tests/Plain.Tests.csproj", "")):
             if detect_platform(rp, rel) != want:
                 fails.append(f"detect_platform({rel}) must be {want!r}")
+        # route: send a queued job to a remote lane, back to the Mac, or to whichever lane is free.
+        ra = run("queue", "add", rp, "Apple.Tests")[1]
+        rc, out, err = run("queue", "route", ra, "--to", "remote")
+        if rc != 0 or f"job #{ra} queued" not in out or "platform=remote" not in out or "Apple" not in err:
+            fails.append(f"route --to remote must mark the job and warn about an apple project: {rc} {out!r} {err!r}")
+        if nxt("--where", "local", "--peek") is not None:
+            fails.append("the local lane must not claim a job routed to a remote lane")
+        rb = run("queue", "add", rp, "Plain.Tests", "--after", ra)[1]
+        rc, out, _ = run("queue", "route", rb, "--to", "local")
+        if rc != 0 or "platform=apple" not in out:
+            fails.append(f"route --to local must mark the job apple: {rc} {out!r}")
+        if nxt("--where", "remote", "--peek") is None or nxt("--where", "remote", "--peek")["id"] != int(ra):
+            fails.append("a remote lane must see a job routed to it")
+        rc, out, err = run("queue", "route", ra, "--to", "any")
+        if rc != 0 or "platform=" in out or err:
+            fails.append(f"route --to any must clear the platform without a warning: {rc} {out!r} {err!r}")
+        got = nxt("--where", "local")
+        if not got or got["id"] != int(ra):
+            fails.append(f"the local lane must claim a job routed to any: {got}")
+        if run("queue", "route", ra, "--to", "remote")[0] == 0:
+            fails.append("route of a running job must fail")
+        if run("queue", "route", "99999", "--to", "remote")[0] == 0:
+            fails.append("route of a missing job must fail")
+        run("queue", "finish", ra, "--status", "done")
+        run("queue", "cancel", rb)
         run("queue", "finish", pp, "--status", "done")
         if run("queue", "requeue", pp, "--reason", "x")[0] == 0:
             fails.append("requeue of a done job must fail")

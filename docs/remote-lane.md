@@ -62,6 +62,8 @@ The copy is the files `git ls-files` lists (tracked and untracked, not ignored) 
 
 A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
 
+To choose for a job already queued, use `brain queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs queued before the upgrade to schema 7 are all marked `platform=apple`, so route the ones you want on a remote host. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
+
 ## Lane problems
 
 If ssh, the copy or docker fails before the test command starts, the job goes back to queued (`brain queue requeue`), no failure is filed, and that lane rests for `TEST_PHASE_REST` seconds (default 600). The local lane, or another host, picks the job up. The rest ends early once no lane is working. If the connection drops during a class rerun, the unfinished classes are marked unverified and the lane rests.
@@ -76,7 +78,7 @@ Run one `test-phase` per host list. The sweep assumes every running job it sees 
 
 ## Reading the output
 
-`brain queue list` shows `on=<host>` for a running remote job and `platform=apple` for pinned jobs. Run rows carry the host. The summary table has a host column only when more than one lane exists.
+`brain queue list` shows `on=<host>` for a running remote job and `platform=apple` or `platform=remote` for routed jobs. Run rows carry the host. The summary table has a host column only when more than one lane exists.
 
 ## Rollout
 

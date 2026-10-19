@@ -674,12 +674,23 @@ def main(argv):
     if not rows:
         if runs:
             print("test-phase: nothing queued")
+        say_waiting_remote()
         return 1 if cancelled else 0
     print()
     print(table(rows, len(lanes) > 1))
     print(f"\ntest-phase: {len(rows)} jobs, {sum(r['real'] for r in rows)} real, "
           f"{sum(r['flaky'] for r in rows)} flaky, {cancelled} cancelled. `brain list --open` has the entries.")
+    say_waiting_remote()
     return 1 if cancelled or any(is_bad(r) for r in rows) else 0
+
+
+def say_waiting_remote():
+    """Name the queued jobs only a remote lane may claim, so one left behind is not a silent wait."""
+    ids = re.findall(r"^job #(\d+) queued .*platform=remote", brain(["queue", "list", "--status", "queued"]) or "",
+                     re.M)
+    if ids:
+        print(f"test-phase: {len(ids)} job{'s wait' if len(ids) > 1 else ' waits'} for a remote lane ("
+              + " ".join(f"#{i}" for i in ids) + "); `brain queue route ID --to any` lets this machine take one")
 
 
 def self_test():
@@ -992,6 +1003,15 @@ echo "Passed!  - Failed: 0"; exit 0
         rc, out, calls = drain()
         if rc != 0 or calls or "nothing queued" not in out:
             fails.append(f"an empty queue should be a quiet 0 ({rc}): {out} {calls}")
+
+        # A job routed to a remote lane, with no remote lane: the Mac leaves it queued and says so.
+        jr = qadd(repo_v, "tests/T/R.csproj", "--cycle", "qr")
+        subprocess.run([sys.executable, BRAIN, "queue", "route", jr, "--to", "remote"], env=env, capture_output=True)
+        rc, out, calls = drain()
+        if rc != 0 or calls or "1 job waits for a remote lane" not in out \
+                or f"job #{jr} queued" not in qlist("--cycle", "qr"):
+            fails.append(f"a job routed to a remote lane must wait, named in the output ({rc}): {out} {calls}")
+        subprocess.run([sys.executable, BRAIN, "queue", "cancel", jr], env=env, capture_output=True)
 
         # Only one drainer: while one holds the lock, a second exits 0 and leaves the job queued.
         import fcntl
