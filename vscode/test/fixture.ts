@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import initSqlJs, { Database } from "sql.js";
 
-// Copied from bin/brain (migrate_2 to migrate_5, and the meta table). schema.test.ts keeps it honest.
+// Copied from bin/brain (migrate_2 to migrate_5, and the meta table; LATER has migrate_6 and migrate_7). schema.test.ts keeps it honest.
 export const SCHEMA = [
   `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE runs (
@@ -40,6 +40,13 @@ export const SCHEMA = [
         started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '')`,
 ];
 
+export const LATER = [
+  `ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE jobs ADD COLUMN platform TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE jobs ADD COLUMN host TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE runs ADD COLUMN host TEXT NOT NULL DEFAULT ''`,
+];
+
 export const NOW = Date.UTC(2026, 9, 19, 12, 0, 0) / 1000;
 export const iso = (secondsAgo: number) => new Date((NOW - secondsAgo) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
 const DAY = 86400;
@@ -49,11 +56,12 @@ export async function sqlJs() {
   return initSqlJs({ wasmBinary: wasm as unknown as ArrayBuffer });
 }
 
-export async function emptyDb(): Promise<Database> {
+/** schema 7 by default; 5 gives a database from before platform and host. */
+export async function emptyDb(version: 5 | 7 = 7): Promise<Database> {
   const SQL = await sqlJs();
   const db = new SQL.Database();
-  for (const s of SCHEMA) db.run(s);
-  db.run(`INSERT INTO meta VALUES ('schema_version','5')`);
+  for (const s of version === 7 ? [...SCHEMA, ...LATER] : SCHEMA) db.run(s);
+  db.run(`INSERT INTO meta VALUES ('schema_version','${version}')`);
   return db;
 }
 

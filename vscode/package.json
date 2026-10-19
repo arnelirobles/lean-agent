@@ -71,6 +71,20 @@
         "command": "leanBrain.sendToClaude",
         "title": "Send to Claude",
         "icon": "$(rocket)"
+      },
+      {
+        "command": "leanBrain.sendToRemote",
+        "title": "Send to a remote lane",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "leanBrain.keepLocal",
+        "title": "Run on this machine only",
+        "icon": "$(device-desktop)"
+      },
+      {
+        "command": "leanBrain.anyLane",
+        "title": "Run on any lane"
       }
     ],
     "viewsContainers": {
@@ -147,6 +161,31 @@
           "command": "leanBrain.copyRef",
           "when": "view == leanBrain.items && viewItem =~ /^item/",
           "group": "2_copy"
+        },
+        {
+          "command": "leanBrain.sendToRemote",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple)$/",
+          "group": "inline"
+        },
+        {
+          "command": "leanBrain.keepLocal",
+          "when": "view == leanBrain.queue && viewItem == job.queued.remote",
+          "group": "inline"
+        },
+        {
+          "command": "leanBrain.sendToRemote",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple)$/",
+          "group": "0_route"
+        },
+        {
+          "command": "leanBrain.keepLocal",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|remote)$/",
+          "group": "0_route"
+        },
+        {
+          "command": "leanBrain.anyLane",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(apple|remote)$/",
+          "group": "0_route"
         }
       ],
       "commandPalette": [
@@ -176,6 +215,18 @@
         },
         {
           "command": "leanBrain.sendToClaude",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.sendToRemote",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.keepLocal",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.anyLane",
           "when": "false"
         }
       ]

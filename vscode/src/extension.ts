@@ -115,6 +115,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     vscode.commands.registerCommand("leanBrain.closeFixed", (arg) => change(arg, "close-fixed")),
     vscode.commands.registerCommand("leanBrain.closeNotABug", (arg) => change(arg, "close-notabug")),
     vscode.commands.registerCommand("leanBrain.reopen", (arg) => change(arg, "reopen")),
+    vscode.commands.registerCommand("leanBrain.sendToRemote", (arg) => route(arg, "remote")),
+    vscode.commands.registerCommand("leanBrain.keepLocal", (arg) => route(arg, "local")),
+    vscode.commands.registerCommand("leanBrain.anyLane", (arg) => route(arg, "any")),
     vscode.commands.registerCommand("leanBrain.showResume", async () => {
       const brain = findOrWarn();
       if (!brain) return;
@@ -158,6 +161,18 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const args = action === "reopen" ? cli.reopenArgs(it.id) : cli.closeArgs(it.id, action === "close-fixed" ? "fixed" : "not-a-bug");
     const r = await cli.runBrain(brain, args, dbPath(), folder);
     if (!r.ok) void vscode.window.showErrorMessage(`brain: ${r.stderr.trim()}`);
+    await refresh();
+  }
+
+  /** Set which lanes may run a queued job. Reversible, so no confirmation; brain's warning shows as a warning. */
+  async function route(arg: unknown, to: "remote" | "local" | "any"): Promise<void> {
+    const id = (arg as { t?: string; job?: { id?: unknown } } | undefined)?.job?.id;
+    if (typeof id !== "number") return;
+    const brain = findOrWarn();
+    if (!brain) return;
+    const r = await cli.runBrain(brain, cli.routeArgs(id, to), dbPath(), folder);
+    if (!r.ok) void vscode.window.showErrorMessage(`brain: ${r.stderr.trim()}`);
+    else if (r.stderr.trim()) void vscode.window.showWarningMessage(r.stderr.trim());
     await refresh();
   }
 

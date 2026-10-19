@@ -41,12 +41,14 @@ export class QueueTree implements vscode.TreeDataProvider<Node> {
     const now = Math.floor(Date.now() / 1000);
     const el = db.jobElapsed(j, now);
     const ti = new vscode.TreeItem(`#${j.id} ${db.shortTestName(j.test_project)}`, vscode.TreeItemCollapsibleState.None);
-    const parts = [j.status === "queued" ? "" : j.status, j.cycle, j.project];
+    const parts = [j.status === "queued" ? "" : j.status, j.cycle, j.project, db.laneLabel(j),
+      j.status === "running" && j.host ? `on ${j.host}` : ""];
     if (el != null) parts.push(db.formatDuration(el));
     else if (j.status === "queued") parts.push("waiting " + db.relativeTime(j.enqueued_at, now).replace(" ago", ""));
     ti.description = parts.filter(Boolean).join(" | ");
     ti.tooltip = j.reason ? `${j.status}: ${j.reason}` : j.status;
     ti.iconPath = themeIcon(jobLook(j.status));
+    ti.contextValue = db.jobContext(j);
     return ti;
   }
 }

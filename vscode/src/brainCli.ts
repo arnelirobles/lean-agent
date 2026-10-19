@@ -79,3 +79,8 @@ export function reopenArgs(id: number): string[] {
 export function resumeArgs(project?: string): string[] {
   return project ? ["resume", "--project", project] : ["resume"];
 }
+
+/** Which lanes may claim a queued job: remote only, this machine only, or any. */
+export function routeArgs(id: number, to: "remote" | "local" | "any"): string[] {
+  return ["queue", "route", String(id), "--to", to];
+}

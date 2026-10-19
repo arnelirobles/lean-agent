@@ -11,6 +11,10 @@ export interface ItemFull extends ItemRow {
 export interface JobRow {
   id: number; cycle: string; project: string; test_project: string; status: string; tier: string;
   enqueued_at: string; started_at: string | null; ended_at: string | null; reason: string;
+  /** remote: only a remote lane; apple: only this machine; empty: any lane. Both empty before schema 7. */
+  platform: string; host: string;
+  /** False on a database from before schema 7, where a job cannot be routed. */
+  routable: boolean;
 }
 export interface Counts { real: number; flaky: number }
 export interface QueueData { running: JobRow[]; queued: JobRow[]; finished: JobRow[] }
