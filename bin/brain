@@ -163,6 +163,8 @@ def migrate_7(con):  # which platform a job needs, and which host ran a job or a
     con.execute("ALTER TABLE jobs ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
     con.execute("ALTER TABLE jobs ADD COLUMN host TEXT NOT NULL DEFAULT ''")
     con.execute("ALTER TABLE runs ADD COLUMN host TEXT NOT NULL DEFAULT ''")
+    # Platform was not detected before this step; unknown means local only.
+    con.execute("UPDATE jobs SET platform='apple' WHERE status IN ('queued','running')")
 
 
 MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7]
@@ -432,23 +434,58 @@ def job_line(r):
 
 
 APPLE_TFM = re.compile(r"-(maccatalyst|ios|macos)", re.I)
+TFM_ELEMENT = re.compile(r"<TargetFrameworks?(?:\s[^>]*)?>(.*?)</TargetFrameworks?\s*>", re.S | re.I)
+USE_MAUI = re.compile(r"<UseMaui(?:\s[^>]*)?>\s*true\s*</UseMaui\s*>", re.I)
+PROJECT_REF = re.compile(r"<ProjectReference\s[^>]*?Include\s*=\s*[\"']([^\"']+)[\"']", re.I)
+
+
+def _apple_text(text):
+    return any(APPLE_TFM.search(m.group(1)) for m in TFM_ELEMENT.finditer(text)) or bool(USE_MAUI.search(text))
 
 
 def detect_platform(repo, test_project):
-    """'apple' when the test project targets an Apple platform, else ''. Unreadable gives ''."""
+    """'apple' when the job may need an Apple platform, else ''.
+
+    Conservative: the project file, Directory.Build.props from its folder up to the repo root, and every
+    project it references (transitively) are checked. A project that cannot be found or read, or a folder
+    with more than one csproj, gives 'apple' too: unknown means local only."""
     path = os.path.join(repo, test_project)
     try:
         if os.path.isdir(path):
             found = [f for f in os.listdir(path) if f.endswith(".csproj")]
             if len(found) != 1:
-                return ""
+                return "apple"
             path = os.path.join(path, found[0])
-        text = open(path, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return ""
-    for m in re.finditer(r"<TargetFrameworks?>(.*?)</TargetFrameworks?>", text, re.S):
-        if APPLE_TFM.search(m.group(1)):
-            return "apple"
+        path = os.path.abspath(path)
+        seen = set()
+        todo = [path]
+        props_done = set()
+        root = os.path.abspath(repo)
+        while todo:
+            cur = todo.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            text = open(cur, encoding="utf-8", errors="replace").read()
+            if _apple_text(text):
+                return "apple"
+            folder = os.path.dirname(cur)
+            while True:
+                props = os.path.join(folder, "Directory.Build.props")
+                if props not in props_done:
+                    props_done.add(props)
+                    if os.path.isfile(props):
+                        if _apple_text(open(props, encoding="utf-8", errors="replace").read()):
+                            return "apple"
+                if folder == root or os.path.dirname(folder) == folder:
+                    break
+                if not (folder + os.sep).startswith(root + os.sep):
+                    break
+                folder = os.path.dirname(folder)
+            for ref in PROJECT_REF.findall(text):
+                todo.append(os.path.abspath(os.path.join(os.path.dirname(cur), ref.replace("\\", "/"))))
+    except (OSError, ValueError):
+        return "apple"
     return ""
 
 
@@ -1066,6 +1103,31 @@ def self_test():
         got = nxt("--where", "remote", "--host", "dev")
         if not got or str(got["id"]) != pp or got["host"] != "dev":
             fails.append(f"a remote lane must claim a plain job and store its host: {got}")
+        # detect_platform is conservative: Apple signals anywhere in the build chain, or anything unknown.
+        def mk(rel, body):
+            full = os.path.join(rp, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as f:
+                f.write(body)
+        net = "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"
+        mk("Cond/Cond.csproj", '<Project><PropertyGroup><TargetFrameworks Condition="\'$(OS)\' == \'OSX\'">'
+                               "net10.0-maccatalyst</TargetFrameworks></PropertyGroup></Project>")
+        mk("Ref/Ref.csproj", '<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>'
+                             '<ItemGroup><ProjectReference Include="..\\Lib\\Lib.csproj" /></ItemGroup></Project>')
+        mk("Lib/Lib.csproj", '<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>'
+                             '<ItemGroup><ProjectReference Include="../Mid/Mid.csproj" /></ItemGroup></Project>')
+        mk("Mid/Mid.csproj", '<Project><PropertyGroup><UseMaui>true</UseMaui></PropertyGroup>'
+                             '<ItemGroup><ProjectReference Include="../Ref/Ref.csproj" /></ItemGroup></Project>')
+        mk("Props/Sub/Sub.csproj", net)
+        mk("Props/Directory.Build.props", "<Project><PropertyGroup><TargetFrameworks>net10.0-ios"
+                                          "</TargetFrameworks></PropertyGroup></Project>")
+        mk("Two/A.csproj", net)
+        mk("Two/B.csproj", net)
+        for rel, want in (("Cond/Cond.csproj", "apple"), ("Ref/Ref.csproj", "apple"),
+                          ("Props/Sub/Sub.csproj", "apple"), ("Nope/Nope.csproj", "apple"),
+                          ("Two", "apple"), ("Plain.Tests/Plain.Tests.csproj", "")):
+            if detect_platform(rp, rel) != want:
+                fails.append(f"detect_platform({rel}) must be {want!r}")
         run("queue", "finish", pp, "--status", "done")
         if run("queue", "requeue", pp, "--reason", "x")[0] == 0:
             fails.append("requeue of a done job must fail")
