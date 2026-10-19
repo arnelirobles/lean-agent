@@ -10,13 +10,16 @@
   brain reopen ID
   brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest]
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
-            [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N]      prints the run id
+            [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain queue add <repo-dir> <test-project> [--filter F] [--tier fast|full] [--after ID] [--cycle C]
-            [--by NAME] [--project P] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
-            extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option
+            [--by NAME] [--project P] [--platform apple|auto|none] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
+            extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
+            --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
+            or -macos; a remote lane never claims an apple job
   brain queue list [--cycle C] [--status S]
   brain queue cancel ID                    a queued job; jobs waiting on it are cancelled too
-  brain queue next [--peek] | finish ID --status done|failed   (what test-phase uses to drain)
+  brain queue next [--peek] [--where local|remote] [--host NAME]   (what test-phase uses to drain)
+  brain queue finish ID --status done|failed | requeue ID --reason R   (requeue puts a running job back)
   brain resume [--project P] [--max N]
   brain stats [--json]
   brain export [--format md|json] [--project P] [--status S]
@@ -156,7 +159,13 @@ def migrate_6(con):  # a bumped job runs before the rest of the queue
     con.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
 
-MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6]
+def migrate_7(con):  # which platform a job needs, and which host ran a job or a run
+    con.execute("ALTER TABLE jobs ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
+    con.execute("ALTER TABLE jobs ADD COLUMN host TEXT NOT NULL DEFAULT ''")
+    con.execute("ALTER TABLE runs ADD COLUMN host TEXT NOT NULL DEFAULT ''")
+
+
+MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7]
 
 
 def connect():
@@ -369,10 +378,10 @@ def cmd_run_add(a):
     with con:
         cur = con.execute(
             "INSERT INTO runs (cycle, project, repo, test_project, runner, tier, started, ended, duration_s,"
-            " lane_wait_s, load_start, load_end, passed, failed, skipped, stalled, exit_code)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " lane_wait_s, load_start, load_end, passed, failed, skipped, stalled, exit_code, host)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (a.cycle, a.project, a.repo, a.test_project, a.runner, a.tier, started, ended, ended - started,
-             a.lane_wait, a.load_start, a.load_end, a.passed, a.failed, a.skipped, a.stalled, a.exit_code))
+             a.lane_wait, a.load_start, a.load_end, a.passed, a.failed, a.skipped, a.stalled, a.exit_code, a.host))
     print(cur.lastrowid)
     return 0
 
@@ -415,7 +424,32 @@ def job_line(r):
         s += f" ({r['reason']})"
     if r["run_id"]:
         s += f" run={r['run_id']}"
+    if r["platform"]:
+        s += f" platform={r['platform']}"
+    if r["host"] and r["status"] == "running":
+        s += f" on={r['host']}"
     return s
+
+
+APPLE_TFM = re.compile(r"-(maccatalyst|ios|macos)", re.I)
+
+
+def detect_platform(repo, test_project):
+    """'apple' when the test project targets an Apple platform, else ''. Unreadable gives ''."""
+    path = os.path.join(repo, test_project)
+    try:
+        if os.path.isdir(path):
+            found = [f for f in os.listdir(path) if f.endswith(".csproj")]
+            if len(found) != 1:
+                return ""
+            path = os.path.join(path, found[0])
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return ""
+    for m in re.finditer(r"<TargetFrameworks?>(.*?)</TargetFrameworks?>", text, re.S):
+        if APPLE_TFM.search(m.group(1)):
+            return "apple"
+    return ""
 
 
 def cmd_queue(a):
@@ -442,10 +476,12 @@ def cmd_queue(a):
         with con:
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
-                " enqueued_at, status, reason, ended_at, args) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " enqueued_at, status, reason, ended_at, args, platform) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.cycle, a.project or project_of(repo), repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
-                 f"dependency #{a.after} {dep['status']}" if dead else "", now() if dead else None, a.args))
+                 f"dependency #{a.after} {dep['status']}" if dead else "", now() if dead else None, a.args,
+                 detect_platform(repo, a.test_project) if a.platform == "auto" else
+                 ("apple" if a.platform == "apple" else "")))
         print(cur.lastrowid)
         return 0
     if a.qcmd == "list":
@@ -487,14 +523,31 @@ def cmd_queue(a):
     if a.qcmd == "next":  # claims the oldest ready job; prints it as one line of JSON, or nothing
         con.isolation_level = None
         con.execute("BEGIN IMMEDIATE")
+        skip = " AND j.platform != 'apple'" if a.where == "remote" else ""
         r = con.execute(
             "SELECT j.* FROM jobs j WHERE j.status='queued' AND (j.after_id IS NULL OR "
-            "(SELECT status FROM jobs d WHERE d.id=j.after_id)='done') ORDER BY j.priority DESC, j.id LIMIT 1").fetchone()
+            "(SELECT status FROM jobs d WHERE d.id=j.after_id)='done')" + skip
+            + " ORDER BY j.priority DESC, j.id LIMIT 1").fetchone()
         if r and not a.peek:
-            con.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now(), r["id"]))
+            con.execute("UPDATE jobs SET status='running', started_at=?, host=?, reason='' WHERE id=?",
+                        (now(), a.host, r["id"]))
         con.execute("COMMIT")
         if r:
-            print(json.dumps(dict(r)))
+            row = dict(r)
+            if not a.peek:
+                row["host"] = a.host
+            print(json.dumps(row))
+        return 0
+    if a.qcmd == "requeue":  # a running job goes back to the queue, for a lane problem
+        with con:
+            r = con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()
+            if not r:
+                sys.exit(f"brain: no job #{a.id}")
+            if r["status"] != "running":
+                sys.exit(f"brain: job #{a.id} is {r['status']}, only a running job can be requeued")
+            con.execute("UPDATE jobs SET status='queued', host='', started_at=NULL, reason=? WHERE id=?",
+                        (a.reason, a.id))
+        print(job_line(con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()))
         return 0
     if a.qcmd == "finish":
         with con:
@@ -708,6 +761,7 @@ def parser():
     s.add_argument("--skipped", type=int, default=0)
     s.add_argument("--stalled", type=int, default=0, choices=(0, 1))
     s.add_argument("--exit-code", type=int)
+    s.add_argument("--host", default="")
     s.set_defaults(fn=cmd_run_add)
     s = sub.add_parser("queue")
     qs = s.add_subparsers(dest="qcmd", required=True)
@@ -721,6 +775,7 @@ def parser():
     q.add_argument("--by", default="")
     q.add_argument("--project", default="")
     q.add_argument("--args", default="")
+    q.add_argument("--platform", choices=("apple", "auto", "none"), default="auto")
     q = qs.add_parser("list")
     q.add_argument("--cycle")
     q.add_argument("--status", choices=JOB_STATUS)
@@ -730,6 +785,11 @@ def parser():
     q.add_argument("id", type=int)
     q = qs.add_parser("next")
     q.add_argument("--peek", action="store_true")
+    q.add_argument("--where", choices=("local", "remote"), default="local")
+    q.add_argument("--host", default="")
+    q = qs.add_parser("requeue")
+    q.add_argument("id", type=int)
+    q.add_argument("--reason", required=True)
     q = qs.add_parser("finish")
     q.add_argument("id", type=int)
     q.add_argument("--status", choices=("done", "failed"), required=True)
@@ -973,6 +1033,52 @@ def self_test():
         if f"job #{k4} queued full r E.csproj" not in out or "queued or running" not in out:
             fails.append(f"resume must list queued jobs: {out!r}")
         run("queue", "cancel", k4)
+
+        # Platform, host and requeue: what a remote lane needs from the queue.
+        rp = os.path.join(d, "plat")
+        os.makedirs(os.path.join(rp, "Apple.Tests"))
+        os.makedirs(os.path.join(rp, "Plain.Tests"))
+        with open(os.path.join(rp, "Apple.Tests", "Apple.Tests.csproj"), "w") as f:
+            f.write("<Project><PropertyGroup><TargetFrameworks>net10.0;net10.0-maccatalyst</TargetFrameworks>"
+                    "</PropertyGroup></Project>")
+        with open(os.path.join(rp, "Plain.Tests", "Plain.Tests.csproj"), "w") as f:
+            f.write("<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>")
+        pa = run("queue", "add", rp, "Apple.Tests")[1]
+        if "platform=apple" not in run("queue", "list", "--status", "queued")[1]:
+            fails.append("a test project targeting maccatalyst must queue as platform=apple")
+        if nxt("--where", "remote") is not None:
+            fails.append("a remote lane claimed an apple job")
+        got = nxt("--where", "local", "--host", "dev")
+        if not got or str(got["id"]) != pa:
+            fails.append(f"the local lane must claim an apple job: {got}")
+        if f"job #{pa} running" not in run("queue", "list", "--status", "running")[1] \
+                or "on=dev" not in run("queue", "list", "--status", "running")[1]:
+            fails.append("a running job must show its host")
+        rc, out, _ = run("queue", "requeue", pa, "--reason", "ssh failed")
+        ql = run("queue", "list", "--status", "queued")[1]
+        if rc != 0 or f"job #{pa} queued" not in ql or "ssh failed" not in ql or "on=" in ql:
+            fails.append(f"requeue must put a running job back with its reason and no host: {rc} {ql!r}")
+        run("queue", "cancel", pa)
+        pp = run("queue", "add", rp, "Plain.Tests/Plain.Tests.csproj")[1]
+        if "platform=" in [x for x in run("queue", "list", "--status", "queued")[1].splitlines()
+                           if x.startswith(f"job #{pp} ")][0]:
+            fails.append("a plain net10.0 job must not carry a platform")
+        got = nxt("--where", "remote", "--host", "dev")
+        if not got or str(got["id"]) != pp or got["host"] != "dev":
+            fails.append(f"a remote lane must claim a plain job and store its host: {got}")
+        run("queue", "finish", pp, "--status", "done")
+        if run("queue", "requeue", pp, "--reason", "x")[0] == 0:
+            fails.append("requeue of a done job must fail")
+        rc, out, _ = run("run-add", "--project", "r", "--test-project", "T", "--tier", "full", "--host", "dev")
+        import sqlite3 as sq0
+        c0 = sq0.connect(env["LEAN_BRAIN_DB"])
+        hosts = [x[0] for x in c0.execute("SELECT host FROM runs WHERE id=?", (out,))]
+        ver = c0.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        c0.close()
+        if hosts != ["dev"]:
+            fails.append(f"run-add --host must store the host: {hosts}")
+        if ver != "7":
+            fails.append(f"schema version after open: {ver}")
 
         # A worktree shares its repository's project name.
         main_repo = os.path.join(d, "mainrepo")
