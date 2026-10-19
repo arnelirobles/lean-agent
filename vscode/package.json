@@ -2,7 +2,7 @@
   "name": "lean-brain",
   "displayName": "Lean Brain",
   "description": "A read-mostly dashboard over the lean-agent brain database.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "baryodev",
   "license": "MIT",
   "private": true,
@@ -26,7 +26,8 @@
     "commands": [
       {
         "command": "leanBrain.openDashboard",
-        "title": "Lean Brain: Open dashboard"
+        "title": "Lean Brain: Open dashboard",
+        "icon": "$(graph)"
       },
       {
         "command": "leanBrain.refresh",
@@ -81,6 +82,11 @@
     },
     "menus": {
       "view/title": [
+        {
+          "command": "leanBrain.openDashboard",
+          "when": "view == leanBrain.items || view == leanBrain.queue",
+          "group": "navigation@0"
+        },
         {
           "command": "leanBrain.refresh",
           "when": "view == leanBrain.items || view == leanBrain.queue",
