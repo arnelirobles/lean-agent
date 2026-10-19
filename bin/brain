@@ -423,6 +423,16 @@ def cmd_queue(a):
         repo = os.path.abspath(a.repo_dir)
         # A job behind one that already failed or was cancelled can never run; record that at once.
         dead = dep and dep["status"] in ("failed", "cancelled")
+        if not dead:
+            # The same run already waiting: join it, so one build serves every agent that asked.
+            same = con.execute(
+                "SELECT id FROM jobs WHERE status='queued' AND repo_dir=? AND test_project=? AND filter IS ?"
+                " AND tier=? AND after_id IS ? AND args IS ? ORDER BY id LIMIT 1",
+                (repo, a.test_project, a.filter, a.tier, a.after, a.args)).fetchone()
+            if same:
+                print(f"brain: the same job is already queued as #{same['id']}; joined it", file=sys.stderr)
+                print(same["id"])
+                return 0
         with con:
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
@@ -906,6 +916,15 @@ def self_test():
             fails.append(f"a job added after a failed or cancelled job must be cancelled with the reason: {out!r}")
         if nxt("--peek") is not None:
             fails.append("a job added behind a dead dependency became ready")
+        d1 = run("queue", "add", "/tmp/r", "H.csproj", "--tier", "fast", "--filter", "X")[1]
+        rc, d2, err = run("queue", "add", "/tmp/r", "H.csproj", "--tier", "fast", "--filter", "X", "--by", "other")
+        if rc != 0 or d2 != d1 or f"#{d1}" not in err:
+            fails.append(f"a job already queued must be joined, not added again: {d1} {d2} {err!r}")
+        d3 = run("queue", "add", "/tmp/r", "H.csproj", "--tier", "fast", "--filter", "Y")[1]
+        if d3 == d1:
+            fails.append("a different filter is a different job")
+        run("queue", "cancel", d1)
+        run("queue", "cancel", d3)
         k4 = run("queue", "add", "/tmp/r", "E.csproj", "--cycle", "q2")[1]
         out = run("resume", "--project", "r")[1]
         if f"job #{k4} queued full r E.csproj" not in out or "queued or running" not in out:
