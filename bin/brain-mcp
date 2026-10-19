@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""An MCP server over stdio that lets a Claude session read and write the brain database.
+
+Newline-delimited JSON-RPC 2.0, Python 3 standard library only. Every tool runs the `brain` CLI that sits
+next to this script as a subprocess with an argument list (never a shell), so the schema and the rules
+stay in one place. A nonzero exit becomes a tool result with isError true and the stderr text.
+
+Tools: brain_list, brain_show, brain_add, brain_close, brain_queue_list, brain_queue_add,
+brain_queue_cancel, brain_queue_bump, brain_stats. `queue next` and `queue finish` are not exposed:
+only the drainer (bin/test-phase) claims and finishes jobs.
+
+A body goes to brain on stdin (--body-file -), never on the command line.
+BRAIN_MCP_ARGV_LOG=FILE appends the argv of every brain call to FILE as one JSON line (used by the
+self-test to prove a body never reaches argv). Logs go to stderr only.
+
+  brain-mcp --self-test
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+BRAIN = os.path.join(HERE, "brain")
+DEFAULT_PROTOCOL = "2025-06-18"
+
+
+def log(*a):
+    print("brain-mcp:", *a, file=sys.stderr, flush=True)
+
+
+def S(desc):
+    return {"type": "string", "description": desc}
+
+
+def I(desc):
+    return {"type": "integer", "description": desc}
+
+
+def B(desc):
+    return {"type": "boolean", "description": desc}
+
+
+def schema(props, required=()):
+    d = {"type": "object", "properties": props, "additionalProperties": False}
+    if required:
+        d["required"] = list(required)
+    return d
+
+
+class Bad(Exception):
+    pass
+
+
+def need_int(a, k):
+    v = a.get(k)
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise Bad(f"{k} must be an integer")
+    return str(v)
+
+
+def need_str(a, k):
+    v = a.get(k)
+    if not isinstance(v, str) or not v:
+        raise Bad(f"{k} is required and must be a non-empty string")
+    return v
+
+
+def opt(a, args, key, flag=None, kind=str):
+    """Append --flag value when key is present."""
+    v = a.get(key)
+    if v is None or v == "":
+        return
+    if kind is int:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise Bad(f"{key} must be an integer")
+        v = str(v)
+    elif not isinstance(v, str):
+        raise Bad(f"{key} must be a string")
+    args.extend([flag or "--" + key.replace("_", "-"), v])
+
+
+def t_list(a):
+    args = ["list"]
+    if a.get("open") is True:
+        args.append("--open")
+    for k in ("status", "project", "kind", "tag", "cycle"):
+        opt(a, args, k)
+    return args, None
+
+
+def t_show(a):
+    return ["show", need_int(a, "id")], None
+
+
+def t_add(a):
+    args = ["add", "--project", need_str(a, "project"), "--kind", need_str(a, "kind"), "--ref", need_str(a, "ref")]
+    for k in ("title", "severity", "repo", "branch", "cycle"):
+        opt(a, args, k)
+    body = a.get("body")
+    stdin = None
+    if body not in (None, ""):
+        if not isinstance(body, str):
+            raise Bad("body must be a string")
+        args.extend(["--body-file", "-"])
+        stdin = body
+    return args, stdin
+
+
+def t_close(a):
+    args = ["close", need_int(a, "id")]
+    opt(a, args, "resolution")
+    opt(a, args, "note")
+    if a.get("wontfix") is True:
+        args.append("--wontfix")
+    return args, None
+
+
+def t_queue_list(a):
+    args = ["queue", "list"]
+    opt(a, args, "status")
+    opt(a, args, "cycle")
+    return args, None
+
+
+def t_queue_add(a):
+    args = ["queue", "add", need_str(a, "repo_dir"), need_str(a, "test_project"), "--by", "mcp"]
+    for k in ("filter", "tier", "cycle"):
+        opt(a, args, k)
+    opt(a, args, "after", kind=int)
+    extra = a.get("args")
+    if extra not in (None, ""):
+        if not isinstance(extra, str):
+            raise Bad("args must be a string")
+        args.append("--args=" + extra)
+    return args, None
+
+
+def t_queue_cancel(a):
+    return ["queue", "cancel", need_int(a, "id")], None
+
+
+def t_queue_bump(a):
+    return ["queue", "bump", need_int(a, "id")], None
+
+
+def t_stats(a):
+    return ["stats", "--json"], None
+
+
+TOOLS = [
+    ("brain_list", "List brain items. Filters are optional.", t_list, schema({
+        "open": B("only open items"), "status": S("open, closed or wontfix"), "project": S("project name"),
+        "kind": S("item kind, such as test-fail or question"), "tag": S("a tag"), "cycle": S("cycle name")})),
+    ("brain_show", "Show one brain item in full.", t_show, schema({"id": I("item id")}, ["id"])),
+    ("brain_add", "Add an item, or bump the count of an open one with the same project, kind and ref.", t_add, schema({
+        "project": S("project name"), "kind": S("test-fail, flaky, minor, question, ticket, security, pending, blocker, agent"),
+        "ref": S("short key that identifies the item"), "title": S("one-line title"), "body": S("details"),
+        "severity": S("critical, important, minor or info"), "repo": S("repository"), "branch": S("branch"),
+        "cycle": S("cycle name")}, ["project", "kind", "ref"])),
+    ("brain_close", "Close an item.", t_close, schema({
+        "id": I("item id"), "resolution": S("fixed, flaky, not-a-bug, duplicate, answered or filed"),
+        "note": S("closing note"), "wontfix": B("close as wontfix")}, ["id"])),
+    ("brain_queue_list", "List test queue jobs.", t_queue_list, schema({
+        "status": S("queued, running, done, failed or cancelled"), "cycle": S("cycle name")})),
+    ("brain_queue_add", "Queue a test job. Returns the job id at once; do not wait for it.", t_queue_add, schema({
+        "repo_dir": S("repository folder"), "test_project": S("test project path"), "filter": S("test filter"),
+        "tier": S("fast or full"), "after": I("job id this one waits for"), "cycle": S("cycle name"),
+        "args": S("extra dotnet arguments for this job")}, ["repo_dir", "test_project"])),
+    ("brain_queue_cancel", "Cancel a queued job and the jobs waiting on it.", t_queue_cancel,
+     schema({"id": I("job id")}, ["id"])),
+    ("brain_queue_bump", "Move a queued job, and the jobs chained after it, ahead of the rest.", t_queue_bump,
+     schema({"id": I("job id")}, ["id"])),
+    ("brain_stats", "Run counts, flaky rate and durations as JSON.", t_stats, schema({})),
+]
+BY_NAME = {n: f for n, _, f, _ in TOOLS}
+
+
+def run_brain(args, stdin):
+    argv = [sys.executable, BRAIN, *args]
+    path = os.environ.get("BRAIN_MCP_ARGV_LOG")
+    if path:
+        with open(path, "a") as f:
+            f.write(json.dumps(argv) + "\n")
+    r = subprocess.run(argv, input=stdin, capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def result(text, err=False):
+    return {"content": [{"type": "text", "text": text}], "isError": err}
+
+
+def call_tool(name, a):
+    fn = BY_NAME.get(name)
+    if fn is None:
+        return None
+    if not isinstance(a, dict):
+        return result("arguments must be an object", True)
+    try:
+        args, stdin = fn(a)
+    except Bad as e:
+        return result(str(e), True)
+    try:
+        rc, out, err = run_brain(args, stdin)
+    except OSError as e:
+        return result(f"could not run brain: {e}", True)
+    if rc != 0:
+        return result((err.strip() or out.strip() or f"brain exited {rc}"), True)
+    return result(out.strip() or "ok")
+
+
+def handle(msg):
+    """Return a response dict, or None for a notification."""
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+    method = msg.get("method")
+    mid = msg.get("id")
+    has_id = "id" in msg
+    params = msg.get("params") or {}
+
+    def ok(res):
+        return {"jsonrpc": "2.0", "id": mid, "result": res}
+
+    def fail(code, text):
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": text}}
+
+    if not has_id:  # notification, never answered
+        return None
+    if method == "initialize":
+        return ok({"protocolVersion": params.get("protocolVersion") or DEFAULT_PROTOCOL,
+                   "capabilities": {"tools": {}}, "serverInfo": {"name": "brain", "version": "1.0.0"}})
+    if method == "ping":
+        return ok({})
+    if method == "tools/list":
+        return ok({"tools": [{"name": n, "description": d, "inputSchema": s} for n, d, _, s in TOOLS]})
+    if method == "tools/call":
+        res = call_tool(params.get("name"), params.get("arguments") or {})
+        if res is None:
+            return fail(-32602, f"unknown tool: {params.get('name')}")
+        return ok(res)
+    return fail(-32601, f"method not found: {method}")
+
+
+def serve():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
+        else:
+            try:
+                resp = handle(msg)
+            except Exception as e:  # keep the server alive
+                log("internal error:", repr(e))
+                resp = {"jsonrpc": "2.0", "id": msg.get("id") if isinstance(msg, dict) else None,
+                        "error": {"code": -32603, "message": "internal error"}}
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+
+
+def self_test():
+    fails = []
+    me = os.path.realpath(__file__)
+    secret = "hunter2"
+    with tempfile.TemporaryDirectory() as d:
+        argv_log = os.path.join(d, "argv.log")
+        env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "brain.db"), BRAIN_MCP_ARGV_LOG=argv_log)
+        env.pop("LEAN_SESSION_ID", None)
+        env.pop("LEAN_SESSION_CWD", None)
+        p = subprocess.Popen([sys.executable, me], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=env)
+        n = [0]
+
+        def rpc(method, params=None):
+            n[0] += 1
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": n[0], "method": method, "params": params or {}}) + "\n")
+            p.stdin.flush()
+            r = json.loads(p.stdout.readline())
+            if r.get("id") != n[0]:
+                fails.append(f"{method}: id mismatch {r}")
+            return r
+
+        def call(name, **a):
+            r = rpc("tools/call", {"name": name, "arguments": a})
+            res = r.get("result", {})
+            text = "".join(c.get("text", "") for c in res.get("content", []))
+            return bool(res.get("isError")), text
+
+        try:
+            r = rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t"}})
+            res = r.get("result", {})
+            if res.get("protocolVersion") != "2025-03-26" or res.get("serverInfo", {}).get("name") != "brain" \
+                    or "tools" not in res.get("capabilities", {}):
+                fails.append(f"initialize: {r}")
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+            p.stdin.flush()
+            if rpc("ping").get("result") != {}:
+                fails.append("ping must return {}")
+            names = {t["name"] for t in rpc("tools/list").get("result", {}).get("tools", [])}
+            want = {"brain_list", "brain_show", "brain_add", "brain_close", "brain_queue_list", "brain_queue_add",
+                    "brain_queue_cancel", "brain_queue_bump", "brain_stats"}
+            if names != want:
+                fails.append(f"tools/list: missing {sorted(want - names)} extra {sorted(names - want)}")
+            err, text = call("brain_add", project="demo", kind="question", ref="q1", title="a title",
+                             body=f"password is {secret}\nsecond line")
+            if err or "added" not in text:
+                fails.append(f"brain_add: {err} {text!r}")
+            err, text = call("brain_list", open=True, project="demo")
+            if err or "q1" not in text:
+                fails.append(f"brain_list must show the item: {err} {text!r}")
+            err, text = call("brain_show", id=1)
+            if err or secret not in text or "second line" not in text:
+                fails.append(f"brain_show must return the stdin body: {err} {text!r}")
+            err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
+            if err:
+                fails.append(f"brain_queue_add: {text!r}")
+            err, text = call("brain_queue_list")
+            if err or "tests/A.csproj" not in text:
+                fails.append(f"brain_queue_list must show the job: {err} {text!r}")
+            err, text = call("brain_stats")
+            if err or not text.lstrip().startswith(("{", "[")):
+                fails.append(f"brain_stats must return json: {err} {text!r}")
+            err, text = call("brain_show", id=99999)
+            if not err or not text:
+                fails.append(f"a bad id must be isError with text: {err} {text!r}")
+            err, text = call("brain_show", id="one")
+            if not err:
+                fails.append("a non-integer id must be isError")
+            r = rpc("tools/call", {"name": "brain_queue_next", "arguments": {}})
+            if "error" not in r:
+                fails.append("queue next must not be exposed")
+            r = rpc("nope/nothing")
+            if r.get("error", {}).get("code") != -32601:
+                fails.append(f"unknown method must be -32601: {r}")
+        except Exception as e:
+            fails.append(f"exception: {e!r}")
+        finally:
+            try:
+                p.stdin.close()
+                p.wait(timeout=10)
+            except Exception:
+                p.kill()
+        if os.path.exists(argv_log):
+            logged = open(argv_log).read()
+            if secret in logged:
+                fails.append("the body reached a brain argv")
+            if "--body-file" not in logged or '"-"' not in logged:
+                fails.append("brain_add must pass --body-file -")
+            if '"mcp"' not in logged:
+                fails.append("queue add must pass --by mcp")
+            for bad in ('"next"', '"finish"'):
+                if bad in logged:
+                    fails.append(f"argv log has {bad}")
+        else:
+            fails.append("no argv log written")
+    if fails:
+        for f in fails:
+            print("FAIL:", f)
+        return 1
+    print("brain-mcp self-test: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    serve()

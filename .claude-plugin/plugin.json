@@ -8,5 +8,10 @@
   },
   "homepage": "https://github.com/arnelirobles/lean-agent",
   "repository": "https://github.com/arnelirobles/lean-agent",
-  "license": "MIT"
+  "license": "MIT",
+  "mcpServers": {
+    "brain": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/brain-mcp"
+    }
+  }
 }
