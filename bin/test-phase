@@ -122,9 +122,10 @@ class Dotnet:
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
             cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
-            # --filter-class matches the full class name; the fast tier takes a fragment, hence the wildcards.
+            # --filter-class matches the full class name. The fast tier takes a fragment, and so does a
+            # name with no namespace in any tier, hence the wildcards. A rerun passes full names.
             for c in cls:
-                cmd += ["--filter-class", f"*{c}*" if fast else c]
+                cmd += ["--filter-class", f"*{c}*" if fast or "." not in c else c]
             return cmd + ["--output", "Detailed"]
         cmd = ["dotnet", "test", project] + list(extra) + ["--logger", "console;verbosity=normal"]
         if cls:
@@ -700,6 +701,11 @@ def self_test():
     if got != ["dotnet", "test", "--project", "T.csproj", "--", "--filter-class", "*ATests*",
                "--filter-class", "*BTests*", "--output", "Detailed"]:
         fails.append(f"mtp must pass one --filter-class per class: {got}")
+    # A full tier filter without a namespace still finds the class; a full name is passed as it is.
+    got = Dotnet.command("mtp", "T.csproj", "ATests|Acme.BTests")
+    if got != ["dotnet", "test", "--project", "T.csproj", "--", "--filter-class", "*ATests*",
+               "--filter-class", "Acme.BTests", "--output", "Detailed"]:
+        fails.append(f"mtp full tier must wildcard a bare class name: {got}")
     try:
         Dotnet.command("mtp", "T.csproj", "A| --help")
         fails.append("a filter piece starting with - must be refused")
