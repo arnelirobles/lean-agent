@@ -30,7 +30,7 @@ const routeBtn = (j: JobRow, to: "remote" | "local" | "any", icon: string, label
 /** The buttons the sidebar shows for the same job: send to a remote lane, or let any lane take it. */
 function routeButtons(j: JobRow): string {
   if (!j.routable) return "";
-  return j.platform === "remote" ? routeBtn(j, "any", "desktop", "Any lane") : routeBtn(j, "remote", "cloud-upload", "Send to remote");
+  return j.platform === "remote" ? routeBtn(j, "any", "device-desktop", "Any lane") : routeBtn(j, "remote", "cloud-upload", "Send to remote");
 }
 
 function lanesSection(d: DashboardData): string {
@@ -43,7 +43,7 @@ function lanesSection(d: DashboardData): string {
         ` <span class="muted">${esc(j.project)}${secs === null ? "" : `, ${esc(formatDuration(secs))}`}</span></div>` +
         `<div class="lane-live" data-lane-live="${esc(j.id)}"></div>`
       : `<div class="lane-job muted">${l.canTake ? "waiting for its next job" : "nothing it may take"}</div>`;
-    return `<div class="lane t-${l.remote ? "purple" : "blue"}"><div class="lane-head"><span class="ico">${ic(l.remote ? "cloud" : "desktop")}</span>` +
+    return `<div class="lane t-${l.remote ? "purple" : "blue"}"><div class="lane-head"><span class="ico">${ic(l.remote ? "cloud" : "device-desktop")}</span>` +
       `<div class="grow"><b>${esc(l.name)}</b><span class="muted">${esc(l.remote ? [l.host !== l.name ? l.host : "", l.spec].filter(Boolean).join(", ") || "remote" : "local")}</span></div>${state}</div>` +
       now +
       `<div class="counts">${pill(`${l.canTake} it may take`, "blue", "list-ordered")}` +
@@ -60,7 +60,7 @@ function queueSection(d: DashboardData): string {
   const running = q.running.map((j) => {
     const secs = jobElapsed(j, d.generatedAt);
     return `<tr><td class="num">#${esc(j.id)}</td>${suite(j)}` +
-      `<td>${j.host ? pill(`on ${j.host}`, "purple", "cloud") : pill("this machine", "blue", "desktop")}</td>` +
+      `<td>${j.host ? pill(`on ${j.host}`, "purple", "cloud") : pill("this machine", "blue", "device-desktop")}</td>` +
       `<td class="num">${secs === null ? "" : esc(formatDuration(secs))}</td></tr>` +
       `<tr class="live-row"><td colspan="5"><div class="live" data-live="${esc(j.id)}" data-median="${esc(median(j) ?? "")}">` +
       `<span class="muted">${ic("sync~spin")}reading the log</span></div></td></tr>`;
@@ -68,7 +68,7 @@ function queueSection(d: DashboardData): string {
   const queued = q.queued.map((j) => {
     const lane = laneLabel(j);
     return `<tr><td class="num">#${esc(j.id)}</td>${suite(j)}` +
-      `<td>${lane ? pill(lane, j.platform === "remote" ? "purple" : "blue", j.platform === "remote" ? "cloud" : "desktop") : `<span class="muted">any lane</span>`}</td>` +
+      `<td>${lane ? pill(lane, j.platform === "remote" ? "purple" : "blue", j.platform === "remote" ? "cloud" : "device-desktop") : `<span class="muted">any lane</span>`}</td>` +
       `<td>${routeButtons(j)}</td></tr>`;
   }).join("");
   return lanesSection(d) + (q.running.length ? sec("Running", "sync~spin", "green", "where each job runs") +

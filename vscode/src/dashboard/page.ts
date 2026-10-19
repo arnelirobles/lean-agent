@@ -155,6 +155,8 @@ export const STYLE = `
   .lane-head b { display: block; font-size: 15px; }
   .lane-head .muted { font-size: 12px; }
   .lane-live { display: grid; gap: 6px; }
+  .lanes > .lane, .lane > * { min-width: 0; }
+  .last { overflow-wrap: anywhere; }
   .lane-live:empty { display: none; }
   tr.live-row td { border-top: none; padding-top: 0; }
   .answer textarea:focus { outline: none; border-color: var(--leaf); }
@@ -196,7 +198,7 @@ export const SCRIPT = `
         (j.skipped ? pill(j.skipped + ' skipped', 'gray', 'debug-step-over') : '') +
         (!j.passed && !j.failed && !j.skipped ? pill('building or starting', 'blue', 'tools') : '') +
         (j.quietFor != null && j.quietFor > 120 ? pill('log quiet for ' + dur(j.quietFor), 'orange', 'warning') : pill('log active', 'green', 'pulse')) +
-        (j.lastTest ? '<span class="muted">last: ' + h(j.lastTest) + '</span>' : '');
+        (j.lastTest ? '<span class="muted last">last: ' + h(j.lastTest) + '</span>' : '');
       el.innerHTML = bar + '<div class="counts">' + counts + '</div>' + (j.tail.length ? '<pre>' + h(j.tail.join('\\n')) + '</pre>' : '');
       // The lane card gets the bar and the counts, without the log tail.
       if (lane) lane.innerHTML = bar + '<div class="counts">' + counts + '</div>';
