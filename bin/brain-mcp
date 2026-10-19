@@ -64,6 +64,13 @@ def need_str(a, k):
     v = a.get(k)
     if not isinstance(v, str) or not v:
         raise Bad(f"{k} is required and must be a non-empty string")
+    return no_dash(k, v)
+
+
+def no_dash(k, v):
+    # A value that starts with a dash would be read by brain as an option, not as the value.
+    if v.startswith("-"):
+        raise Bad(f"{k} must not start with -")
     return v
 
 
@@ -78,6 +85,8 @@ def opt(a, args, key, flag=None, kind=str):
         v = str(v)
     elif not isinstance(v, str):
         raise Bad(f"{key} must be a string")
+    else:
+        no_dash(key, v)
     args.extend([flag or "--" + key.replace("_", "-"), v])
 
 
@@ -129,11 +138,9 @@ def t_queue_add(a):
     for k in ("filter", "tier", "cycle"):
         opt(a, args, k)
     opt(a, args, "after", kind=int)
-    extra = a.get("args")
-    if extra not in (None, ""):
-        if not isinstance(extra, str):
-            raise Bad("args must be a string")
-        args.append("--args=" + extra)
+    # No extra dotnet arguments here: they run on the drainer's machine, so they stay a shell-only choice.
+    if not os.path.isdir(args[2]):
+        raise Bad("repo_dir must be an existing folder")
     return args, None
 
 
@@ -166,8 +173,8 @@ TOOLS = [
         "status": S("queued, running, done, failed or cancelled"), "cycle": S("cycle name")})),
     ("brain_queue_add", "Queue a test job. Returns the job id at once; do not wait for it.", t_queue_add, schema({
         "repo_dir": S("repository folder"), "test_project": S("test project path"), "filter": S("test filter"),
-        "tier": S("fast or full"), "after": I("job id this one waits for"), "cycle": S("cycle name"),
-        "args": S("extra dotnet arguments for this job")}, ["repo_dir", "test_project"])),
+        "tier": S("fast or full"), "after": I("job id this one waits for"), "cycle": S("cycle name")},
+        ["repo_dir", "test_project"])),
     ("brain_queue_cancel", "Cancel a queued job and the jobs waiting on it.", t_queue_cancel,
      schema({"id": I("job id")}, ["id"])),
     ("brain_queue_bump", "Move a queued job, and the jobs chained after it, ahead of the rest.", t_queue_bump,
@@ -319,6 +326,14 @@ def self_test():
             err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
             if err:
                 fails.append(f"brain_queue_add: {text!r}")
+            for bad in ({"repo_dir": d, "test_project": "--help"}, {"repo_dir": d, "test_project": "t", "filter": "-x"},
+                        {"repo_dir": os.path.join(d, "nope"), "test_project": "t"},
+                        {"repo_dir": d, "test_project": "t", "args": "-p:X=1"}):
+                err, text = call("brain_queue_add", **bad)
+                if not err and "args" not in bad:
+                    fails.append(f"brain_queue_add must refuse {bad}: {text!r}")
+            if "--args" in open(argv_log).read():
+                fails.append("brain_queue_add must never pass --args")
             err, text = call("brain_queue_list")
             if err or "tests/A.csproj" not in text:
                 fails.append(f"brain_queue_list must show the job: {err} {text!r}")
