@@ -6,60 +6,146 @@
   "publisher": "baryodev",
   "license": "MIT",
   "private": true,
-  "repository": { "type": "git", "url": "https://github.com/arnelirobles/lean-agent.git", "directory": "vscode" },
-  "engines": { "vscode": "^1.90.0" },
-  "categories": ["Other"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arnelirobles/lean-agent.git",
+    "directory": "vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "main": "./out/extension.js",
   "icon": "media/icon.png",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
-      { "command": "leanBrain.openDashboard", "title": "Lean Brain: Open dashboard" },
-      { "command": "leanBrain.refresh", "title": "Lean Brain: Refresh", "icon": "$(refresh)" },
-      { "command": "leanBrain.showResume", "title": "Lean Brain: Show resume digest" },
-      { "command": "leanBrain.showItem", "title": "Lean Brain: Show item" },
-      { "command": "leanBrain.closeFixed", "title": "Close as fixed" },
-      { "command": "leanBrain.closeNotABug", "title": "Close as not a bug" },
-      { "command": "leanBrain.reopen", "title": "Reopen" },
-      { "command": "leanBrain.copyRef", "title": "Copy ref" }
+      {
+        "command": "leanBrain.openDashboard",
+        "title": "Lean Brain: Open dashboard"
+      },
+      {
+        "command": "leanBrain.refresh",
+        "title": "Lean Brain: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "leanBrain.showResume",
+        "title": "Lean Brain: Show resume digest"
+      },
+      {
+        "command": "leanBrain.showItem",
+        "title": "Lean Brain: Show item"
+      },
+      {
+        "command": "leanBrain.closeFixed",
+        "title": "Close as fixed"
+      },
+      {
+        "command": "leanBrain.closeNotABug",
+        "title": "Close as not a bug"
+      },
+      {
+        "command": "leanBrain.reopen",
+        "title": "Reopen"
+      },
+      {
+        "command": "leanBrain.copyRef",
+        "title": "Copy ref"
+      }
     ],
     "viewsContainers": {
-      "activitybar": [ { "id": "leanBrain", "title": "Lean Brain", "icon": "media/brain.svg" } ]
+      "activitybar": [
+        {
+          "id": "leanBrain",
+          "title": "Lean Brain",
+          "icon": "media/brain.svg"
+        }
+      ]
     },
     "views": {
       "leanBrain": [
-        { "id": "leanBrain.items", "name": "Open items" },
-        { "id": "leanBrain.queue", "name": "Queue" }
+        {
+          "id": "leanBrain.items",
+          "name": "Open items"
+        },
+        {
+          "id": "leanBrain.queue",
+          "name": "Queue"
+        }
       ]
     },
     "menus": {
       "view/title": [
-        { "command": "leanBrain.refresh", "when": "view == leanBrain.items || view == leanBrain.queue", "group": "navigation" }
+        {
+          "command": "leanBrain.refresh",
+          "when": "view == leanBrain.items || view == leanBrain.queue",
+          "group": "navigation"
+        }
       ],
       "view/item/context": [
-        { "command": "leanBrain.closeFixed", "when": "view == leanBrain.items && viewItem == item", "group": "1_close" },
-        { "command": "leanBrain.closeNotABug", "when": "view == leanBrain.items && viewItem == item", "group": "1_close" },
-        { "command": "leanBrain.reopen", "when": "view == leanBrain.items && viewItem == item", "group": "1_close" },
-        { "command": "leanBrain.copyRef", "when": "view == leanBrain.items && viewItem == item", "group": "2_copy" }
+        {
+          "command": "leanBrain.closeFixed",
+          "when": "view == leanBrain.items && viewItem == item",
+          "group": "1_close"
+        },
+        {
+          "command": "leanBrain.closeNotABug",
+          "when": "view == leanBrain.items && viewItem == item",
+          "group": "1_close"
+        },
+        {
+          "command": "leanBrain.reopen",
+          "when": "view == leanBrain.items && viewItem == item",
+          "group": "1_close"
+        },
+        {
+          "command": "leanBrain.copyRef",
+          "when": "view == leanBrain.items && viewItem == item",
+          "group": "2_copy"
+        }
       ],
       "commandPalette": [
-        { "command": "leanBrain.showItem", "when": "false" },
-        { "command": "leanBrain.closeFixed", "when": "false" },
-        { "command": "leanBrain.closeNotABug", "when": "false" },
-        { "command": "leanBrain.reopen", "when": "false" },
-        { "command": "leanBrain.copyRef", "when": "false" }
+        {
+          "command": "leanBrain.showItem",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.closeFixed",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.closeNotABug",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.reopen",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.copyRef",
+          "when": "false"
+        }
       ]
     },
     "configuration": {
       "title": "Lean Brain",
       "properties": {
         "leanBrain.dbPath": {
-          "type": "string", "default": "",
-          "description": "Path to brain.db. Empty uses LEAN_BRAIN_DB, then ~/.local/share/lean/brain.db."
+          "type": "string",
+          "default": "",
+          "description": "Path to brain.db. Empty uses LEAN_BRAIN_DB, then ~/.local/share/lean/brain.db.",
+          "scope": "machine"
         },
         "leanBrain.brainPath": {
-          "type": "string", "default": "",
-          "description": "Path to the bin/brain script. Empty uses brain on PATH, then the newest lean-agent plugin."
+          "type": "string",
+          "default": "",
+          "description": "Path to the bin/brain script. Empty uses brain on PATH, then the newest lean-agent plugin.",
+          "scope": "machine"
         }
       }
     }
@@ -80,5 +166,15 @@
     "sql.js": "^1.12.0",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "brainPath and dbPath are read only from user settings, since a workspace could point them at another program.",
+      "restrictedConfigurations": [
+        "leanBrain.brainPath",
+        "leanBrain.dbPath"
+      ]
+    }
   }
 }

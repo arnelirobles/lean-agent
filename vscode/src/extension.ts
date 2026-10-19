@@ -11,7 +11,9 @@ import { StatusBar } from "./views/statusBar";
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   const cfg = () => vscode.workspace.getConfiguration("leanBrain");
-  const dbPath = () => cli.defaultDbPath(cfg().get<string>("dbPath", ""));
+  // Only the user-level value counts, so a workspace cannot point these at another program.
+  const userSetting = (key: string) => cfg().inspect<string>(key)?.globalValue ?? "";
+  const dbPath = () => cli.defaultDbPath(userSetting("dbPath"));
   const store = new Store(path.join(ctx.extensionPath, "out", "sql-wasm.wasm"));
   const items = new ItemsTree();
   const queueTree = new QueueTree();
@@ -67,7 +69,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   );
 
   function findOrWarn(): string | undefined {
-    const brain = cli.findBrain(cfg().get<string>("brainPath", ""));
+    const brain = cli.findBrain(userSetting("brainPath"));
     if (!brain) void vscode.window.showWarningMessage("Lean Brain: bin/brain not found. Set leanBrain.brainPath.");
     return brain;
   }
