@@ -152,7 +152,11 @@ def migrate_5(con):  # the session that filed an item and its folder, so an answ
         started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '')""")
 
 
-MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5]
+def migrate_6(con):  # a bumped job runs before the rest of the queue
+    con.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+
+
+MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6]
 
 
 def connect():
@@ -405,6 +409,8 @@ def job_line(r):
         s += f" cycle={r['cycle']}"
     if r["after_id"]:
         s += f" after=#{r['after_id']}"
+    if r["priority"] and r["status"] == "queued":
+        s += " bumped"
     if r["reason"]:
         s += f" ({r['reason']})"
     if r["run_id"]:
@@ -462,12 +468,28 @@ def cmd_queue(a):
             cancel_dependents(con, a.id, f"dependency #{a.id} cancelled")
         print(f"cancelled job #{a.id}")
         return 0
+    if a.qcmd == "bump":  # moves a queued job, and the queued jobs chained after it, to the front
+        with con:
+            r = con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()
+            if not r:
+                sys.exit(f"brain: no job #{a.id}")
+            if r["status"] != "queued":
+                sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be bumped")
+            todo, bumped = [a.id], []
+            while todo:
+                job = todo.pop()
+                con.execute("UPDATE jobs SET priority=1 WHERE id=?", (job,))
+                bumped.append(job)
+                todo += [d["id"] for d in con.execute(
+                    "SELECT id FROM jobs WHERE status='queued' AND after_id=?", (job,)).fetchall()]
+        print("bumped " + " ".join(f"#{j}" for j in sorted(bumped)))
+        return 0
     if a.qcmd == "next":  # claims the oldest ready job; prints it as one line of JSON, or nothing
         con.isolation_level = None
         con.execute("BEGIN IMMEDIATE")
         r = con.execute(
             "SELECT j.* FROM jobs j WHERE j.status='queued' AND (j.after_id IS NULL OR "
-            "(SELECT status FROM jobs d WHERE d.id=j.after_id)='done') ORDER BY j.id LIMIT 1").fetchone()
+            "(SELECT status FROM jobs d WHERE d.id=j.after_id)='done') ORDER BY j.priority DESC, j.id LIMIT 1").fetchone()
         if r and not a.peek:
             con.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?", (now(), r["id"]))
         con.execute("COMMIT")
@@ -704,6 +726,8 @@ def parser():
     q.add_argument("--status", choices=JOB_STATUS)
     q = qs.add_parser("cancel")
     q.add_argument("id", type=int)
+    q = qs.add_parser("bump")
+    q.add_argument("id", type=int)
     q = qs.add_parser("next")
     q.add_argument("--peek", action="store_true")
     q = qs.add_parser("finish")
@@ -925,6 +949,25 @@ def self_test():
             fails.append("a different filter is a different job")
         run("queue", "cancel", d1)
         run("queue", "cancel", d3)
+        b1 = run("queue", "add", "/tmp/r", "I.csproj")[1]
+        b2 = run("queue", "add", "/tmp/r", "J.csproj")[1]
+        b3 = run("queue", "add", "/tmp/r", "J.csproj", "--after", b2)[1]
+        rc, out, _ = run("queue", "bump", b2)
+        if rc != 0 or f"#{b2}" not in out or f"#{b3}" not in out:
+            fails.append(f"bump must reach the jobs chained after it: {out!r}")
+        if f"job #{b2} queued full r J.csproj bumped" not in run("queue", "list", "--status", "queued")[1]:
+            fails.append("a bumped job must show as bumped")
+        got = nxt()
+        if not got or str(got["id"]) != b2:
+            fails.append(f"a bumped job must be claimed before older jobs: {got}")
+        run("queue", "finish", b2, "--status", "done")
+        got = nxt()
+        if not got or str(got["id"]) != b3:
+            fails.append(f"a bumped chain must keep its order: {got}")
+        run("queue", "finish", b3, "--status", "done")
+        run("queue", "cancel", b1)
+        if run("queue", "bump", b1)[0] == 0:
+            fails.append("only a queued job can be bumped")
         k4 = run("queue", "add", "/tmp/r", "E.csproj", "--cycle", "q2")[1]
         out = run("resume", "--project", "r")[1]
         if f"job #{k4} queued full r E.csproj" not in out or "queued or running" not in out:
