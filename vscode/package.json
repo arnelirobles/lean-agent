@@ -1,0 +1,236 @@
+{
+  "name": "lean-brain",
+  "displayName": "Lean Brain",
+  "description": "A read-mostly dashboard over the lean-agent brain database.",
+  "version": "0.5.0",
+  "publisher": "baryodev",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arnelirobles/lean-agent.git",
+    "directory": "vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "icon": "media/icon.png",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "leanBrain.openDashboard",
+        "title": "Lean Brain: Open dashboard",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "leanBrain.refresh",
+        "title": "Lean Brain: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "leanBrain.showResume",
+        "title": "Lean Brain: Show resume digest"
+      },
+      {
+        "command": "leanBrain.showItem",
+        "title": "Lean Brain: Show item"
+      },
+      {
+        "command": "leanBrain.closeFixed",
+        "title": "Close as fixed"
+      },
+      {
+        "command": "leanBrain.closeNotABug",
+        "title": "Close as not a bug"
+      },
+      {
+        "command": "leanBrain.reopen",
+        "title": "Reopen"
+      },
+      {
+        "command": "leanBrain.copyRef",
+        "title": "Copy ref"
+      },
+      {
+        "command": "leanBrain.openClaude",
+        "title": "Lean Brain: Open Claude Code",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "leanBrain.askClaude",
+        "title": "Ask Claude about this"
+      },
+      {
+        "command": "leanBrain.sendToClaude",
+        "title": "Send to Claude",
+        "icon": "$(rocket)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "leanBrain",
+          "title": "Lean Brain",
+          "icon": "media/brain.svg"
+        }
+      ]
+    },
+    "views": {
+      "leanBrain": [
+        {
+          "id": "leanBrain.items",
+          "name": "Open items"
+        },
+        {
+          "id": "leanBrain.queue",
+          "name": "Queue"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "leanBrain.openDashboard",
+          "when": "view == leanBrain.items || view == leanBrain.queue",
+          "group": "navigation@0"
+        },
+        {
+          "command": "leanBrain.openClaude",
+          "when": "view == leanBrain.items || view == leanBrain.queue",
+          "group": "navigation@1"
+        },
+        {
+          "command": "leanBrain.refresh",
+          "when": "view == leanBrain.items || view == leanBrain.queue",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "leanBrain.sendToClaude",
+          "when": "view == leanBrain.items && viewItem == item.send",
+          "group": "inline"
+        },
+        {
+          "command": "leanBrain.sendToClaude",
+          "when": "view == leanBrain.items && viewItem == item.send",
+          "group": "0_claude"
+        },
+        {
+          "command": "leanBrain.askClaude",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
+          "group": "0_claude"
+        },
+        {
+          "command": "leanBrain.closeFixed",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
+          "group": "1_close"
+        },
+        {
+          "command": "leanBrain.closeNotABug",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
+          "group": "1_close"
+        },
+        {
+          "command": "leanBrain.reopen",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
+          "group": "1_close"
+        },
+        {
+          "command": "leanBrain.copyRef",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
+          "group": "2_copy"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "leanBrain.showItem",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.closeFixed",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.closeNotABug",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.reopen",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.copyRef",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.askClaude",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.sendToClaude",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Lean Brain",
+      "properties": {
+        "leanBrain.dbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to brain.db. Empty uses LEAN_BRAIN_DB, then ~/.local/share/lean/brain.db.",
+          "scope": "machine"
+        },
+        "leanBrain.brainPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the bin/brain script. Empty uses brain on PATH, then the newest lean-agent plugin.",
+          "scope": "machine"
+        },
+        "leanBrain.claudeCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the claude executable. Empty finds claude in the absolute PATH entries. It runs as the terminal process, not through a shell, so give the program only, no arguments. Windows .cmd and .bat shims are refused.",
+          "scope": "machine"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "compile": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "package": "npm run typecheck && node esbuild.mjs --production && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/sql.js": "^1.4.9",
+    "@types/vscode": "^1.90.0",
+    "@vscode/codicons": "^0.0.36",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.25.0",
+    "sql.js": "^1.12.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "brainPath and dbPath are read only from user settings, since a workspace could point them at another program.",
+      "restrictedConfigurations": [
+        "leanBrain.brainPath",
+        "leanBrain.dbPath",
+        "leanBrain.claudeCommand"
+      ]
+    }
+  }
+}
