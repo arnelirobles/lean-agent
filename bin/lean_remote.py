@@ -210,6 +210,129 @@ def remote_load(r, run=subprocess.run):
         return None
 
 
+def excluded(rel, patterns):
+    """True when the path, its basename or any folder on the way matches an exclude glob."""
+    parts = rel.split("/")
+    return any(fnmatch.fnmatchcase(rel, pat) or any(fnmatch.fnmatchcase(x, pat) for x in parts) for pat in patterns)
+
+
+def file_list(repo, extra_paths, exclude):
+    """Relative paths to copy: tracked and untracked files git does not ignore, plus each extra path."""
+    p = subprocess.run(["git", "-C", repo, "ls-files", "-z", "-co", "--exclude-standard"], capture_output=True)
+    if p.returncode != 0:
+        raise LaneProblem("git ls-files failed in " + repo)
+    found = {x.decode("utf-8", "surrogateescape") for x in p.stdout.split(b"\0") if x}
+    for extra in extra_paths:
+        top = os.path.join(repo, extra)
+        if os.path.isdir(top) and not os.path.islink(top):
+            for root, _, files in os.walk(top):
+                for f in files:
+                    found.add(os.path.relpath(os.path.join(root, f), repo))
+        elif os.path.lexists(top):
+            found.add(os.path.normpath(extra))
+    return sorted(f for f in found if os.path.lexists(os.path.join(repo, f)) and not excluded(f, exclude))
+
+
+def job_dir(r, job_id):
+    return f"{r.workdir.rstrip('/')}/job-{job_id}"
+
+
+def sync_argv(r, repo, job_id):
+    """rsync argv; the caller writes the NUL-joined file_list on its stdin."""
+    jd = sh_path(job_dir(r, job_id))
+    return ["rsync", "-a", "--files-from=-", "--from0", "-e", " ".join(ssh_cmd_opts()),
+            f"--rsync-path=mkdir -p {jd} && rsync", repo.rstrip("/") + "/", f"{r.host}:{job_dir(r, job_id)}/"]
+
+
+def ssh_cmd_opts():
+    return ["ssh"] + SSH_OPTS
+
+
+def send_env(r, job_id, env_file, run=subprocess.run):
+    """Put the env file in the job folder, mode 600, by ssh stdin. Never on a command line."""
+    jd = sh_path(job_dir(r, job_id))
+    try:
+        with open(env_file, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        raise LaneProblem(f"cannot read env_file {env_file}: {e.strerror}")
+    try:
+        p = run(ssh_argv(r, f"umask 077; mkdir -p {jd} && cat > {jd}/.lean.env && chmod 600 {jd}/.lean.env"),
+                input=data, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise LaneProblem(f"{r.name}: env file not sent ({type(e).__name__})")
+    if p.returncode != 0:
+        raise LaneProblem(f"{r.name}: env file not sent (exit {p.returncode})")
+
+
+def run_script(r, cfg, job_id, cmd):
+    """One shell script for ssh: network, sidecars, then the capped test container. Its exit code is the test's."""
+    jd = sh_path(job_dir(r, job_id))
+    nuget = sh_path(r.workdir.rstrip("/") + "/.nuget")
+    label, net = f"lean.job={job_id}", f"lean-{job_id}"
+    caps = f"--cpus {shlex.quote(r.cpus)} --memory {shlex.quote(r.memory)}"
+    env = f" --env-file {jd}/.lean.env" if cfg and cfg.env_file else ""
+    fail = lambda why: f'{{ echo "lean-remote: {why}"; exit 125; }}'
+    out = [f"install -d {nuget}",
+           f"docker network create --label {label} {net} >/dev/null || " + fail("docker network failed")]
+    sidecars = list(cfg.sidecars.items()) if cfg else []
+    for alias, image in sidecars:
+        out.append(f"docker run -d --rm --name {net}-{alias} --label {label} --network {net} "
+                   f"--network-alias {alias} {caps}{env} {shlex.quote(image)} >/dev/null || " + fail(f"sidecar {alias} failed"))
+    if sidecars and cfg.ready:
+        out.append("n=0")
+        out.append(f"until docker exec {net}-{sidecars[0][0]} sh -c {shlex.quote(cfg.ready)} >/dev/null 2>&1; do")
+        out.append('  n=$((n + 1)); [ "$n" -ge 60 ] && ' + fail("sidecar not ready") + "; sleep 1")
+        out.append("done")
+    inner = f'echo "{MARKER}"; exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
+    out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
+               f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget -v {jd}:/work -w /work{env} "
+               f"{shlex.quote(r.image)} sh -c {shlex.quote(inner)}")
+    out.append("rc=$?")
+    out.append('exit "$rc"')
+    return "\n".join(out) + "\n"
+
+
+def remove_labelled(selector):
+    """Shell lines that remove every container and network matching a docker label filter."""
+    return [f'ids=$(docker ps -aq --filter {selector} 2>/dev/null); [ -n "$ids" ] && docker rm -f $ids >/dev/null 2>&1',
+            f'nets=$(docker network ls -q --filter {selector} 2>/dev/null); [ -n "$nets" ] && docker network rm $nets >/dev/null 2>&1']
+
+
+def cleanup_script(r, job_id):
+    """Remove the job's containers, network and folder. Never fails."""
+    out = remove_labelled(f"label=lean.job={job_id}")
+    out.append(f"rm -rf {sh_path(job_dir(r, job_id))}")
+    return "\n".join(out) + "\nexit 0\n"
+
+
+def sweep_script(r, running_ids):
+    """Remove what belongs to no running job: labelled objects, job folders, and folders over a day old.
+    The package cache is emptied when it passes cache_max_gb and no job is using it. Never fails."""
+    keep = " " + " ".join(str(int(i)) for i in running_ids) + " "
+    wd = sh_path(r.workdir.rstrip("/"))
+    out = [f'keep="{keep}"',
+           'for id in $(docker ps -aq --filter label=lean.job 2>/dev/null); do',
+           '  j=$(docker inspect -f \'{{index .Config.Labels "lean.job"}}\' "$id" 2>/dev/null)',
+           '  case "$keep" in *" $j "*) ;; *) docker rm -f "$id" >/dev/null 2>&1 ;; esac',
+           "done",
+           'for net in $(docker network ls -q --filter label=lean.job 2>/dev/null); do',
+           '  j=$(docker network inspect -f \'{{index .Labels "lean.job"}}\' "$net" 2>/dev/null)',
+           '  case "$keep" in *" $j "*) ;; *) docker network rm "$net" >/dev/null 2>&1 ;; esac',
+           "done",
+           f"for d in {wd}/job-*; do",
+           '  [ -d "$d" ] || continue',
+           '  n=${d##*/job-}',
+           '  case "$keep" in *" $n "*) [ -n "$(find "$d" -maxdepth 0 -mtime +1 2>/dev/null)" ] && rm -rf "$d" ;; *) rm -rf "$d" ;; esac',
+           "done"]
+    if r.cache_max_gb > 0:
+        out += [f"if [ -d {wd}/.nuget ] && [ -z \"$(docker ps -q --filter label=lean.job 2>/dev/null)\" ]; then",
+                f'  kb=$(du -sk {wd}/.nuget 2>/dev/null | cut -f1)',
+                f'  [ "${{kb:-0}}" -gt {r.cache_max_gb * 1048576} ] && rm -rf {wd}/.nuget',
+                "fi"]
+    return "\n".join(out) + "\nexit 0\n"
+
+
 def self_test():
     fails = []
     with tempfile.TemporaryDirectory() as d:
@@ -291,6 +414,73 @@ ready = pg_isready -U postgres
             fails.append("a timeout must not pass")
         if remote_load(r, fake(Fake(0, "0.52 0.40 0.30 1/200 99\n"))) != 0.52 or remote_load(r, fake(Fake(255))) is not None:
             fails.append("remote_load")
+    with tempfile.TemporaryDirectory() as d:
+        repo = os.path.join(d, "repo")
+        os.makedirs(os.path.join(repo, "local-packages"))
+        for name, text in (("a.cs", "x"), (".env.local", "TOKEN=abc123"), ("secrets.json", "{}"),
+                           ("local-packages/p.nupkg", "p"), ("local-packages/x.key", "k")):
+            with open(os.path.join(repo, name), "w") as fh:
+                fh.write(text)
+        with open(os.path.join(repo, ".gitignore"), "w") as fh:
+            fh.write("local-packages/\n")
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        subprocess.run(["git", "-C", repo, "add", "a.cs", ".env.local"], check=True)
+        got = file_list(repo, ["local-packages"], DEFAULT_EXCLUDE)
+        if got != [".gitignore", "a.cs", "local-packages/p.nupkg"]:
+            fails.append(f"file_list must drop excluded files, extra paths included, and keep ignored extra paths: {got}")
+        if file_list(repo, [], ["a.*"]) != [".env.local", ".gitignore", "secrets.json"]:
+            fails.append("exclude must apply to a custom list")
+        if file_list(repo, ["local-packages/p.nupkg"], DEFAULT_EXCLUDE)[-1] != "local-packages/p.nupkg":
+            fails.append("an extra path may be one file")
+        r = Remote(name="dev", host="devbox", workdir="~/lean-runs", cpus="2", memory="8g")
+        cfg = RepoCfg(name="app", sidecars={"db": "postgres:16"}, env_file=os.path.join(d, "app.env"),
+                      ready="pg_isready")
+        with open(cfg.env_file, "w") as fh:
+            fh.write("POSTGRES_PASSWORD=hunter2\n")
+        sc = run_script(r, cfg, 7, ["dotnet", "test", "--project", "T.csproj"])
+        for want in ("--label lean.job=7", "--cpus 2", "--memory 8g", "--user", "lean-remote: started",
+                     "--network lean-7", "--network-alias db", "--env-file", "nice -n 19", "pg_isready",
+                     "NUGET_PACKAGES=/nuget", "install -d"):
+            if want not in sc:
+                fails.append(f"run_script must contain {want!r}")
+        if " -p " in sc or "-p " in sc or "hunter2" in sc:
+            fails.append("run_script must publish no ports and hold no env file value")
+        bare = run_script(r, None, 8, ["dotnet", "test"])
+        if "--env-file" in bare or "network-alias" in bare or "until " in bare:
+            fails.append("a job with no repo section has no sidecars and no env file")
+        cs = cleanup_script(r, 7)
+        if "lean.job=7" not in cs or "job-7" not in cs or "lean.job=8" in cs:
+            fails.append(f"cleanup_script: {cs!r}")
+        ss = sweep_script(r, [3])
+        if 'keep=" 3 "' not in ss or "job-*" not in ss or "-mtime +1" not in ss:
+            fails.append(f"sweep_script must keep running ids and drop old folders: {ss!r}")
+        for script in (sc, cs, ss, bare):
+            if subprocess.run(["sh", "-n", "-c", script]).returncode != 0:
+                fails.append("a generated script is not valid shell")
+        sa = sync_argv(r, repo, 7)
+        if sa[0] != "rsync" or "--files-from=-" not in sa or sa[-1] != "devbox:~/lean-runs/job-7/" \
+                or "StrictHostKeyChecking=yes" not in sa[sa.index("-e") + 1]:
+            fails.append(f"sync_argv: {sa}")
+
+        class Rec:
+            def __init__(self, rc=0):
+                self.rc, self.calls = rc, []
+
+            def __call__(self, argv, **kw):
+                self.calls.append((argv, kw))
+                return subprocess.CompletedProcess(argv, self.rc, b"", b"")
+
+        rec = Rec()
+        send_env(r, 7, cfg.env_file, rec)
+        argv, kw = rec.calls[0]
+        if kw.get("input") != b"POSTGRES_PASSWORD=hunter2\n" or "hunter2" in " ".join(argv) \
+                or "umask 077" not in argv[-1] or "chmod 600" not in argv[-1]:
+            fails.append(f"send_env must pass the file on stdin, mode 600, never in argv: {argv}")
+        try:
+            send_env(r, 7, cfg.env_file, Rec(255))
+            fails.append("a failed env upload must raise LaneProblem")
+        except LaneProblem:
+            pass
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
