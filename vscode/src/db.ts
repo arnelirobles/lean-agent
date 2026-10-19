@@ -55,6 +55,18 @@ export function getItem(db: Database, id: number): ItemFull | undefined {
   return { ...(r as any), tags } as ItemFull;
 }
 
+export type SessionState = "open" | "ended" | "unknown";
+
+/** Whether a Claude session is still open, as the session-env hook recorded it. A database before schema 5 has no sessions table. */
+export function sessionState(db: Database, id: string): SessionState {
+  try {
+    const r = one(db, Q.SESSION, [id]);
+    return !r ? "unknown" : r.ended_at ? "ended" : "open";
+  } catch {
+    return "unknown";
+  }
+}
+
 /** Open item counts. With a project filter (case-insensitive, any of the names) only those projects count. */
 export function openCounts(db: Database, projects?: string[]): { counts: Counts; scoped: boolean } {
   const want = (projects ?? []).map((p) => p.toLowerCase());

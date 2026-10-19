@@ -7,6 +7,7 @@ export const OPEN_ITEMS = `
   FROM items WHERE status='open' ORDER BY project, kind, last_seen DESC, id DESC`;
 
 export const ITEM = `SELECT * FROM items WHERE id=?`;
+export const SESSION = `SELECT ended_at FROM sessions WHERE id=?`;
 export const ITEM_TAGS = `SELECT tag FROM tags WHERE item_id=? ORDER BY tag`;
 
 export const RUNNING_JOBS = `

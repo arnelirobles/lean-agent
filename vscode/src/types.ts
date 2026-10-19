@@ -5,6 +5,8 @@ export interface ItemRow {
 export interface ItemFull extends ItemRow {
   repo: string; branch: string; body: string; resolution: string; phase: string; source: string; model: string;
   commit_hash: string; link: string; run_id: number | null; closed_at: string | null; tags: string[];
+  /** The Claude session that filed it and its folder; empty on items from before schema 5. */
+  session_id?: string; session_cwd?: string;
 }
 export interface JobRow {
   id: number; cycle: string; project: string; test_project: string; status: string; tier: string;

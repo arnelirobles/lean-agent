@@ -126,10 +126,15 @@ export const STYLE = `
   a:hover { color: var(--leaf); border-color: var(--leaf); }
   .fields th { width: 140px; color: var(--muted); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
   .fields td { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; }
+  .answer textarea { width: 100%; min-height: 96px; box-sizing: border-box; resize: vertical; font: inherit; font-size: 13.5px;
+                     color: var(--ink); background: var(--bg); border: 1.5px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .answer textarea:focus { outline: none; border-color: var(--leaf); }
+  .answer .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
 `;
 
 /** Buttons with data-copy copy text, data-open opens an item, data-refresh refreshes, data-tab switches tabs,
- *  data-claude opens Claude Code, data-ask puts an item into it, data-send starts a session that works on it. */
+ *  data-claude opens Claude Code, data-ask puts an item into it, data-send starts a session that works on it,
+ *  data-answer sends the text in #answer as the answer to a question. */
 export const SCRIPT = `
   const vscode = acquireVsCodeApi();
   function showTab(name) {
@@ -142,10 +147,16 @@ export const SCRIPT = `
   const saved = (vscode.getState() || {}).tab;
   if (saved) showTab(saved);
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send]');
+    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send],[data-answer]');
     if (!el) return;
     if (el.dataset.tab !== undefined) showTab(el.dataset.tab);
     else if (el.dataset.claude !== undefined) vscode.postMessage({ type: 'claude' });
+    else if (el.dataset.answer !== undefined) {
+      const box = document.getElementById('answer');
+      const text = box ? box.value.trim() : '';
+      if (text) vscode.postMessage({ type: 'answer', id: Number(el.dataset.answer), text });
+      else if (box) box.focus();
+    }
     else if (el.dataset.send !== undefined) vscode.postMessage({ type: 'send', id: Number(el.dataset.send) });
     else if (el.dataset.ask !== undefined) vscode.postMessage({ type: 'ask', id: Number(el.dataset.ask) });
     else if (el.dataset.copy !== undefined) vscode.postMessage({ type: 'copy', text: el.dataset.copy });

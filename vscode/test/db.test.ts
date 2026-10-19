@@ -7,8 +7,20 @@ let d: Database;
 beforeAll(async () => { d = await seededDb(); });
 
 describe("db queries", () => {
+  it("reads the session that filed an item and whether it is still open", async () => {
+    const q = db.getItem(d, 2)!;
+    expect(q.session_id).toBe("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b");
+    expect(q.session_cwd).toBe("/work/core");
+    expect(db.sessionState(d, "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")).toBe("open");
+    expect(db.sessionState(d, "ended-1")).toBe("ended");
+    expect(db.sessionState(d, "nobody")).toBe("unknown");
+    const old = await emptyDb();
+    old.run("DROP TABLE sessions");
+    expect(db.sessionState(old, "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")).toBe("unknown");
+  });
+
   it("reads the schema version", () => {
-    expect(db.schemaVersion(d)).toBe(4);
+    expect(db.schemaVersion(d)).toBe(5);
   });
 
   it("lists open items only, and the fixture is not empty", () => {
