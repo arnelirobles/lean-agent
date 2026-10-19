@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { jobLook, kindLook, severityTone, toneColorId } from "../src/style";
-import { donut, trendTone } from "../src/dashboard/charts";
+import { trendTone } from "../src/dashboard/charts";
 
 describe("looks", () => {
   it("gives each common kind its own icon and tone", () => {
@@ -29,11 +29,5 @@ describe("charts", () => {
     expect(trendTone([10, 10, 10, 5])).toBe("green");
     expect(trendTone([10, 11, 10, 10])).toBe("blue");
     expect(trendTone([10])).toBe("blue");
-  });
-
-  it("draws one donut arc per non-empty slice", () => {
-    const svg = donut([{ value: 3, color: "#f00", label: "real" }, { value: 0, color: "#ff0", label: "flaky" }], "3", "open");
-    expect(svg.match(/stroke-dasharray/g)?.length).toBe(1);
-    expect(svg).toContain("<title>real: 3</title>");
   });
 });

@@ -2,10 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import * as cli from "./brainCli";
+import * as db from "./db";
 import { Store } from "./store";
 import { projectNames } from "./workspace";
 import { ItemsTree, itemFromArg } from "./views/itemsTree";
-import { DashboardPanel, ItemPanel } from "./views/panels";
+import { ClaudeTerminal } from "./views/claudeTerminal";
+import { DashboardPanel, ItemPanel, type Actions } from "./views/panels";
 import { QueueTree } from "./views/queueTree";
 import { StatusBar } from "./views/statusBar";
 
@@ -31,8 +33,16 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     dashboard.render(d, store.note);
     itemPanel.render(d);
   };
-  const dashboard = new DashboardPanel(ctx.extensionUri, (id) => itemPanel.show(store.database, id), () => void refresh());
-  const itemPanel = new ItemPanel(ctx.extensionUri, () => void refresh());
+  const claude = new ClaudeTerminal(() => userSetting("claudeCommand") || "claude", () => folder);
+  const ask = (id: number) => {
+    const it = store.database && db.getItem(store.database, id);
+    if (it) claude.ask(it);
+  };
+  const actions: Actions = {
+    openItem: (id) => itemPanel.show(store.database, id), refresh: () => void refresh(), claude: () => claude.open(), ask,
+  };
+  const dashboard = new DashboardPanel(ctx.extensionUri, actions);
+  const itemPanel = new ItemPanel(ctx.extensionUri, actions);
 
   ctx.subscriptions.push(
     status,
@@ -43,6 +53,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       dashboard.show(store.database, store.note);
     }),
     vscode.commands.registerCommand("leanBrain.refresh", () => refresh()),
+    vscode.commands.registerCommand("leanBrain.openClaude", () => claude.open()),
+    vscode.commands.registerCommand("leanBrain.askClaude", (arg) => {
+      const it = itemFromArg(arg);
+      if (it) ask(it.id);
+    }),
     vscode.commands.registerCommand("leanBrain.showItem", (id: number) => itemPanel.show(store.database, id)),
     vscode.commands.registerCommand("leanBrain.copyRef", async (arg) => {
       const it = itemFromArg(arg);

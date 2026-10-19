@@ -69,6 +69,21 @@ describe("dashboard html", () => {
     expect(html).toContain("font-src vscode-resource:");
   });
 
+  it("draws flat charts with no gradient fills", () => {
+    expect(dashboardBody(data)).not.toMatch(/linearGradient|url\(#/);
+  });
+
+  it("loads the bundled fonts and fox mark from the media folder", () => {
+    const html = dashboardHtml(data, "N", "vscode-resource:", "", "", "vscode-resource:/media");
+    expect(html).toContain(`url("vscode-resource:/media/fonts/plus-jakarta-sans.woff2")`);
+    expect(html).toContain(`src="vscode-resource:/media/fox-mark.webp"`);
+    expect(html).not.toContain("MEDIA");
+  });
+
+  it("offers Claude Code from the header", () => {
+    expect(dashboardBody(data)).toContain(`data-claude="1"`);
+  });
+
   it("hygiene button copies a read-only list command", () => {
     expect(listCommand("test-fail")).toBe("brain list --open --kind test-fail");
     expect(listCommand("a b")).toBe("brain list --open --kind 'a b'");
@@ -100,5 +115,6 @@ describe("item html", () => {
     expect(html).toContain("body &lt;b&gt;bold&lt;/b&gt; &amp; more");
     const first = itemHtml(db.getItem(d, 1)!, NOW, "N", "vscode-resource:");
     expect(first).toContain(`<span class="tag">urgent</span>`);
+    expect(first).toContain(`data-ask="1"`);
   });
 });
