@@ -43,6 +43,7 @@ Label every agent you start, so `lean-stats` can count it by role. The Agent des
 - Check the runner mode before `dotnet test`. A repository whose `global.json` sets `test.runner` to `Microsoft.Testing.Platform` takes `dotnet test --project X`; any other takes `dotnet test X`. The wrong form loses the run.
 - Brain is where state that changes lives, so it survives a compaction. Open an item when you dispatch an agent (kind `agent`: id, task, worktree), when you defer work (`pending` for the next step, `minor` for a deferred fix) or when an action is denied or waits on the person (`blocker`). Close it when the agent reports back, the work is done or the answer comes. A denied action is not worked around.
 - What goes where: brain holds anything with a status that changes (test failures, flaky classes, deferred minors, questions for the user, tickets, security findings). Markdown ledgers keep rulings with the cost if wrong, task complete lines and user decisions, and point to open items with `open items: brain list --project X --status open`. Memory files keep standing preferences. Run logs are scratch.
+- A question for the person: file it with `brain add --kind question` (title is the question, body has the options and your recommendation), then end your turn. Do not wait in the session. Brain stores the session id, and the answer comes back to this session: the extension resumes it, or the next prompt carries it.
 - Never store secrets, tokens or passwords in brain.
 
 ## After a batch
