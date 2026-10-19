@@ -20,7 +20,7 @@ remote off. One section per host and, optionally, one per repository:
   [repo app]                  ; app is the brain project name of the job
   sidecars = db=postgres:16, cache=redis:7
   env_file = ~/.config/lean/app.env
-  ready = pg_isready -U postgres
+  ready = pg_isready -h 127.0.0.1 -U postgres
 
 Nothing here runs a test. test-phase calls these functions and keeps the results, parsing and brain on
 the local machine. The docs are in docs/remote-lane.md.
@@ -289,7 +289,9 @@ def run_script(r, cfg, job_id, cmd):
                    f"--network-alias {alias} {caps}{env} {shlex.quote(image)} >/dev/null || " + fail(f"sidecar {alias} failed"))
     if sidecars and cfg.ready:
         out.append("n=0")
-        out.append(f"until docker exec {net}-{sidecars[0][0]} sh -c {shlex.quote(cfg.ready)} >/dev/null 2>&1; do")
+        # Two passes a second apart: an image's temporary init server can answer once and then restart.
+        probe = f"docker exec {net}-{sidecars[0][0]} sh -c {shlex.quote(cfg.ready)} >/dev/null 2>&1"
+        out.append(f"until {probe} && sleep 1 && {probe}; do")
         out.append('  n=$((n + 1)); [ "$n" -ge 60 ] && ' + fail("sidecar not ready") + "; sleep 1")
         out.append("done")
     inner = f'echo "{MARKER}"; exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
@@ -358,7 +360,7 @@ extra_paths = local-packages, tools
 [repo app]
 sidecars = db=postgres:16, cache=redis:7
 env_file = /tmp/app.env
-ready = pg_isready -U postgres
+ready = pg_isready -h 127.0.0.1 -U postgres
 """)
         remotes, repos = load(ini, {})
         r = remotes[0] if remotes else None
@@ -368,7 +370,7 @@ ready = pg_isready -U postgres
             fails.append(f"remote defaults or lists: {r}")
         c = repos.get("app")
         if not c or list(c.sidecars.items()) != [("db", "postgres:16"), ("cache", "redis:7")] \
-                or c.env_file != "/tmp/app.env" or c.ready != "pg_isready -U postgres":
+                or c.env_file != "/tmp/app.env" or c.ready != "pg_isready -h 127.0.0.1 -U postgres":
             fails.append(f"repo parse: {repos}")
         if load(os.path.join(d, "none.ini"), {}) != ([], {}):
             fails.append("a missing file must give no remotes")
@@ -449,15 +451,18 @@ ready = pg_isready -U postgres
             fails.append("an extra path may be one file")
         r = Remote(name="dev", host="devbox", workdir="~/lean-runs", cpus="2", memory="8g")
         cfg = RepoCfg(name="app", sidecars={"db": "postgres:16"}, env_file=os.path.join(d, "app.env"),
-                      ready="pg_isready")
+                      ready="pg_isready -h 127.0.0.1 -U postgres")
         with open(cfg.env_file, "w") as fh:
             fh.write("POSTGRES_PASSWORD=hunter2\n")
         sc = run_script(r, cfg, 7, ["dotnet", "test", "--project", "T.csproj"])
         for want in ("--label lean.job=7", "--cpus 2", "--memory 8g", "--user", "lean-remote: started",
-                     "--network lean-7", "--network-alias db", "--env-file", "nice -n 19", "pg_isready",
+                     "--network lean-7", "--network-alias db", "--env-file", "nice -n 19",
+                     "pg_isready -h 127.0.0.1 -U postgres",
                      "NUGET_PACKAGES=/nuget", "install -d"):
             if want not in sc:
                 fails.append(f"run_script must contain {want!r}")
+        if sc.count("docker exec lean-7-db") != 2 or "&& sleep 1 &&" not in sc:
+            fails.append("the ready check must pass twice, a second apart")
         if " -p " in sc or "-p " in sc or "hunter2" in sc:
             fails.append("run_script must publish no ports and hold no env file value")
         bare = run_script(r, None, 8, ["dotnet", "test"])

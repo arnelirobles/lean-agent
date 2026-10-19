@@ -27,7 +27,7 @@ exclude = .env*, *.key, *.pem, *license-key*, secrets*
 [repo app]
 sidecars = db=postgres:16, cache=redis:7
 env_file = ~/.config/lean/app.env
-ready = pg_isready -U postgres
+ready = pg_isready -h 127.0.0.1 -U postgres
 ```
 
 Remote section keys:
@@ -50,7 +50,7 @@ Repo section keys (the section name is the brain project name of the job):
 |---|---|
 | `sidecars` | `alias=image` pairs. Each starts on a private network for the job, reachable by its alias. |
 | `env_file` | A local file of `NAME=value` lines. It is sent as `.lean.env` (mode 600) and loaded into the test container. It never appears on a command line. |
-| `ready` | A command run in each sidecar until it exits 0, before the tests start. |
+| `ready` | A command run in the first sidecar until it exits 0 twice in a row, one second apart, before the tests start. Use `-h 127.0.0.1` with `pg_isready`, because the postgres image's temporary init server answers only on the socket. |
 
 Sidecars get the same `cpus` and `memory` caps as the test container, so a job with a sidecar can use up to twice the cap.
 
