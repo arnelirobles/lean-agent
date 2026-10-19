@@ -2,7 +2,7 @@
   "name": "lean-brain",
   "displayName": "Lean Brain",
   "description": "A read-mostly dashboard over the lean-agent brain database.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "baryodev",
   "license": "MIT",
   "private": true,
