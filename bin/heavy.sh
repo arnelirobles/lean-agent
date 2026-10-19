@@ -206,6 +206,8 @@ self_suite() { # runs the lane tests with the current HEAVY_BACKEND; prints fail
   grep -q "running pid [0-9]*: .*sleep $hold" <<<"$out" || { echo "self-test failed: the holder's command not listed: '$out'"; fails=$((fails + 1)); }
   out=$(bash "$HEAVY_SELF" status l2); rc=$?
   { [ "$rc" = 1 ] && grep -q '^busy' <<<"$out" && grep -q "sleep $hold" <<<"$out"; } || { echo "self-test failed: busy lane did not read busy with its holder: $rc '$out'"; fails=$((fails + 1)); }
+  # Linux runs this suite twice, so clear the file the first pass left.
+  rm -f "$t/ran"
   out=$( (HEAVY_WAIT=1 run_lane l2 touch "$t/ran") 2>&1 ); rc=$?
   [ "$rc" = 75 ] || { echo "self-test failed: timeout exit was $rc, want 75"; fails=$((fails + 1)); }
   grep -q "timed out after 1s waiting for lane 'l2'" <<<"$out" || { echo "self-test failed: no timeout message: $out"; fails=$((fails + 1)); }
