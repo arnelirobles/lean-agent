@@ -24,13 +24,14 @@ export class StatusBar {
       const now = Math.floor(Date.now() / 1000);
       const { counts, scoped } = db.openCounts(database, projects);
       const running = db.queue(database).running[0];
-      let text = `$(database) brain: ${counts.real} real, ${counts.flaky} flaky`;
+      let text = `$(${counts.real ? "bug" : "pass"}) ${counts.real}  $(warning) ${counts.flaky}`;
       if (running) {
         const el = db.jobElapsed(running, now);
-        text += ` | running ${db.shortTestName(running.test_project)}${el == null ? "" : " " + db.formatDuration(el)}`;
+        text += `  $(sync~spin) ${db.shortTestName(running.test_project)}${el == null ? "" : " " + db.formatDuration(el)}`;
       }
       this.item.text = text;
-      this.item.tooltip = (scoped ? `Open items for ${projects.join(" / ")}` : "Open items, all projects") + (note ? `\n${note}` : "");
+      this.item.color = new vscode.ThemeColor(counts.real ? "charts.red" : "charts.green");
+      this.item.tooltip = `Brain: ${counts.real} real, ${counts.flaky} flaky. ` + (scoped ? `Open items for ${projects.join(" / ")}` : "Open items, all projects") + (note ? `\n${note}` : "");
     };
     render();
     if (db.queue(database).running.length) this.timer = setInterval(render, 5000);

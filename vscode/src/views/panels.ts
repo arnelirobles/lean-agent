@@ -6,6 +6,15 @@ import { itemHtml } from "../dashboard/itemHtml";
 import { makeNonce } from "../dashboard/page";
 import type { DashboardData } from "../types";
 
+/** The codicon stylesheet copied to out/codicons by the build, as a webview URI. */
+function codicons(panel: vscode.WebviewPanel, root: vscode.Uri): string {
+  return panel.webview.asWebviewUri(vscode.Uri.joinPath(root, "out", "codicons", "codicon.css")).toString();
+}
+
+function options(root: vscode.Uri): vscode.WebviewPanelOptions & vscode.WebviewOptions {
+  return { enableScripts: true, localResourceRoots: [vscode.Uri.joinPath(root, "out", "codicons")] };
+}
+
 interface Msg { type: string; text?: string; id?: number }
 
 function wire(panel: vscode.WebviewPanel, openItem: (id: number) => void, refresh: () => void): void {
@@ -27,12 +36,11 @@ function emptyData(): DashboardData {
 
 export class DashboardPanel {
   private panel?: vscode.WebviewPanel;
-  constructor(private readonly openItem: (id: number) => void, private readonly refresh: () => void) {}
+  constructor(private readonly root: vscode.Uri, private readonly openItem: (id: number) => void, private readonly refresh: () => void) {}
 
   show(database: Database | undefined, note: string): void {
     if (!this.panel) {
-      this.panel = vscode.window.createWebviewPanel("leanBrain.dashboard", "Lean Brain", vscode.ViewColumn.Active,
-        { enableScripts: true, localResourceRoots: [] });
+      this.panel = vscode.window.createWebviewPanel("leanBrain.dashboard", "Lean Brain", vscode.ViewColumn.Active, options(this.root));
       this.panel.onDidDispose(() => (this.panel = undefined));
       wire(this.panel, this.openItem, this.refresh);
     } else this.panel.reveal();
@@ -43,21 +51,20 @@ export class DashboardPanel {
     if (!this.panel) return;
     const nonce = makeNonce();
     const data = database ? db.dashboard(database, Math.floor(Date.now() / 1000)) : emptyData();
-    this.panel.webview.html = dashboardHtml(data, nonce, this.panel.webview.cspSource, database ? note : note || "No data.");
+    this.panel.webview.html = dashboardHtml(data, nonce, this.panel.webview.cspSource, database ? note : note || "No data.", codicons(this.panel, this.root));
   }
 }
 
 export class ItemPanel {
   private panel?: vscode.WebviewPanel;
   private current?: number;
-  constructor(private readonly refresh: () => void) {}
+  constructor(private readonly root: vscode.Uri, private readonly refresh: () => void) {}
 
   show(database: Database | undefined, id: number): void {
     if (!database) return;
     this.current = id;
     if (!this.panel) {
-      this.panel = vscode.window.createWebviewPanel("leanBrain.item", `Item ${id}`, vscode.ViewColumn.Beside,
-        { enableScripts: true, localResourceRoots: [] });
+      this.panel = vscode.window.createWebviewPanel("leanBrain.item", `Item ${id}`, vscode.ViewColumn.Beside, options(this.root));
       this.panel.onDidDispose(() => (this.panel = undefined));
       wire(this.panel, () => undefined, this.refresh);
     } else this.panel.reveal(undefined, true);
@@ -70,7 +77,7 @@ export class ItemPanel {
     this.panel.title = `Item ${this.current}`;
     const nonce = makeNonce();
     this.panel.webview.html = item
-      ? itemHtml(item, Math.floor(Date.now() / 1000), nonce, this.panel.webview.cspSource)
+      ? itemHtml(item, Math.floor(Date.now() / 1000), nonce, this.panel.webview.cspSource, codicons(this.panel, this.root))
       : `<p>Item ${this.current} is gone.</p>`;
   }
 }

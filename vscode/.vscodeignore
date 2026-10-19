@@ -1,6 +1,7 @@
 **
 !out/extension.js
 !out/sql-wasm.wasm
+!out/codicons/**
 !media/**
 !README.md
 !package.json
