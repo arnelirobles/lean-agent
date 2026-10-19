@@ -3,7 +3,7 @@
 
   brain add --project P --kind K --ref R [--repo R] [--branch B] [--title T] [--body B | --body-file F]
             [--severity S] [--phase P] [--source S] [--model M] [--cycle C] [--commit H] [--link L]
-            [--run-id N] [--tag T ...]
+            [--run-id N] [--tag T ...] [--session ID] [--session-cwd DIR]
   brain list [--open] [--status S] [--project P] [--kind K] [--tag T] [--cycle C]
   brain show ID
   brain close ID [--wontfix] [--resolution R] [--note N] [--commit H] [--tag T ...]
@@ -20,6 +20,8 @@
   brain resume [--project P] [--max N]
   brain stats [--json]
   brain export [--format md|json] [--project P] [--status S]
+  brain session start|end|status ID [--cwd DIR]
+  brain answers --session ID
   brain --self-test
 
 The file is ${LEAN_BRAIN_DB:-~/.local/share/lean/brain.db}, one sqlite database with a schema version
@@ -37,6 +39,11 @@ or nothing open. Queued and running jobs are listed after the blockers and agent
 Status: open, closed, wontfix. Resolution: fixed, flaky, not-a-bug, duplicate, answered, filed.
 Severity: critical, important, minor, info. Phase: code, test, fix, review.
 Source: test-phase, agent, review, user. Model: haiku, sonnet, opus, or empty.
+add stores the Claude session that filed the item and its folder (--session, --session-cwd, defaulting
+to $LEAN_SESSION_ID and $LEAN_SESSION_CWD, which the session-env hook sets), so an answer can resume it.
+session records whether a session is open or ended (the session-env hook calls it), so an answer
+never starts a second copy of a live session. answers prints the answered questions a session filed that
+it has not had yet and marks them delivered; close --delivered marks one delivered at once.
 
 Adding an open item with the same project, kind and ref does not make a new row: it raises
 occurrences and moves last_seen, so a failure seen in ten runs is one line.
@@ -137,7 +144,15 @@ def migrate_4(con):  # extra arguments for the test command, per job
     con.execute("ALTER TABLE jobs ADD COLUMN args TEXT NOT NULL DEFAULT ''")
 
 
-MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4]
+def migrate_5(con):  # the session that filed an item and its folder, so an answer can resume it
+    con.execute("ALTER TABLE items ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+    con.execute("ALTER TABLE items ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''")
+    con.execute("ALTER TABLE items ADD COLUMN answer_delivered_at TEXT NOT NULL DEFAULT ''")
+    con.execute("""CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '')""")
+
+
+MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5]
 
 
 def connect():
@@ -212,7 +227,13 @@ def body_of(a):
     return a.body or ""
 
 
+def session_ok(ident):
+    return bool(re.fullmatch(r"[A-Za-z0-9-]{1,100}", ident))
+
+
 def cmd_add(a):
+    if a.session and not session_ok(a.session):
+        sys.exit("brain: --session takes letters, digits and dashes only")
     con = connect()
     body = body_of(a)
     t = now()
@@ -222,7 +243,8 @@ def cmd_add(a):
         if row:
             sets = {"last_seen": t}
             for col, val in (("branch", a.branch), ("body", body), ("repo", a.repo), ("cycle", a.cycle),
-                             ("severity", a.severity), ("link", a.link), ("run_id", a.run_id)):
+                             ("severity", a.severity), ("link", a.link), ("run_id", a.run_id),
+                             ("session_id", a.session), ("session_cwd", a.session_cwd if a.session else "")):
                 if val not in ("", None):
                     sets[col] = val
             con.execute("UPDATE items SET occurrences=occurrences+1, " + ", ".join(f"{k}=?" for k in sets)
@@ -231,9 +253,11 @@ def cmd_add(a):
         else:
             cur = con.execute(
                 "INSERT INTO items (project, repo, branch, kind, ref, title, body, severity, phase, source, model,"
-                " cycle, commit_hash, link, run_id, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cycle, commit_hash, link, run_id, first_seen, last_seen, session_id, session_cwd)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.project, a.repo, a.branch, a.kind, a.ref, a.title or a.ref, body, a.severity, a.phase,
-                 a.source, a.model, a.cycle, a.commit, a.link, a.run_id, t, t))
+                 a.source, a.model, a.cycle, a.commit, a.link, a.run_id, t, t, a.session,
+                 a.session_cwd if a.session else ""))
             item_id, verb = cur.lastrowid, "added"
         add_tags(con, item_id, a.tag)
         print(f"{verb}: " + line(con, get(con, item_id)))
@@ -263,9 +287,11 @@ def cmd_show(a):
     print(line(con, r))
     print(f"title: {r['title']}")
     print(f"first seen: {r['first_seen']}")
-    for col in ("repo", "resolution", "phase", "source", "model", "cycle", "commit_hash", "link", "run_id", "closed_at"):
+    for col in ("repo", "resolution", "phase", "source", "model", "cycle", "commit_hash", "link", "run_id", "closed_at",
+                "session_id", "session_cwd"):
         if r[col] not in ("", None):
-            print(f"{col.replace('_hash', '').replace('_', ' ')}: {r[col]}")
+            label = "session" if col == "session_id" else col.replace("_hash", "").replace("_", " ")
+            print(f"{label}: {r[col]}")
     if r["body"]:
         print("body: " + r["body"])
     return 0
@@ -278,11 +304,42 @@ def cmd_close(a):
         if r["status"] != "open":
             sys.exit(f"brain: #{a.id} is already {r['status']}")
         body = r["body"] + (("\n\nclosed: " + a.note) if a.note else "")
-        con.execute("UPDATE items SET status=?, resolution=?, closed_at=?, body=?,"
+        t = now()
+        con.execute("UPDATE items SET status=?, resolution=?, closed_at=?, body=?, answer_delivered_at=?,"
                     " commit_hash=COALESCE(NULLIF(?, ''), commit_hash) WHERE id=?",
-                    ("wontfix" if a.wontfix else "closed", a.resolution, now(), body, a.commit, a.id))
+                    ("wontfix" if a.wontfix else "closed", a.resolution, t, body, t if a.delivered else "",
+                     a.commit, a.id))
         add_tags(con, a.id, a.tag)
         print("closed: " + line(con, get(con, a.id)))
+    return 0
+
+
+def cmd_session(a):
+    if not session_ok(a.id):
+        sys.exit("brain: a session id takes letters, digits and dashes only")
+    con = connect()
+    with con:
+        if a.action == "start":
+            con.execute("INSERT INTO sessions (id, cwd, started_at) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE"
+                        " SET cwd=excluded.cwd, started_at=excluded.started_at, ended_at=''", (a.id, a.cwd, now()))
+        elif a.action == "end":
+            con.execute("UPDATE sessions SET ended_at=? WHERE id=?", (now(), a.id))
+        else:
+            r = con.execute("SELECT * FROM sessions WHERE id=?", (a.id,)).fetchone()
+            print("unknown" if not r else f"{'ended' if r['ended_at'] else 'open'} {r['cwd']}")
+    return 0
+
+
+def cmd_answers(a):
+    """Print the answers to this session's questions that it has not had yet, and mark them delivered."""
+    con = connect()
+    with con:
+        rows = con.execute("SELECT * FROM items WHERE session_id=? AND kind='question' AND resolution='answered'"
+                           " AND answer_delivered_at='' ORDER BY id", (a.session,)).fetchall()
+        for r in rows:
+            answer = r["body"].rsplit("\n\nclosed: ", 1)[1] if "\n\nclosed: " in r["body"] else ""
+            print(f"#{r['id']} {r['title']}: {answer}")
+            con.execute("UPDATE items SET answer_delivered_at=? WHERE id=?", (now(), r["id"]))
     return 0
 
 
@@ -566,6 +623,10 @@ def parser():
     s.add_argument("--link", default="")
     s.add_argument("--run-id", type=int)
     s.add_argument("--tag", action="append")
+    s.add_argument("--session", default=os.environ.get("LEAN_SESSION_ID", ""),
+                   help="the Claude session that filed it (default $LEAN_SESSION_ID)")
+    s.add_argument("--session-cwd", default=os.environ.get("LEAN_SESSION_CWD", ""),
+                   help="that session's folder (default $LEAN_SESSION_CWD)")
     s.set_defaults(fn=cmd_add)
     s = sub.add_parser("list")
     s.add_argument("--open", action="store_true")
@@ -585,7 +646,16 @@ def parser():
     s.add_argument("--note", default="")
     s.add_argument("--commit", default="")
     s.add_argument("--tag", action="append")
+    s.add_argument("--delivered", action="store_true", help="the answer already reached the asking session")
     s.set_defaults(fn=cmd_close)
+    s = sub.add_parser("session")
+    s.add_argument("action", choices=("start", "end", "status"))
+    s.add_argument("id")
+    s.add_argument("--cwd", default="")
+    s.set_defaults(fn=cmd_session)
+    s = sub.add_parser("answers")
+    s.add_argument("--session", required=True)
+    s.set_defaults(fn=cmd_answers)
     s = sub.add_parser("reopen")
     s.add_argument("id", type=int)
     s.set_defaults(fn=cmd_reopen)
@@ -652,6 +722,8 @@ def self_test():
     me = os.path.realpath(__file__)
     with tempfile.TemporaryDirectory() as d:
         env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "sub", "brain.db"))
+        env.pop("LEAN_SESSION_ID", None)
+        env.pop("LEAN_SESSION_CWD", None)
 
         def run(*args, stdin=None):
             r = subprocess.run([sys.executable, me, *args], env=env, capture_output=True, text=True, input=stdin)
@@ -940,6 +1012,74 @@ def self_test():
             os.environ.pop("LEAN_BRAIN_DB")
         else:
             os.environ["LEAN_BRAIN_DB"] = saved
+
+        # The session that filed an item is kept, so an answer can go back to it.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "session.db")
+        env["LEAN_SESSION_ID"], env["LEAN_SESSION_CWD"] = "abc-123", "/work/repo"
+        rc, out, _ = run("add", "--project", "p", "--kind", "question", "--ref", "q1")
+        rc, out, _ = run("show", "1")
+        if rc != 0 or "session: abc-123" not in out or "session cwd: /work/repo" not in out:
+            fails.append(f"add must store the session from the environment: {out!r}")
+        rc, out, _ = run("add", "--project", "p", "--kind", "question", "--ref", "q2", "--session", "def-456",
+                         "--session-cwd", "/other")
+        rc, out, _ = run("show", "2")
+        if "session: def-456" not in out or "session cwd: /other" not in out:
+            fails.append(f"--session and --session-cwd must win over the environment: {out!r}")
+        env.pop("LEAN_SESSION_ID"), env.pop("LEAN_SESSION_CWD")
+        run("add", "--project", "p", "--kind", "question", "--ref", "q1")
+        rc, out, _ = run("show", "1")
+        if "session: abc-123" not in out:
+            fails.append(f"a sighting with no session must keep the old one: {out!r}")
+        run("add", "--project", "p", "--kind", "question", "--ref", "q1", "--session", "new-1", "--session-cwd", "/n")
+        rc, out, _ = run("show", "1")
+        if "session: new-1" not in out or "session cwd: /n" not in out:
+            fails.append(f"a sighting from another session must take it over: {out!r}")
+        run("add", "--project", "p", "--kind", "note", "--ref", "plain")
+        rc, out, _ = run("show", "3")
+        if "session" in out:
+            fails.append(f"an item with no session must not print one: {out!r}")
+        rc, _, err = run("add", "--project", "p", "--kind", "question", "--ref", "bad", "--session", "a b;rm")
+        if rc == 0 or "session" not in err:
+            fails.append(f"a session id with odd characters must be refused: {rc} {err!r}")
+
+        # Session liveness: the extension resumes only a session that has ended.
+        rc, out, _ = run("session", "status", "abc-123")
+        if (rc, out) != (0, "unknown"):
+            fails.append(f"a session never seen is unknown: {rc} {out!r}")
+        run("session", "start", "abc-123", "--cwd", "/work/repo")
+        rc, out, _ = run("session", "status", "abc-123")
+        if out != "open /work/repo":
+            fails.append(f"a started session is open: {out!r}")
+        run("session", "end", "abc-123")
+        if run("session", "status", "abc-123")[1] != "ended /work/repo":
+            fails.append("an ended session must say so")
+        run("session", "start", "abc-123", "--cwd", "/work/repo")
+        if run("session", "status", "abc-123")[1] != "open /work/repo":
+            fails.append("a resumed session is open again")
+        if run("session", "start", "x;y", "--cwd", "/")[0] == 0:
+            fails.append("session start must refuse an odd id")
+
+        # Answers reach the asking session once: by the hook, unless the extension delivered it already.
+        run("add", "--project", "p", "--kind", "question", "--ref", "q9", "--title", "which port", "--session", "s-9")
+        rc, out, _ = run("answers", "--session", "s-9")
+        if (rc, out) != (0, ""):
+            fails.append(f"an open question has no answer yet: {rc} {out!r}")
+        run("close", "4", "--resolution", "answered", "--note", "use 8080")
+        rc, out, _ = run("answers", "--session", "s-9")
+        if "#4 which port" not in out or "use 8080" not in out:
+            fails.append(f"an answered question must reach its session: {out!r}")
+        if run("answers", "--session", "s-9")[1] != "":
+            fails.append("an answer must be delivered once")
+        run("add", "--project", "p", "--kind", "question", "--ref", "q10", "--session", "s-9")
+        run("close", "5", "--resolution", "answered", "--note", "yes", "--delivered")
+        if run("answers", "--session", "s-9")[1] != "":
+            fails.append("close --delivered must keep the hook from sending it again")
+        run("add", "--project", "p", "--kind", "question", "--ref", "q11", "--session", "s-9")
+        run("close", "6", "--resolution", "fixed")
+        if run("answers", "--session", "s-9")[1] != "":
+            fails.append("only questions closed as answered are answers")
+        if run("answers", "--session", "other")[1] != "":
+            fails.append("answers go only to the session that asked")
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
