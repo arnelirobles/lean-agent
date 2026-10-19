@@ -25,7 +25,7 @@ interface Msg { type: string; text?: string; id?: number }
 /** What the webviews can ask the extension to do. */
 export interface Actions {
   openItem: (id: number) => void; refresh: () => void; claude: () => void; ask: (id: number) => void; send: (id: number) => void;
-  answer: (id: number, text: string) => void;
+  answer: (id: number, text: string) => void; route: (id: number, to: "remote" | "local" | "any") => void;
 }
 
 function wire(panel: vscode.WebviewPanel, a: Actions): void {
@@ -38,6 +38,8 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
     else if (m.type === "send" && typeof m.id === "number") a.send(m.id);
     else if (m.type === "answer" && typeof m.id === "number" && typeof m.text === "string" && m.text.trim() && m.text.length <= 20000)
       a.answer(m.id, m.text.trim());
+    else if (m.type === "route" && typeof m.id === "number" && (m.text === "remote" || m.text === "local" || m.text === "any"))
+      a.route(m.id, m.text);
     else if (m.type === "claude") a.claude();
     else if (m.type === "refresh") a.refresh();
   });
@@ -46,7 +48,7 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
 function emptyData(): DashboardData {
   return {
     schemaVersion: null, waiting: [], headline: { realOpen: 0, flakyOpen: 0, closed7d: 0, runs7d: 0, testSeconds7d: 0 },
-    cycles: [], suites: [], flakiest: [], load: [], stale: [], generatedAt: Math.floor(Date.now() / 1000),
+    cycles: [], suites: [], flakiest: [], load: [], stale: [], queue: { running: [], queued: [], finished: [] }, generatedAt: Math.floor(Date.now() / 1000),
   };
 }
 

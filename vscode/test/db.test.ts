@@ -152,3 +152,10 @@ describe("db queries", () => {
     expect(db.openCounts(e).counts).toEqual({ real: 0, flaky: 0 });
   });
 });
+
+describe("dashboard queue", () => {
+  it("carries the queue", async () => {
+    const e = await seededDb();
+    expect(db.dashboard(e, NOW).queue).toEqual(db.queue(e));
+  });
+});

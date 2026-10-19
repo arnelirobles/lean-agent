@@ -84,7 +84,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   };
   const actions: Actions = {
     openItem: (id) => itemPanel.show(store.database, id), refresh: () => void refresh(), claude: () => claude.open(), ask, send,
-    answer: (id, text) => void answer(id, text),
+    answer: (id, text) => void answer(id, text), route: (id, to) => void routeJob(id, to),
   };
   const dashboard = new DashboardPanel(ctx.extensionUri, actions);
   const itemPanel = new ItemPanel(ctx.extensionUri, actions);
@@ -167,7 +167,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   /** Set which lanes may run a queued job. Reversible, so no confirmation; brain's warning shows as a warning. */
   async function route(arg: unknown, to: "remote" | "local" | "any"): Promise<void> {
     const id = (arg as { t?: string; job?: { id?: unknown } } | undefined)?.job?.id;
-    if (typeof id !== "number") return;
+    if (typeof id === "number") await routeJob(id, to);
+  }
+
+  async function routeJob(id: number, to: "remote" | "local" | "any"): Promise<void> {
     const brain = findOrWarn();
     if (!brain) return;
     const r = await cli.runBrain(brain, cli.routeArgs(id, to), dbPath(), folder);

@@ -188,6 +188,7 @@ export function dashboard(db: Database, now: number): DashboardData {
     flakiest: flakiest(db),
     load: loadPoints(db),
     stale: stale(db, now),
+    queue: queue(db),
     generatedAt: now,
   };
 }

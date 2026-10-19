@@ -148,7 +148,7 @@ export const STYLE = `
 
 /** Buttons with data-copy copy text, data-open opens an item, data-refresh refreshes, data-tab switches tabs,
  *  data-claude opens Claude Code, data-ask puts an item into it, data-send starts a session that works on it,
- *  data-answer sends the text in #answer as the answer to a question. */
+ *  data-answer sends the text in #answer as the answer to a question, data-route="ID:to" routes a queued job. */
 export const SCRIPT = `
   const vscode = acquireVsCodeApi();
   function showTab(name) {
@@ -161,7 +161,7 @@ export const SCRIPT = `
   const saved = (vscode.getState() || {}).tab;
   if (saved) showTab(saved);
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send],[data-answer]');
+    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send],[data-answer],[data-route]');
     if (!el) return;
     if (el.dataset.tab !== undefined) showTab(el.dataset.tab);
     else if (el.dataset.claude !== undefined) vscode.postMessage({ type: 'claude' });
@@ -170,6 +170,10 @@ export const SCRIPT = `
       const text = box ? box.value.trim() : '';
       if (text) vscode.postMessage({ type: 'answer', id: Number(el.dataset.answer), text });
       else if (box) box.focus();
+    }
+    else if (el.dataset.route !== undefined) {
+      const [id, to] = el.dataset.route.split(':');
+      vscode.postMessage({ type: 'route', id: Number(id), text: to });
     }
     else if (el.dataset.send !== undefined) vscode.postMessage({ type: 'send', id: Number(el.dataset.send) });
     else if (el.dataset.ask !== undefined) vscode.postMessage({ type: 'ask', id: Number(el.dataset.ask) });

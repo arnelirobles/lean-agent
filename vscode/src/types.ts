@@ -37,5 +37,6 @@ export interface DashboardData {
   flakiest: ItemRow[];
   load: LoadPoint[];
   stale: StaleRow[];
+  queue: QueueData;
   generatedAt: number;
 }

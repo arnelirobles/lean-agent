@@ -133,3 +133,40 @@ describe("item html", () => {
     expect(o).toContain("no session on record");
   });
 });
+
+describe("dashboard queue tab", () => {
+  const job = (id: number, status: string, platform: string, host: string, routable = true) => ({
+    id, cycle: "c", project: "core", test_project: "Core.Tests/Core.Tests.csproj", status, tier: "full",
+    enqueued_at: "2026-10-19T08:00:00Z", started_at: status === "running" ? "2026-10-19T08:00:00Z" : null,
+    ended_at: null, reason: "", platform, host, routable,
+  });
+  const withQueue = (running: ReturnType<typeof job>[], queued: ReturnType<typeof job>[]): DashboardData =>
+    ({ ...data, queue: { running, queued, finished: [] } });
+
+  it("says where each running job runs", () => {
+    const html = dashboardBody(withQueue([job(1, "running", "", "dev"), job(2, "running", "apple", "")], []));
+    expect(html).toContain(`data-tab="queue"`);
+    expect(html).toMatch(/#1<\/td>.*?on dev/s);
+    expect(html).toMatch(/#2<\/td>.*?this machine/s);
+  });
+
+  it("offers the route buttons that fit each queued job", () => {
+    const html = dashboardBody(withQueue([], [job(3, "queued", "", ""), job(4, "queued", "remote", ""), job(5, "queued", "apple", "")]));
+    expect(html).toContain(`data-route="3:remote"`);
+    expect(html).not.toContain(`data-route="3:any"`);
+    expect(html).toContain(`data-route="4:any"`);
+    expect(html).not.toContain(`data-route="4:remote"`);
+    expect(html).toContain(`data-route="5:remote"`);
+    expect(html).toMatch(/#4<\/td>.*?remote only/s);
+  });
+
+  it("shows no route buttons on a database from before schema 7", () => {
+    const html = dashboardBody(withQueue([], [job(6, "queued", "", "", false)]));
+    expect(html).toContain("#6</td>");
+    expect(html).not.toContain("data-route=");
+  });
+
+  it("says when nothing is queued or running", () => {
+    expect(dashboardBody(withQueue([], []))).toContain("Nothing queued or running.");
+  });
+});

@@ -1,7 +1,7 @@
-import { formatDuration, relativeTime, shortTestName, STALE_DAYS } from "../db";
+import { formatDuration, jobElapsed, laneLabel, relativeTime, shortTestName, STALE_DAYS } from "../db";
 import { canSend } from "../claude";
 import { kindLook, severityTone, type Tone } from "../style";
-import type { DashboardData } from "../types";
+import type { DashboardData, JobRow } from "../types";
 import { bar, loadChart, sparkline, trendTone } from "./charts";
 import { esc } from "./escape";
 import { ic, page, pill } from "./page";
@@ -21,6 +21,37 @@ function waitingSection(d: DashboardData): string {
     `<td class="muted">${esc(i.project)}</td><td class="muted">${esc(relativeTime(i.last_seen, d.generatedAt))}</td>` +
     `<td>${canSend(i.kind) ? `<button class="small" data-send="${esc(i.id)}">${ic("rocket")}Send to Claude</button>` : ""}</td></tr>`).join("");
   return card(`<table><thead><tr><th>kind</th><th>item</th><th>severity</th><th>project</th><th>last seen</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
+}
+
+const routeBtn = (j: JobRow, to: "remote" | "local" | "any", icon: string, label: string) =>
+  `<button class="small" data-route="${esc(j.id)}:${to}">${ic(icon)}${esc(label)}</button>`;
+
+/** The buttons the sidebar shows for the same job: send to a remote lane, or let any lane take it. */
+function routeButtons(j: JobRow): string {
+  if (!j.routable) return "";
+  return j.platform === "remote" ? routeBtn(j, "any", "desktop", "Any lane") : routeBtn(j, "remote", "cloud-upload", "Send to remote");
+}
+
+function queueSection(d: DashboardData): string {
+  const q = d.queue;
+  if (!q.running.length && !q.queued.length) return empty("Nothing queued or running.", "info");
+  const suite = (j: JobRow) => `<td title="${esc(j.test_project)}">${esc(shortTestName(j.test_project))}</td><td class="muted">${esc(j.project)}</td>`;
+  const running = q.running.map((j) => {
+    const secs = jobElapsed(j, d.generatedAt);
+    return `<tr><td class="num">#${esc(j.id)}</td>${suite(j)}` +
+      `<td>${j.host ? pill(`on ${j.host}`, "purple", "cloud") : pill("this machine", "blue", "desktop")}</td>` +
+      `<td class="num">${secs === null ? "" : esc(formatDuration(secs))}</td></tr>`;
+  }).join("");
+  const queued = q.queued.map((j) => {
+    const lane = laneLabel(j);
+    return `<tr><td class="num">#${esc(j.id)}</td>${suite(j)}` +
+      `<td>${lane ? pill(lane, j.platform === "remote" ? "purple" : "blue", j.platform === "remote" ? "cloud" : "desktop") : `<span class="muted">any lane</span>`}</td>` +
+      `<td>${routeButtons(j)}</td></tr>`;
+  }).join("");
+  return (q.running.length ? sec("Running", "sync~spin", "green", "where each job runs") +
+      card(`<table><thead><tr><th class="num">job</th><th>suite</th><th>project</th><th>where</th><th class="num">for</th></tr></thead><tbody>${running}</tbody></table>`) : "") +
+    (q.queued.length ? sec("Queued", "list-ordered", "blue", "which lanes may take each job") +
+      card(`<table><thead><tr><th class="num">job</th><th>suite</th><th>project</th><th>lanes</th><th></th></tr></thead><tbody>${queued}</tbody></table>`) : "");
 }
 
 function headlineSection(d: DashboardData): string {
@@ -121,6 +152,8 @@ export function dashboardBody(d: DashboardData, note = "", media = ""): string {
     { id: "overview", label: "Overview", icon: "dashboard", tone: "blue", badge: d.waiting.length,
       body: sec("Waiting on you", "bell", "orange", "questions, blockers and rulings") + waitingSection(d) +
         sec("Numbers", "graph", "blue") + headlineSection(d) },
+    { id: "queue", label: "Queue", icon: "list-ordered", tone: "green", badge: d.queue.running.length + d.queue.queued.length,
+      body: queueSection(d) },
     { id: "cycles", label: "Cycles", icon: "history", tone: "green", badge: d.cycles.length,
       body: sec("Cycles", "history", "green", "one row per test cycle") + cyclesSection(d) },
     { id: "suites", label: "Suites", icon: "beaker", tone: "purple",
