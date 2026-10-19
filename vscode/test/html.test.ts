@@ -1,4 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import * as db from "../src/db";
 import { esc } from "../src/dashboard/escape";
 import { dashboardBody, dashboardHtml, listCommand } from "../src/dashboard/dashboardHtml";
@@ -190,6 +192,32 @@ describe("dashboard lanes", () => {
     expect(html).toContain('data-lane-live="9"');
     expect(html).toMatch(/dev[\s\S]*2 cpus, 6g/);
     expect(html).toContain("idle");
+  });
+
+  it("keeps a long last-test name inside its lane card", () => {
+    const html = dashboardHtml(data, "n", "c");
+    // Grid items default to min-width: auto, so an unbroken test name widens the card past its column.
+    expect(html).toMatch(/\.lanes > \.lane, \.lane > \* \{ min-width: 0; \}/);
+    expect(html).toMatch(/\.last \{[^}]*overflow-wrap: anywhere/);
+    expect(html).toContain(`'<span class="muted last">last: '`);
+  });
+});
+
+describe("icons", () => {
+  it("names only icons the codicon font has", () => {
+    const css = readFileSync(join(__dirname, "../node_modules/@vscode/codicons/dist/codicon.css"), "utf8");
+    const d: DashboardData = { ...data, remotes: [{ name: "dev", host: "dev", cpus: "2", memory: "6g" }] };
+    const job = (id: number, status: string, platform: string, host: string) => ({ id, cycle: "", project: "p", test_project: "A/A.Tests.csproj",
+      status, tier: "full", enqueued_at: "", started_at: null, ended_at: null, reason: "", platform, host, routable: true });
+    d.queue = { running: [job(1, "running", "", ""), job(2, "running", "", "dev")],
+      queued: [job(3, "queued", "", ""), job(4, "queued", "remote", ""), job(5, "queued", "apple", "")], finished: [], today: [] };
+    const html = dashboardHtml(d, "n", "c");
+    const names = new Set([...html.matchAll(/codicon-([a-z][a-z0-9-]*)/g)].map((m) => m[1]));
+    // The webview script builds its pills from string literals: pill(text, 'tone', 'icon').
+    for (const m of html.matchAll(/pill\([^()]*?, '[a-z]+', '([a-z0-9-]+)'\)/g)) names.add(m[1]);
+    names.delete("modifier-spin");
+    const missing = [...names].filter((n) => !css.includes(`.codicon-${n}:before`));
+    expect(missing).toEqual([]);
   });
 });
 
