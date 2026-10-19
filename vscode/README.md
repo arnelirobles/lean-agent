@@ -23,6 +23,8 @@ npm run package
 code --install-extension lean-brain-0.5.0.vsix
 ```
 
+The fonts in `media/fonts` (Plus Jakarta Sans, IBM Plex Mono) are licensed under the SIL Open Font License 1.1; each ships with its license text beside it.
+
 `npm run build` bundles to `out/`. `npm test` runs the vitest tests. No telemetry and no network calls.
 
 ## Settings
