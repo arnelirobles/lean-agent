@@ -2,7 +2,7 @@
   "name": "lean-brain",
   "displayName": "Lean Brain",
   "description": "A read-mostly dashboard over the lean-agent brain database.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "baryodev",
   "license": "MIT",
   "private": true,
@@ -57,6 +57,15 @@
       {
         "command": "leanBrain.copyRef",
         "title": "Copy ref"
+      },
+      {
+        "command": "leanBrain.openClaude",
+        "title": "Lean Brain: Open Claude Code",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "leanBrain.askClaude",
+        "title": "Ask Claude about this"
       }
     ],
     "viewsContainers": {
@@ -88,12 +97,22 @@
           "group": "navigation@0"
         },
         {
+          "command": "leanBrain.openClaude",
+          "when": "view == leanBrain.items || view == leanBrain.queue",
+          "group": "navigation@1"
+        },
+        {
           "command": "leanBrain.refresh",
           "when": "view == leanBrain.items || view == leanBrain.queue",
           "group": "navigation"
         }
       ],
       "view/item/context": [
+        {
+          "command": "leanBrain.askClaude",
+          "when": "view == leanBrain.items && viewItem == item",
+          "group": "0_claude"
+        },
         {
           "command": "leanBrain.closeFixed",
           "when": "view == leanBrain.items && viewItem == item",
@@ -135,6 +154,10 @@
         {
           "command": "leanBrain.copyRef",
           "when": "false"
+        },
+        {
+          "command": "leanBrain.askClaude",
+          "when": "false"
         }
       ]
     },
@@ -151,6 +174,12 @@
           "type": "string",
           "default": "",
           "description": "Path to the bin/brain script. Empty uses brain on PATH, then the newest lean-agent plugin.",
+          "scope": "machine"
+        },
+        "leanBrain.claudeCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command that starts Claude Code in the terminal. Empty uses claude.",
           "scope": "machine"
         }
       }
@@ -180,7 +209,8 @@
       "description": "brainPath and dbPath are read only from user settings, since a workspace could point them at another program.",
       "restrictedConfigurations": [
         "leanBrain.brainPath",
-        "leanBrain.dbPath"
+        "leanBrain.dbPath",
+        "leanBrain.claudeCommand"
       ]
     }
   }

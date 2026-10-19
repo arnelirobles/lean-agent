@@ -1,14 +1,14 @@
 import { formatDuration, relativeTime, shortTestName, STALE_DAYS } from "../db";
 import { kindLook, severityTone, type Tone } from "../style";
 import type { DashboardData } from "../types";
-import { bar, donut, loadChart, sparkline, trendTone } from "./charts";
+import { bar, loadChart, sparkline, trendTone } from "./charts";
 import { esc } from "./escape";
 import { ic, page, pill } from "./page";
 
 const empty = (what: string, icon = "check-all") => `<p class="empty">${ic(icon)}${esc(what)}</p>`;
 const card = (inner: string) => `<div class="card">${inner}</div>`;
 const sec = (title: string, icon: string, tone: Tone, hint = "") =>
-  `<div class="sec t-${tone}"><span class="ico">${ic(icon)}</span><h2>${esc(title)}</h2>${hint ? `<span class="hint">${esc(hint)}</span>` : ""}</div>`;
+  `<div class="sec t-${tone}"><span class="ico">${ic(icon)}</span><div>${hint ? `<div class="eyebrow">${esc(hint)}</div>` : ""}<h2>${esc(title)}</h2></div></div>`;
 const kindPill = (kind: string) => { const l = kindLook(kind); return pill(kind, l.tone, l.icon); };
 const numCell = (n: number, tone: "hot" | "good" | "warm") => `<td class="num ${n ? tone : "zero"}">${esc(n)}</td>`;
 
@@ -93,29 +93,27 @@ function staleSection(d: DashboardData): string {
     `<tr><td>${kindPill(s.kind)}</td><td class="num"><span class="count t-${kindLook(s.kind).tone}">${esc(s.n)}</span></td>` +
     `<td class="muted">oldest ${esc(s.oldest)}</td>` +
     `<td><button data-copy="${esc(listCommand(s.kind))}">${ic("copy")}Copy list command</button></td></tr>`).join("");
-  return `<p>${esc(total)} open items were last seen more than ${STALE_DAYS} days ago. The button copies a read-only command.</p>` +
+  return `<p class="lead">${esc(total)} open items were last seen more than ${STALE_DAYS} days ago. The button copies a read-only command.</p>` +
     card(`<table><thead><tr><th>kind</th><th class="num">count</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
 }
 
-function hero(d: DashboardData): string {
+function hero(d: DashboardData, media: string): string {
   const h = d.headline;
   const when = new Date(d.generatedAt * 1000).toLocaleString("en-GB");
-  const open = h.realOpen + h.flakyOpen;
-  const chart = donut([
-    { value: h.realOpen, color: "#ff6b6b", label: "real" },
-    { value: h.flakyOpen, color: "#ffd166", label: "flaky" },
-  ], String(open), "open");
-  const kpi = (n: number | string, label: string) => `<span class="kpi"><b>${esc(n)}</b> ${esc(label)}</span>`;
-  return `<div class="hero">${chart}<div class="grow"><h1>${ic("pulse")}Lean Brain</h1>` +
+  const stat = (n: number | string, label: string, hot = false) => `<div class="stat${hot ? " hot" : ""}"><b>${esc(n)}</b><span>${esc(label)}</span></div>`;
+  const logo = media ? `<img class="fox" src="${esc(media)}/fox-mark.webp" alt="">` : `<span class="mark t-green">${ic("pulse")}</span>`;
+  return `<div class="hero">${logo}<div class="grow"><div class="eyebrow">Lean agent analytics</div>` +
+    `<h1>lean<span class="dot">.brain</span></h1>` +
     `<div class="sub">schema ${esc(d.schemaVersion ?? "unknown")}, read ${esc(when)}</div>` +
-    `<div class="kpis">${kpi(h.realOpen, "real")}${kpi(h.flakyOpen, "flaky")}${kpi(d.waiting.length, "waiting on you")}` +
-    `${kpi(h.runs7d, "runs this week")}</div></div>` +
-    `<button data-refresh="1">${ic("refresh")}Refresh</button></div>`;
+    `<div class="stats">${stat(h.realOpen, "real failures", h.realOpen > 0)}${stat(h.flakyOpen, "flaky")}` +
+    `${stat(d.waiting.length, "waiting on you", d.waiting.length > 0)}${stat(h.runs7d, "runs this week")}</div></div>` +
+    `<div class="actions"><button class="leaf" data-claude="1">${ic("terminal")}Claude Code</button>` +
+    `<button class="sun" data-refresh="1">${ic("refresh")}Refresh</button></div></div>`;
 }
 
 interface Tab { id: string; label: string; icon: string; tone: Tone; badge?: number; body: string }
 
-export function dashboardBody(d: DashboardData, note = ""): string {
+export function dashboardBody(d: DashboardData, note = "", media = ""): string {
   const staleTotal = d.stale.reduce((a, s) => a + s.n, 0);
   const tabs: Tab[] = [
     { id: "overview", label: "Overview", icon: "dashboard", tone: "blue", badge: d.waiting.length,
@@ -136,9 +134,9 @@ export function dashboardBody(d: DashboardData, note = ""): string {
     `<button class="tab t-${t.tone}${i === 0 ? " active" : ""}" role="tab" data-tab="${t.id}">${ic(t.icon)}${esc(t.label)}` +
     (t.badge ? `<span class="badge">${esc(t.badge)}</span>` : "") + `</button>`).join("") + `</div>`;
   const panels = tabs.map((t, i) => `<section class="panel${i === 0 ? " active" : ""}" data-panel="${t.id}">${t.body}</section>`).join("");
-  return hero(d) + (note ? `<p class="note">${esc(note)}</p>` : "") + bar + panels;
+  return hero(d, media) + (note ? `<p class="note">${esc(note)}</p>` : "") + bar + panels;
 }
 
-export function dashboardHtml(d: DashboardData, nonce: string, cspSource: string, note = "", codiconCss = ""): string {
-  return page("Lean Brain", dashboardBody(d, note), nonce, cspSource, codiconCss);
+export function dashboardHtml(d: DashboardData, nonce: string, cspSource: string, note = "", codiconCss = "", media = ""): string {
+  return page("Lean Brain", dashboardBody(d, note, media), nonce, cspSource, codiconCss, media);
 }

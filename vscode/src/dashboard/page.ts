@@ -1,101 +1,133 @@
 import { esc } from "./escape";
 import type { Tone } from "../style";
 
+/** The baryo.dev house style: flat fills on white, leaf and sun accents. Always white, whatever the VS Code theme, so it stays readable. */
 export const STYLE = `
   :root {
-    --red: var(--vscode-charts-red, #f14c4c); --orange: var(--vscode-charts-orange, #f5a623);
-    --yellow: var(--vscode-charts-yellow, #e2c541); --green: var(--vscode-charts-green, #4fc778);
-    --blue: var(--vscode-charts-blue, #3794ff); --purple: var(--vscode-charts-purple, #b180d7);
-    --gray: var(--vscode-descriptionForeground, #8a8a8a);
-    --fg: var(--vscode-foreground); --bg: var(--vscode-editor-background);
-    --card: color-mix(in srgb, var(--bg) 93%, var(--fg) 7%);
-    --card2: color-mix(in srgb, var(--bg) 88%, var(--fg) 12%);
-    --line: color-mix(in srgb, var(--fg) 14%, transparent);
+    --ink: #1c2321; --body: #4d5552; --muted: #6b736f; --leaf: #0b7a55; --leaf-dark: #075a3e; --mint: #7cc4a4;
+    --sun: #ffcd3c; --sun-soft: #ffe08a; --cream: #fff8e8; --sand: #fbf7ee; --line: #ece4d0;
+    --tangerine: #f08a24; --rust: #c2461a; --coral: #e8755a; --peach: #f6a99a;
+    --bg: #ffffff; --card: #ffffff; --head: #ffffff; --track: var(--line); --area: var(--mint);
+    --red: var(--rust); --orange: var(--tangerine); --yellow: #b8860b; --green: var(--leaf); --blue: var(--ink);
+    --purple: var(--coral); --gray: var(--muted);
+    --shadow: 0 1px 2px rgba(28,35,33,0.04); --lift: 0 14px 32px rgba(28,35,33,0.09);
   }
+  @font-face { font-family: "Plus Jakarta Sans"; font-weight: 400 700; font-display: swap; src: url("MEDIA/fonts/plus-jakarta-sans.woff2") format("woff2"); }
+  @font-face { font-family: "IBM Plex Mono"; font-weight: 400; font-display: swap; src: url("MEDIA/fonts/ibm-plex-mono.woff2") format("woff2"); }
   * { box-sizing: border-box; }
-  body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--fg); background: var(--bg);
-         padding: 16px 22px 40px; margin: 0; }
-  .t-red { --tone: var(--red); } .t-orange { --tone: var(--orange); } .t-yellow { --tone: var(--yellow); }
-  .t-green { --tone: var(--green); } .t-blue { --tone: var(--blue); } .t-purple { --tone: var(--purple); } .t-gray { --tone: var(--gray); }
+  body { font-family: "Plus Jakarta Sans", var(--vscode-font-family, system-ui), sans-serif; font-size: 13.5px; line-height: 1.5;
+         color: var(--body); background: var(--bg); padding: 20px 26px 48px; margin: 0; }
+  code, pre, .mono { font-family: "IBM Plex Mono", var(--vscode-editor-font-family, ui-monospace), monospace; }
+  b, h1, h2 { color: var(--ink); }
 
-  .hero { display: flex; align-items: center; gap: 18px; padding: 16px 20px; border-radius: 12px; color: #fff;
-          background: linear-gradient(120deg, #6d3fd6 0%, #3a6ff0 55%, #14b8a6 100%); box-shadow: 0 6px 24px #0004; }
-  .hero[class*="t-"] { background: linear-gradient(120deg, color-mix(in srgb, var(--tone) 80%, #000) 0%, color-mix(in srgb, var(--tone) 55%, #6d3fd6) 100%); }
-  .hero h1 { font-size: 1.6em; margin: 0; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
-  .hero h1 .codicon { font-size: 1.1em; }
-  .hero .sub { opacity: .85; font-size: .92em; margin-top: 3px; }
-  .hero .grow { flex: 1; }
-  .hero .donut text { fill: #fff; }
-  .hero button { background: #ffffff26; color: #fff; border: 1px solid #ffffff55; }
-  .hero button:hover { background: #ffffff40; }
-  .kpis { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-  .kpi { background: #ffffff1f; border: 1px solid #ffffff33; border-radius: 999px; padding: 2px 10px; font-size: .9em; }
-  .kpi b { font-size: 1.05em; }
+  .t-red { --tone: var(--red); --fill: var(--rust); --on: #fff; }
+  .t-orange { --tone: var(--orange); --fill: var(--tangerine); --on: #1c2321; }
+  .t-yellow { --tone: var(--yellow); --fill: var(--sun); --on: #1c2321; }
+  .t-green { --tone: var(--green); --fill: var(--leaf); --on: #fff; }
+  .t-blue { --tone: var(--blue); --fill: var(--cream); --on: var(--ink); }
+  .t-purple { --tone: var(--purple); --fill: var(--peach); --on: #1c2321; }
+  .t-gray { --tone: var(--gray); --fill: var(--cream); --on: var(--body); }
 
-  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 16px 0 14px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
-  .tab { background: transparent; color: var(--fg); border: 1px solid transparent; border-radius: 8px; padding: 5px 12px;
-         display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font: inherit; opacity: .8; }
-  .tab:hover { background: var(--card); opacity: 1; }
-  .tab.active { opacity: 1; background: color-mix(in srgb, var(--tone, var(--blue)) 16%, transparent);
-                border-color: color-mix(in srgb, var(--tone, var(--blue)) 45%, transparent); }
-  .tab .codicon { color: var(--tone, var(--blue)); }
-  .badge { background: var(--tone, var(--blue)); color: #fff; border-radius: 999px; padding: 0 7px; font-size: .8em; font-weight: 600; }
-  .panel { display: none; animation: fade .18s ease-out; } .panel.active { display: block; }
-  @keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+  .eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--rust); }
 
-  .sec { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; }
-  .sec:first-child { margin-top: 4px; }
-  .sec .ico { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center;
-              background: color-mix(in srgb, var(--tone) 20%, transparent); color: var(--tone); }
-  h2 { font-size: 1.1em; margin: 0; } .sec .hint { color: var(--gray); font-size: .9em; }
+  .hero { position: relative; overflow: hidden; display: flex; align-items: center; gap: 18px; padding: 22px 24px;
+          background: #ffffff; border: 1px solid var(--line); border-radius: 20px; box-shadow: var(--shadow); }
+  .hero::after { content: ""; position: absolute; right: -30px; top: -30px; width: 150px; height: 150px; border-radius: 50%; opacity: .55;
+                 background: repeating-linear-gradient(135deg, var(--stripe, var(--sun)) 0 3px, transparent 3px 7px); pointer-events: none; }
+  .hero > * { position: relative; z-index: 1; }
+  .hero .fox { width: 52px; height: 52px; flex: none; }
+  .hero .mark { width: 52px; height: 52px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--fill); color: var(--on); }
+  .hero .mark .codicon { font-size: 24px; }
+  .hero h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.015em; margin: 2px 0 0; line-height: 1.15; }
+  .hero h1 .dot { color: var(--leaf); }
+  .hero .sub { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .hero .grow { flex: 1; min-width: 0; }
+  .hero .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .stats { display: flex; gap: 26px; flex-wrap: wrap; margin-top: 14px; }
+  .stat b { display: block; font-size: 28px; font-weight: 700; letter-spacing: -0.02em; line-height: 1; color: var(--leaf); }
+  .stat.hot b { color: var(--red); }
+  .stat span { font-size: 12px; color: var(--muted); }
 
-  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
-  .tile { background: var(--card); border-radius: 10px; padding: 12px 14px; border-left: 4px solid var(--tone);
-          display: flex; gap: 12px; align-items: center; }
-  .tile .ico { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none;
-               background: color-mix(in srgb, var(--tone) 20%, transparent); color: var(--tone); }
-  .tile .ico .codicon { font-size: 18px; }
-  .tile b { display: block; font-size: 1.6em; line-height: 1.1; color: var(--tone); }
-  .tile span { color: var(--gray); font-size: .9em; }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; margin: 18px 0 16px; padding: 5px; background: var(--card);
+          border: 1px solid var(--line); border-radius: 999px; width: fit-content; box-shadow: var(--shadow); }
+  .tab { background: transparent; color: var(--ink); border: 0; border-radius: 999px; padding: 7px 14px; box-shadow: none;
+         display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font: inherit; font-size: 12px; font-weight: 700;
+         letter-spacing: .06em; text-transform: uppercase; }
+  .tab:hover { background: var(--cream); }
+  .tab.active { background: var(--leaf); color: #fff; }
+  .badge { background: var(--sun); color: #1c2321; border-radius: 999px; padding: 0 7px; font-size: 11px; font-weight: 700; letter-spacing: 0; }
+  .tab.active .badge { background: #fff; color: var(--leaf); }
+  .panel { display: none; } .panel.active { display: block; }
 
-  .card { background: var(--card); border-radius: 10px; overflow: hidden; border: 1px solid var(--line); }
-  .card.pad { padding: 12px 14px; }
+  .sec { display: flex; align-items: center; gap: 12px; margin: 26px 0 12px; }
+  .panel > .sec:first-child { margin-top: 6px; }
+  .sec .ico { width: 34px; height: 34px; border-radius: 50%; flex: none; display: grid; place-items: center; background: var(--fill); color: var(--on); }
+  .sec .ico .codicon { font-size: 16px; }
+  h2 { font-size: 19px; font-weight: 700; letter-spacing: -0.015em; margin: 0; line-height: 1.2; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+  .tile { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; box-shadow: var(--shadow);
+          display: flex; flex-direction: column; gap: 10px; transition: box-shadow .15s, transform .15s; }
+  .tile:hover { box-shadow: var(--lift); transform: translateY(-2px); }
+  .tile .ico { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: var(--fill); color: var(--on); }
+  .tile b { display: block; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; line-height: 1; color: var(--tone); }
+  .tile.t-blue b, .tile.t-gray b { color: var(--green); }
+  .tile span { color: var(--muted); font-size: 12.5px; }
+
+  .card { background: var(--card); border-radius: 16px; overflow: hidden; border: 1px solid var(--line); box-shadow: var(--shadow); }
+  .card.pad { padding: 16px 18px; }
   table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 6px 12px; vertical-align: middle; }
-  thead th { background: var(--card2); color: var(--gray); font-weight: 600; font-size: .85em; text-transform: uppercase; letter-spacing: .4px; }
-  tbody tr:nth-child(even) { background: color-mix(in srgb, var(--fg) 3%, transparent); }
-  tbody tr:hover { background: color-mix(in srgb, var(--blue) 12%, transparent); }
+  th, td { text-align: left; padding: 9px 14px; vertical-align: middle; }
+  thead th { background: var(--head); color: var(--muted); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+             border-bottom: 1px solid var(--line); }
+  tbody tr + tr td, tbody tr + tr th { border-top: 1px solid var(--line); }
+  tbody tr:hover { background: #fdfbf6; }
+  td { color: var(--ink); }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-  td.zero { color: var(--gray); opacity: .6; }
-  td.hot { color: var(--red); font-weight: 600; } td.good { color: var(--green); font-weight: 600; } td.warm { color: var(--orange); font-weight: 600; }
-  .muted { color: var(--gray); } td.muted, td.num { white-space: nowrap; }
-  .note { color: var(--vscode-editorWarning-foreground, var(--yellow)); background: color-mix(in srgb, var(--yellow) 12%, transparent);
-          padding: 6px 10px; border-radius: 6px; }
-  .empty { color: var(--gray); padding: 14px; text-align: center; display: flex; gap: 8px; align-items: center; justify-content: center; }
+  td.zero { color: var(--muted); opacity: .6; }
+  td.hot { color: var(--red); font-weight: 700; } td.good { color: var(--green); font-weight: 700; } td.warm { color: var(--orange); font-weight: 700; }
+  .muted, td.muted { color: var(--muted); } td.muted, td.num { white-space: nowrap; }
+  .note { color: #1c2321; background: var(--sun-soft); padding: 10px 14px; border-radius: 12px; font-weight: 500; }
+  .empty { color: var(--muted); padding: 22px; text-align: center; display: flex; gap: 8px; align-items: center; justify-content: center;
+           background: var(--card); border: 1px dashed var(--line); border-radius: 16px; margin: 0; }
   .empty .codicon { color: var(--green); }
 
-  .tag, .pill { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 1px 8px; font-size: .85em; white-space: nowrap; vertical-align: middle; line-height: 18px; margin: 1px 2px 1px 0;
-                background: color-mix(in srgb, var(--tone, var(--gray)) 18%, transparent); color: var(--tone, var(--fg));
-                border: 1px solid color-mix(in srgb, var(--tone, var(--gray)) 40%, transparent); }
-  .count { display: inline-block; min-width: 26px; text-align: center; border-radius: 6px; padding: 1px 6px; font-weight: 600;
-           background: color-mix(in srgb, var(--tone) 20%, transparent); color: var(--tone); }
+  .tag { font-family: "Plus Jakarta Sans", sans-serif; display: inline-block; background: var(--cream); color: var(--body); border-radius: 999px; padding: 3px 10px; font-size: 12px;
+         font-weight: 700; margin: 1px 2px 1px 0; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 2px 10px; font-size: 11.5px; font-weight: 700;
+          white-space: nowrap; vertical-align: middle; line-height: 18px; margin: 1px 2px 1px 0; background: var(--fill, var(--cream)); color: var(--on, var(--ink)); }
+  .pill .codicon { font-size: 13px; }
+  .t-blue .ico, .t-gray .ico, .t-blue.mark, .t-gray.mark { background: var(--ink); color: var(--bg); }
+  .t-blue.pill, .t-gray.pill { box-shadow: inset 0 0 0 1px var(--line); }
+  .count { display: inline-block; min-width: 28px; text-align: center; border-radius: 999px; padding: 1px 8px; font-weight: 700;
+           background: var(--fill); color: var(--on); }
+  .pills { display: flex; flex-wrap: wrap; gap: 4px; margin: 16px 0 4px; }
 
-  .legend { color: var(--gray); font-size: 0.9em; margin-top: 6px; display: flex; gap: 14px; flex-wrap: wrap; }
-  .sw { display: inline-block; width: 14px; height: 4px; border-radius: 2px; margin-right: 5px; vertical-align: middle; background: var(--tone, var(--gray)); }
-  .sw.dot { height: 9px; width: 9px; border-radius: 5px; }
-  .axis { fill: var(--gray); font-size: 9px; }
-  .grid { stroke: var(--line); stroke-dasharray: 2 3; }
+  .legend { color: var(--muted); font-size: 12px; margin-top: 10px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  .sw { display: inline-block; width: 16px; height: 4px; border-radius: 2px; margin-right: 6px; vertical-align: middle; background: var(--tone, var(--gray)); }
+  .sw.dot { height: 10px; width: 10px; border-radius: 50%; }
+  .axis { fill: var(--muted); font-size: 9px; font-family: "IBM Plex Mono", monospace; }
+  .grid { stroke: var(--line); }
+  .lead { color: var(--body); margin: 0 0 12px; }
 
-  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 0; padding: 4px 11px; cursor: pointer;
-           border-radius: 6px; font: inherit; display: inline-flex; align-items: center; gap: 5px; }
-  button:hover { background: var(--vscode-button-hoverBackground); }
-  pre { white-space: pre-wrap; word-break: break-word; background: var(--vscode-textCodeBlock-background, var(--card)); padding: 12px;
-        border-radius: 8px; border: 1px solid var(--line); }
-  a { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none; } a:hover { text-decoration: underline; }
-  .fields th { width: 130px; color: var(--gray); font-weight: 500; background: transparent; text-transform: none; letter-spacing: 0; font-size: 1em; }
+  button { font: inherit; font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; cursor: pointer;
+           border-radius: 999px; padding: 7px 14px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+           background: transparent; color: var(--ink); border: 1.5px solid var(--ink); transition: background .15s, color .15s; }
+  button:hover { background: var(--ink); color: var(--bg); }
+  button.sun { background: var(--sun); color: #1c2321; border-color: var(--sun); box-shadow: 0 6px 16px rgba(255,205,60,.35); }
+  button.sun:hover { background: var(--sun-soft); border-color: var(--sun-soft); }
+  button.leaf { background: var(--leaf); color: #fff; border-color: var(--leaf); }
+  button.leaf:hover { background: var(--leaf-dark); border-color: var(--leaf-dark); }
+  pre { white-space: pre-wrap; word-break: break-word; background: var(--card); color: var(--ink); padding: 16px 18px; margin: 0;
+        border-radius: 16px; border: 1px solid var(--line); font-size: 12.5px; }
+  a { color: var(--ink); cursor: pointer; text-decoration: none; font-weight: 600; border-bottom: 1.5px solid var(--sun); }
+  a:hover { color: var(--leaf); border-color: var(--leaf); }
+  .fields th { width: 140px; color: var(--muted); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .fields td { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; }
 `;
 
-/** Buttons with data-copy copy text, data-open opens an item, data-refresh refreshes, data-tab switches tabs. */
+/** Buttons with data-copy copy text, data-open opens an item, data-refresh refreshes, data-tab switches tabs,
+ *  data-claude opens Claude Code, data-ask puts an item into it. */
 export const SCRIPT = `
   const vscode = acquireVsCodeApi();
   function showTab(name) {
@@ -108,9 +140,11 @@ export const SCRIPT = `
   const saved = (vscode.getState() || {}).tab;
   if (saved) showTab(saved);
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab]');
+    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask]');
     if (!el) return;
     if (el.dataset.tab !== undefined) showTab(el.dataset.tab);
+    else if (el.dataset.claude !== undefined) vscode.postMessage({ type: 'claude' });
+    else if (el.dataset.ask !== undefined) vscode.postMessage({ type: 'ask', id: Number(el.dataset.ask) });
     else if (el.dataset.copy !== undefined) vscode.postMessage({ type: 'copy', text: el.dataset.copy });
     else if (el.dataset.open !== undefined) vscode.postMessage({ type: 'open', id: Number(el.dataset.open) });
     else vscode.postMessage({ type: 'refresh' });
@@ -127,13 +161,14 @@ export function pill(text: string, tone: Tone, icon?: string): string {
   return `<span class="pill t-${tone}">${icon ? ic(icon) : ""}${esc(text)}</span>`;
 }
 
-export function page(title: string, body: string, nonce: string, cspSource: string, codiconCss = ""): string {
+/** media is the webview URI of the extension's media folder, where the fonts live. */
+export function page(title: string, body: string, nonce: string, cspSource: string, codiconCss = "", media = ""): string {
   const csp = `default-src 'none'; style-src 'nonce-${nonce}' ${cspSource}; font-src ${cspSource}; script-src 'nonce-${nonce}'; img-src ${cspSource} data:;`;
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">` +
     `<meta http-equiv="Content-Security-Policy" content="${esc(csp)}">` +
     `<meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)}</title>` +
     (codiconCss ? `<link rel="stylesheet" href="${esc(codiconCss)}">` : "") +
-    `<style nonce="${esc(nonce)}">${STYLE}</style></head><body>${body}` +
+    `<style nonce="${esc(nonce)}">${STYLE.split("MEDIA").join(media)}</style></head><body>${body}` +
     `<script nonce="${esc(nonce)}">${SCRIPT}</script></body></html>`;
 }
 
