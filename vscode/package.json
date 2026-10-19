@@ -3,7 +3,7 @@
   "displayName": "Lean Brain",
   "description": "A read-mostly dashboard over the lean-agent brain database.",
   "version": "0.5.1",
-  "publisher": "baryodev",
+  "publisher": "baryo-dev",
   "license": "MIT",
   "private": true,
   "repository": {
