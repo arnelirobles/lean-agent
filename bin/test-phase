@@ -182,7 +182,7 @@ class Lane:
 LOCAL = Lane("local", "local")
 
 
-def heavy(lane, cmd, cwd, log, stall):
+def heavy(lane, cmd, cwd, log, stall, header=None):
     """Run cmd in the lane. Returns (exit code, output, started, ended, seconds spent waiting for the lane)."""
     env = dict(os.environ)
     env.setdefault("HEAVY_WAIT", "3600")
@@ -194,7 +194,8 @@ def heavy(lane, cmd, cwd, log, stall):
     env["HEAVY_TIMING_FILE"] = timing
     started = int(time.time())
     with open(log, "w") as fh:
-        fh.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
+        # The header is always one line, so what follows it is the command's own output.
+        fh.write(header if header is not None else "$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
         fh.flush()
         rc = subprocess.run(["bash", HEAVY, lane] + cmd, cwd=cwd, env=env, stdout=fh,
                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL).returncode
@@ -306,8 +307,10 @@ def tier_note(rc):
 def lane_problem(rc, text):
     """Why a remote command never really ran, or "". No marker line means the test command never started."""
     if not re.search("^" + re.escape(lr.MARKER) + r"\s*$", text, re.M):
-        lines = [l for l in text.splitlines()[1:] if l.strip()]  # the first line is the command itself
-        return f"nothing ran on the host (exit {rc})" + (": " + mask(lines[-1].strip())[:160] if lines else "")
+        lines = [l for l in text.splitlines()[1:] if l.strip()]  # line one is the one-line header
+        if not lines:
+            return f"nothing ran on the host: no output (exit {rc})"
+        return f"nothing ran on the host (exit {rc}): " + mask(lines[-1].strip())[:160]
     if rc == 255:
         return "connection to the host lost (ssh exit 255)"
     return ""
@@ -385,7 +388,8 @@ def _run_job(job, a, run_dir, runner, lane):
             prepare()
             before = lr.remote_load(remote)
             ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd))
-            rc, text, started, ended, wait = heavy(f"remote-{remote.name}", ssh, repo, log, a.stall)
+            rc, text, started, ended, wait = heavy(f"remote-{remote.name}", ssh, repo, log, a.stall,
+                                                   header=f"$ ssh {remote.name} <script for job {job['id']}>\n")
             problem = lane_problem(rc, text)
             if problem:
                 raise LaneProblem(problem)
@@ -724,6 +728,16 @@ def self_test():
     if "hunter2" in " ".join(seen.get("args", [])) or "hunter2" in (seen.get("stdin") or "") \
             or "-" not in seen.get("args", []) or "--body" in seen.get("args", []):
         fails.append(f"item body must be masked and sent by stdin, not argv: {seen}")
+
+    # A remote job's log opens with a one-line header, so the reason is never script text.
+    head = "$ ssh dev <script for job 9>\n"
+    why = lane_problem(255, head + "ssh: connect refused\n")
+    if "connect refused" not in why or "script" in why:
+        fails.append(f"lane_problem must read the output after the header: {why!r}")
+    if "no output (exit 255)" not in lane_problem(255, head):
+        fails.append(f"an empty output must read as no output: {lane_problem(255, head)!r}")
+    if lane_problem(1, head + "marker\n".replace("marker", lr.MARKER) + "x\n") != "":
+        fails.append("a log with the marker line is not a lane problem")
 
     # A requeue that fails once is retried; one that keeps failing is said loudly.
     calls, said = [], []
