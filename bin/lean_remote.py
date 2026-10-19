@@ -240,7 +240,7 @@ def job_dir(r, job_id):
 def sync_argv(r, repo, job_id):
     """rsync argv; the caller writes the NUL-joined file_list on its stdin."""
     jd = sh_path(job_dir(r, job_id))
-    return ["rsync", "-a", "--files-from=-", "--from0", "-e", " ".join(ssh_cmd_opts()),
+    return ["rsync", "-a", "--timeout=600", "--files-from=-", "--from0", "-e", " ".join(ssh_cmd_opts()),
             f"--rsync-path=mkdir -p {jd} && rsync", repo.rstrip("/") + "/", f"{r.host}:{job_dir(r, job_id)}/"]
 
 
@@ -273,7 +273,8 @@ def run_script(r, cfg, job_id, cmd):
     caps = f"--cpus {shlex.quote(r.cpus)} --memory {shlex.quote(r.memory)}"
     env = f" --env-file {jd}/.lean.env" if cfg and cfg.env_file else ""
     fail = lambda why: f'{{ echo "lean-remote: {why}"; exit 125; }}'
-    out = [f"install -d {nuget}",
+    # A job runs several commands (its tier, then class reruns); each starts from a clean network and sidecars.
+    out = remove_labelled(f"label={label}") + [f"install -d {nuget}",
            f"docker network create --label {label} {net} >/dev/null || " + fail("docker network failed")]
     sidecars = list(cfg.sidecars.items()) if cfg else []
     for alias, image in sidecars:
@@ -289,6 +290,7 @@ def run_script(r, cfg, job_id, cmd):
                f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget -v {jd}:/work -w /work{env} "
                f"{shlex.quote(r.image)} sh -c {shlex.quote(inner)}")
     out.append("rc=$?")
+    out += remove_labelled(f"label={label}")
     out.append('exit "$rc"')
     return "\n".join(out) + "\n"
 

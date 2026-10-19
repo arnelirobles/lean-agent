@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fake ssh for the test-phase self-test: logs the call, then runs the last argument locally with sh -c.
+# $FAKE_DIR/ssh-down makes every call fail; $FAKE_DIR/ssh-fail-run makes only the test run fail, as a
+# dropped connection would, before the command prints anything.
+echo "ssh $*" >> "$FAKE_SSH_LOG"
+if [ -f "$FAKE_DIR/ssh-down" ]; then echo "ssh: connect to host failed" >&2; exit 255; fi
+for a; do last=$a; done
+case "$last" in
+  *"lean-remote: started"*)
+    if [ -f "$FAKE_DIR/ssh-fail-run" ]; then echo "ssh: connection reset by peer" >&2; exit 255; fi ;;
+esac
+exec sh -c "$last"

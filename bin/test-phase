@@ -47,6 +47,14 @@ Every command is also recorded as a row in brain's runs table (tier fast, full o
 spent waiting for the lane, load average at start and end, passed, failed, skipped, stalled, exit code),
 and each item points at the run that showed it. `brain stats` reads them.
 
+Remote lanes. When ~/.config/lean/remotes.ini names SSH hosts, the one drainer runs one lane per host next
+to the local lane, each claiming the next ready job with `brain queue next`. A remote lane copies the job's
+worktree to the host, runs the same test command in a capped container there, and streams the output back
+into the same log, so parsing and brain stay local. A job that targets an Apple platform runs only on the
+local lane. If the host, the connection or the copy fails, the job goes back to queued and the lane rests
+(TEST_PHASE_REST seconds, default 600) while the other lanes go on. TEST_PHASE_REMOTES=off turns every
+remote lane off. See docs/remote-lane.md.
+
 TEST_PHASE_RUNNER=mtp or vstest overrides detection. The wait for a busy lane is HEAVY_WAIT, here
 defaulting to 3600 seconds. Exit 0 when nothing real failed and no job was cancelled during the drain, 1 otherwise. A job whose
 failures were all flaky finishes done, so the jobs after it still run.
@@ -63,9 +71,16 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+try:
+    import lean_remote as lr
+except ImportError:  # a copy of test-phase without its module still drains the local lane
+    lr = None
+LaneProblem = lr.LaneProblem if lr else type("LaneProblem", (Exception,), {})
 HEAVY = os.path.join(HERE, "heavy.sh")
 BRAIN = os.path.join(HERE, "brain")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -155,6 +170,16 @@ class Dotnet:
 RUNNERS = [Dotnet]
 
 
+class Lane:
+    """One place jobs run: the local machine, or one SSH host."""
+
+    def __init__(self, name, where, remote=None, repos=None):
+        self.name, self.where, self.remote, self.repos = name, where, remote, repos or {}
+
+
+LOCAL = Lane("local", "local")
+
+
 def heavy(lane, cmd, cwd, log, stall):
     """Run cmd in the lane. Returns (exit code, output, started, ended, seconds spent waiting for the lane)."""
     env = dict(os.environ)
@@ -222,16 +247,18 @@ def add_item(row, kind, ref, severity, body, run_id, ctx):
     brain(args, stdin=mask(body))  # the body goes by stdin, not argv, where any user's ps could read it
 
 
-def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start, project):
+def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start, project, lane=LOCAL):
     passed, failed, skipped = ctx["runner"].counts(text)
+    load_end = lr.remote_load(lane.remote) if lane.remote else load1()
     out = brain(["run-add", "--cycle", ctx["cycle"], "--project", row["project"], "--repo", ctx["repo"],
                  "--test-project", os.path.basename(project), "--runner", mode, "--tier", tier,
                  "--started", str(started), "--ended", str(ended), "--passed", str(passed),
                  "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc == 76 else "0",
                  "--exit-code", str(rc)]
+                + (["--host", lane.remote.name] if lane.remote else [])
                 + (["--lane-wait", str(wait)] if wait is not None else [])
                 + (["--load-start", "%.2f" % load_start] if load_start is not None else [])
-                + (["--load-end", "%.2f" % load1()] if load1() is not None else []))
+                + (["--load-end", "%.2f" % load_end] if load_end is not None else []))
     return int(out) if out and out.isdigit() else None
 
 
@@ -265,10 +292,40 @@ def tier_note(rc):
     return {0: "pass", 75: "busy", 76: "stalled"}.get(rc, "fail")
 
 
-def run_job(job, a, run_dir, runner):
+def lane_problem(rc, text):
+    """Why a remote command never really ran, or "". No marker line means the test command never started."""
+    if not re.search("^" + re.escape(lr.MARKER) + r"\s*$", text, re.M):
+        lines = [l for l in text.splitlines()[1:] if l.strip()]  # the first line is the command itself
+        return f"nothing ran on the host (exit {rc})" + (": " + mask(lines[-1].strip())[:160] if lines else "")
+    if rc == 255:
+        return "connection to the host lost (ssh exit 255)"
+    return ""
+
+
+def clean_remote(remote, job_id):
+    """Remove a job's folder, containers and network on the host. Best effort: the next claim sweeps too."""
+    try:
+        subprocess.run(lr.ssh_argv(remote, "sh", "-c", lr.cleanup_script(remote, job_id)), capture_output=True,
+                       timeout=180, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def run_job(job, a, run_dir, runner, lane=LOCAL):
+    try:
+        return _run_job(job, a, run_dir, runner, lane)
+    finally:
+        if lane.remote:
+            clean_remote(lane.remote, job["id"])
+
+
+def _run_job(job, a, run_dir, runner, lane):
     repo, project = job["repo_dir"], job["test_project"]
+    remote = lane.remote
+    cfg = lane.repos.get(job["project"]) if remote else None
     row = {"job": job["id"], "project": job["project"], "test": project, "tier": job["tier"],
-           "result": "", "failing": 0, "real": 0, "flaky": 0, "notes": [], "run_id": None, "rc": 1}
+           "result": "", "failing": 0, "real": 0, "flaky": 0, "notes": [], "run_id": None, "rc": 1,
+           "host": remote.name if remote else ""}
     if not os.path.isdir(repo):
         row["result"] = "error"
         row["notes"].append("no such directory")
@@ -287,13 +344,44 @@ def run_job(job, a, run_dir, runner):
         row["notes"].append(f"bad extra arguments: {e}")
         return row
 
-    def tier(name, cls_filter, log):
-        before = load1()
-        rc, text, started, ended, wait = heavy(a.lane, runner.command(mode, project, cls_filter, name == "fast", extra),
-                                               repo, log, a.stall)
-        return rc, text, record_run(row, ctx, name, mode, rc, text, started, ended, wait, before, project)
+    synced = []
 
-    rc, text, run_id = tier(job["tier"], job["filter"] or None, stem + ".log")
+    def prepare():  # the copy and the env file go once per job, however many commands follow
+        if synced:
+            return
+        files = lr.file_list(repo, remote.extra_paths, remote.exclude)
+        data = b"".join(f.encode("utf-8", "surrogateescape") + b"\0" for f in files)
+        try:
+            p = subprocess.run(lr.sync_argv(remote, repo, job["id"]), input=data, capture_output=True)
+        except OSError as e:
+            raise LaneProblem(f"{remote.name}: rsync did not start ({e.strerror})")
+        if p.returncode != 0:
+            tail = p.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+            raise LaneProblem(f"{remote.name}: copy failed (rsync exit {p.returncode}) {mask(tail[0])[:120]}".strip())
+        if cfg and cfg.env_file:
+            lr.send_env(remote, job["id"], cfg.env_file)
+        synced.append(1)
+
+    def tier(name, cls_filter, log):
+        cmd = runner.command(mode, project, cls_filter, name == "fast", extra)
+        if remote:
+            prepare()
+            before = lr.remote_load(remote)
+            ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd))
+            rc, text, started, ended, wait = heavy(f"remote-{remote.name}", ssh, repo, log, a.stall)
+            problem = lane_problem(rc, text)
+            if problem:
+                raise LaneProblem(problem)
+        else:
+            before = load1()
+            rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall)
+        return rc, text, record_run(row, ctx, name, mode, rc, text, started, ended, wait, before, project, lane)
+
+    try:
+        rc, text, run_id = tier(job["tier"], job["filter"] or None, stem + ".log")
+    except LaneProblem as e:
+        row["result"], row["lane_problem"] = "requeued", str(e)
+        return row
     row["rc"], row["run_id"] = rc, run_id
     row["result"] = tier_note(rc)
     for name, detail in runner.failures(text):
@@ -313,9 +401,16 @@ def run_job(job, a, run_dir, runner):
     for name in failing:
         by_class.setdefault(runner.class_of(name), []).append(name)
     row["failing"] = len(failing)
+    lost = None
     for cls, names in by_class.items():
         log = f"{stem}-class-{safe(cls)}.log"
-        rrc, rtext, _ = tier("rerun", cls, log)
+        rrc, rtext = 75, ""  # a rerun that could not run proves nothing: unverified
+        if not lost:
+            try:
+                rrc, rtext, _ = tier("rerun", cls, log)
+            except LaneProblem as e:
+                lost = row["lane_rest"] = str(e)
+                row["notes"].append(f"rerun not run: {lost}")
         again = {n for n, _ in runner.failures(rtext)}
         rpassed = runner.counts(rtext)[0]
         for name in names:
@@ -359,33 +454,139 @@ def only_flaky(row):
     return row["result"] == "fail" and row["failing"] > 0 and row["real"] == 0 and row["flaky"] == row["failing"]
 
 
-def drain(a, run_dir, runner):
-    """(rows, how many jobs were cancelled while draining)."""
+def rest_seconds():
+    try:
+        return float(os.environ.get("TEST_PHASE_REST", "600"))
+    except ValueError:
+        return 600.0
+
+
+def running_ids():
+    return [int(x) for x in re.findall(r"^job #(\d+) running", brain(["queue", "list", "--status", "running"]) or "", re.M)]
+
+
+def sweep_remote(remote):
+    """Remove what belongs to no running job on the host. Best effort."""
+    try:
+        subprocess.run(lr.ssh_argv(remote, "sh", "-c", lr.sweep_script(remote, running_ids())),
+                       capture_output=True, timeout=180, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def error_row(job_id, why):
+    return {"job": job_id, "project": "-", "test": "-", "tier": "-", "result": "error", "failing": 0, "real": 0,
+            "flaky": 0, "notes": [why], "run_id": None, "rc": 1, "host": ""}
+
+
+def drain(a, run_dir, runner, lanes=None):
+    """(rows, how many jobs were cancelled while draining). One thread per lane."""
+    lanes = lanes or [LOCAL]
     before = cancelled_ids()
+    remotes = {l.remote.name: l.remote for l in lanes if l.remote}
     # Jobs left running by a drainer that died cannot finish; fail them so their dependents are cancelled.
     for line in (brain(["queue", "list", "--status", "running"]) or "").splitlines():
         m = re.match(r"job #(\d+) ", line)
         if m:
+            on = re.search(r" on=(\S+)$", line)
+            if on and on.group(1) in remotes:
+                clean_remote(remotes[on.group(1)], m.group(1))
             brain(["queue", "finish", m.group(1), "--status", "failed", "--reason", "drainer died"])
     rows = []
-    while True:
-        out = brain(["queue", "next"])
-        if not out:
-            return rows, len(cancelled_ids() - before)
-        job = json.loads(out)
-        print(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})", flush=True)
-        row = run_job(job, a, run_dir, runner)
-        rows.append(row)
-        reason = "; ".join(row["notes"])
-        brain(["queue", "finish", str(job["id"]), "--status", "done" if row["rc"] == 0 or only_flaky(row) else "failed"]
-              + (["--run-id", str(row["run_id"])] if row["run_id"] else [])
-              + (["--reason", reason] if reason else []))
+    lock = threading.Lock()  # guards printing, rows and state
+    stop = threading.Event()  # set when no lane is working, so a resting lane wakes and ends
+    state = {l.name: "work" for l in lanes}
+
+    def say(msg):
+        with lock:
+            print(msg, flush=True)
+
+    def settle(lane, st):
+        with lock:
+            state[lane.name] = st
+            if all(v != "work" for v in state.values()):
+                stop.set()
+
+    def rest(lane):
+        """Rest after a lane problem. False when the drain ended meanwhile."""
+        settle(lane, "rest")
+        if stop.is_set() or stop.wait(rest_seconds()):
+            return False
+        with lock:
+            state[lane.name] = "work"
+        return True
+
+    def lane_loop(lane):
+        last_why, job = None, None
+        try:
+            while True:
+                if lane.remote:
+                    sweep_remote(lane.remote)
+                    ok, why = lr.preflight(lane.remote)
+                    if not ok:
+                        if why != last_why:
+                            say(f"test-phase: lane {lane.name} rests: {why}")
+                        last_why = why
+                        if not rest(lane):
+                            return
+                        continue
+                    last_why = None
+                out = brain(["queue", "next", "--where", lane.where]
+                            + (["--host", lane.remote.name] if lane.remote else []))
+                if not out:
+                    return
+                job = json.loads(out)
+                say(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})"
+                    + (f" on {lane.remote.name}" if lane.remote else ""))
+                row = run_job(job, a, run_dir, runner, lane)
+                problem = row.get("lane_problem")
+                if problem:
+                    brain(["queue", "requeue", str(job["id"]), "--reason", problem[:200]])
+                    say(f"test-phase: job #{job['id']} back to queued, lane {lane.name} rests: {problem}")
+                    job = None
+                    if not rest(lane):
+                        return
+                    continue
+                with lock:
+                    rows.append(row)
+                reason = "; ".join(row["notes"])
+                brain(["queue", "finish", str(job["id"]), "--status",
+                       "done" if row["rc"] == 0 or only_flaky(row) else "failed"]
+                      + (["--run-id", str(row["run_id"])] if row["run_id"] else [])
+                      + (["--reason", reason] if reason else []))
+                job = None
+                if row.get("lane_rest"):
+                    say(f"test-phase: lane {lane.name} rests: {row['lane_rest']}")
+                    if not rest(lane):
+                        return
+        except Exception as e:  # noqa: BLE001  a crashed lane must not hang the others
+            say(f"test-phase: lane {lane.name} crashed: {e!r}")
+            if job:
+                brain(["queue", "finish", str(job["id"]), "--status", "failed", "--reason", f"lane crashed: {e!r}"[:200]])
+            with lock:
+                rows.append(error_row(job["id"] if job else 0, f"lane {lane.name} crashed: {e!r}"))
+        finally:
+            settle(lane, "ended")
+
+    threads = [threading.Thread(target=lane_loop, args=(l,)) for l in lanes]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return rows, len(cancelled_ids() - before)
 
 
-def table(rows):
-    heads = ["job", "project:test", "runner", "tier", "result", "failing", "real", "flaky", "notes"]
+def table(rows, show_host=False):
+    heads = ["job", "project:test", "runner", "tier", "result", "failing", "real", "flaky"]
     data = [["#" + str(r["job"]), r["project"] + ":" + os.path.basename(r["test"]), r.get("runner", "-"), r["tier"],
-             r["result"], str(r["failing"]), str(r["real"]), str(r["flaky"]), "; ".join(r["notes"])] for r in rows]
+             r["result"], str(r["failing"]), str(r["real"]), str(r["flaky"])] for r in rows]
+    if show_host:  # the column appears only when a remote lane exists, so a local-only table is unchanged
+        heads.append("host")
+        for d, r in zip(data, rows):
+            d.append(r.get("host") or "local")
+    heads.append("notes")
+    for d, r in zip(data, rows):
+        d.append("; ".join(r["notes"]))
     widths = [max(len(x[i]) for x in data + [heads]) for i in range(len(heads))]
     out = ["  ".join(h.ljust(w) for h, w in zip(heads, widths)).rstrip()]
     out += ["  ".join(c.ljust(w) for c, w in zip(d, widths)).rstrip() for d in data]
@@ -417,6 +618,14 @@ def main(argv):
     base = os.environ.get("LEAN_TEST_PHASE_DIR") or os.path.expanduser("~/.local/share/lean/test-phase")
     os.makedirs(base, exist_ok=True)
     lock = open(os.path.join(base, "drainer.lock"), "w")
+    lanes = [LOCAL]
+    if lr:
+        try:
+            remotes, repos = lr.load()
+        except ValueError as e:  # a bad config must not stop the local lane
+            print(f"test-phase: remote lanes off, bad config: {e}", file=sys.stderr)
+            remotes, repos = [], {}
+        lanes += [Lane(f"remote-{r.name}", "remote", r, repos) for r in remotes]
     rows = []
     cancelled = 0
     runs = 0
@@ -432,7 +641,9 @@ def main(argv):
         os.makedirs(run_dir, exist_ok=True)
         if runs == 1:
             print(f"test-phase: logs in {run_dir}", flush=True)
-        got, dropped = drain(a, run_dir, RUNNERS[0])
+            if len(lanes) > 1:
+                print("test-phase: lanes " + ", ".join(l.name for l in lanes), flush=True)
+        got, dropped = drain(a, run_dir, RUNNERS[0], lanes)
         rows += got
         cancelled += dropped
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -444,7 +655,7 @@ def main(argv):
             print("test-phase: nothing queued")
         return 1 if cancelled else 0
     print()
-    print(table(rows))
+    print(table(rows, len(lanes) > 1))
     print(f"\ntest-phase: {len(rows)} jobs, {sum(r['real'] for r in rows)} real, "
           f"{sum(r['flaky'] for r in rows)} flaky, {cancelled} cancelled. `brain list --open` has the entries.")
     return 1 if cancelled or any(is_bad(r) for r in rows) else 0
@@ -535,7 +746,7 @@ echo "Passed!  - Failed: 0"; exit 0
         env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=BRAIN,
                    FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"),
                    HEAVY_LOCK_DIR=os.path.join(d, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"),
-                   HEAVY_WAIT="20")
+                   HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
         env.pop("TEST_PHASE_RUNNER", None)
         repo_v = os.path.join(d, "vrepo")
         repo_m = os.path.join(d, "mrepo")
@@ -770,6 +981,144 @@ echo "Passed!  - Failed: 0"; exit 0
         r = subprocess.run([sys.executable, os.path.realpath(__file__), pf], env=env, capture_output=True, text=True)
         if r.returncode == 0:
             fails.append("an empty plan exited 0")
+
+        # Remote lanes: a fake ssh, rsync and docker act on local folders (tests/fixtures/test-phase/remote).
+        # The apple job keeps the local lane busy for about three seconds, so a plain job goes to the remote lane.
+        rfix = os.path.realpath(os.path.join(fix, "remote"))
+        hostwork, dockdir, rrepo = (os.path.join(d, x) for x in ("hostwork", "docker", "rrepo"))
+        ini = os.path.join(d, "remotes.ini")
+        for sub in ("tests/T", "tests/U", "tests/Apple", "local-packages"):
+            os.makedirs(os.path.join(rrepo, sub))
+        net = "<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"
+        apple = "<Project><PropertyGroup><TargetFrameworks>net10.0;net10.0-maccatalyst</TargetFrameworks></PropertyGroup></Project>"
+        for name, text in ((".gitignore", "local-packages/\n"), (".env.local", "TOKEN=zzz\n"), ("secrets.json", "{}\n"),
+                           ("tests/Apple/Apple.csproj", apple), ("local-packages/p.nupkg", "p"),
+                           ("local-packages/x.key", "k")) + tuple(
+                (f"tests/{x[0]}/{x[1]}.csproj", net) for x in ("TPlain", "TFail", "TStall", "TLost", "TOff", "TStale")):
+            os.makedirs(os.path.dirname(os.path.join(rrepo, name)), exist_ok=True)
+            open(os.path.join(rrepo, name), "w").write(text)
+        for x in ("T/Hs", "U/Hs", "T/Plain", "T/Fail", "T/Stall", "T/Lost", "T/Off", "T/Stale"):
+            open(os.path.join(rrepo, "tests", x + ".csproj"), "w").write(net)
+        subprocess.run(["git", "init", "-q", rrepo], check=True)
+        open(os.path.join(d, "rrepo.env"), "w").write("POSTGRES_PASSWORD=hunter2\n")
+        open(ini, "w").write(f"[remote dev]\nhost = devbox\nworkdir = {hostwork}\ncpus = 2\nmemory = 8g\n"
+                             f"min_free_gb = 0\nextra_paths = local-packages\n\n[repo rrepo]\n"
+                             f"sidecars = db=postgres:16\nenv_file = {d}/rrepo.env\nready = pg_isready\n")
+        renv = dict(env, PATH=rfix + os.pathsep + os.environ["PATH"], TEST_PHASE_REMOTES_FILE=ini,
+                    FAKE_SSH_LOG=os.path.join(d, "ssh.log"), FAKE_DOCKER_DIR=dockdir, TEST_PHASE_REST="600",
+                    HEAVY_WAIT="60")
+        renv.pop("TEST_PHASE_REMOTES")
+
+        def reset():
+            for f in os.listdir(d):
+                if f.startswith(("where", "files-", "peers", "envmode", "docker.log", "ssh.log", "rsync", "inflight-")):
+                    os.remove(os.path.join(d, f))
+
+        def rdrain(*extra, e=None):
+            reset()
+            t0 = time.time()
+            r = subprocess.run([sys.executable, os.path.realpath(__file__), *extra], env=dict(e or renv),
+                               capture_output=True, text=True, timeout=240)
+            return r.returncode, r.stdout + r.stderr, time.time() - t0
+
+        def rlog(name):
+            try:
+                return open(os.path.join(d, name)).read()
+            except OSError:
+                return ""
+
+        def runs_of(test_project):
+            c = sqlite3.connect(env["LEAN_BRAIN_DB"])
+            got = c.execute("SELECT tier, host FROM runs WHERE test_project=? ORDER BY id", (test_project,)).fetchall()
+            c.close()
+            return got
+
+        def leftovers():
+            jobs = [f for f in os.listdir(hostwork) if f.startswith("job-")] if os.path.isdir(hostwork) else []
+            return jobs, os.listdir(dockdir) if os.path.isdir(dockdir) else []
+
+        # Two lanes run two jobs at once; the copy skips excluded files; the env file stays off every command line.
+        qadd(rrepo, "tests/T/Hs.csproj", "--cycle", "r1")
+        qadd(rrepo, "tests/U/Hs.csproj", "--cycle", "r1")
+        rc, out, _ = rdrain()
+        if rc != 0 or rlog("peers.log").split() != ["peers=2", "peers=2"]:
+            fails.append(f"two jobs must run at the same time on two lanes ({rc}): {rlog('peers.log')!r} {out}")
+        starts = sorted(l.split()[0].split("-")[0] for l in rlog("where.log").splitlines())
+        if starts != ["job", "rrepo"]:
+            fails.append(f"one job on each lane: {rlog('where.log')!r}")
+        if sorted(h for _, h in runs_of("Hs.csproj")) != ["", "dev"]:
+            fails.append(f"the remote run's row must carry the host: {runs_of('Hs.csproj')}")
+        remote_files = "".join(rlog(f) for f in os.listdir(d) if f.startswith("files-job-"))
+        if "./local-packages/p.nupkg" not in remote_files or "./tests/T/Plain.csproj" not in remote_files \
+                or any(x in remote_files for x in (".env.local", "secrets.json", "x.key")):
+            fails.append(f"the host must get the repo and extra paths but no excluded file: {remote_files!r}")
+        if "-rw-------" not in rlog("envmode.log") or "./.lean.env" not in remote_files:
+            fails.append(f"the env file must sit in the job folder with mode 600: {rlog('envmode.log')!r}")
+        everything = rlog("ssh.log") + rlog("docker.log") + rlog("rsync.log")
+        if "hunter2" in everything or ".env.local" in rlog("rsync.log"):
+            fails.append("a secret or an excluded file reached a command line or the copy list")
+        if "--cpus 2" not in rlog("docker.log") or "--memory 8g" not in rlog("docker.log") \
+                or "--user" not in rlog("docker.log"):
+            fails.append(f"every container is capped and runs as the ssh user: {rlog('docker.log')!r}")
+        if leftovers() != ([], []) or not re.search(r"\bhost\b", out) or "dev" not in out:
+            fails.append(f"nothing may be left on the host after a pass, and the summary shows the host: {leftovers()} {out}")
+
+        # An apple-platform job runs on the local lane only.
+        qadd(rrepo, "tests/Apple/Apple.csproj", "--cycle", "r2")
+        qadd(rrepo, "tests/T/Plain.csproj", "--cycle", "r2")
+        rc, out, _ = rdrain()
+        if runs_of("Apple.csproj")[-1:] != [("full", "")] or runs_of("Plain.csproj") != [("full", "dev")]:
+            fails.append(f"apple job local, plain job remote: {runs_of('Apple.csproj')} {runs_of('Plain.csproj')} {out}")
+        if any("Apple.csproj" in l and not l.startswith("rrepo ") for l in rlog("where.log").splitlines()):
+            fails.append(f"a remote lane ran an apple job: {rlog('where.log')!r}")
+
+        # A lost connection puts the job back in the queue, is not a test failure, and does not hold the drain.
+        open(os.path.join(d, "ssh-fail-run"), "w").close()
+        qadd(rrepo, "tests/Apple/Apple.csproj", "--cycle", "r3")
+        lost = qadd(rrepo, "tests/T/Lost.csproj", "--cycle", "r3")
+        rc, out, secs = rdrain()
+        os.remove(os.path.join(d, "ssh-fail-run"))
+        if "back to queued" not in out or rc != 0 or secs > 60:
+            fails.append(f"a lost connection must requeue the job and end the drain in seconds ({rc}, {secs:.0f}s): {out}")
+        if "Lost" in brain_list() or runs_of("Lost.csproj") != [("full", "")] \
+                or f"job #{lost} done" not in qlist("--cycle", "r3"):
+            fails.append(f"the requeued job runs on the local lane and files no failure: {brain_list()!r} {runs_of('Lost.csproj')}")
+        if leftovers() != ([], []):
+            fails.append(f"cleanup must run after a lane problem: {leftovers()}")
+
+        # A failing test reruns on the same host; the rerun's row carries the host too; cleanup follows a fail.
+        qadd(rrepo, "tests/Apple/Apple.csproj", "--cycle", "r4")
+        qadd(rrepo, "tests/T/Fail.csproj", "--cycle", "r4")
+        rc, out, _ = rdrain()
+        if rc != 1 or runs_of("Fail.csproj") != [("full", "dev"), ("rerun", "dev")] \
+                or "Acme.RemoteTests.Breaks" not in brain_list("--open") or leftovers() != ([], []):
+            fails.append(f"remote fail and rerun ({rc}): {runs_of('Fail.csproj')} {leftovers()} {out}")
+
+        # A stall on the host is stopped, noted, and cleaned up after.
+        qadd(rrepo, "tests/Apple/Apple.csproj", "--cycle", "r5")
+        qadd(rrepo, "tests/T/Stall.csproj", "--cycle", "r5")
+        rc, out, _ = rdrain("--stall", "3")
+        if rc != 1 or "stalled: tests/T/Stall.csproj" not in brain_list("--kind", "note") or leftovers() != ([], []) \
+                or runs_of("Stall.csproj") != [("full", "dev")]:
+            fails.append(f"remote stall ({rc}): {runs_of('Stall.csproj')} {leftovers()} {out}")
+
+        # TEST_PHASE_REMOTES=off is today's behavior: one lane, no ssh.
+        qadd(rrepo, "tests/T/Off.csproj", "--cycle", "r6")
+        rc, out, _ = rdrain(e=dict(renv, TEST_PHASE_REMOTES="off"))
+        if rc != 0 or rlog("ssh.log") or runs_of("Off.csproj") != [("full", "")] or "lanes" in out:
+            fails.append(f"remotes off must not touch ssh ({rc}): {rlog('ssh.log')!r} {out}")
+
+        # A job left running on a host by a dead drainer: the host's folder and containers go first.
+        stale = qadd(rrepo, "tests/T/Stale.csproj", "--cycle", "r7")
+        got = subprocess.run([sys.executable, BRAIN, "queue", "next", "--host", "dev"], env=env, capture_output=True,
+                             text=True).stdout
+        os.makedirs(os.path.join(hostwork, f"job-{stale}"), exist_ok=True)
+        os.makedirs(dockdir, exist_ok=True)
+        open(os.path.join(dockdir, f"c-lean-{stale}-run"), "w").write(stale)
+        rc, out, _ = rdrain()
+        if f'"id": {stale}' not in got or f"job #{stale} failed" not in qlist("--cycle", "r7") \
+                or leftovers() != ([], []):
+            fails.append(f"a stale remote job needs its host cleaned: {got!r} {qlist('--cycle', 'r7')} {leftovers()}")
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
