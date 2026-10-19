@@ -199,22 +199,22 @@
         },
         {
           "command": "leanBrain.moveUp",
-          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/ && leanBrain.canMove",
           "group": "inline@0"
         },
         {
           "command": "leanBrain.moveDown",
-          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/ && leanBrain.canMove",
           "group": "inline@1"
         },
         {
           "command": "leanBrain.moveUp",
-          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/ && leanBrain.canMove",
           "group": "1_order"
         },
         {
           "command": "leanBrain.moveDown",
-          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/ && leanBrain.canMove",
           "group": "1_order"
         }
       ],

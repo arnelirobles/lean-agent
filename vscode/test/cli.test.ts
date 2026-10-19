@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { answerArgs, closeArgs, defaultDbPath, findBrain, reopenArgs, moveArgs, resumeArgs, routeArgs } from "../src/brainCli";
+import { answerArgs, brainCanMove, closeArgs, defaultDbPath, findBrain, reopenArgs, moveArgs, resumeArgs, routeArgs } from "../src/brainCli";
 
 function exe(p: string) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -46,5 +46,18 @@ describe("brain cli", () => {
     expect(findBrain(set, { PATH: bin }, home)).toBe(set);
     expect(findBrain(path.join(home, "missing"), { PATH: bin }, home)).toBeUndefined();
     expect(findBrain("", { PATH: "" }, path.join(home, "empty"))).toBeUndefined();
+  });
+
+  it("knows whether a brain has queue move from its queue help", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lb-"));
+    const help = (name: string, cmds: string) => {
+      const p = path.join(dir, name);
+      fs.writeFileSync(p, `#!/bin/sh\n[ "$1 $2" = "queue --help" ] && echo "usage: brain queue [-h] {${cmds}} ..."\n`);
+      fs.chmodSync(p, 0o755);
+      return p;
+    };
+    expect(await brainCanMove(help("new", "add,list,cancel,bump,move,next"))).toBe(true);
+    expect(await brainCanMove(help("old", "add,list,cancel,bump,next,route"))).toBe(false);
+    expect(await brainCanMove(path.join(dir, "missing"))).toBe(false);
   });
 });

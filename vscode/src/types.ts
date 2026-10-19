@@ -47,4 +47,6 @@ export interface DashboardData {
   generatedAt: number;
   /** Remote lanes from remotes.ini; the panel fills it, the database does not know them. */
   remotes?: RemoteLane[];
+  /** Whether the brain the extension runs has `queue move`; the panel fills it. */
+  canMove?: boolean;
 }

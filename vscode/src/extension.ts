@@ -25,8 +25,18 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (folder) projects = await projectNames(folder);
 
+  // Asked once per brain path: an older brain has no `queue move`, so the up and down buttons stay hidden.
+  let moveCheck: { brain: string; can: Promise<boolean> } | undefined;
+  const canMove = (): Promise<boolean> => {
+    const brain = cli.findBrain(userSetting("brainPath"));
+    if (!brain) return Promise.resolve(false);
+    if (moveCheck?.brain !== brain) moveCheck = { brain, can: cli.brainCanMove(brain) };
+    return moveCheck.can;
+  };
   const refresh = async (): Promise<void> => {
     await store.refresh(dbPath());
+    dashboard.canMove = await canMove();
+    void vscode.commands.executeCommand("setContext", "leanBrain.canMove", dashboard.canMove);
     const d = store.database;
     status.update(d, projects, store.note);
     items.setData(d);

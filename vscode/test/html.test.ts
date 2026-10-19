@@ -143,7 +143,7 @@ describe("dashboard queue tab", () => {
     ended_at: null, reason: "", platform, host, routable, priority,
   });
   const withQueue = (running: ReturnType<typeof job>[], queued: ReturnType<typeof job>[]): DashboardData =>
-    ({ ...data, queue: { running, queued, finished: [], today: [] } });
+    ({ ...data, queue: { running, queued, finished: [], today: [] }, canMove: true });
 
   it("says where each running job runs", () => {
     const html = dashboardBody(withQueue([job(1, "running", "", "dev"), job(2, "running", "apple", "")], []));
@@ -191,6 +191,12 @@ describe("dashboard queue tab", () => {
   it("offers no moves on a database from before schema 6", () => {
     const html = dashboardBody(withQueue([], [job(6, "queued", "", "", false, null), job(8, "queued", "", "", false, null)]));
     expect(html).not.toContain("data-move=");
+  });
+
+  it("offers no moves when the brain it runs has no queue move", () => {
+    const d = withQueue([], [job(7, "queued", "", "", true, 0), job(3, "queued", "", "", true, 0)]);
+    expect(dashboardBody({ ...d, canMove: false })).not.toContain("data-move=");
+    expect(dashboardBody({ ...d, canMove: undefined })).not.toContain("data-move=");
   });
 
   it("says when nothing is queued or running", () => {

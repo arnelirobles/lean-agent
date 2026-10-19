@@ -62,6 +62,8 @@ export class DashboardPanel {
   private panel?: vscode.WebviewPanel;
   private running: JobRow[] = [];
   private timer?: NodeJS.Timeout;
+  /** Whether the brain the extension runs has `queue move`. */
+  canMove = false;
   constructor(private readonly root: vscode.Uri, private readonly actions: Actions) {}
 
   show(database: Database | undefined, note: string): void {
@@ -83,6 +85,7 @@ export class DashboardPanel {
     const nonce = makeNonce();
     const data = database ? db.dashboard(database, Math.floor(Date.now() / 1000)) : emptyData();
     data.remotes = readRemotes(process.env, os.homedir());
+    data.canMove = this.canMove;
     this.running = data.queue.running;
     this.panel.webview.html = dashboardHtml(data, nonce, this.panel.webview.cspSource, database ? note : note || "No data.",
       codicons(this.panel, this.root), media(this.panel, this.root));
