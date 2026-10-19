@@ -230,7 +230,12 @@ def file_list(repo, extra_paths, exclude):
                     found.add(os.path.relpath(os.path.join(root, f), repo))
         elif os.path.lexists(top):
             found.add(os.path.normpath(extra))
-    return sorted(f for f in found if os.path.lexists(os.path.join(repo, f)) and not excluded(f, exclude))
+    # .lean.env is where send_env writes; a repo file of that name must not be copied over it.
+    return sorted(f for f in found if os.path.lexists(os.path.join(repo, f)) and not excluded(f, exclude)
+                  and f != ENV_NAME)
+
+
+ENV_NAME = ".lean.env"
 
 
 def job_dir(r, job_id):
@@ -240,7 +245,8 @@ def job_dir(r, job_id):
 def sync_argv(r, repo, job_id):
     """rsync argv; the caller writes the NUL-joined file_list on its stdin."""
     jd = sh_path(job_dir(r, job_id))
-    return ["rsync", "-a", "--timeout=600", "--files-from=-", "--from0", "-e", " ".join(ssh_cmd_opts()),
+    # --safe-links skips a symlink that points outside the repo, so nothing outside the job folder is reached.
+    return ["rsync", "-a", "--safe-links", "--timeout=600", "--files-from=-", "--from0", "-e", " ".join(ssh_cmd_opts()),
             f"--rsync-path=mkdir -p {jd} && rsync", repo.rstrip("/") + "/", f"{r.host}:{job_dir(r, job_id)}/"]
 
 
@@ -257,7 +263,8 @@ def send_env(r, job_id, env_file, run=subprocess.run):
     except OSError as e:
         raise LaneProblem(f"cannot read env_file {env_file}: {e.strerror}")
     try:
-        p = run(ssh_argv(r, f"umask 077; mkdir -p {jd} && cat > {jd}/.lean.env && chmod 600 {jd}/.lean.env"),
+        p = run(ssh_argv(r, # A fresh temp file renamed into place, so a symlink already at that name is replaced, never followed.
+            f"umask 077; mkdir -p {jd} && t=$(mktemp {jd}/.lean.env.XXXXXX) && cat > \"$t\" && mv -f \"$t\" {jd}/.lean.env"),
                 input=data, capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         raise LaneProblem(f"{r.name}: env file not sent ({type(e).__name__})")
@@ -432,6 +439,12 @@ ready = pg_isready -U postgres
             fails.append(f"file_list must drop excluded files, extra paths included, and keep ignored extra paths: {got}")
         if file_list(repo, [], ["a.*"]) != [".env.local", ".gitignore", "secrets.json"]:
             fails.append("exclude must apply to a custom list")
+        os.symlink("/etc/hosts", os.path.join(repo, ".lean.env"))
+        if ".lean.env" in file_list(repo, [], []):
+            fails.append("a repo file named .lean.env must never be copied over the env file")
+        os.remove(os.path.join(repo, ".lean.env"))
+        if "--safe-links" not in sync_argv(Remote(name="dev", host="h", workdir="~/w"), repo, 1):
+            fails.append("rsync must skip symlinks that point outside the repo")
         if file_list(repo, ["local-packages/p.nupkg"], DEFAULT_EXCLUDE)[-1] != "local-packages/p.nupkg":
             fails.append("an extra path may be one file")
         r = Remote(name="dev", host="devbox", workdir="~/lean-runs", cpus="2", memory="8g")
@@ -476,7 +489,8 @@ ready = pg_isready -U postgres
         send_env(r, 7, cfg.env_file, rec)
         argv, kw = rec.calls[0]
         if kw.get("input") != b"POSTGRES_PASSWORD=hunter2\n" or "hunter2" in " ".join(argv) \
-                or "umask 077" not in argv[-1] or "chmod 600" not in argv[-1]:
+                or "umask 077" not in argv[-1] or "mktemp" not in argv[-1] or "mv -f" not in argv[-1] \
+                or "cat > /" in argv[-1] or "cat > ~" in argv[-1]:
             fails.append(f"send_env must pass the file on stdin, mode 600, never in argv: {argv}")
         try:
             send_env(r, 7, cfg.env_file, Rec(255))

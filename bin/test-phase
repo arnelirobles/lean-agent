@@ -117,6 +117,8 @@ class Dotnet:
         # A filter may name several classes joined by |, with or without the FullyQualifiedName~ prefix.
         cls = [c.strip().removeprefix("FullyQualifiedName~") for c in (cls_filter or "").split("|")]
         cls = [c for c in cls if c]
+        if any(c.startswith("-") for c in cls):  # a piece read as a dotnet option instead of a class
+            raise ValueError("a filter piece starts with -")
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
             cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
@@ -342,6 +344,12 @@ def _run_job(job, a, run_dir, runner, lane):
     except ValueError as e:
         row["result"] = "error"
         row["notes"].append(f"bad extra arguments: {e}")
+        return row
+    try:
+        runner.command(runner.mode(repo), project, job["filter"] or None, job["tier"] == "fast", extra)
+    except ValueError as e:
+        row["result"] = "error"
+        row["notes"].append(f"bad filter: {e}")
         return row
 
     synced = []
@@ -668,6 +676,11 @@ def self_test():
     if got != ["dotnet", "test", "--project", "T.csproj", "--", "--filter-class", "*ATests*",
                "--filter-class", "*BTests*", "--output", "Detailed"]:
         fails.append(f"mtp must pass one --filter-class per class: {got}")
+    try:
+        Dotnet.command("mtp", "T.csproj", "A| --help")
+        fails.append("a filter piece starting with - must be refused")
+    except ValueError:
+        pass
     got = Dotnet.command("vstest", "T.csproj", "ATests|BTests", fast=True)
     if got[-2:] != ["--filter", "FullyQualifiedName~ATests|FullyQualifiedName~BTests"]:
         fails.append(f"vstest must prefix every class: {got}")
