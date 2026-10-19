@@ -36,6 +36,15 @@ Label every agent you start, so `lean-stats` can count it by role. The Agent des
 - Verify content and identity, not status codes or ratios: a page baked empty still answers 200, a small pixel ratio can hide wrong dates, and the deployed commit sha proves a deploy where a version string does not.
 - A task is not done until the pull request URL exists.
 
+## Tests and brain
+- Code first, build only. Run the tests once, as one phase: add each test project with `${CLAUDE_PLUGIN_ROOT}/bin/brain queue add <repo-dir> <test project> [--after ID]`, then the orchestrator starts one `${CLAUDE_PLUGIN_ROOT}/bin/test-phase` as a background task. Failures land in `${CLAUDE_PLUGIN_ROOT}/bin/brain`. The fix round reads `brain list --open`, closes entries with a resolution and the fix commit, and the phase runs again.
+- Never write a `sleep` or `pgrep` wait loop. Enqueue the job, end the turn, and the orchestrator's one drainer runs it. The orchestrator gets one notice when the drainer exits, then reads `brain list --cycle C` or `brain stats`. `brain resume` shows queued and running jobs after a compaction.
+- Ask whether a lane is free with `heavy.sh status <lane>`. Never write a `pgrep` loop for it: it matches its own command line and never ends. Set `HEAVY_STALL` on test commands so a stalled run stops as load, not as a code failure.
+- Check the runner mode before `dotnet test`. A repository whose `global.json` sets `test.runner` to `Microsoft.Testing.Platform` takes `dotnet test --project X`; any other takes `dotnet test X`. The wrong form loses the run.
+- Brain is where state that changes lives, so it survives a compaction. Open an item when you dispatch an agent (kind `agent`: id, task, worktree), when you defer work (`pending` for the next step, `minor` for a deferred fix) or when an action is denied or waits on the person (`blocker`). Close it when the agent reports back, the work is done or the answer comes. A denied action is not worked around.
+- What goes where: brain holds anything with a status that changes (test failures, flaky classes, deferred minors, questions for the user, tickets, security findings). Markdown ledgers keep rulings with the cost if wrong, task complete lines and user decisions, and point to open items with `open items: brain list --project X --status open`. Memory files keep standing preferences. Run logs are scratch.
+- Never store secrets, tokens or passwords in brain.
+
 ## After a batch
 - Run the `lean-retro` skill: facts from `${CLAUDE_PLUGIN_ROOT}/bin/lean-stats`, fixed triggers, check whether the last method change helped, propose changes with evidence. Nothing changes without the owner's approval.
 - Log every review with `${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh`.

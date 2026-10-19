@@ -69,10 +69,50 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 | `/lean-agent:adversarial-review` | The critic: one agent hunts, a second tries to refute. | [Adversarial critic](https://github.com/arnelirobles/lean-agent/wiki/Adversarial-Critic) |
 | `/lean-agent:lean-retro` | The retro that changes the method from numbers. | [Self-improving retro](https://github.com/arnelirobles/lean-agent/wiki/Self-Improving-Retro) |
 | Scripts in `bin/` | Preflight, holdout, needs-review, cost, hygiene and more, on the agent's PATH. Each has a `--self-test`. | [Scripts](https://github.com/arnelirobles/lean-agent/wiki/Scripts) |
-| Hooks | Three block (attribution and slop in public text, a bad commit author, files in a scratchpad root). The rest add a note and never stop the call. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
+| `bin/test-phase` | Drains the test queue in brain through `heavy.sh` with a stall watchdog, one drainer at a time. Takes a plan file too (one project per line). Sorts failures into flaky and real, logs every command as a run, and writes the failures to brain. | [The cycle](#the-cycle) |
+| `bin/brain` | A local SQLite list of open failures, deferred minors, questions, blockers, running agents and next steps, plus the test queue, with tags, runs and stats. `brain resume` prints what is open for a project. | [The cycle](#the-cycle) |
+| Hooks | Three block (attribution and slop in public text, a bad commit author, files in a scratchpad root). The rest add a note and never stop the call. One of them hands the session its open brain items at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
 | `lean-stats` | One local SQLite file of tokens, reviews, merges and hook fires. Nothing leaves the machine. | [Measure every batch](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) |
 
 Everything in the method still works without the plugin. The scripts at the root are links into `bin/`.
+
+## The cycle
+
+Code everything first, with builds only. Then run one test phase, load balanced. Failures go to brain. Then one fix round.
+
+```bash
+bin/brain queue add ~/repos/app tests/App.Tests/App.Tests.csproj --cycle c1 --by me   # prints the job id
+bin/brain queue add ~/repos/app tests/Api.Tests/Api.Tests.csproj --after 1 --cycle c1
+bin/test-phase                     # drains the queue; start it once, as a background task
+bin/test-phase plan.txt            # same, after enqueuing the plan (<repo-dir> <test project path> [fast-filter])
+bin/brain list --cycle c1          # what the phase found
+bin/brain list --open              # what the fix round works from
+bin/brain close 12 --resolution fixed --commit abc1234
+bin/test-phase                     # again, to see the list empty
+bin/brain stats                    # flaky rate, lane wait and duration per test project
+```
+
+Nobody waits in a loop. A session adds jobs with `brain queue add` (it returns at once) and ends its turn. The orchestrator starts one `test-phase` as a background task and gets one notice when it exits. `test-phase` takes the oldest job whose `--after` job is done, runs it, records the run and the failures, and repeats until nothing is ready. A second `test-phase` while one drains says so and exits 0. A job whose dependency failed or was cancelled is cancelled with the reason. `brain queue list` and `brain resume` show queued and running jobs; `brain queue cancel ID` drops a queued one.
+
+`test-phase` runs every command in the `dotnet` lane of `heavy.sh`, so sessions on one machine take turns instead of loading Docker together. It stops a command that shows no test progress for `HEAVY_STALL` seconds (exit 76, "likely load, not code"). Progress is a Microsoft Testing Platform counter line (`[+passed/xfailed/?skipped]`) whose counts changed, or a passed or failed result line, so a repeating counter where only the elapsed time moves does not count. It reruns each failing class alone, and labels the test flaky if it passes alone and real if it fails again. Ask whether a lane is free with `heavy.sh status dotnet`, never with a `pgrep` loop: the loop matches its own command line and never ends.
+
+A rerun is flaky only when it exits 0 or passes tests without the name; a rerun that proves nothing is unverified. A job whose failures are all flaky finishes done, so its dependents run. Extra dotnet arguments come from `TEST_PHASE_DOTNET_ARGS`, an `args=EXTRA` field on a plan line or `brain queue add --args=EXTRA`, for example `-p:ValidateXcodeVersion=false` for medXpress. The brain project of a job is the main repository's name, so worktrees share it. Secrets in test output (passwords, bearer tokens, JWTs, api keys) are masked before they reach brain.
+
+Known limits:
+
+- The watchdog's orphan cleanup records a process group only when `HEAVY_STALL` is on, so a killed caller without the watchdog leaves its command running.
+- A rerun runs a whole class, so one flaky test in a large class costs the class's runtime.
+- The drainer's options (`--stall`, `--lane`, `--cycle`) apply to every job it drains, including jobs queued by others.
+- A job left `running` by a drainer that died is only cleaned up when the next drainer starts.
+
+What goes where:
+
+- brain holds anything whose status changes: test failures, flaky classes, deferred minors, open questions for the user, unfiled or filed tickets, security findings, blockers, running agents, next steps.
+- Markdown ledgers keep rulings (decisions, with the cost if wrong), task complete lines and user decisions. A ledger points to open items with a line like `open items: brain list --project X --status open`.
+- Memory files keep standing preferences.
+- Run logs are scratch. They can expire once their failures are in brain.
+
+Brain never holds secrets, tokens or passwords.
 
 ## Settings
 
@@ -86,6 +126,8 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_MODEL_STRONG` | `opus` | The model that takes what the cheap steps could not close. |
 | `LEAN_MODEL_FAST` | `haiku` | The model for agents that read and report: code search, running the gates, the retro's fact collection. It never judges code. |
 | `LEAN_STATS` | on | `off` stops every `lean-stats` write. |
+| `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where `brain` keeps its database. |
+| `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing open brain items. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
 
@@ -115,7 +157,7 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 
 - Claude Code with plugin support.
 - `python3`, `git` and `gh` on PATH.
-- Linux, or macOS with its stock bash 3.2. `heavy.sh` needs util-linux `flock` and `/proc` and refuses to run without them.
+- Linux, or macOS with its stock bash 3.2. `heavy.sh` uses util-linux `flock` on Linux. On macOS it takes the lock with python3 and names holders with `lsof`.
 
 ## Contributing
 
