@@ -16,6 +16,7 @@ self-test to prove a body never reaches argv). Logs go to stderr only.
   brain-mcp --self-test
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -133,8 +134,17 @@ def t_queue_list(a):
     return args, None
 
 
+CLASS = re.compile(r"[A-Za-z0-9_.*~`+<>]+")
+
+
 def t_queue_add(a):
     args = ["queue", "add", need_str(a, "repo_dir"), need_str(a, "test_project"), "--by", "mcp"]
+    # test-phase splits a filter on | and hands each piece to dotnet, so check each piece, not the whole.
+    f = a.get("filter")
+    if f not in (None, "") and not (isinstance(f, str) and all(CLASS.fullmatch(p.strip()) for p in f.split("|"))):
+        raise Bad("filter must be class names joined by |")
+    if a.get("tier") not in (None, "", "fast", "full"):
+        raise Bad("tier must be fast or full")
     for k in ("filter", "tier", "cycle"):
         opt(a, args, k)
     opt(a, args, "after", kind=int)
@@ -327,6 +337,8 @@ def self_test():
             if err:
                 fails.append(f"brain_queue_add: {text!r}")
             for bad in ({"repo_dir": d, "test_project": "--help"}, {"repo_dir": d, "test_project": "t", "filter": "-x"},
+                        {"repo_dir": d, "test_project": "t", "filter": "A| --help"},
+                        {"repo_dir": d, "test_project": "t", "tier": "slow"},
                         {"repo_dir": os.path.join(d, "nope"), "test_project": "t"},
                         {"repo_dir": d, "test_project": "t", "args": "-p:X=1"}):
                 err, text = call("brain_queue_add", **bad)
