@@ -1,0 +1,83 @@
+# Remote lanes
+
+`test-phase` can run queued jobs on SSH hosts as well as on this machine. Each host is one more lane. A lane takes one job at a time, so with one remote host two jobs run at once: one local, one remote. Parsing, reruns, the stall watchdog and brain stay on the local machine. Only the test command runs on the host, inside a docker container with a CPU and memory cap.
+
+## What a host needs
+
+- ssh access with a key, no password prompt, and the host key already in `known_hosts` (`StrictHostKeyChecking=yes`, `BatchMode=yes`).
+- `docker` usable by the ssh user, and `rsync`. The host does not need git.
+- Free disk above `min_free_gb` in the workdir.
+
+## Config
+
+`~/.config/lean/remotes.ini`, or the file named by `TEST_PHASE_REMOTES_FILE`. `TEST_PHASE_REMOTES=off` turns every remote off. A bad file prints a warning and the drainer runs the local lane only.
+
+```ini
+[remote dev]
+host = dev
+workdir = ~/lean-runs
+cpus = 2
+memory = 8g
+min_free_gb = 15
+cache_max_gb = 10
+image = mcr.microsoft.com/dotnet/sdk:10.0
+extra_paths = local-packages
+exclude = .env*, *.key, *.pem, *license-key*, secrets*
+
+[repo app]
+sidecars = db=postgres:16, cache=redis:7
+env_file = ~/.config/lean/app.env
+ready = pg_isready -U postgres
+```
+
+Remote section keys:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `host` | An ssh config `Host` name. Required. | none |
+| `workdir` | Folder on the host for job folders and the NuGet cache. | `~/lean-runs` |
+| `cpus` | `--cpus` for every container of a job. | `2` |
+| `memory` | `--memory` for every container of a job. | `8g` |
+| `min_free_gb` | The lane does not claim a job when the workdir has less free space. | `15` |
+| `cache_max_gb` | The shared NuGet cache (`<workdir>/.nuget`) is emptied when it is bigger and no job runs. `0` keeps it. | `10` |
+| `image` | The test container image. | `mcr.microsoft.com/dotnet/sdk:10.0` |
+| `extra_paths` | Git-ignored paths to copy anyway, for example a local package folder. | none |
+| `exclude` | Patterns never copied. A pattern matches a file name, a path, or any folder in the path. | the list above |
+
+Repo section keys (the section name is the brain project name of the job):
+
+| Key | Meaning |
+|---|---|
+| `sidecars` | `alias=image` pairs. Each starts on a private network for the job, reachable by its alias. |
+| `env_file` | A local file of `NAME=value` lines. It is sent as `.lean.env` (mode 600) and loaded into the test container. It never appears on a command line. |
+| `ready` | A command run in each sidecar until it exits 0, before the tests start. |
+
+Sidecars get the same `cpus` and `memory` caps as the test container, so a job with a sidecar can use up to twice the cap.
+
+## What is copied and what is not
+
+The copy is the files `git ls-files` lists (tracked and untracked, not ignored) plus `extra_paths`, minus anything matching `exclude`. Files deleted in the working tree are skipped. Nothing else leaves this machine. Secrets go only through `env_file`.
+
+## Which jobs go where
+
+A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
+
+## Lane problems
+
+If ssh, the copy or docker fails before the test command starts, the job goes back to queued (`brain queue requeue`), no failure is filed, and that lane rests for `TEST_PHASE_REST` seconds (default 600). The local lane, or another host, picks the job up. The rest ends early once no lane is working. If the connection drops during a class rerun, the unfinished classes are marked unverified and the lane rests.
+
+## Cleanup
+
+Every container and network carries the label `lean.job=<id>`. A job removes its own after it ends, whatever the result. Before each claim a remote lane sweeps its host for labelled objects that belong to no running job, and for `job-*` folders older than a day. When the drainer finds a job left running by a dead drainer on a host, it cleans that host first and then fails the job with "drainer died".
+
+## One drainer per host
+
+Run one `test-phase` per host list. The sweep assumes every running job it sees in brain is its own. Two drainers sharing a host would remove each other's work.
+
+## Reading the output
+
+`brain queue list` shows `on=<host>` for a running remote job and `platform=apple` for pinned jobs. Run rows carry the host. The summary table has a host column only when more than one lane exists.
+
+## Rollout
+
+The first new `brain` moves the database to schema 7 (`jobs.platform`, `jobs.host`, `runs.host`). Older brains then refuse the database. Stop the drainer, then replace every copy of `brain` and `test-phase` in one step, then start the drainer.
