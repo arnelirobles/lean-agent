@@ -6,7 +6,7 @@ A read-mostly dashboard over the lean-agent brain database. It reads the SQLite 
 
 - Status bar: `brain: N real, M flaky` for open items of the current workspace project (matched to the folder name or the git main repo name, case-insensitive), or all projects when none match. While a test job runs it adds the suite name and elapsed time. Click opens the dashboard.
 - Activity bar, "Open items": grouped by project, then kind. Click an item for all its fields. Right click to close as fixed, close as not a bug, reopen, or copy the ref.
-- Activity bar, "Queue": queued and running jobs with elapsed time, and the last 10 finished.
+- Activity bar, "Queue": queued and running jobs with elapsed time and host, and the last 10 finished. A queued job has a button to send it to a remote lane, or back to this machine; right-click for "Run on any lane". This needs lean-agent 1.10.0 (brain schema 7).
 - Dashboard (`Lean Brain: Open dashboard`): waiting on you (question, blocker, pending style kinds), headline numbers, cycles, slowest suites with sparklines, flakiest tests, machine load, and hygiene (open items not seen for 14 days, with a button that copies a `brain list` command).
 - `Lean Brain: Show resume digest` runs `brain resume` into an output channel.
 - Claude Code: the dashboard opens Claude Code in an editor tab. Pending, risk and question items have Send to Claude, which starts a new session on them.

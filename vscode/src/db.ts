@@ -79,11 +79,24 @@ export function openCounts(db: Database, projects?: string[]): { counts: Counts;
 }
 
 export function queue(db: Database): QueueData {
-  return {
-    running: rows(db, Q.RUNNING_JOBS) as JobRow[],
-    queued: rows(db, Q.QUEUED_JOBS) as JobRow[],
-    finished: rows(db, Q.FINISHED_JOBS) as JobRow[],
-  };
+  const lane = (schemaVersion(db) ?? 0) >= 7 ? Q.LANE_COLUMNS : Q.NO_LANE_COLUMNS;
+  const jobs = (sql: string) => rows(db, sql.replace("%LANE%", lane))
+    .map((r) => ({ ...r, routable: Boolean(r.routable) })) as JobRow[];
+  const today = rows(db, Q.LANE_TODAY.replace("%LANE%", lane))
+    .map((r) => ({ host: String(r.host ?? ""), status: String(r.status), n: Number(r.n) }));
+  return { running: jobs(Q.RUNNING_JOBS), queued: jobs(Q.QUEUED_JOBS), finished: jobs(Q.FINISHED_JOBS), today };
+}
+
+/** Which lanes may claim the job, in words. Empty when any lane may. */
+export function laneLabel(job: JobRow): string {
+  return job.platform === "remote" ? "remote only" : job.platform === "apple" ? "this machine only" : "";
+}
+
+/** The tree item's contextValue, which picks the route buttons a job shows. */
+export function jobContext(job: JobRow): string {
+  if (job.status !== "queued") return `job.${job.status}`;
+  if (!job.routable) return "job.queued.old";
+  return `job.queued.${job.platform === "remote" ? "remote" : job.platform === "apple" ? "apple" : "any"}`;
 }
 
 /** The kinds in use that mean the user is being waited on. Picked from kinds actually present. */
@@ -177,6 +190,7 @@ export function dashboard(db: Database, now: number): DashboardData {
     flakiest: flakiest(db),
     load: loadPoints(db),
     stale: stale(db, now),
+    queue: queue(db),
     generatedAt: now,
   };
 }

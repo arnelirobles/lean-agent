@@ -142,13 +142,28 @@ export const STYLE = `
     th, td { padding: 8px 10px; }
     .fields th { width: 96px; }
   }
+  .live { display: grid; gap: 8px; padding: 4px 0 6px; }
+  .live .track, .lane-live .track { height: 10px; border-radius: 6px; background: var(--track); overflow: hidden; }
+  .live .fill, .lane-live .fill { height: 100%; border-radius: 6px; background: var(--green); transition: width .6s; }
+  .live .fill.over, .lane-live .fill.over { background: var(--orange); }
+  .live .counts, .lane .counts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
+  .live pre { font-size: 11.5px; padding: 8px 12px; border-radius: 10px; max-height: 70px; overflow: hidden; }
+  .lanes { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-bottom: 8px; }
+  .lane { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; box-shadow: var(--shadow); display: grid; gap: 8px; }
+  .lane-head { display: flex; align-items: center; gap: 10px; }
+  .lane-head .ico { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: var(--fill); color: var(--on); }
+  .lane-head b { display: block; font-size: 15px; }
+  .lane-head .muted { font-size: 12px; }
+  .lane-live { display: grid; gap: 6px; }
+  .lane-live:empty { display: none; }
+  tr.live-row td { border-top: none; padding-top: 0; }
   .answer textarea:focus { outline: none; border-color: var(--leaf); }
   .answer .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
 `;
 
 /** Buttons with data-copy copy text, data-open opens an item, data-refresh refreshes, data-tab switches tabs,
  *  data-claude opens Claude Code, data-ask puts an item into it, data-send starts a session that works on it,
- *  data-answer sends the text in #answer as the answer to a question. */
+ *  data-answer sends the text in #answer as the answer to a question, data-route="ID:to" routes a queued job. */
 export const SCRIPT = `
   const vscode = acquireVsCodeApi();
   function showTab(name) {
@@ -158,10 +173,41 @@ export const SCRIPT = `
     document.querySelectorAll('[data-panel]').forEach((p) => p.classList.toggle('active', p.dataset.panel === name));
     vscode.setState({ ...(vscode.getState() || {}), tab: name });
   }
+  function h(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
+  function dur(s) { s = Math.max(0, Math.round(s)); const m = Math.floor(s / 60); return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m + 'm ' + (s % 60) + 's'; }
+  function pill(text, tone, icon) { return '<span class="pill t-' + tone + '"><i class="codicon codicon-' + icon + '" aria-hidden="true"></i>' + h(text) + '</span>'; }
+  // Live progress of running jobs, posted by the extension every few seconds.
+  window.addEventListener('message', (e) => {
+    if (!e.data || e.data.type !== 'live') return;
+    for (const j of e.data.jobs) {
+      const el = document.querySelector('[data-live="' + j.id + '"]');
+      if (!el) continue;
+      const median = Number(el.dataset.median) || 0;
+      const lane = document.querySelector('[data-lane-live="' + j.id + '"]');
+      let bar = '';
+      if (median && j.elapsed != null) {
+        const pct = Math.min(100, Math.round(100 * j.elapsed / median));
+        const left = median - j.elapsed;
+        bar = '<div class="track"><div class="fill' + (left < 0 ? ' over' : '') + '" data-pct="' + pct + '"></div></div>' +
+          '<span class="muted">' + (left >= 0 ? 'about ' + dur(left) + ' left, usual run ' + dur(median) : dur(-left) + ' past the usual ' + dur(median)) + '</span>';
+      }
+      const counts = (j.passed ? pill(j.passed + ' passed', 'green', 'pass') : '') +
+        (j.failed ? pill(j.failed + ' failed', 'red', 'error') : '') +
+        (j.skipped ? pill(j.skipped + ' skipped', 'gray', 'debug-step-over') : '') +
+        (!j.passed && !j.failed && !j.skipped ? pill('building or starting', 'blue', 'tools') : '') +
+        (j.quietFor != null && j.quietFor > 120 ? pill('log quiet for ' + dur(j.quietFor), 'orange', 'warning') : pill('log active', 'green', 'pulse')) +
+        (j.lastTest ? '<span class="muted">last: ' + h(j.lastTest) + '</span>' : '');
+      el.innerHTML = bar + '<div class="counts">' + counts + '</div>' + (j.tail.length ? '<pre>' + h(j.tail.join('\\n')) + '</pre>' : '');
+      // The lane card gets the bar and the counts, without the log tail.
+      if (lane) lane.innerHTML = bar + '<div class="counts">' + counts + '</div>';
+      // Set through the DOM, which the CSP allows, not as a style attribute, which it blocks.
+      document.querySelectorAll('.fill[data-pct]').forEach((f) => { f.style.width = f.dataset.pct + '%'; });
+    }
+  });
   const saved = (vscode.getState() || {}).tab;
   if (saved) showTab(saved);
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send],[data-answer]');
+    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send],[data-answer],[data-route]');
     if (!el) return;
     if (el.dataset.tab !== undefined) showTab(el.dataset.tab);
     else if (el.dataset.claude !== undefined) vscode.postMessage({ type: 'claude' });
@@ -170,6 +216,10 @@ export const SCRIPT = `
       const text = box ? box.value.trim() : '';
       if (text) vscode.postMessage({ type: 'answer', id: Number(el.dataset.answer), text });
       else if (box) box.focus();
+    }
+    else if (el.dataset.route !== undefined) {
+      const [id, to] = el.dataset.route.split(':');
+      vscode.postMessage({ type: 'route', id: Number(id), text: to });
     }
     else if (el.dataset.send !== undefined) vscode.postMessage({ type: 'send', id: Number(el.dataset.send) });
     else if (el.dataset.ask !== undefined) vscode.postMessage({ type: 'ask', id: Number(el.dataset.ask) });

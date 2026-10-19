@@ -10,14 +10,23 @@ export const ITEM = `SELECT * FROM items WHERE id=?`;
 export const SESSION = `SELECT ended_at FROM sessions WHERE id=?`;
 export const ITEM_TAGS = `SELECT tag FROM tags WHERE item_id=? ORDER BY tag`;
 
+// %LANE% is ", platform, host" on schema 7 and later, and a constant pair before it.
+export const LANE_COLUMNS = ", platform, host, 1 AS routable";
+export const NO_LANE_COLUMNS = ", '' AS platform, '' AS host, 0 AS routable";
+
+export const LANE_TODAY = `
+  SELECT host, status, COUNT(*) AS n FROM (SELECT status, ended_at%LANE% FROM jobs)
+  WHERE status IN ('done','failed') AND ended_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day')
+  GROUP BY host, status`;
+
 export const RUNNING_JOBS = `
-  SELECT id, cycle, project, test_project, status, tier, enqueued_at, started_at, ended_at, reason
+  SELECT id, cycle, project, test_project, status, tier, enqueued_at, started_at, ended_at, reason%LANE%
   FROM jobs WHERE status='running' ORDER BY id`;
 export const QUEUED_JOBS = `
-  SELECT id, cycle, project, test_project, status, tier, enqueued_at, started_at, ended_at, reason
+  SELECT id, cycle, project, test_project, status, tier, enqueued_at, started_at, ended_at, reason%LANE%
   FROM jobs WHERE status='queued' ORDER BY id`;
 export const FINISHED_JOBS = `
-  SELECT id, cycle, project, test_project, status, tier, enqueued_at, started_at, ended_at, reason
+  SELECT id, cycle, project, test_project, status, tier, enqueued_at, started_at, ended_at, reason%LANE%
   FROM jobs WHERE status IN ('done','failed','cancelled') ORDER BY COALESCE(ended_at, enqueued_at) DESC, id DESC LIMIT 10`;
 
 export const WAITING = `

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { answerArgs, closeArgs, defaultDbPath, findBrain, reopenArgs, resumeArgs } from "../src/brainCli";
+import { answerArgs, closeArgs, defaultDbPath, findBrain, reopenArgs, resumeArgs, routeArgs } from "../src/brainCli";
 
 function exe(p: string) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -17,6 +17,8 @@ describe("brain cli", () => {
     expect(reopenArgs(7)).toEqual(["reopen", "7"]);
     expect(resumeArgs("p")).toEqual(["resume", "--project", "p"]);
     expect(resumeArgs()).toEqual(["resume"]);
+    expect(routeArgs(7, "remote")).toEqual(["queue", "route", "7", "--to", "remote"]);
+    expect(routeArgs(7, "any")).toEqual(["queue", "route", "7", "--to", "any"]);
     expect(answerArgs(7, "use 8080\nnot 80", false)).toEqual(["close", "7", "--resolution", "answered", "--note", "use 8080\nnot 80"]);
     expect(answerArgs(7, "yes", true)).toEqual(["close", "7", "--resolution", "answered", "--note", "yes", "--delivered"]);
   });

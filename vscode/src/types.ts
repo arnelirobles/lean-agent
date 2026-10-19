@@ -11,9 +11,17 @@ export interface ItemFull extends ItemRow {
 export interface JobRow {
   id: number; cycle: string; project: string; test_project: string; status: string; tier: string;
   enqueued_at: string; started_at: string | null; ended_at: string | null; reason: string;
+  /** remote: only a remote lane; apple: only this machine; empty: any lane. Both empty before schema 7. */
+  platform: string; host: string;
+  /** False on a database from before schema 7, where a job cannot be routed. */
+  routable: boolean;
 }
 export interface Counts { real: number; flaky: number }
-export interface QueueData { running: JobRow[]; queued: JobRow[]; finished: JobRow[] }
+/** Jobs a lane finished in the last 24 hours, by status. host is the remote's name, empty for this machine. */
+export interface LaneCount { host: string; status: string; n: number }
+export interface QueueData { running: JobRow[]; queued: JobRow[]; finished: JobRow[]; today: LaneCount[] }
+/** A [remote NAME] section of remotes.ini, as far as the dashboard shows it. */
+export interface RemoteLane { name: string; host: string; cpus: string; memory: string }
 export interface CycleRow {
   cycle: string; jobs: number; passed: number; failed: number; duration_s: number; stalls: number; flaky_filed: number;
 }
@@ -33,5 +41,8 @@ export interface DashboardData {
   flakiest: ItemRow[];
   load: LoadPoint[];
   stale: StaleRow[];
+  queue: QueueData;
   generatedAt: number;
+  /** Remote lanes from remotes.ini; the panel fills it, the database does not know them. */
+  remotes?: RemoteLane[];
 }

@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import type { Database } from "sql.js";
 import * as db from "../src/db";
-import { emptyDb, NOW, seededDb } from "./fixture";
+import { emptyDb, iso, NOW, seededDb } from "./fixture";
 
 let d: Database;
 beforeAll(async () => { d = await seededDb(); });
@@ -20,7 +20,7 @@ describe("db queries", () => {
   });
 
   it("reads the schema version", () => {
-    expect(db.schemaVersion(d)).toBe(5);
+    expect(db.schemaVersion(d)).toBe(7);
   });
 
   it("lists open items only, and the fixture is not empty", () => {
@@ -102,6 +102,32 @@ describe("db queries", () => {
     expect(db.shortTestName(q.running[0].test_project)).toBe("B.Tests");
   });
 
+  it("queue carries which lane may run a job, and the host of a running one", () => {
+    const qid = db.queue(d).queued[0].id;
+    d.run(`UPDATE jobs SET platform='remote' WHERE id=?`, [qid]);
+    d.run(`UPDATE jobs SET host='dev' WHERE status='running'`);
+    const q = db.queue(d);
+    expect(q.queued[0].platform).toBe("remote");
+    expect(q.running[0].host).toBe("dev");
+    expect(db.laneLabel(q.queued[0])).toBe("remote only");
+    expect(db.laneLabel({ ...q.queued[0], platform: "apple" })).toBe("this machine only");
+    expect(db.laneLabel({ ...q.queued[0], platform: "" })).toBe("");
+    expect(db.jobContext(q.queued[0])).toBe("job.queued.remote");
+    expect(db.jobContext({ ...q.queued[0], platform: "apple" })).toBe("job.queued.apple");
+    expect(db.jobContext({ ...q.queued[0], platform: "" })).toBe("job.queued.any");
+    expect(db.jobContext(q.running[0])).toBe("job.running");
+    d.run(`UPDATE jobs SET platform='', host=''`);
+  });
+
+  it("queue reads a database from before platform and host", async () => {
+    const old = await emptyDb(5);
+    old.run(`INSERT INTO jobs (project, repo_dir, test_project, enqueued_at) VALUES ('p','/r','T.csproj',?)`, [iso(60)]);
+    const q = db.queue(old);
+    expect(q.queued).toHaveLength(1);
+    expect(q.queued[0].platform).toBe("");
+    expect(db.jobContext(q.queued[0])).toBe("job.queued.old");
+  });
+
   it("getItem returns all fields and tags", () => {
     const i = db.getItem(d, 1)!;
     expect(i.ref).toBe("need-key");
@@ -124,5 +150,12 @@ describe("db queries", () => {
     expect(data.load).toEqual([]);
     expect(data.headline).toEqual({ realOpen: 0, flakyOpen: 0, closed7d: 0, runs7d: 0, testSeconds7d: 0 });
     expect(db.openCounts(e).counts).toEqual({ real: 0, flaky: 0 });
+  });
+});
+
+describe("dashboard queue", () => {
+  it("carries the queue", async () => {
+    const e = await seededDb();
+    expect(db.dashboard(e, NOW).queue).toEqual(db.queue(e));
   });
 });

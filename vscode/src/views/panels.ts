@@ -4,7 +4,10 @@ import * as db from "../db";
 import { dashboardHtml } from "../dashboard/dashboardHtml";
 import { itemHtml } from "../dashboard/itemHtml";
 import { makeNonce } from "../dashboard/page";
-import type { DashboardData } from "../types";
+import * as os from "os";
+import { readRemotes } from "../lanes";
+import { liveJobs, testPhaseDir } from "../progress";
+import type { DashboardData, JobRow } from "../types";
 
 /** The codicon stylesheet copied to out/codicons by the build, as a webview URI. */
 function codicons(panel: vscode.WebviewPanel, root: vscode.Uri): string {
@@ -25,7 +28,7 @@ interface Msg { type: string; text?: string; id?: number }
 /** What the webviews can ask the extension to do. */
 export interface Actions {
   openItem: (id: number) => void; refresh: () => void; claude: () => void; ask: (id: number) => void; send: (id: number) => void;
-  answer: (id: number, text: string) => void;
+  answer: (id: number, text: string) => void; route: (id: number, to: "remote" | "local" | "any") => void;
 }
 
 function wire(panel: vscode.WebviewPanel, a: Actions): void {
@@ -38,6 +41,8 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
     else if (m.type === "send" && typeof m.id === "number") a.send(m.id);
     else if (m.type === "answer" && typeof m.id === "number" && typeof m.text === "string" && m.text.trim() && m.text.length <= 20000)
       a.answer(m.id, m.text.trim());
+    else if (m.type === "route" && typeof m.id === "number" && (m.text === "remote" || m.text === "local" || m.text === "any"))
+      a.route(m.id, m.text);
     else if (m.type === "claude") a.claude();
     else if (m.type === "refresh") a.refresh();
   });
@@ -46,19 +51,26 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
 function emptyData(): DashboardData {
   return {
     schemaVersion: null, waiting: [], headline: { realOpen: 0, flakyOpen: 0, closed7d: 0, runs7d: 0, testSeconds7d: 0 },
-    cycles: [], suites: [], flakiest: [], load: [], stale: [], generatedAt: Math.floor(Date.now() / 1000),
+    cycles: [], suites: [], flakiest: [], load: [], stale: [], queue: { running: [], queued: [], finished: [], today: [] }, generatedAt: Math.floor(Date.now() / 1000),
   };
 }
 
 export class DashboardPanel {
   private panel?: vscode.WebviewPanel;
+  private running: JobRow[] = [];
+  private timer?: NodeJS.Timeout;
   constructor(private readonly root: vscode.Uri, private readonly actions: Actions) {}
 
   show(database: Database | undefined, note: string): void {
     if (!this.panel) {
       this.panel = vscode.window.createWebviewPanel("leanBrain.dashboard", "Lean Brain", vscode.ViewColumn.Active, options(this.root));
-      this.panel.onDidDispose(() => (this.panel = undefined));
+      this.panel.onDidDispose(() => {
+        this.panel = undefined;
+        clearInterval(this.timer);
+      });
       wire(this.panel, this.actions);
+      // Running jobs' logs grow between database refreshes, so the live blocks get their own 3 second tick.
+      this.timer = setInterval(() => this.postLive(), 3000);
     } else this.panel.reveal();
     this.render(database, note);
   }
@@ -67,8 +79,17 @@ export class DashboardPanel {
     if (!this.panel) return;
     const nonce = makeNonce();
     const data = database ? db.dashboard(database, Math.floor(Date.now() / 1000)) : emptyData();
+    data.remotes = readRemotes(process.env, os.homedir());
+    this.running = data.queue.running;
     this.panel.webview.html = dashboardHtml(data, nonce, this.panel.webview.cspSource, database ? note : note || "No data.",
       codicons(this.panel, this.root), media(this.panel, this.root));
+    this.postLive();
+  }
+
+  private postLive(): void {
+    if (!this.panel || this.running.length === 0) return;
+    const jobs = liveJobs(this.running, testPhaseDir(process.env, os.homedir()), Math.floor(Date.now() / 1000));
+    void this.panel.webview.postMessage({ type: "live", jobs });
   }
 }
 

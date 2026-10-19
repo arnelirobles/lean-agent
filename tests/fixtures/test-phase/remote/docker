@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Fake docker for the test-phase self-test. Containers and networks are files under $FAKE_DOCKER_DIR
+(c-NAME and n-NAME, holding the lean.job label value). `run` without -d executes the command in the folder
+mounted at /work."""
+import os
+import subprocess
+import sys
+
+STATE = os.environ["FAKE_DOCKER_DIR"]
+os.makedirs(STATE, exist_ok=True)
+args = sys.argv[1:]
+with open(os.path.join(os.environ["FAKE_DIR"], "docker.log"), "a") as fh:
+    fh.write(" ".join(args) + "\n")
+
+
+def label_of(argv):
+    for i, a in enumerate(argv):
+        if a == "--label" and argv[i + 1].startswith("lean.job="):
+            return argv[i + 1].split("=", 1)[1]
+    return ""
+
+
+def names(prefix, argv):
+    flt = argv[argv.index("--filter") + 1] if "--filter" in argv else "label=lean.job"
+    want = flt.split("label=", 1)[1].partition("=")[2]
+    out = []
+    for f in sorted(os.listdir(STATE)):
+        if f.startswith(prefix) and (not want or open(os.path.join(STATE, f)).read().strip() == want):
+            out.append(f[len(prefix):])
+    return out
+
+
+def drop(prefix, which):
+    for n in which:
+        try:
+            os.remove(os.path.join(STATE, prefix + n))
+        except OSError:
+            pass
+
+
+cmd = args[0] if args else ""
+if cmd == "info" or cmd == "exec":
+    sys.exit(0)
+if cmd == "network":
+    sub = args[1]
+    if sub == "create":
+        open(os.path.join(STATE, "n-" + args[-1]), "w").write(label_of(args))
+    elif sub == "ls":
+        print("\n".join(names("n-", args)))
+    elif sub == "inspect":
+        print(open(os.path.join(STATE, "n-" + args[-1])).read().strip())
+    elif sub == "rm":
+        drop("n-", args[2:])
+    sys.exit(0)
+if cmd == "ps":
+    print("\n".join(names("c-", args)))
+    sys.exit(0)
+if cmd == "inspect":
+    print(open(os.path.join(STATE, "c-" + args[-1])).read().strip())
+    sys.exit(0)
+if cmd == "rm":
+    drop("c-", [a for a in args[1:] if not a.startswith("-")])
+    sys.exit(0)
+if cmd == "run":
+    rest, i, opts, mounts, envs = args[1:], 0, {}, {}, {}
+    while rest[i].startswith("-"):
+        flag = rest[i]
+        if flag in ("-d", "--rm"):
+            opts[flag] = True
+            i += 1
+            continue
+        val = rest[i + 1]
+        if flag == "-v":
+            host, _, cont = val.rpartition(":")
+            mounts[cont] = host
+        elif flag == "-e":
+            k, _, v = val.partition("=")
+            envs[k] = v
+        else:
+            opts[flag] = val
+        i += 2
+    command = rest[i + 1:]
+    name = opts.get("--name", "anon-%d" % os.getpid())
+    open(os.path.join(STATE, "c-" + name), "w").write(label_of(args))
+    if "-d" in opts:
+        sys.exit(0)
+    env = dict(os.environ, **envs)
+    rc = subprocess.call(command, cwd=mounts.get("/work"), env=env)
+    drop("c-", [name])
+    sys.exit(rc)
+sys.exit("fake docker: unsupported " + " ".join(args))

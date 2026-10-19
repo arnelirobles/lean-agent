@@ -133,3 +133,70 @@ describe("item html", () => {
     expect(o).toContain("no session on record");
   });
 });
+
+describe("dashboard queue tab", () => {
+  const job = (id: number, status: string, platform: string, host: string, routable = true) => ({
+    id, cycle: "c", project: "core", test_project: "Core.Tests/Core.Tests.csproj", status, tier: "full",
+    enqueued_at: "2026-10-19T08:00:00Z", started_at: status === "running" ? "2026-10-19T08:00:00Z" : null,
+    ended_at: null, reason: "", platform, host, routable,
+  });
+  const withQueue = (running: ReturnType<typeof job>[], queued: ReturnType<typeof job>[]): DashboardData =>
+    ({ ...data, queue: { running, queued, finished: [], today: [] } });
+
+  it("says where each running job runs", () => {
+    const html = dashboardBody(withQueue([job(1, "running", "", "dev"), job(2, "running", "apple", "")], []));
+    expect(html).toContain(`data-tab="queue"`);
+    expect(html).toMatch(/#1<\/td>.*?on dev/s);
+    expect(html).toMatch(/#2<\/td>.*?this machine/s);
+  });
+
+  it("offers the route buttons that fit each queued job", () => {
+    const html = dashboardBody(withQueue([], [job(3, "queued", "", ""), job(4, "queued", "remote", ""), job(5, "queued", "apple", "")]));
+    expect(html).toContain(`data-route="3:remote"`);
+    expect(html).not.toContain(`data-route="3:any"`);
+    expect(html).toContain(`data-route="4:any"`);
+    expect(html).not.toContain(`data-route="4:remote"`);
+    expect(html).toContain(`data-route="5:remote"`);
+    expect(html).toMatch(/#4<\/td>.*?remote only/s);
+  });
+
+  it("shows no route buttons on a database from before schema 7", () => {
+    const html = dashboardBody(withQueue([], [job(6, "queued", "", "", false)]));
+    expect(html).toContain("#6</td>");
+    expect(html).not.toContain("data-route=");
+  });
+
+  it("gives each running job a live block with the suite's usual duration", () => {
+    const d = withQueue([job(1, "running", "", "dev")], []);
+    d.suites = [{ project: "core", test_project: "Core.Tests/Core.Tests.csproj", runs: 3, median_s: 1800, last_s: 1700, history: [], mean_lane_wait_s: 0 }];
+    const html = dashboardBody(d);
+    expect(html).toContain(`data-live="1"`);
+    expect(html).toContain(`data-median="1800"`);
+  });
+
+  it("says when nothing is queued or running", () => {
+    expect(dashboardBody(withQueue([], []))).toContain("Nothing queued or running.");
+  });
+});
+
+describe("dashboard lanes", () => {
+  it("shows a card per lane with its running job's live bar", () => {
+    const d: DashboardData = { ...data, remotes: [{ name: "dev", host: "dev", cpus: "2", memory: "6g" }] };
+    d.queue = { running: [{ id: 9, cycle: "", project: "p", test_project: "A/A.Tests.csproj", status: "running", tier: "full",
+      enqueued_at: "", started_at: null, ended_at: null, reason: "", platform: "", host: "dev", routable: true }],
+      queued: [], finished: [], today: [] };
+    const html = dashboardHtml(d, "n", "c");
+    expect(html).toContain("this machine");
+    expect(html).toContain('data-lane-live="9"');
+    expect(html).toMatch(/dev[\s\S]*2 cpus, 6g/);
+    expect(html).toContain("idle");
+  });
+});
+
+describe("webview script", () => {
+  it("parses", () => {
+    const html = dashboardHtml(data, "n", "c");
+    const js = html.split('<script nonce="n">')[1].split("</script>")[0];
+    expect(() => new Function(js)).not.toThrow();
+  });
+});
