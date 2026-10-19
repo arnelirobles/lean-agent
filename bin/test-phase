@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""Drain the test queue: every queued test run once, in the heavy lane, failures sorted into brain.
+
+usage: test-phase [PLAN] [--cycle C] [--lane L] [--stall S] [--run-dir D] [--project NAME] [--branch B]
+       test-phase --self-test
+
+The cycle this serves: code everything with builds only, queue the test runs, drain the queue once,
+read `brain list --open`, fix, run again. Nobody waits in a loop: `brain queue add` returns at once,
+and one drainer (start it as a background task) takes the oldest ready job, runs it, and repeats until
+nothing is ready. A second test-phase while one is draining says so and exits 0; the running drainer
+picks up whatever was enqueued. A job whose --after job failed or was cancelled is cancelled with the
+reason. Every command goes through bin/heavy.sh in one lane, so sessions on one machine queue instead
+of loading the database together; ask whether the lane is free with `heavy.sh status dotnet`.
+
+PLAN is optional. When given, its lines are enqueued first. One project per line, blank lines and lines
+starting with # are skipped:
+
+    <repo-dir> <test project path> [fast-filter] [args=EXTRA]
+
+The project path is relative to repo-dir. Quote a field that holds spaces. A fast filter is a class
+name or a fragment of one (for MTP the fast tier passes *fragment* to --filter-class, and a rerun passes
+the exact class); with it the line becomes two jobs, the fast slice and then the whole project.
+
+Extra dotnet arguments, such as MSBuild properties, go on every command of a job: set TEST_PHASE_DOTNET_ARGS
+(split like a shell line) for all jobs, and "args=EXTRA" on a plan line or `brain queue add --args=EXTRA` for
+one job. They come after the project and before the logger, or before `--` in MTP mode. Example for the
+Mac Catalyst desktop tests, which need Xcode checks off:
+
+    TEST_PHASE_DOTNET_ARGS="-p:ValidateXcodeVersion=false" test-phase plan.txt
+    ~/app tests/Desktop.Tests/Desktop.Tests.csproj "args=-p:ValidateXcodeVersion=false"
+
+For each job: run it, list the failing tests, run each failing class alone, and label the test flaky if
+it passes alone (exit 0, or passed tests and the name absent) or real if it fails again. It is unverified
+when the rerun was cut off or failed without naming the test or passing anything. Real and unverified
+go to brain as test-fail, flaky as flaky. A job that fails without naming a failing test (a build error)
+goes in as test-fail too. A stall is only a note, because the watchdog says it is likely load, not code.
+Logs are under the run directory: ${LEAN_TEST_PHASE_DIR:-~/.local/share/lean/test-phase}/<timestamp>.
+
+  --cycle      cycle label for a plan's jobs, runs and items (default: the run directory's name)
+  --lane       heavy.sh lane (default dotnet)
+  --stall      seconds without test progress before a command is stopped (default 600, 0 is off);
+               it starts when the command starts, so keep it above the build time
+  --project    brain project name for a plan's jobs (default: the main repository's name, so worktrees share it)
+  --branch     brain branch (default: the repo's current branch)
+
+Every command is also recorded as a row in brain's runs table (tier fast, full or rerun, duration, time
+spent waiting for the lane, load average at start and end, passed, failed, skipped, stalled, exit code),
+and each item points at the run that showed it. `brain stats` reads them.
+
+TEST_PHASE_RUNNER=mtp or vstest overrides detection. The wait for a busy lane is HEAVY_WAIT, here
+defaulting to 3600 seconds. Exit 0 when nothing real failed and no job was cancelled during the drain, 1 otherwise. A job whose
+failures were all flaky finishes done, so the jobs after it still run.
+
+Runner support is a class with mode, command, failures, counts and class_of. Dotnet is the one that
+exists; another runner is another class in RUNNERS.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HEAVY = os.path.join(HERE, "heavy.sh")
+BRAIN = os.path.join(HERE, "brain")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# MTP prints "failed Name (1s 184ms)" at column 0. The VSTest console logger prints "  Failed Name [3 ms]"
+# with exactly two spaces; a deeper indent is an assertion dump ("    Failed = 1,") and is not a test.
+FAILED = re.compile(r"^(?:failed|  Failed)\s+(\S.*?)\s*$")
+DURATION = re.compile(r"\s+\((?:\d+(?:\.\d+)?\s*(?:ms|s|m|h)\s*)+\)$|\s+\[[^\]]*\]$")
+TEST_NAME = re.compile(r"[A-Za-z_][\w`<>+]*(?:\.[\w`<>+]+)+(?:\(.*\))?")
+
+
+class Dotnet:
+    name = "dotnet"
+
+    @staticmethod
+    def mode(repo):
+        forced = os.environ.get("TEST_PHASE_RUNNER")
+        if forced in ("mtp", "vstest"):
+            return forced
+        d = os.path.abspath(repo)
+        while True:
+            g = os.path.join(d, "global.json")
+            if os.path.isfile(g):
+                try:
+                    runner = json.load(open(g)).get("test", {}).get("runner", "")
+                except (ValueError, OSError, AttributeError):
+                    runner = ""
+                return "mtp" if runner == "Microsoft.Testing.Platform" else "vstest"
+            if os.path.dirname(d) == d:
+                return "vstest"
+            d = os.path.dirname(d)
+
+    @classmethod
+    def command(cls, mode, project, cls_filter=None, fast=False, extra=()):
+        # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
+        if mode == "mtp":
+            cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
+            if cls_filter:
+                # --filter-class matches the full class name; the fast tier takes a fragment, hence the wildcards.
+                cmd += ["--filter-class", f"*{cls_filter}*" if fast else cls_filter]
+            return cmd + ["--output", "Detailed"]
+        cmd = ["dotnet", "test", project] + list(extra) + ["--logger", "console;verbosity=normal"]
+        if cls_filter:
+            cmd += ["--filter", "FullyQualifiedName~" + cls_filter]
+        return cmd
+
+    @staticmethod
+    def failures(text):
+        """[(test name, the lines that follow it)] in order, each name once."""
+        lines = [ANSI.sub("", l).rstrip() for l in text.splitlines()]
+        seen, out = set(), []
+        for i, l in enumerate(lines):
+            m = FAILED.match(l)
+            if not m:
+                continue
+            name = DURATION.sub("", m.group(1))
+            if not TEST_NAME.fullmatch(name) or name in seen:
+                continue
+            seen.add(name)
+            out.append((name, "\n".join(lines[i:i + 12])))
+        return out
+
+    @staticmethod
+    def counts(text):
+        """(passed, failed, skipped) from the run summary, zeros when there is none."""
+        text = ANSI.sub("", text)
+        m = re.search(r"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+)", text)
+        if m:
+            return int(m.group(2)), int(m.group(1)), int(m.group(3))
+        blk = {k.lower(): int(v) for k, v in re.findall(r"^\s*(Total tests|Passed|Failed|Skipped):\s*(\d+)\s*$", text, re.M)}
+        if "total tests" in blk:  # the detailed VSTest logger leaves out the lines that are zero
+            failed, skipped = blk.get("failed", 0), blk.get("skipped", 0)
+            return blk.get("passed", blk["total tests"] - failed - skipped), failed, skipped
+        got = {k.lower(): int(v) for k, v in re.findall(r"^\s*(total|failed|succeeded|skipped):\s*(\d+)", text, re.M)}
+        if got:
+            return got.get("succeeded", 0), got.get("failed", 0), got.get("skipped", 0)
+        return 0, 0, 0
+
+    @staticmethod
+    def class_of(test):
+        base = re.split(r"[(\[]", test, maxsplit=1)[0]
+        return base.rsplit(".", 1)[0] if "." in base else base
+
+
+RUNNERS = [Dotnet]
+
+
+def heavy(lane, cmd, cwd, log, stall):
+    """Run cmd in the lane. Returns (exit code, output, started, ended, seconds spent waiting for the lane)."""
+    env = dict(os.environ)
+    env.setdefault("HEAVY_WAIT", "3600")
+    if stall:
+        env["HEAVY_STALL"] = str(stall)
+    else:
+        env.pop("HEAVY_STALL", None)
+    timing = log + ".wait"
+    env["HEAVY_TIMING_FILE"] = timing
+    started = int(time.time())
+    with open(log, "w") as fh:
+        fh.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
+        fh.flush()
+        rc = subprocess.run(["bash", HEAVY, lane] + cmd, cwd=cwd, env=env, stdout=fh,
+                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL).returncode
+    ended = int(time.time())
+    try:
+        wait = float(open(timing).read().strip() or 0)
+        os.remove(timing)
+    except (OSError, ValueError):
+        wait = None
+    return rc, open(log, errors="replace").read(), started, ended, wait
+
+
+def load1():
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return None
+
+
+SECRETS = [
+    (re.compile(r"(?i)\b(password|pwd)(\s*=\s*)(?:\"[^\"]*\"|'[^']*'|[^;\s\"']+)"), r"\1\2***"),
+    (re.compile(r"(?i)\b(api[-_ ]?key)(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^;\s\"',]+)"), r"\1\2***"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer ***"),
+    (re.compile(r"\beyJ[A-Za-z0-9_=-]*(?:\.[A-Za-z0-9_=-]*)*"), "***"),
+]
+
+
+def mask(text):
+    """Test output can carry connection strings and tokens; none of it goes into brain."""
+    for pattern, repl in SECRETS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def brain(args, stdin=None):
+    r = subprocess.run([sys.executable, BRAIN] + args, capture_output=True, text=True, input=stdin)
+    if r.returncode != 0:
+        sys.stderr.write("test-phase: brain failed: " + r.stderr.strip() + "\n")
+        return None
+    return r.stdout.strip()
+
+
+def add_item(row, kind, ref, severity, body, run_id, ctx):
+    ref = mask(ref)
+    args = ["add", "--project", row["project"], "--repo", ctx["repo"], "--kind", kind, "--ref", ref,
+            "--title", ref, "--body-file", "-", "--severity", severity, "--phase", "test", "--source", "test-phase",
+            "--cycle", ctx["cycle"]]
+    if ctx["branch"]:
+        args += ["--branch", ctx["branch"]]
+    if run_id:
+        args += ["--run-id", str(run_id)]
+    brain(args, stdin=mask(body))  # the body goes by stdin, not argv, where any user's ps could read it
+
+
+def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start, project):
+    passed, failed, skipped = ctx["runner"].counts(text)
+    out = brain(["run-add", "--cycle", ctx["cycle"], "--project", row["project"], "--repo", ctx["repo"],
+                 "--test-project", os.path.basename(project), "--runner", mode, "--tier", tier,
+                 "--started", str(started), "--ended", str(ended), "--passed", str(passed),
+                 "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc == 76 else "0",
+                 "--exit-code", str(rc)]
+                + (["--lane-wait", str(wait)] if wait is not None else [])
+                + (["--load-start", "%.2f" % load_start] if load_start is not None else [])
+                + (["--load-end", "%.2f" % load1()] if load1() is not None else []))
+    return int(out) if out and out.isdigit() else None
+
+
+def current_branch(repo):
+    r = subprocess.run(["git", "-C", repo, "branch", "--show-current"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def parse_plan(path):
+    entries = []
+    for n, raw in enumerate(open(path), 1):
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = shlex.split(raw)
+        extra = [x[len("args="):] for x in parts[2:] if x.startswith("args=")]
+        parts = parts[:2] + [x for x in parts[2:] if not x.startswith("args=")]
+        if len(parts) not in (2, 3) or len(extra) > 1:
+            sys.exit(f"test-phase: {path} line {n}: want <repo-dir> <test project path> [fast-filter] [args=EXTRA]")
+        entries.append(parts + [None] * (3 - len(parts)) + [extra[0] if extra else ""])
+    if not entries:
+        sys.exit(f"test-phase: {path} lists no projects, so nothing would run")
+    return entries
+
+
+def safe(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")[:60]
+
+
+def tier_note(rc):
+    return {0: "pass", 75: "busy", 76: "stalled"}.get(rc, "fail")
+
+
+def run_job(job, a, run_dir, runner):
+    repo, project = job["repo_dir"], job["test_project"]
+    row = {"job": job["id"], "project": job["project"], "test": project, "tier": job["tier"],
+           "result": "", "failing": 0, "real": 0, "flaky": 0, "notes": [], "run_id": None, "rc": 1}
+    if not os.path.isdir(repo):
+        row["result"] = "error"
+        row["notes"].append("no such directory")
+        return row
+    mode = runner.mode(repo)
+    row["runner"] = f"{runner.name}/{mode}"
+    ctx = {"repo": repo, "cycle": job["cycle"], "runner": runner,
+           "branch": a.branch if a.branch is not None else current_branch(repo)}
+    stem = os.path.join(run_dir, f"job{job['id']:03d}-{safe(os.path.basename(project))}-{job['tier']}")
+    failing = {}  # test name to its detail
+
+    try:
+        extra = shlex.split(os.environ.get("TEST_PHASE_DOTNET_ARGS", "")) + shlex.split(job.get("args") or "")
+    except ValueError as e:
+        row["result"] = "error"
+        row["notes"].append(f"bad extra arguments: {e}")
+        return row
+
+    def tier(name, cls_filter, log):
+        before = load1()
+        rc, text, started, ended, wait = heavy(a.lane, runner.command(mode, project, cls_filter, name == "fast", extra),
+                                               repo, log, a.stall)
+        return rc, text, record_run(row, ctx, name, mode, rc, text, started, ended, wait, before, project)
+
+    rc, text, run_id = tier(job["tier"], job["filter"] or None, stem + ".log")
+    row["rc"], row["run_id"] = rc, run_id
+    row["result"] = tier_note(rc)
+    for name, detail in runner.failures(text):
+        failing.setdefault(name, detail)
+    if rc == 76:
+        row["notes"].append("stalled, likely load")
+        add_item(row, "note", f"stalled: {project}", "info",
+                 f"no test progress for {a.stall} s, stopped by heavy.sh. Log: {stem}.log", run_id, ctx)
+    elif rc == 75:
+        row["notes"].append("lane busy, nothing ran")
+    elif rc != 0 and not failing:
+        tail = "\n".join(text.splitlines()[-15:])
+        add_item(row, "test-fail", f"run-failed: {project}", "important",
+                 f"exit {rc} with no failing test named. Log: {stem}.log\n{tail}", run_id, ctx)
+        row["notes"].append(f"exit {rc}, no test named (build error?)")
+    by_class = {}
+    for name in failing:
+        by_class.setdefault(runner.class_of(name), []).append(name)
+    row["failing"] = len(failing)
+    for cls, names in by_class.items():
+        log = f"{stem}-class-{safe(cls)}.log"
+        rrc, rtext, _ = tier("rerun", cls, log)
+        again = {n for n, _ in runner.failures(rtext)}
+        rpassed = runner.counts(rtext)[0]
+        for name in names:
+            # A rerun that named no failure is not proof: a crash or build error names none either.
+            if rrc in (75, 76):
+                label = "unverified"
+            elif rrc == 0 or (rpassed > 0 and name not in again):
+                label = "flaky"
+            elif name not in again:
+                label = "unverified"
+            else:
+                label = "real"
+            body = f"{label}; alone: {tier_note(rrc)}. Log: {log}\n{failing[name]}"
+            if label == "flaky":
+                row["flaky"] += 1
+                add_item(row, "flaky", name, "minor", body, run_id, ctx)
+            else:
+                row["real"] += 1
+                add_item(row, "test-fail", name, "important", body, run_id, ctx)
+    return row
+
+
+def enqueue(entries, a, cycle):
+    for repo, project, fast, extra in entries:
+        base = ["queue", "add", repo, project, "--cycle", cycle, "--by", "test-phase"]
+        if extra:
+            base.append("--args=" + extra)
+        if a.project:
+            base += ["--project", a.project]
+        if fast:
+            brain(base + ["--tier", "fast", "--filter", fast])
+        brain(base + ["--tier", "full"])
+
+
+def cancelled_ids():
+    return set(re.findall(r"^job #(\d+) cancelled", brain(["queue", "list", "--status", "cancelled"]) or "", re.M))
+
+
+def only_flaky(row):
+    """The job failed, every failing test passed alone, and nothing else went wrong."""
+    return row["result"] == "fail" and row["failing"] > 0 and row["real"] == 0 and row["flaky"] == row["failing"]
+
+
+def drain(a, run_dir, runner):
+    """(rows, how many jobs were cancelled while draining)."""
+    before = cancelled_ids()
+    # Jobs left running by a drainer that died cannot finish; fail them so their dependents are cancelled.
+    for line in (brain(["queue", "list", "--status", "running"]) or "").splitlines():
+        m = re.match(r"job #(\d+) ", line)
+        if m:
+            brain(["queue", "finish", m.group(1), "--status", "failed", "--reason", "drainer died"])
+    rows = []
+    while True:
+        out = brain(["queue", "next"])
+        if not out:
+            return rows, len(cancelled_ids() - before)
+        job = json.loads(out)
+        print(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})", flush=True)
+        row = run_job(job, a, run_dir, runner)
+        rows.append(row)
+        reason = "; ".join(row["notes"])
+        brain(["queue", "finish", str(job["id"]), "--status", "done" if row["rc"] == 0 or only_flaky(row) else "failed"]
+              + (["--run-id", str(row["run_id"])] if row["run_id"] else [])
+              + (["--reason", reason] if reason else []))
+
+
+def table(rows):
+    heads = ["job", "project:test", "runner", "tier", "result", "failing", "real", "flaky", "notes"]
+    data = [["#" + str(r["job"]), r["project"] + ":" + os.path.basename(r["test"]), r.get("runner", "-"), r["tier"],
+             r["result"], str(r["failing"]), str(r["real"]), str(r["flaky"]), "; ".join(r["notes"])] for r in rows]
+    widths = [max(len(x[i]) for x in data + [heads]) for i in range(len(heads))]
+    out = ["  ".join(h.ljust(w) for h, w in zip(heads, widths)).rstrip()]
+    out += ["  ".join(c.ljust(w) for c, w in zip(d, widths)).rstrip() for d in data]
+    return "\n".join(out)
+
+
+def is_bad(r):
+    if r["result"] in ("stalled", "busy", "error"):
+        return True
+    if r["real"]:
+        return True
+    return r["result"] == "fail" and r["failing"] == 0  # failed without naming a test
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="test-phase", description="Drain the test queue.")
+    p.add_argument("plan", nargs="?")
+    p.add_argument("--lane", default="dotnet")
+    p.add_argument("--stall", type=int, default=int(os.environ.get("TEST_PHASE_STALL", "600")))
+    p.add_argument("--run-dir")
+    p.add_argument("--project")
+    p.add_argument("--branch")
+    p.add_argument("--cycle")
+    a = p.parse_args(argv)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    cycle = a.cycle or stamp
+    if a.plan:
+        enqueue(parse_plan(a.plan), a, cycle)
+    base = os.environ.get("LEAN_TEST_PHASE_DIR") or os.path.expanduser("~/.local/share/lean/test-phase")
+    os.makedirs(base, exist_ok=True)
+    lock = open(os.path.join(base, "drainer.lock"), "w")
+    rows = []
+    cancelled = 0
+    runs = 0
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if runs == 0:
+                print("test-phase: a drainer is running; it will take what is queued")
+            break
+        runs += 1
+        run_dir = a.run_dir or os.path.join(base, stamp)
+        os.makedirs(run_dir, exist_ok=True)
+        if runs == 1:
+            print(f"test-phase: logs in {run_dir}", flush=True)
+        got, dropped = drain(a, run_dir, RUNNERS[0])
+        rows += got
+        cancelled += dropped
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        # A job enqueued just as the drain ended would wait for the next drainer; look once more.
+        if not (brain(["queue", "next", "--peek"]) or "").strip():
+            break
+    if not rows:
+        if runs:
+            print("test-phase: nothing queued")
+        return 1 if cancelled else 0
+    print()
+    print(table(rows))
+    print(f"\ntest-phase: {len(rows)} jobs, {sum(r['real'] for r in rows)} real, "
+          f"{sum(r['flaky'] for r in rows)} flaky, {cancelled} cancelled. `brain list --open` has the entries.")
+    return 1 if cancelled or any(is_bad(r) for r in rows) else 0
+
+
+def self_test():
+    fails = []
+    fix = os.path.join(HERE, "..", "tests", "fixtures", "test-phase")
+
+    def fixture(name):
+        return open(os.path.join(fix, name), errors="replace").read()
+
+    for name, want in (("vstest-detailed-summary.log", (7, 0, 0)), ("vstest-detailed-failed.log", (6, 3, 1))):
+        if Dotnet.counts(fixture(name)) != want:
+            fails.append(f"detailed VSTest summary {name}: {Dotnet.counts(fixture(name))}, want {want}")
+    if Dotnet.counts("Failed!  - Failed:     2, Passed:     1, Skipped:     0, Total:     3\n") != (1, 2, 0):
+        fails.append("the one-line summary must still parse")
+
+    # Secrets in test output are masked, and the body travels by stdin.
+    probe = ("Server=db;Password=hunter2;User=x\nPwd=\"p w\" Authorization: Bearer abc.DEF-123/x=\n"
+             "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig_nature apikey=sk-123 api_key: 'k k'\n")
+    masked = mask(probe)
+    for leak in ("hunter2", "p w", "abc.DEF", "eyJhbGci", "eyJzdWIi", "sig_nature", "sk-123", "k k"):
+        if leak in masked:
+            fails.append(f"secret {leak!r} survived masking: {masked!r}")
+    if "Server=db" not in masked or "User=x" not in masked:
+        fails.append(f"masking removed more than the secret: {masked!r}")
+    seen = {}
+    real_brain = globals()["brain"]
+    globals()["brain"] = lambda args, stdin=None: seen.update(args=args, stdin=stdin)
+    try:
+        add_item({"project": "p"}, "test-fail", "T.a", "important", probe, None,
+                 {"repo": "r", "cycle": "c", "branch": ""})
+    finally:
+        globals()["brain"] = real_brain
+    if "hunter2" in " ".join(seen.get("args", [])) or "hunter2" in (seen.get("stdin") or "") \
+            or "-" not in seen.get("args", []) or "--body" in seen.get("args", []):
+        fails.append(f"item body must be masked and sent by stdin, not argv: {seen}")
+
+    # Names come out stable and only real test lines count.
+    got = [n for n, _ in Dotnet.failures(fixture("mtp-failure.log"))]
+    if got != ["BarakoCMS.Tests.ModuleCapabilityGrantTests.Every_module_grants_its_own_capabilities_to_admin"]:
+        fails.append(f"mtp duration suffix must not be part of the name: {got}")
+    for tail in ("(12ms)", "(1.5s)", "(1s 184ms)", "(1m 02s 100ms)", "(2h 1m 3s)"):
+        got = [n for n, _ in Dotnet.failures(f"failed A.B.C.D {tail}\n")]
+        if got != ["A.B.C.D"]:
+            fails.append(f"duration {tail} not stripped: {got}")
+    got = [n for n, _ in Dotnet.failures("failed A.B.C.D(x: 1.5) (3ms)\n")]
+    if got != ["A.B.C.D(x: 1.5)"]:
+        fails.append(f"argument list lost: {got}")
+    got = [n for n, _ in Dotnet.failures(fixture("vstest-assertion-dump.log"))]
+    if got != ["Shop.Client.ContractTests.Orders.OrderServerTests.ShippingCounts_are_18_23_1"]:
+        fails.append(f"an assertion dump must not parse as tests: {got}")
+    got = [n for n, _ in Dotnet.failures('  Failed A.B.T(code: "1 2", e: True) [10 s]\n    Failed = 1,\nFailed!  - Failed: 2\n')]
+    if got != ['A.B.T(code: "1 2", e: True)']:
+        fails.append(f"vstest line with arguments: {got}")
+    with tempfile.TemporaryDirectory() as d:
+        bin_dir = os.path.join(d, "shims")
+        os.mkdir(bin_dir)
+        # A fake dotnet. FAKE_FULL and FAKE_CLASS_<name> pick what it prints, FAKE_LOG records every call.
+        shim = os.path.join(bin_dir, "dotnet")
+        with open(shim, "w") as fh:
+            fh.write('''#!/bin/sh
+echo "$*" >> "$FAKE_LOG"
+case "$*" in
+  *Canceller.csproj*) python3 "$FAKE_BRAIN" queue cancel "$FAKE_CANCEL" >/dev/null ;;
+esac
+case "$*" in
+  *"--filter-class "*|*"FullyQualifiedName~"*)
+    all="$*"; cls=${all##*--filter-class }; [ "$cls" = "$all" ] && cls=${all##*FullyQualifiedName~}
+    cls=${cls%% *}
+    f=$FAKE_DIR/class-$cls
+    if [ -f "$f" ]; then cat "$f"; [ -f "$f.rc" ] && exit "$(cat "$f.rc")"; exit 0; fi
+    echo "passed $cls.Any (1ms)"; exit 0 ;;
+esac
+if [ -f "$FAKE_DIR/full" ]; then cat "$FAKE_DIR/full"; exit "$(cat "$FAKE_DIR/full.rc")"; fi
+echo "Passed!  - Failed: 0"; exit 0
+''')
+        os.chmod(shim, 0o755)
+        env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=BRAIN,
+                   FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"),
+                   HEAVY_LOCK_DIR=os.path.join(d, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"),
+                   HEAVY_WAIT="20")
+        env.pop("TEST_PHASE_RUNNER", None)
+        repo_v = os.path.join(d, "vrepo")
+        repo_m = os.path.join(d, "mrepo")
+        for r in (repo_v, repo_m):
+            os.makedirs(os.path.join(r, "tests", "T"))
+        with open(os.path.join(repo_m, "global.json"), "w") as fh:
+            fh.write('{"sdk": {"version": "10.0.100"}, "test": {"runner": "Microsoft.Testing.Platform"}}')
+
+        def put(name, text, rc=None):
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write(text)
+            if rc is not None:
+                with open(os.path.join(d, name + ".rc"), "w") as fh:
+                    fh.write(str(rc))
+
+        def run(plan, *extra):
+            pf = os.path.join(d, "plan.txt")
+            open(pf, "w").write(plan)
+            open(env["FAKE_LOG"], "w").close()
+            r = subprocess.run([sys.executable, os.path.realpath(__file__), pf, *extra], env=env,
+                               capture_output=True, text=True, timeout=240)
+            calls = open(env["FAKE_LOG"]).read().splitlines()
+            return r.returncode, r.stdout + r.stderr, calls
+
+        def brain_list(*args):
+            return subprocess.run([sys.executable, BRAIN, "list", *args], env=env, capture_output=True,
+                                  text=True).stdout
+
+        # VSTest repo: one real failure, one flaky, one that passes.
+        put("full", "  Failed Acme.RealTests.Breaks [3 ms]\n  Failed Acme.FlakyTests.Sometimes(x: 1.5) [9 ms]\n"
+                    "  Passed Acme.OkTests.Fine [1 ms]\nFailed!  - Failed:     2, Passed:     1, Skipped:     0, Total:     3\n", 1)
+        put("class-Acme.RealTests", "  Failed Acme.RealTests.Breaks [3 ms]\nFailed!  - Failed: 1\n", 1)
+        put("class-Acme.FlakyTests", "  Passed Acme.FlakyTests.Sometimes(x: 1.5) [9 ms]\nPassed!\n", 0)
+        rc, out, calls = run(f"# plan\n{repo_v} tests/T/T.csproj Fast\n")
+        if rc != 1:
+            fails.append(f"a real failure must exit 1, got {rc}: {out}")
+        want = ["test tests/T/T.csproj --logger console;verbosity=normal --filter FullyQualifiedName~Fast",
+                "test tests/T/T.csproj --logger console;verbosity=normal"]
+        if calls[:2] != want:
+            fails.append(f"vstest order or arguments wrong (fast first, then full): {calls}")
+        if not any("--filter FullyQualifiedName~Acme.RealTests" in c for c in calls) or \
+           not any("--filter FullyQualifiedName~Acme.FlakyTests" in c for c in calls):
+            fails.append(f"each failing class must rerun alone: {calls}")
+        if any("--project" in c for c in calls):
+            fails.append(f"vstest repo used MTP syntax: {calls}")
+        lst = brain_list()
+        if "test-fail vrepo" not in lst or "Acme.RealTests.Breaks" not in lst:
+            fails.append(f"real failure not in brain: {lst!r}")
+        if "flaky vrepo" not in lst or "Acme.FlakyTests.Sometimes(x: 1.5)" not in lst:
+            fails.append(f"flaky test not in brain as flaky: {lst!r}")
+        if "OkTests" in lst:
+            fails.append(f"a passing test reached brain: {lst!r}")
+        if not re.search(r"vrepo:T\.csproj\s+dotnet/vstest\s+full\s+fail\s+2\s+1\s+1", out):
+            fails.append(f"summary row wrong: {out}")
+        runs = os.path.join(d, "runs")
+        logs = [f for r_, _, fs in os.walk(runs) for f in fs]
+        if not any(f.endswith("-fast.log") for f in logs) or not any(f.endswith("-full.log") for f in logs):
+            fails.append(f"logs not written to the run dir: {logs}")
+
+        import sqlite3
+        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        runs = con.execute("SELECT tier, passed, failed, exit_code, lane_wait_s, load_end IS NOT NULL, cycle FROM runs"
+                           " ORDER BY id").fetchall()
+        if [r[0] for r in runs] != ["fast", "full", "rerun", "rerun"] or runs[1][1:4] != (1, 2, 1) \
+                or runs[1][4] is None or not runs[1][5] or not runs[1][6]:
+            fails.append(f"runs table rows wrong: {runs}")
+        linked = con.execute("SELECT COUNT(*) FROM items WHERE run_id IS NOT NULL AND source='test-phase'"
+                             " AND phase='test' AND cycle != ''").fetchone()[0]
+        if linked != 2:
+            fails.append(f"items must link to their run and carry source, phase and cycle: {linked}")
+        con.close()
+        st = json.loads(subprocess.run([sys.executable, BRAIN, "stats", "--json"], env=env, capture_output=True,
+                                       text=True).stdout)
+        if st["suites"][0]["runs"] != 2 or st["suites"][0]["flaky_items"] != 1:
+            fails.append(f"stats over test-phase runs: {st['suites']}")
+
+        # The same failure again is one brain row with a higher seen count.
+        run(f"{repo_v} tests/T/T.csproj\n")
+        lst = brain_list("--kind", "test-fail")
+        if len(lst.splitlines()) != 1 or "occ=2" not in lst:
+            fails.append(f"a repeat run must dedupe in brain: {lst!r}")
+
+        # MTP repo, with ANSI colour and a passing project: exit 0, MTP syntax.
+        os.remove(os.path.join(d, "full"))
+        os.remove(os.path.join(d, "full.rc"))
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj\n")
+        if rc != 0 or calls != ["test --project tests/T/T.csproj -- --output Detailed"]:
+            fails.append(f"mtp passing run: {rc} {calls} {out}")
+        put("full", "\x1b[31mfailed Acme.MtpTests.Bad (12ms)\x1b[0m\n  Assert failed\nTest run summary: Failed!\n", 2)
+        put("class-Acme.MtpTests", "failed Acme.MtpTests.Bad (12ms)\n", 2)
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj\n")
+        if not any("--project tests/T/T.csproj -- --filter-class Acme.MtpTests" in c for c in calls):
+            fails.append(f"mtp class rerun wrong: {calls}")
+        if "Acme.MtpTests.Bad" not in brain_list("--open") or rc != 1:
+            fails.append(f"mtp failure not in brain or exit not 1 ({rc})")
+        env["TEST_PHASE_DOTNET_ARGS"] = "-p:ValidateXcodeVersion=false"
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj \"args=-p:Job=1 -p:Two='a b'\"\n")
+        env.pop("TEST_PHASE_DOTNET_ARGS")
+        if calls[0] != "test --project tests/T/T.csproj -p:ValidateXcodeVersion=false -p:Job=1 -p:Two=a b -- --output Detailed":
+            fails.append(f"extra args go before -- in mtp mode, env first then the job's: {calls}")
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj args=-p:V=1\n")
+        if calls[0] != "test tests/T/T.csproj -p:V=1 --logger console;verbosity=normal":
+            fails.append(f"extra args in vstest mode: {calls}")
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj Mtp\n")
+        if calls[0] != "test --project tests/T/T.csproj -- --filter-class *Mtp* --output Detailed" or \
+           "test --project tests/T/T.csproj -- --filter-class Acme.MtpTests --output Detailed" not in calls:
+            fails.append(f"mtp fast tier needs wildcards, reruns the exact class: {calls}")
+
+        # A build error: nonzero exit, no failing test named. It must not look like a pass.
+        os.remove(os.path.join(d, "class-Acme.MtpTests"))
+        put("full", "error CS1002: ; expected\n", 1)
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj\n")
+        if rc != 1 or "run-failed: tests/T/T.csproj" not in subprocess.run(
+                [sys.executable, BRAIN, "show", "4"], env=env, capture_output=True, text=True).stdout + brain_list():
+            fails.append(f"build error not reported ({rc}): {out}")
+
+        # A rerun that names no failure proves nothing: only exit 0, or passed tests with the name absent, is flaky.
+        put("full", "  Failed Un.UnverTests.A [1 ms]\n  Failed Pa.PartTests.A [1 ms]\nFailed!  - Failed: 2, Passed: 0, Skipped: 0, Total: 2\n", 1)
+        put("class-Un.UnverTests", "Unhandled exception. The host crashed\n", 1)
+        put("class-Pa.PartTests", "Failed!  - Failed: 1, Passed: 4, Skipped: 0, Total: 5\n  Failed Pa.PartTests.Other [1 ms]\n", 1)
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj\n")
+        lst = brain_list()
+        if "flaky vrepo Un.UnverTests.A" in lst or "test-fail vrepo Un.UnverTests.A" not in lst:
+            fails.append(f"a rerun with no named failure and a nonzero exit must not be flaky: {lst!r}")
+        if "flaky vrepo Pa.PartTests.A" not in lst:
+            fails.append(f"a rerun with passed tests and the name absent is flaky: {lst!r}")
+        un = subprocess.run([sys.executable, BRAIN, "show", re.search(r"#(\d+) \S+ test-fail vrepo Un\.UnverTests\.A", lst).group(1)],
+                            env=env, capture_output=True, text=True).stdout if "test-fail vrepo Un.UnverTests.A" in lst else ""
+        if "unverified" not in un:
+            fails.append(f"an unproven rerun must be labelled unverified: {un!r}")
+        put("full", "error CS1002: ; expected\n", 1)
+
+        # The queue. Job A fails to build, B waits on A, C is independent, D waits on B (a chain).
+        # Drain order is by id among ready jobs; B and D are cancelled with the reason.
+        def qadd(*args):
+            return subprocess.run([sys.executable, BRAIN, "queue", "add", *args], env=env, capture_output=True,
+                                  text=True).stdout.strip()
+
+        def drain(*extra):
+            open(env["FAKE_LOG"], "w").close()
+            r = subprocess.run([sys.executable, os.path.realpath(__file__), *extra], env=env, capture_output=True,
+                               text=True, timeout=240)
+            return r.returncode, r.stdout + r.stderr, open(env["FAKE_LOG"]).read().splitlines()
+
+        def qlist(*args):
+            return subprocess.run([sys.executable, BRAIN, "queue", "list", *args], env=env, capture_output=True,
+                                  text=True).stdout
+
+        ja = qadd(repo_v, "tests/T/A.csproj", "--cycle", "qa")
+        jb = qadd(repo_v, "tests/T/B.csproj", "--after", ja, "--cycle", "qa")
+        jc = qadd(repo_v, "tests/T/C.csproj", "--cycle", "qa")
+        jd = qadd(repo_v, "tests/T/D.csproj", "--after", jb, "--cycle", "qa")
+        rc, out, calls = drain()
+        order = [c.split()[1] for c in calls if "FullyQualifiedName" not in c]
+        if order != ["tests/T/A.csproj", "tests/T/C.csproj"]:
+            fails.append(f"queue ran the wrong jobs or order: {calls}")
+        ql = qlist("--cycle", "qa")
+        if f"job #{ja} failed" not in ql or f"job #{jc} failed" not in ql \
+                or f"job #{jb} cancelled" not in ql or f"job #{jd} cancelled" not in ql \
+                or ql.count(f"dependency #{ja} failed") != 2:
+            fails.append(f"dependents not cancelled with a reason: {ql}")
+        if rc != 1:
+            fails.append(f"a failed job must exit 1, got {rc}")
+
+        # A job whose failures are all flaky is done: its dependent runs and the exit is 0.
+        put("full", "  Failed Fl.FlakyOnly.A [1 ms]\nFailed!  - Failed: 1, Passed: 2, Skipped: 0, Total: 3\n", 1)
+        put("class-Fl.FlakyOnly", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        jf1 = qadd(repo_v, "tests/T/F1.csproj", "--cycle", "qf")
+        jf2 = qadd(repo_v, "tests/T/F2.csproj", "--after", jf1, "--cycle", "qf")
+        rc, out, calls = drain()
+        ql = qlist("--cycle", "qf")
+        if f"job #{jf1} done" not in ql or f"job #{jf2} done" not in ql or rc != 0:
+            fails.append(f"an all-flaky job must finish done and run its dependents, exit 0 ({rc}): {ql} {out}")
+        put("full", "error CS1002: ; expected\n", 1)
+
+        # A job cancelled while the drain runs makes the exit 1, even though nothing failed.
+        os.remove(os.path.join(d, "full"))
+        os.remove(os.path.join(d, "full.rc"))
+        jx = qadd(repo_v, "tests/T/Canceller.csproj", "--cycle", "qx")
+        jy = qadd(repo_v, "tests/T/Victim.csproj", "--cycle", "qx")
+        env["FAKE_CANCEL"] = jy
+        rc, out, calls = drain()
+        env.pop("FAKE_CANCEL")
+        if rc != 1 or f"job #{jy} cancelled" not in qlist("--cycle", "qx"):
+            fails.append(f"a job cancelled during the drain must exit 1 ({rc}): {out}")
+        put("full", "error CS1002: ; expected\n", 1)
+
+        # Nothing ready: a drain says so, exits 0, runs nothing.
+        rc, out, calls = drain()
+        if rc != 0 or calls or "nothing queued" not in out:
+            fails.append(f"an empty queue should be a quiet 0 ({rc}): {out} {calls}")
+
+        # Only one drainer: while one holds the lock, a second exits 0 and leaves the job queued.
+        import fcntl
+        jl = qadd(repo_v, "tests/T/L.csproj", "--cycle", "ql")
+        os.makedirs(os.path.join(d, "runs"), exist_ok=True)
+        held = open(os.path.join(d, "runs", "drainer.lock"), "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        rc, out, calls = drain()
+        if rc != 0 or "a drainer is running" not in out or calls or f"job #{jl} queued" not in qlist("--cycle", "ql"):
+            fails.append(f"second drainer must exit 0 and leave the queue alone ({rc}): {out} {calls}")
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+        rc, out, calls = drain()
+        if f"job #{jl} failed" not in qlist("--cycle", "ql"):  # the shim still reports a build error
+            fails.append(f"the job should run once the lock is free: {qlist('--cycle', 'ql')} {out}")
+
+        # A job left running by a dead drainer is failed, and its dependent cancelled.
+        jr = qadd(repo_v, "tests/T/R.csproj", "--cycle", "qr")
+        jr2 = qadd(repo_v, "tests/T/R2.csproj", "--after", jr, "--cycle", "qr")
+        subprocess.run([sys.executable, BRAIN, "queue", "next"], env=env, capture_output=True, text=True)
+        # that claimed an older ready job, if any; claim until jr is running
+        while f"job #{jr} running" not in qlist("--cycle", "qr"):
+            if not subprocess.run([sys.executable, BRAIN, "queue", "next"], env=env, capture_output=True,
+                                  text=True).stdout.strip():
+                break
+        rc, out, calls = drain()
+        ql = qlist("--cycle", "qr")
+        if f"job #{jr} failed" not in ql or "drainer died" not in ql or f"job #{jr2} cancelled" not in ql:
+            fails.append(f"stale running job not failed: {ql}")
+
+        # A stall: a silent hang is stopped and only noted, not logged as a failing test.
+        put("full", "", 0)
+        with open(shim, "w") as fh:
+            fh.write('#!/bin/sh\necho "[+1/x0/?0] t"\nsleep 60\n')
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj\n", "--stall", "2")
+        if rc != 1 or "stalled" not in out or "stalled: tests/T/T.csproj" not in brain_list("--kind", "note"):
+            fails.append(f"stall not handled ({rc}): {out}")
+        # No plan lines means nothing ran, which must not read as success.
+        pf = os.path.join(d, "empty.txt")
+        open(pf, "w").write("# nothing\n")
+        r = subprocess.run([sys.executable, os.path.realpath(__file__), pf], env=env, capture_output=True, text=True)
+        if r.returncode == 0:
+            fails.append("an empty plan exited 0")
+    if fails:
+        print("self-test failed:\n  " + "\n  ".join(fails))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    sys.exit(main(sys.argv[1:]))
