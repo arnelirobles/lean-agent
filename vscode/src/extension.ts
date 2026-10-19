@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import * as cli from "./brainCli";
+import { canSend } from "./claude";
 import * as db from "./db";
 import { Store } from "./store";
 import { projectNames } from "./workspace";
@@ -33,13 +34,17 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     dashboard.render(d, store.note);
     itemPanel.render(d);
   };
-  const claude = new ClaudeTerminal(() => userSetting("claudeCommand") || "claude", () => folder);
+  const claude = new ClaudeTerminal(() => userSetting("claudeCommand"), () => folder);
   const ask = (id: number) => {
     const it = store.database && db.getItem(store.database, id);
     if (it) claude.ask(it);
   };
+  const send = (id: number) => {
+    const it = store.database && db.getItem(store.database, id);
+    if (it && canSend(it.kind)) claude.send(it);
+  };
   const actions: Actions = {
-    openItem: (id) => itemPanel.show(store.database, id), refresh: () => void refresh(), claude: () => claude.open(), ask,
+    openItem: (id) => itemPanel.show(store.database, id), refresh: () => void refresh(), claude: () => claude.open(), ask, send,
   };
   const dashboard = new DashboardPanel(ctx.extensionUri, actions);
   const itemPanel = new ItemPanel(ctx.extensionUri, actions);
@@ -54,6 +59,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     }),
     vscode.commands.registerCommand("leanBrain.refresh", () => refresh()),
     vscode.commands.registerCommand("leanBrain.openClaude", () => claude.open()),
+    vscode.commands.registerCommand("leanBrain.sendToClaude", (arg) => {
+      const it = itemFromArg(arg);
+      if (it) send(it.id);
+    }),
     vscode.commands.registerCommand("leanBrain.askClaude", (arg) => {
       const it = itemFromArg(arg);
       if (it) ask(it.id);

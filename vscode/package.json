@@ -2,7 +2,7 @@
   "name": "lean-brain",
   "displayName": "Lean Brain",
   "description": "A read-mostly dashboard over the lean-agent brain database.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "baryodev",
   "license": "MIT",
   "private": true,
@@ -66,6 +66,11 @@
       {
         "command": "leanBrain.askClaude",
         "title": "Ask Claude about this"
+      },
+      {
+        "command": "leanBrain.sendToClaude",
+        "title": "Send to Claude",
+        "icon": "$(rocket)"
       }
     ],
     "viewsContainers": {
@@ -109,28 +114,38 @@
       ],
       "view/item/context": [
         {
+          "command": "leanBrain.sendToClaude",
+          "when": "view == leanBrain.items && viewItem == item.send",
+          "group": "inline"
+        },
+        {
+          "command": "leanBrain.sendToClaude",
+          "when": "view == leanBrain.items && viewItem == item.send",
+          "group": "0_claude"
+        },
+        {
           "command": "leanBrain.askClaude",
-          "when": "view == leanBrain.items && viewItem == item",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
           "group": "0_claude"
         },
         {
           "command": "leanBrain.closeFixed",
-          "when": "view == leanBrain.items && viewItem == item",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
           "group": "1_close"
         },
         {
           "command": "leanBrain.closeNotABug",
-          "when": "view == leanBrain.items && viewItem == item",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
           "group": "1_close"
         },
         {
           "command": "leanBrain.reopen",
-          "when": "view == leanBrain.items && viewItem == item",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
           "group": "1_close"
         },
         {
           "command": "leanBrain.copyRef",
-          "when": "view == leanBrain.items && viewItem == item",
+          "when": "view == leanBrain.items && viewItem =~ /^item/",
           "group": "2_copy"
         }
       ],
@@ -158,6 +173,10 @@
         {
           "command": "leanBrain.askClaude",
           "when": "false"
+        },
+        {
+          "command": "leanBrain.sendToClaude",
+          "when": "false"
         }
       ]
     },
@@ -179,7 +198,7 @@
         "leanBrain.claudeCommand": {
           "type": "string",
           "default": "",
-          "description": "Path or name of the claude executable. Empty uses claude on PATH. It runs as the terminal process, not through a shell, so give the program only, no arguments.",
+          "description": "Absolute path to the claude executable. Empty finds claude in the absolute PATH entries. It runs as the terminal process, not through a shell, so give the program only, no arguments. Windows .cmd and .bat shims are refused.",
           "scope": "machine"
         }
       }

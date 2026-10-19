@@ -1,4 +1,5 @@
 import { relativeTime } from "../db";
+import { canSend } from "../claude";
 import { kindLook, severityTone } from "../style";
 import type { ItemFull } from "../types";
 import { esc } from "./escape";
@@ -18,7 +19,9 @@ export function itemBody(i: ItemFull, now: number): string {
   return `<div class="hero t-${look.tone}"><span class="mark">${ic(look.icon)}</span>` +
     `<div class="grow"><div class="eyebrow">${esc(i.kind)} #${esc(i.id)}</div><h1>${esc(i.title || i.ref)}</h1>` +
     `<div class="sub">${esc(i.project)}, last seen ${esc(relativeTime(i.last_seen, now))}</div></div>` +
-    `<div class="actions"><button class="leaf" data-ask="${esc(i.id)}">${ic("terminal")}Ask Claude</button>` +
+    `<div class="actions">` +
+    (canSend(i.kind) && i.status === "open" ? `<button class="leaf" data-send="${esc(i.id)}">${ic("rocket")}Send to Claude</button>` : "") +
+    `<button data-ask="${esc(i.id)}">${ic("terminal")}Ask Claude</button>` +
     `<button class="sun" data-copy="${esc(i.ref || String(i.id))}">${ic("copy")}Copy ref</button></div></div>` +
     `<div class="pills">${pills}</div>` +
     `<div class="sec t-blue"><span class="ico">${ic("list-unordered")}</span><h2>Fields</h2></div>` +

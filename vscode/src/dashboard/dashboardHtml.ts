@@ -1,4 +1,5 @@
 import { formatDuration, relativeTime, shortTestName, STALE_DAYS } from "../db";
+import { canSend } from "../claude";
 import { kindLook, severityTone, type Tone } from "../style";
 import type { DashboardData } from "../types";
 import { bar, loadChart, sparkline, trendTone } from "./charts";
@@ -17,8 +18,9 @@ function waitingSection(d: DashboardData): string {
   const rows = d.waiting.map((i) =>
     `<tr><td>${kindPill(i.kind)}</td><td><a data-open="${esc(i.id)}">${esc(i.title || i.ref)}</a></td>` +
     `<td>${i.severity ? pill(i.severity, severityTone(i.severity)) : ""}</td>` +
-    `<td class="muted">${esc(i.project)}</td><td class="muted">${esc(relativeTime(i.last_seen, d.generatedAt))}</td></tr>`).join("");
-  return card(`<table><thead><tr><th>kind</th><th>item</th><th>severity</th><th>project</th><th>last seen</th></tr></thead><tbody>${rows}</tbody></table>`);
+    `<td class="muted">${esc(i.project)}</td><td class="muted">${esc(relativeTime(i.last_seen, d.generatedAt))}</td>` +
+    `<td>${canSend(i.kind) ? `<button class="small" data-send="${esc(i.id)}">${ic("rocket")}Send to Claude</button>` : ""}</td></tr>`).join("");
+  return card(`<table><thead><tr><th>kind</th><th>item</th><th>severity</th><th>project</th><th>last seen</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
 }
 
 function headlineSection(d: DashboardData): string {
