@@ -1174,10 +1174,11 @@ echo "Passed!  - Failed: 0"; exit 0
                 or "Acme.RemoteTests.Breaks" not in brain_list("--open") or leftovers() != ([], []):
             fails.append(f"remote fail and rerun ({rc}): {runs_of('Fail.csproj')} {leftovers()} {out}")
 
-        # A stall on the host is stopped, noted, and cleaned up after.
+        # A stall on the host is stopped, noted, and cleaned up after. The window counts the copy and the
+        # container setup too, which on a loaded machine can pass 3 s before the test starts.
         qadd(rrepo, "tests/Apple/Apple.csproj", "--cycle", "r5")
         qadd(rrepo, "tests/T/Stall.csproj", "--cycle", "r5")
-        rc, out, _ = rdrain("--stall", "3")
+        rc, out, _ = rdrain("--stall", "10")
         if rc != 1 or "stalled: tests/T/Stall.csproj" not in brain_list("--kind", "note") or leftovers() != ([], []) \
                 or runs_of("Stall.csproj") != [("full", "dev")]:
             fails.append(f"remote stall ({rc}): {runs_of('Stall.csproj')} {leftovers()} {out}")
