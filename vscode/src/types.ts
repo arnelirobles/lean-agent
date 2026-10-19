@@ -17,7 +17,11 @@ export interface JobRow {
   routable: boolean;
 }
 export interface Counts { real: number; flaky: number }
-export interface QueueData { running: JobRow[]; queued: JobRow[]; finished: JobRow[] }
+/** Jobs a lane finished in the last 24 hours, by status. host is the remote's name, empty for this machine. */
+export interface LaneCount { host: string; status: string; n: number }
+export interface QueueData { running: JobRow[]; queued: JobRow[]; finished: JobRow[]; today: LaneCount[] }
+/** A [remote NAME] section of remotes.ini, as far as the dashboard shows it. */
+export interface RemoteLane { name: string; host: string; cpus: string; memory: string }
 export interface CycleRow {
   cycle: string; jobs: number; passed: number; failed: number; duration_s: number; stalls: number; flaky_filed: number;
 }
@@ -39,4 +43,6 @@ export interface DashboardData {
   stale: StaleRow[];
   queue: QueueData;
   generatedAt: number;
+  /** Remote lanes from remotes.ini; the panel fills it, the database does not know them. */
+  remotes?: RemoteLane[];
 }

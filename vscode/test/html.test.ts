@@ -141,7 +141,7 @@ describe("dashboard queue tab", () => {
     ended_at: null, reason: "", platform, host, routable,
   });
   const withQueue = (running: ReturnType<typeof job>[], queued: ReturnType<typeof job>[]): DashboardData =>
-    ({ ...data, queue: { running, queued, finished: [] } });
+    ({ ...data, queue: { running, queued, finished: [], today: [] } });
 
   it("says where each running job runs", () => {
     const html = dashboardBody(withQueue([job(1, "running", "", "dev"), job(2, "running", "apple", "")], []));
@@ -176,5 +176,27 @@ describe("dashboard queue tab", () => {
 
   it("says when nothing is queued or running", () => {
     expect(dashboardBody(withQueue([], []))).toContain("Nothing queued or running.");
+  });
+});
+
+describe("dashboard lanes", () => {
+  it("shows a card per lane with its running job's live bar", () => {
+    const d: DashboardData = { ...data, remotes: [{ name: "dev", host: "dev", cpus: "2", memory: "6g" }] };
+    d.queue = { running: [{ id: 9, cycle: "", project: "p", test_project: "A/A.Tests.csproj", status: "running", tier: "full",
+      enqueued_at: "", started_at: null, ended_at: null, reason: "", platform: "", host: "dev", routable: true }],
+      queued: [], finished: [], today: [] };
+    const html = dashboardHtml(d, "n", "c");
+    expect(html).toContain("this machine");
+    expect(html).toContain('data-lane-live="9"');
+    expect(html).toMatch(/dev[\s\S]*2 cpus, 6g/);
+    expect(html).toContain("idle");
+  });
+});
+
+describe("webview script", () => {
+  it("parses", () => {
+    const html = dashboardHtml(data, "n", "c");
+    const js = html.split('<script nonce="n">')[1].split("</script>")[0];
+    expect(() => new Function(js)).not.toThrow();
   });
 });

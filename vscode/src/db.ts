@@ -82,7 +82,9 @@ export function queue(db: Database): QueueData {
   const lane = (schemaVersion(db) ?? 0) >= 7 ? Q.LANE_COLUMNS : Q.NO_LANE_COLUMNS;
   const jobs = (sql: string) => rows(db, sql.replace("%LANE%", lane))
     .map((r) => ({ ...r, routable: Boolean(r.routable) })) as JobRow[];
-  return { running: jobs(Q.RUNNING_JOBS), queued: jobs(Q.QUEUED_JOBS), finished: jobs(Q.FINISHED_JOBS) };
+  const today = rows(db, Q.LANE_TODAY.replace("%LANE%", lane))
+    .map((r) => ({ host: String(r.host ?? ""), status: String(r.status), n: Number(r.n) }));
+  return { running: jobs(Q.RUNNING_JOBS), queued: jobs(Q.QUEUED_JOBS), finished: jobs(Q.FINISHED_JOBS), today };
 }
 
 /** Which lanes may claim the job, in words. Empty when any lane may. */

@@ -10,10 +10,10 @@ type Node = { t: "group"; label: string; jobs: JobRow[] } | { t: "job"; job: Job
 export class QueueTree implements vscode.TreeDataProvider<Node> {
   private emitter = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this.emitter.event;
-  private q: QueueData = { running: [], queued: [], finished: [] };
+  private q: QueueData = { running: [], queued: [], finished: [], today: [] };
 
   setData(database: Database | undefined): void {
-    this.q = database ? db.queue(database) : { running: [], queued: [], finished: [] };
+    this.q = database ? db.queue(database) : { running: [], queued: [], finished: [], today: [] };
     this.emitter.fire();
   }
 

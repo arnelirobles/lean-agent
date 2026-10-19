@@ -5,6 +5,7 @@ import { dashboardHtml } from "../dashboard/dashboardHtml";
 import { itemHtml } from "../dashboard/itemHtml";
 import { makeNonce } from "../dashboard/page";
 import * as os from "os";
+import { readRemotes } from "../lanes";
 import { liveJobs, testPhaseDir } from "../progress";
 import type { DashboardData, JobRow } from "../types";
 
@@ -50,7 +51,7 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
 function emptyData(): DashboardData {
   return {
     schemaVersion: null, waiting: [], headline: { realOpen: 0, flakyOpen: 0, closed7d: 0, runs7d: 0, testSeconds7d: 0 },
-    cycles: [], suites: [], flakiest: [], load: [], stale: [], queue: { running: [], queued: [], finished: [] }, generatedAt: Math.floor(Date.now() / 1000),
+    cycles: [], suites: [], flakiest: [], load: [], stale: [], queue: { running: [], queued: [], finished: [], today: [] }, generatedAt: Math.floor(Date.now() / 1000),
   };
 }
 
@@ -78,6 +79,7 @@ export class DashboardPanel {
     if (!this.panel) return;
     const nonce = makeNonce();
     const data = database ? db.dashboard(database, Math.floor(Date.now() / 1000)) : emptyData();
+    data.remotes = readRemotes(process.env, os.homedir());
     this.running = data.queue.running;
     this.panel.webview.html = dashboardHtml(data, nonce, this.panel.webview.cspSource, database ? note : note || "No data.",
       codicons(this.panel, this.root), media(this.panel, this.root));

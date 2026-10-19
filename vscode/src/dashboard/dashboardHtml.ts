@@ -1,3 +1,4 @@
+import { laneCards } from "../lanes";
 import { formatDuration, jobElapsed, laneLabel, relativeTime, shortTestName, STALE_DAYS } from "../db";
 import { canSend } from "../claude";
 import { kindLook, severityTone, type Tone } from "../style";
@@ -32,9 +33,28 @@ function routeButtons(j: JobRow): string {
   return j.platform === "remote" ? routeBtn(j, "any", "desktop", "Any lane") : routeBtn(j, "remote", "cloud-upload", "Send to remote");
 }
 
+function lanesSection(d: DashboardData): string {
+  const cards = laneCards(d.queue, d.remotes ?? []).map((l) => {
+    const j = l.running;
+    const secs = j ? jobElapsed(j, d.generatedAt) : null;
+    const state = j ? pill("busy", "green", "sync~spin") : pill("idle", "gray", "circle-large-outline");
+    const now = j
+      ? `<div class="lane-job"><b>#${esc(j.id)}</b> <span title="${esc(j.test_project)}">${esc(shortTestName(j.test_project))}</span>` +
+        ` <span class="muted">${esc(j.project)}${secs === null ? "" : `, ${esc(formatDuration(secs))}`}</span></div>` +
+        `<div class="lane-live" data-lane-live="${esc(j.id)}"></div>`
+      : `<div class="lane-job muted">${l.canTake ? "waiting for its next job" : "nothing it may take"}</div>`;
+    return `<div class="lane t-${l.remote ? "purple" : "blue"}"><div class="lane-head"><span class="ico">${ic(l.remote ? "cloud" : "desktop")}</span>` +
+      `<div class="grow"><b>${esc(l.name)}</b><span class="muted">${esc(l.remote ? [l.host !== l.name ? l.host : "", l.spec].filter(Boolean).join(", ") || "remote" : "local")}</span></div>${state}</div>` +
+      now +
+      `<div class="counts">${pill(`${l.canTake} it may take`, "blue", "list-ordered")}` +
+      `${pill(`${l.done} done`, "green", "pass")}${l.failed ? pill(`${l.failed} failed`, "red", "error") : ""}<span class="muted">last 24 hours</span></div></div>`;
+  }).join("");
+  return sec("Lanes", "server-environment", "purple", "what each lane runs now") + `<div class="lanes">${cards}</div>`;
+}
+
 function queueSection(d: DashboardData): string {
   const q = d.queue;
-  if (!q.running.length && !q.queued.length) return empty("Nothing queued or running.", "info");
+  if (!q.running.length && !q.queued.length) return lanesSection(d) + empty("Nothing queued or running.", "info");
   const suite = (j: JobRow) => `<td title="${esc(j.test_project)}">${esc(shortTestName(j.test_project))}</td><td class="muted">${esc(j.project)}</td>`;
   const median = (j: JobRow) => d.suites.find((s) => s.project === j.project && s.test_project === j.test_project)?.median_s;
   const running = q.running.map((j) => {
@@ -51,7 +71,7 @@ function queueSection(d: DashboardData): string {
       `<td>${lane ? pill(lane, j.platform === "remote" ? "purple" : "blue", j.platform === "remote" ? "cloud" : "desktop") : `<span class="muted">any lane</span>`}</td>` +
       `<td>${routeButtons(j)}</td></tr>`;
   }).join("");
-  return (q.running.length ? sec("Running", "sync~spin", "green", "where each job runs") +
+  return lanesSection(d) + (q.running.length ? sec("Running", "sync~spin", "green", "where each job runs") +
       card(`<table><thead><tr><th class="num">job</th><th>suite</th><th>project</th><th>where</th><th class="num">for</th></tr></thead><tbody>${running}</tbody></table>`) : "") +
     (q.queued.length ? sec("Queued", "list-ordered", "blue", "which lanes may take each job") +
       card(`<table><thead><tr><th class="num">job</th><th>suite</th><th>project</th><th>lanes</th><th></th></tr></thead><tbody>${queued}</tbody></table>`) : "");

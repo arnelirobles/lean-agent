@@ -143,11 +143,19 @@ export const STYLE = `
     .fields th { width: 96px; }
   }
   .live { display: grid; gap: 8px; padding: 4px 0 6px; }
-  .live .track { height: 10px; border-radius: 6px; background: var(--track); overflow: hidden; }
-  .live .fill { height: 100%; border-radius: 6px; background: var(--green); transition: width .6s; }
-  .live .fill.over { background: var(--orange); }
-  .live .counts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
+  .live .track, .lane-live .track { height: 10px; border-radius: 6px; background: var(--track); overflow: hidden; }
+  .live .fill, .lane-live .fill { height: 100%; border-radius: 6px; background: var(--green); transition: width .6s; }
+  .live .fill.over, .lane-live .fill.over { background: var(--orange); }
+  .live .counts, .lane .counts { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
   .live pre { font-size: 11.5px; padding: 8px 12px; border-radius: 10px; max-height: 70px; overflow: hidden; }
+  .lanes { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-bottom: 8px; }
+  .lane { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; box-shadow: var(--shadow); display: grid; gap: 8px; }
+  .lane-head { display: flex; align-items: center; gap: 10px; }
+  .lane-head .ico { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: var(--fill); color: var(--on); }
+  .lane-head b { display: block; font-size: 15px; }
+  .lane-head .muted { font-size: 12px; }
+  .lane-live { display: grid; gap: 6px; }
+  .lane-live:empty { display: none; }
   tr.live-row td { border-top: none; padding-top: 0; }
   .answer textarea:focus { outline: none; border-color: var(--leaf); }
   .answer .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
@@ -175,6 +183,7 @@ export const SCRIPT = `
       const el = document.querySelector('[data-live="' + j.id + '"]');
       if (!el) continue;
       const median = Number(el.dataset.median) || 0;
+      const lane = document.querySelector('[data-lane-live="' + j.id + '"]');
       let bar = '';
       if (median && j.elapsed != null) {
         const pct = Math.min(100, Math.round(100 * j.elapsed / median));
@@ -189,8 +198,10 @@ export const SCRIPT = `
         (j.quietFor != null && j.quietFor > 120 ? pill('log quiet for ' + dur(j.quietFor), 'orange', 'warning') : pill('log active', 'green', 'pulse')) +
         (j.lastTest ? '<span class="muted">last: ' + h(j.lastTest) + '</span>' : '');
       el.innerHTML = bar + '<div class="counts">' + counts + '</div>' + (j.tail.length ? '<pre>' + h(j.tail.join('\\n')) + '</pre>' : '');
+      // The lane card gets the bar and the counts, without the log tail.
+      if (lane) lane.innerHTML = bar + '<div class="counts">' + counts + '</div>';
       // Set through the DOM, which the CSP allows, not as a style attribute, which it blocks.
-      el.querySelectorAll('.fill').forEach((f) => { f.style.width = f.dataset.pct + '%'; });
+      document.querySelectorAll('.fill[data-pct]').forEach((f) => { f.style.width = f.dataset.pct + '%'; });
     }
   });
   const saved = (vscode.getState() || {}).tab;
