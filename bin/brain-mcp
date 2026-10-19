@@ -86,9 +86,8 @@ def opt(a, args, key, flag=None, kind=str):
         v = str(v)
     elif not isinstance(v, str):
         raise Bad(f"{key} must be a string")
-    else:
-        no_dash(key, v)
-    args.extend([flag or "--" + key.replace("_", "-"), v])
+    # --flag=value keeps a value such as "-1 offset" a value, so a title or note may start with a dash.
+    args.append((flag or "--" + key.replace("_", "-")) + "=" + v)
 
 
 def t_list(a):
@@ -149,8 +148,12 @@ def t_queue_add(a):
         opt(a, args, k)
     opt(a, args, "after", kind=int)
     # No extra dotnet arguments here: they run on the drainer's machine, so they stay a shell-only choice.
-    if not os.path.isdir(args[2]):
-        raise Bad("repo_dir must be an existing folder")
+    # Only the top of a git work tree: a queued job builds and runs that folder's code, and a remote
+    # lane copies its files, so a scratch folder somewhere is not a place to queue from.
+    top = subprocess.run(["git", "-C", args[2], "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if not os.path.isdir(args[2]) or top.returncode != 0 or \
+            os.path.realpath(top.stdout.strip()) != os.path.realpath(args[2]):
+        raise Bad("repo_dir must be the top folder of a git work tree")
     return args, None
 
 
@@ -333,6 +336,17 @@ def self_test():
             err, text = call("brain_show", id=1)
             if err or secret not in text or "second line" not in text:
                 fails.append(f"brain_show must return the stdin body: {err} {text!r}")
+            err, text = call("brain_add", project="demo", kind="note", ref="q2", title="-1 offset in the parser")
+            if err:
+                fails.append(f"a title may start with a dash: {text!r}")
+            repo = os.path.join(d, "repo")
+            os.makedirs(os.path.join(repo, "sub"))
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            for not_top in (d, os.path.join(repo, "sub")):
+                err, text = call("brain_queue_add", repo_dir=not_top, test_project="tests/A.csproj")
+                if not err:
+                    fails.append(f"brain_queue_add must refuse a folder that is not a git top folder: {not_top}")
+            d = repo
             err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
             if err:
                 fails.append(f"brain_queue_add: {text!r}")
