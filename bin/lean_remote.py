@@ -21,6 +21,7 @@ remote off. One section per host and, optionally, one per repository:
   sidecars = db=postgres:16, cache=redis:7
   env_file = ~/.config/lean/app.env
   ready = pg_isready -h 127.0.0.1 -U postgres
+  docker = yes                ; a private, privileged Docker daemon per job, for Testcontainers
 
 Nothing here runs a test. test-phase calls these functions and keeps the results, parsing and brain on
 the local machine. The docs are in docs/remote-lane.md.
@@ -66,6 +67,7 @@ class RepoCfg:
     sidecars: dict = field(default_factory=dict)  # alias to image, in the order given
     env_file: str = ""
     ready: str = ""
+    docker: bool = False  # a private Docker daemon for the job, for tests that start containers (Testcontainers)
 
 
 def default_path(env):
@@ -146,6 +148,10 @@ def load(path=None, env=os.environ):
             c.ready = sec.get("ready", "").strip()
             if c.ready and not c.sidecars:
                 bad("ready", "needs at least one sidecar to run in")
+            dk = sec.get("docker", "no").strip().lower()
+            if dk not in ("yes", "no"):
+                bad("docker", f"want yes or no, got {dk!r}")
+            c.docker = dk == "yes"
             repos[name] = c
     names = [r.name for r in remotes]
     if len(set(names)) != len(names):
@@ -156,7 +162,9 @@ def load(path=None, env=os.environ):
 IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@-]*")
 REMOTE_KEYS = {"host", "workdir", "cpus", "memory", "min_free_gb", "cache_max_gb", "image", "extra_paths",
                "exclude"}
-REPO_KEYS = {"sidecars", "env_file", "ready"}
+REPO_KEYS = {"sidecars", "env_file", "ready", "docker"}
+DIND_IMAGE = "docker:27-dind"
+DIND_VOLUME = "lean-dind"  # image cache kept between jobs; one lane per host, so one daemon uses it at a time
 
 
 def sh_path(p):
@@ -294,9 +302,25 @@ def run_script(r, cfg, job_id, cmd):
         out.append(f"until {probe} && sleep 1 && {probe}; do")
         out.append('  n=$((n + 1)); [ "$n" -ge 60 ] && ' + fail("sidecar not ready") + "; sleep 1")
         out.append("done")
+    denv = ""
+    if cfg and cfg.docker:
+        # The job's own daemon, capped like the test container. Containers the tests start live inside it,
+        # so they share its caps and go when it goes. Images stay in DIND_VOLUME; old containers are pruned.
+        out.append(f"docker run -d --rm --privileged --name {net}-docker --label {label} --network {net} "
+                   f"--network-alias docker {caps} -e DOCKER_TLS_CERTDIR= -v {DIND_VOLUME}:/var/lib/docker "
+                   f"{DIND_IMAGE} >/dev/null || " + fail("docker sidecar failed"))
+        out.append("n=0")
+        out.append(f"until docker exec {net}-docker docker info >/dev/null 2>&1; do")
+        out.append('  n=$((n + 1)); [ "$n" -ge 60 ] && ' + fail("docker sidecar not ready") + "; sleep 1")
+        out.append("done")
+        out.append(f"docker exec {net}-docker docker system prune -af --filter until=168h >/dev/null 2>&1; "
+                   f"docker exec {net}-docker sh -c 'ids=$(docker ps -aq); [ -z \"$ids\" ] || docker rm -f $ids' "
+                   ">/dev/null 2>&1")
+        denv = (" -e DOCKER_HOST=tcp://docker:2375 -e TESTCONTAINERS_HOST_OVERRIDE=docker"
+                " -e TESTCONTAINERS_RYUK_DISABLED=true")
     inner = f'echo "{MARKER}"; exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
     out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
-               f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget -v {jd}:/work -w /work{env} "
+               f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget -v {jd}:/work -w /work{env}{denv} "
                f"{shlex.quote(r.image)} sh -c {shlex.quote(inner)}")
     out.append("rc=$?")
     out += remove_labelled(f"label={label}")
@@ -361,6 +385,9 @@ extra_paths = local-packages, tools
 sidecars = db=postgres:16, cache=redis:7
 env_file = /tmp/app.env
 ready = pg_isready -h 127.0.0.1 -U postgres
+
+[repo tc]
+docker = yes
 """)
         remotes, repos = load(ini, {})
         r = remotes[0] if remotes else None
@@ -372,6 +399,8 @@ ready = pg_isready -h 127.0.0.1 -U postgres
         if not c or list(c.sidecars.items()) != [("db", "postgres:16"), ("cache", "redis:7")] \
                 or c.env_file != "/tmp/app.env" or c.ready != "pg_isready -h 127.0.0.1 -U postgres":
             fails.append(f"repo parse: {repos}")
+        if c and c.docker or not repos.get("tc") or not repos["tc"].docker:
+            fails.append(f"docker = yes must parse, and default to off: {repos}")
         if load(os.path.join(d, "none.ini"), {}) != ([], {}):
             fails.append("a missing file must give no remotes")
         if load(ini, {"TEST_PHASE_REMOTES": "off"}) != ([], {}):
@@ -385,6 +414,7 @@ ready = pg_isready -h 127.0.0.1 -U postgres
                            ("[remote x]\nhost = h\nbogus = 1\n", "[remote x] bogus"),
                            ("[remote x]\nhost = -oProxyCommand=y\n", "[remote x] host"),
                            ("[repo y]\nsidecars = postgres:16\n", "[repo y] sidecars"),
+                           ("[repo y]\ndocker = maybe\n", "[repo y] docker"),
                            ("[box z]\nhost = h\n", "[box z]")):
             with open(ini, "w") as fh:
                 fh.write(body)
@@ -465,7 +495,20 @@ ready = pg_isready -h 127.0.0.1 -U postgres
             fails.append("the ready check must pass twice, a second apart")
         if " -p " in sc or "-p " in sc or "hunter2" in sc:
             fails.append("run_script must publish no ports and hold no env file value")
+        dk = run_script(r, RepoCfg(name="app", docker=True), 9, ["dotnet", "test"])
+        for want in ("--privileged", "--network-alias docker", "DOCKER_TLS_CERTDIR=", "lean-dind:/var/lib/docker",
+                     "-e DOCKER_HOST=tcp://docker:2375", "-e TESTCONTAINERS_HOST_OVERRIDE=docker",
+                     "-e TESTCONTAINERS_RYUK_DISABLED=true", "docker exec lean-9-docker docker info",
+                     "docker exec lean-9-docker docker system prune -af --filter until=", "--label lean.job=9"):
+            if want not in dk:
+                fails.append(f"a docker job's script must contain {want!r}")
+        if dk.count("--cpus 2") != 2:
+            fails.append("the docker sidecar must carry the same caps as the test container")
+        if dk.index("docker info") > dk.index(MARKER):
+            fails.append("the docker daemon must be up before the tests start")
         bare = run_script(r, None, 8, ["dotnet", "test"])
+        if "--privileged" in bare or "DOCKER_HOST" in bare or "--privileged" in sc:
+            fails.append("only a repo with docker = yes gets a docker daemon")
         if "--env-file" in bare or "network-alias" in bare or "until " in bare:
             fails.append("a job with no repo section has no sidecars and no env file")
         cs = cleanup_script(r, 7)
@@ -474,7 +517,7 @@ ready = pg_isready -h 127.0.0.1 -U postgres
         ss = sweep_script(r, [3])
         if 'keep=" 3 "' not in ss or "job-*" not in ss or "-mtime +1" not in ss:
             fails.append(f"sweep_script must keep running ids and drop old folders: {ss!r}")
-        for script in (sc, cs, ss, bare):
+        for script in (sc, cs, ss, bare, dk):
             if subprocess.run(["sh", "-n", "-c", script]).returncode != 0:
                 fails.append("a generated script is not valid shell")
         sa = sync_argv(r, repo, 7)

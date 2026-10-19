@@ -51,8 +51,11 @@ Repo section keys (the section name is the brain project name of the job):
 | `sidecars` | `alias=image` pairs. Each starts on a private network for the job, reachable by its alias. |
 | `env_file` | A local file of `NAME=value` lines. It is sent as `.lean.env` (mode 600) and loaded into the test container. It never appears on a command line. |
 | `ready` | A command run in the first sidecar until it exits 0 twice in a row, one second apart, before the tests start. Use `-h 127.0.0.1` with `pg_isready`, because the postgres image's temporary init server answers only on the socket. |
+| `docker` | `yes` starts a Docker daemon for the job (see below). Default `no`. |
 
 Sidecars get the same `cpus` and `memory` caps as the test container, so a job with a sidecar can use up to twice the cap.
+
+`docker = yes` gives the job its own Docker daemon, for tests that start containers themselves (Testcontainers). A `docker:27-dind` sidecar runs privileged on the job's network as `docker`, and the test container gets `DOCKER_HOST=tcp://docker:2375`, `TESTCONTAINERS_HOST_OVERRIDE=docker` and `TESTCONTAINERS_RYUK_DISABLED=true`. Containers the tests start live inside that daemon, so they never touch containers already on the host, and they go when the sidecar goes. Pulled images stay in the `lean-dind` volume between runs; images unused for a week are pruned at the start of a run.
 
 ## What is copied and what is not
 
