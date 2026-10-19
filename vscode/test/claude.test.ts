@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { askPrompt, canSend, clean, resolveClaude, workPrompt } from "../src/claude";
+import { answerPrompt, answerRoute, askPrompt, canSend, clean, claudeArgs, resolveClaude, validSession, workPrompt } from "../src/claude";
 
 const item = { id: 12, kind: "test-fail", project: "demo", ref: "T.Suite.It", title: "it's broken" };
 
@@ -52,5 +52,39 @@ describe("claude", () => {
   it("refuses Windows cmd and bat shims", () => {
     expect(resolveClaude("C:\\npm\\claude.cmd", "", () => true, "win32")).toBeUndefined();
     expect(resolveClaude("", "C:\\npm", (p) => p === "C:\\npm\\claude.exe", "win32")).toBe("C:\\npm\\claude.exe");
+  });
+
+  it("accepts only plain session ids, never one that looks like a flag", () => {
+    expect(validSession("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")).toBe(true);
+    expect(validSession("-x")).toBe(false);
+    expect(validSession("a b")).toBe(false);
+    expect(validSession("")).toBe(false);
+  });
+
+  it("routes an answer so a live session is never started twice", () => {
+    expect(answerRoute("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "ended", false)).toBe("resume");
+    expect(answerRoute("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "open", true)).toBe("type");
+    expect(answerRoute("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "ended", true)).toBe("type");
+    expect(answerRoute("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "open", false)).toBe("ask");
+    expect(answerRoute("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "unknown", false)).toBe("ask");
+    expect(answerRoute("", "unknown", false)).toBe("save");
+    expect(answerRoute("-x", "ended", false)).toBe("save");
+  });
+
+  it("puts the answer in one clean line", () => {
+    const p = answerPrompt({ ...item, kind: "question", title: "which port?" }, "use 8080\nnot 80\x1b[2J");
+    expect(p).toContain("#12");
+    expect(p).toContain("which port?");
+    expect(p).toContain("use 8080 not 80");
+    expect(p).not.toMatch(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/);
+    expect(p.startsWith("-")).toBe(false);
+  });
+
+  it("builds claude arguments with the prompt last", () => {
+    expect(claudeArgs({ sessionId: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b" }, "go")).toEqual(["--session-id", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "go"]);
+    expect(claudeArgs({ resume: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b" }, "go")).toEqual(["--resume", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "go"]);
+    expect(claudeArgs({ resume: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", fork: true }, "go")).toEqual(["--resume", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "--fork-session", "go"]);
+    expect(claudeArgs({ sessionId: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b" })).toEqual(["--session-id", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"]);
+    expect(() => claudeArgs({ resume: "-p" }, "go")).toThrow();
   });
 });

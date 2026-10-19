@@ -67,6 +67,11 @@ export function closeArgs(id: number, resolution: "fixed" | "not-a-bug"): string
     : ["close", String(id), "--wontfix", "--resolution", "not-a-bug"];
 }
 
+/** Close a question with the answer as the note. delivered: the answer already reached the session that asked. */
+export function answerArgs(id: number, answer: string, delivered: boolean): string[] {
+  return ["close", String(id), "--resolution", "answered", "--note", answer, ...(delivered ? ["--delivered"] : [])];
+}
+
 export function reopenArgs(id: number): string[] {
   return ["reopen", String(id)];
 }

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import * as cli from "./brainCli";
-import { canSend } from "./claude";
+import { answerPrompt, answerRoute, canSend, validSession } from "./claude";
 import * as db from "./db";
 import { Store } from "./store";
 import { projectNames } from "./workspace";
@@ -43,8 +43,48 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const it = store.database && db.getItem(store.database, id);
     if (it && canSend(it.kind)) claude.send(it);
   };
+  const answer = async (id: number, text: string): Promise<void> => {
+    const d = store.database;
+    const it = d && db.getItem(d, id);
+    if (!d || !it || it.status !== "open") return;
+    const sid = it.session_id ?? "";
+    const route = answerRoute(sid, validSession(sid) ? db.sessionState(d, sid) : "unknown", validSession(sid) && claude.owns(sid));
+    let how: "type" | "resume" | "fork" | "later" | "save" = route === "ask" ? "later" : route;
+    if (route === "ask") {
+      const later = "On its next prompt", fork = "Resume as a fork";
+      const pick = await vscode.window.showWarningMessage(`The session that asked #${id} may still be open in another window.`, {
+        modal: true,
+        detail: "Resuming it would run two copies of one conversation. On its next prompt: the answer is saved and that session " +
+          "gets it the next time you type in it. Resume as a fork: a new session starts from that conversation with the answer, " +
+          "and the old one stays as it was.",
+      }, later, fork);
+      if (!pick) return;
+      how = pick === fork ? "fork" : "later";
+    }
+    const dir = sessionDir(it.session_cwd);
+    if ((how === "resume" || how === "fork") && !dir) {
+      void vscode.window.showErrorMessage(`Lean Brain: the folder of the session that asked (${it.session_cwd || "none"}) is gone. Nothing was sent.`);
+      return;
+    }
+    const brain = findOrWarn();
+    if (!brain) return;
+    const delivered = how === "type" || how === "resume" || how === "fork";
+    const r = await cli.runBrain(brain, cli.answerArgs(id, text, delivered), dbPath(), folder);
+    if (!r.ok) {
+      void vscode.window.showErrorMessage(`brain: ${r.stderr.trim()}`);
+      return;
+    }
+    const prompt = answerPrompt(it, text);
+    if (how === "type") claude.typeInto(sid, prompt);
+    else if (how === "resume" || how === "fork") claude.resume(sid, dir!, prompt, how === "fork");
+    else void vscode.window.showInformationMessage(how === "later"
+      ? `Answer saved. The session that asked #${id} gets it with your next prompt there.`
+      : `Answer saved on #${id}.`);
+    await refresh();
+  };
   const actions: Actions = {
     openItem: (id) => itemPanel.show(store.database, id), refresh: () => void refresh(), claude: () => claude.open(), ask, send,
+    answer: (id, text) => void answer(id, text),
   };
   const dashboard = new DashboardPanel(ctx.extensionUri, actions);
   const itemPanel = new ItemPanel(ctx.extensionUri, actions);
@@ -91,6 +131,15 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       }
     }),
   );
+
+  /** The asking session's folder, only if it is an absolute path to a directory that still exists. */
+  function sessionDir(dir: string | undefined): string | undefined {
+    try {
+      return dir && path.isAbsolute(dir) && fs.statSync(dir).isDirectory() ? dir : undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   function findOrWarn(): string | undefined {
     const brain = cli.findBrain(userSetting("brainPath"));

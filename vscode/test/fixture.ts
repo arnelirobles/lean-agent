@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import initSqlJs, { Database } from "sql.js";
 
-// Copied from bin/brain (migrate_2, migrate_3, migrate_4, and the meta table). schema.test.ts keeps it honest.
+// Copied from bin/brain (migrate_2 to migrate_5, and the meta table). schema.test.ts keeps it honest.
 export const SCHEMA = [
   `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE runs (
@@ -33,6 +33,11 @@ export const SCHEMA = [
         run_id INTEGER REFERENCES runs(id))`,
   `CREATE INDEX jobs_status ON jobs (status, id)`,
   `ALTER TABLE jobs ADD COLUMN args TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE items ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE items ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE items ADD COLUMN answer_delivered_at TEXT NOT NULL DEFAULT ''`,
+  `CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '')`,
 ];
 
 export const NOW = Date.UTC(2026, 9, 19, 12, 0, 0) / 1000;
@@ -48,7 +53,7 @@ export async function emptyDb(): Promise<Database> {
   const SQL = await sqlJs();
   const db = new SQL.Database();
   for (const s of SCHEMA) db.run(s);
-  db.run(`INSERT INTO meta VALUES ('schema_version','4')`);
+  db.run(`INSERT INTO meta VALUES ('schema_version','5')`);
   return db;
 }
 
@@ -83,6 +88,9 @@ export async function seededDb(): Promise<Database> {
   item(db, { project: "core", kind: "test-fail", ref: "Closed.Recent", title: "Closed.Recent", status: "closed", resolution: "fixed", first_seen: iso(9 * DAY), last_seen: iso(8 * DAY), closed_at: iso(DAY) });
   item(db, { project: "core", kind: "test-fail", ref: "Closed.Long", title: "Closed.Long", status: "closed", first_seen: iso(90 * DAY), last_seen: iso(80 * DAY), closed_at: iso(60 * DAY) });
   db.run(`INSERT INTO tags VALUES (1,'user'),(1,'urgent')`);
+  db.run(`UPDATE items SET session_id='0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b', session_cwd='/work/core' WHERE id=2`);
+  db.run(`INSERT INTO sessions VALUES ('0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b','/work/core',?,'')`, [iso(7200)]);
+  db.run(`INSERT INTO sessions VALUES ('ended-1','/work/x',?,?)`, [iso(9000), iso(8000)]);
 
   const job = (status: string, tp: string, enq: number, start: number | null, end: number | null) =>
     db.run(`INSERT INTO jobs (cycle, project, repo_dir, test_project, status, enqueued_at, started_at, ended_at) VALUES ('c2','core','/r',?,?,?,?,?)`,

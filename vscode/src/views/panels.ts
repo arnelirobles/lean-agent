@@ -23,7 +23,10 @@ function options(root: vscode.Uri): vscode.WebviewPanelOptions & vscode.WebviewO
 interface Msg { type: string; text?: string; id?: number }
 
 /** What the webviews can ask the extension to do. */
-export interface Actions { openItem: (id: number) => void; refresh: () => void; claude: () => void; ask: (id: number) => void; send: (id: number) => void }
+export interface Actions {
+  openItem: (id: number) => void; refresh: () => void; claude: () => void; ask: (id: number) => void; send: (id: number) => void;
+  answer: (id: number, text: string) => void;
+}
 
 function wire(panel: vscode.WebviewPanel, a: Actions): void {
   panel.webview.onDidReceiveMessage((m: Msg) => {
@@ -33,6 +36,8 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
     } else if (m.type === "open" && typeof m.id === "number") a.openItem(m.id);
     else if (m.type === "ask" && typeof m.id === "number") a.ask(m.id);
     else if (m.type === "send" && typeof m.id === "number") a.send(m.id);
+    else if (m.type === "answer" && typeof m.id === "number" && typeof m.text === "string" && m.text.trim() && m.text.length <= 20000)
+      a.answer(m.id, m.text.trim());
     else if (m.type === "claude") a.claude();
     else if (m.type === "refresh") a.refresh();
   });

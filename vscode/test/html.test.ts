@@ -117,4 +117,19 @@ describe("item html", () => {
     expect(first).toContain(`<span class="tag">urgent</span>`);
     expect(first).toContain(`data-ask="1"`);
   });
+
+  it("gives an open question an answer box that goes back to the session that asked", async () => {
+    const d = await seededDb();
+    const html = itemHtml(db.getItem(d, 2)!, NOW, "N", "vscode-resource:");
+    expect(html).toContain(`<textarea id="answer"`);
+    expect(html).toContain(`data-answer="2"`);
+    expect(html).toContain("back to the session that asked");
+    expect(itemHtml(db.getItem(d, 1)!, NOW, "N", "vscode-resource:")).not.toContain(`data-answer="`);
+    const closed = { ...db.getItem(d, 2)!, status: "closed" };
+    expect(itemHtml(closed, NOW, "N", "vscode-resource:")).not.toContain(`data-answer="`);
+    const orphan = { ...db.getItem(d, 2)!, session_id: "" };
+    const o = itemHtml(orphan, NOW, "N", "vscode-resource:");
+    expect(o).toContain(`data-answer="2"`);
+    expect(o).toContain("no session on record");
+  });
 });
