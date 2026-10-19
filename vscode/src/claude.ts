@@ -2,14 +2,14 @@
 
 export interface AskItem { id: number; kind: string; project: string; ref: string; title: string }
 
-/** One line, so typing it into a running claude session does not submit early. */
-export function askPrompt(i: AskItem): string {
-  const title = (i.title || i.ref).replace(/\s+/g, " ").trim();
-  return `Look at lean brain item #${i.id} (${i.kind}, project ${i.project}, ref ${i.ref}): ${title}. ` +
-    `Read it with brain show ${i.id}, then tell me what you find before changing anything.`;
+/** Brain fields come from agents and test output, so control characters and line breaks become spaces. */
+export function clean(s: unknown): string {
+  return String(s ?? "").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/** The shell line that starts claude, with an optional first prompt in single quotes. */
-export function claudeLine(command: string, prompt?: string): string {
-  return prompt === undefined ? command : `${command} '${prompt.replace(/'/g, `'\\''`)}'`;
+/** One line with no control characters, so typing it into claude never submits early or reaches a shell. */
+export function askPrompt(i: AskItem): string {
+  const id = Number.isInteger(i.id) ? i.id : 0;
+  return `Look at lean brain item #${id} (${clean(i.kind)}, project ${clean(i.project)}, ref ${clean(i.ref)}): ` +
+    `${clean(i.title || i.ref)}. Read it with brain show ${id}, then tell me what you find before changing anything.`;
 }
