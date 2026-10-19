@@ -49,6 +49,14 @@ describe("claude", () => {
     expect(resolveClaude("/opt/claude", "", has(["/opt/claude"]), "darwin")).toBe("/opt/claude");
   });
 
+  it("finds claude in the usual install folders when the editor's PATH lacks them", () => {
+    const has = (set: string[]) => (p: string) => set.includes(p);
+    expect(resolveClaude("", "/usr/bin:/bin", has(["/Users/me/.local/bin/claude"]), "darwin", ":", "/Users/me")).toBe("/Users/me/.local/bin/claude");
+    expect(resolveClaude("", "/usr/bin", has(["/opt/homebrew/bin/claude"]), "darwin", ":", "/Users/me")).toBe("/opt/homebrew/bin/claude");
+    expect(resolveClaude("", "/usr/bin", has(["/usr/bin/claude", "/Users/me/.local/bin/claude"]), "darwin", ":", "/Users/me")).toBe("/usr/bin/claude");
+    expect(resolveClaude("", "/usr/bin", () => false, "darwin", ":", "/Users/me")).toBeUndefined();
+  });
+
   it("refuses Windows cmd and bat shims", () => {
     expect(resolveClaude("C:\\npm\\claude.cmd", "", () => true, "win32")).toBeUndefined();
     expect(resolveClaude("", "C:\\npm", (p) => p === "C:\\npm\\claude.exe", "win32")).toBe("C:\\npm\\claude.exe");

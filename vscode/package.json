@@ -2,7 +2,7 @@
   "name": "lean-brain",
   "displayName": "Lean Brain",
   "description": "A read-mostly dashboard over the lean-agent brain database.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "baryodev",
   "license": "MIT",
   "private": true,
@@ -198,7 +198,7 @@
         "leanBrain.claudeCommand": {
           "type": "string",
           "default": "",
-          "description": "Absolute path to the claude executable. Empty finds claude in the absolute PATH entries. It runs as the terminal process, not through a shell, so give the program only, no arguments. Windows .cmd and .bat shims are refused.",
+          "description": "Absolute path to the claude executable. Empty finds claude in the absolute PATH entries, then in ~/.local/bin, ~/.claude/local, /opt/homebrew/bin and /usr/local/bin (an editor started from the Dock lacks the shell PATH). It runs as the terminal process, not through a shell, so give the program only, no arguments. Windows .cmd and .bat shims are refused.",
           "scope": "machine"
         }
       }
