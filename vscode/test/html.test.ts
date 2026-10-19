@@ -137,13 +137,13 @@ describe("item html", () => {
 });
 
 describe("dashboard queue tab", () => {
-  const job = (id: number, status: string, platform: string, host: string, routable = true) => ({
+  const job = (id: number, status: string, platform: string, host: string, routable = true, priority: number | null = 0) => ({
     id, cycle: "c", project: "core", test_project: "Core.Tests/Core.Tests.csproj", status, tier: "full",
     enqueued_at: "2026-10-19T08:00:00Z", started_at: status === "running" ? "2026-10-19T08:00:00Z" : null,
-    ended_at: null, reason: "", platform, host, routable,
+    ended_at: null, reason: "", platform, host, routable, priority,
   });
   const withQueue = (running: ReturnType<typeof job>[], queued: ReturnType<typeof job>[]): DashboardData =>
-    ({ ...data, queue: { running, queued, finished: [], today: [] } });
+    ({ ...data, queue: { running, queued, finished: [], today: [] }, canMove: true });
 
   it("says where each running job runs", () => {
     const html = dashboardBody(withQueue([job(1, "running", "", "dev"), job(2, "running", "apple", "")], []));
@@ -174,6 +174,29 @@ describe("dashboard queue tab", () => {
     const html = dashboardBody(d);
     expect(html).toContain(`data-live="1"`);
     expect(html).toContain(`data-median="1800"`);
+  });
+
+  it("offers up and down on queued jobs, none past either end, and marks bumped ones", () => {
+    const html = dashboardBody(withQueue([], [job(7, "queued", "", "", true, 1), job(3, "queued", "", ""), job(5, "queued", "", "")]));
+    expect(html).not.toContain(`data-move="7:up"`);
+    expect(html).toContain(`data-move="7:down"`);
+    expect(html).toContain(`data-move="3:up"`);
+    expect(html).toContain(`data-move="3:down"`);
+    expect(html).toContain(`data-move="5:up"`);
+    expect(html).not.toContain(`data-move="5:down"`);
+    expect(html).toMatch(/#7<\/td>.*?bumped.*?#3<\/td>/s);
+    expect(html.match(/>bumped</g)).toHaveLength(1);
+  });
+
+  it("offers no moves on a database from before schema 6", () => {
+    const html = dashboardBody(withQueue([], [job(6, "queued", "", "", false, null), job(8, "queued", "", "", false, null)]));
+    expect(html).not.toContain("data-move=");
+  });
+
+  it("offers no moves when the brain it runs has no queue move", () => {
+    const d = withQueue([], [job(7, "queued", "", "", true, 0), job(3, "queued", "", "", true, 0)]);
+    expect(dashboardBody({ ...d, canMove: false })).not.toContain("data-move=");
+    expect(dashboardBody({ ...d, canMove: undefined })).not.toContain("data-move=");
   });
 
   it("says when nothing is queued or running", () => {

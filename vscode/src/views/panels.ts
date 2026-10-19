@@ -29,6 +29,7 @@ interface Msg { type: string; text?: string; id?: number }
 export interface Actions {
   openItem: (id: number) => void; refresh: () => void; claude: () => void; ask: (id: number) => void; send: (id: number) => void;
   answer: (id: number, text: string) => void; route: (id: number, to: "remote" | "local" | "any") => void;
+  move: (id: number, where: "up" | "down") => void;
 }
 
 function wire(panel: vscode.WebviewPanel, a: Actions): void {
@@ -43,6 +44,8 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
       a.answer(m.id, m.text.trim());
     else if (m.type === "route" && typeof m.id === "number" && (m.text === "remote" || m.text === "local" || m.text === "any"))
       a.route(m.id, m.text);
+    else if (m.type === "move" && typeof m.id === "number" && (m.text === "up" || m.text === "down"))
+      a.move(m.id, m.text);
     else if (m.type === "claude") a.claude();
     else if (m.type === "refresh") a.refresh();
   });
@@ -59,6 +62,8 @@ export class DashboardPanel {
   private panel?: vscode.WebviewPanel;
   private running: JobRow[] = [];
   private timer?: NodeJS.Timeout;
+  /** Whether the brain the extension runs has `queue move`. */
+  canMove = false;
   constructor(private readonly root: vscode.Uri, private readonly actions: Actions) {}
 
   show(database: Database | undefined, note: string): void {
@@ -80,6 +85,7 @@ export class DashboardPanel {
     const nonce = makeNonce();
     const data = database ? db.dashboard(database, Math.floor(Date.now() / 1000)) : emptyData();
     data.remotes = readRemotes(process.env, os.homedir());
+    data.canMove = this.canMove;
     this.running = data.queue.running;
     this.panel.webview.html = dashboardHtml(data, nonce, this.panel.webview.cspSource, database ? note : note || "No data.",
       codicons(this.panel, this.root), media(this.panel, this.root));

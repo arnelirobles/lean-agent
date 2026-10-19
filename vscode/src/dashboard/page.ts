@@ -116,6 +116,8 @@ export const STYLE = `
   button:hover { background: var(--ink); color: var(--bg); }
   button.small { padding: 4px 10px; font-size: 10.5px; border-color: var(--leaf); color: var(--leaf); }
   button.small:hover { background: var(--leaf); color: #fff; }
+  button.small.icon { padding: 4px 6px; }
+  td > button + button { margin-left: 4px; }
   button.sun { background: var(--sun); color: #1c2321; border-color: var(--sun); box-shadow: 0 6px 16px rgba(255,205,60,.35); }
   button.sun:hover { background: var(--sun-soft); border-color: var(--sun-soft); }
   button.leaf { background: var(--leaf); color: #fff; border-color: var(--leaf); }
@@ -165,7 +167,8 @@ export const STYLE = `
 
 /** Buttons with data-copy copy text, data-open opens an item, data-refresh refreshes, data-tab switches tabs,
  *  data-claude opens Claude Code, data-ask puts an item into it, data-send starts a session that works on it,
- *  data-answer sends the text in #answer as the answer to a question, data-route="ID:to" routes a queued job. */
+ *  data-answer sends the text in #answer as the answer to a question, data-route="ID:to" routes a queued job,
+ *  data-move="ID:up|down" moves it in run order. */
 export const SCRIPT = `
   const vscode = acquireVsCodeApi();
   function showTab(name) {
@@ -209,7 +212,7 @@ export const SCRIPT = `
   const saved = (vscode.getState() || {}).tab;
   if (saved) showTab(saved);
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send],[data-answer],[data-route]');
+    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send],[data-answer],[data-route],[data-move]');
     if (!el) return;
     if (el.dataset.tab !== undefined) showTab(el.dataset.tab);
     else if (el.dataset.claude !== undefined) vscode.postMessage({ type: 'claude' });
@@ -218,6 +221,10 @@ export const SCRIPT = `
       const text = box ? box.value.trim() : '';
       if (text) vscode.postMessage({ type: 'answer', id: Number(el.dataset.answer), text });
       else if (box) box.focus();
+    }
+    else if (el.dataset.move !== undefined) {
+      const [id, where] = el.dataset.move.split(':');
+      vscode.postMessage({ type: 'move', id: Number(id), text: where });
     }
     else if (el.dataset.route !== undefined) {
       const [id, to] = el.dataset.route.split(':');

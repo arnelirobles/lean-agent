@@ -80,6 +80,18 @@ export function resumeArgs(project?: string): string[] {
   return project ? ["resume", "--project", project] : ["resume"];
 }
 
+/** Swap a queued job with the one before or after it in run order. */
+export function moveArgs(id: number, where: "up" | "down"): string[] {
+  return ["queue", "move", String(id), where];
+}
+
+/** Whether this brain has `queue move`. A brain from before it lists no move in its queue help. */
+export async function brainCanMove(brain: string): Promise<boolean> {
+  const r = await new Promise<string>((resolve) =>
+    execFile(brain, ["queue", "--help"], { timeout: 10000 }, (_err, stdout, stderr) => resolve(`${stdout}${stderr}`)));
+  return /[{,]move[,}]/.test(r);
+}
+
 /** Which lanes may claim a queued job: remote only, this machine only, or any. */
 export function routeArgs(id: number, to: "remote" | "local" | "any"): string[] {
   return ["queue", "route", String(id), "--to", to];
