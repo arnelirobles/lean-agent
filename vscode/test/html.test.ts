@@ -166,6 +166,14 @@ describe("dashboard queue tab", () => {
     expect(html).not.toContain("data-route=");
   });
 
+  it("gives each running job a live block with the suite's usual duration", () => {
+    const d = withQueue([job(1, "running", "", "dev")], []);
+    d.suites = [{ project: "core", test_project: "Core.Tests/Core.Tests.csproj", runs: 3, median_s: 1800, last_s: 1700, history: [], mean_lane_wait_s: 0 }];
+    const html = dashboardBody(d);
+    expect(html).toContain(`data-live="1"`);
+    expect(html).toContain(`data-median="1800"`);
+  });
+
   it("says when nothing is queued or running", () => {
     expect(dashboardBody(withQueue([], []))).toContain("Nothing queued or running.");
   });

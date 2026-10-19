@@ -36,11 +36,14 @@ function queueSection(d: DashboardData): string {
   const q = d.queue;
   if (!q.running.length && !q.queued.length) return empty("Nothing queued or running.", "info");
   const suite = (j: JobRow) => `<td title="${esc(j.test_project)}">${esc(shortTestName(j.test_project))}</td><td class="muted">${esc(j.project)}</td>`;
+  const median = (j: JobRow) => d.suites.find((s) => s.project === j.project && s.test_project === j.test_project)?.median_s;
   const running = q.running.map((j) => {
     const secs = jobElapsed(j, d.generatedAt);
     return `<tr><td class="num">#${esc(j.id)}</td>${suite(j)}` +
       `<td>${j.host ? pill(`on ${j.host}`, "purple", "cloud") : pill("this machine", "blue", "desktop")}</td>` +
-      `<td class="num">${secs === null ? "" : esc(formatDuration(secs))}</td></tr>`;
+      `<td class="num">${secs === null ? "" : esc(formatDuration(secs))}</td></tr>` +
+      `<tr class="live-row"><td colspan="5"><div class="live" data-live="${esc(j.id)}" data-median="${esc(median(j) ?? "")}">` +
+      `<span class="muted">${ic("sync~spin")}reading the log</span></div></td></tr>`;
   }).join("");
   const queued = q.queued.map((j) => {
     const lane = laneLabel(j);
