@@ -1,4 +1,5 @@
 /** Text for the Claude Code terminal. No vscode import, so it can be tested. */
+import * as os from "node:os";
 
 export interface AskItem { id: number; kind: string; project: string; ref: string; title: string }
 
@@ -68,13 +69,15 @@ export function claudeArgs(o: { sessionId?: string; resume?: string; fork?: bool
  * because cmd.exe re-parses their arguments.
  */
 export function resolveClaude(setting: string, pathEnv: string, isExec: (p: string) => boolean,
-  platform: string = process.platform, sep = platform === "win32" ? ";" : ":"): string | undefined {
+  platform: string = process.platform, sep = platform === "win32" ? ";" : ":", home = os.homedir()): string | undefined {
   const name = setting.trim() || "claude";
   const shim = (p: string) => platform === "win32" && /\.(cmd|bat)$/i.test(p);
   const abs = (p: string) => p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p);
   if (/[\\/]/.test(name)) return abs(name) && !shim(name) && isExec(name) ? name : undefined;
   const exts = platform === "win32" ? [".exe", ""] : [""];
-  for (const dir of pathEnv.split(sep)) {
+  // An editor started from the Dock does not get the login shell's PATH, so the usual install folders come after it.
+  const extra = platform === "win32" ? [] : [`${home}/.local/bin`, `${home}/.claude/local`, "/opt/homebrew/bin", "/usr/local/bin"];
+  for (const dir of [...pathEnv.split(sep), ...(home ? extra : [])]) {
     if (!abs(dir)) continue;
     for (const ext of exts) {
       const p = `${dir.replace(/[\\/]+$/, "")}${platform === "win32" ? "\\" : "/"}${name}${ext}`;
