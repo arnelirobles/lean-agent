@@ -119,6 +119,17 @@ describe("db queries", () => {
     d.run(`UPDATE jobs SET platform='', host=''`);
   });
 
+  it("lists queued jobs in the order the drainer takes them", () => {
+    const first = db.queue(d).queued[0].id;
+    d.run(`INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) VALUES ('core','/r','D.csproj','queued',?)`, [iso(50)]);
+    const later = db.queue(d).queued[1].id;
+    d.run(`UPDATE jobs SET priority=2 WHERE id=?`, [later]);
+    const q = db.queue(d);
+    expect(q.queued.map((j) => j.id)).toEqual([later, first]);
+    expect(q.queued.map((j) => j.priority)).toEqual([2, 0]);
+    d.run(`DELETE FROM jobs WHERE id=?`, [later]);
+  });
+
   it("queue reads a database from before platform and host", async () => {
     const old = await emptyDb(5);
     old.run(`INSERT INTO jobs (project, repo_dir, test_project, enqueued_at) VALUES ('p','/r','T.csproj',?)`, [iso(60)]);
@@ -126,6 +137,7 @@ describe("db queries", () => {
     expect(q.queued).toHaveLength(1);
     expect(q.queued[0].platform).toBe("");
     expect(db.jobContext(q.queued[0])).toBe("job.queued.old");
+    expect(q.queued[0].priority).toBeNull();
   });
 
   it("getItem returns all fields and tags", () => {

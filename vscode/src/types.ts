@@ -15,6 +15,8 @@ export interface JobRow {
   platform: string; host: string;
   /** False on a database from before schema 7, where a job cannot be routed. */
   routable: boolean;
+  /** Above 0: moved ahead of its place by bump or move. Null on a database from before schema 6, where jobs cannot move. */
+  priority?: number | null;
 }
 export interface Counts { real: number; flaky: number }
 /** Jobs a lane finished in the last 24 hours, by status. host is the remote's name, empty for this machine. */

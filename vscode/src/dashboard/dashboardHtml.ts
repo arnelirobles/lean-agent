@@ -33,6 +33,14 @@ function routeButtons(j: JobRow): string {
   return j.platform === "remote" ? routeBtn(j, "any", "device-desktop", "Any lane") : routeBtn(j, "remote", "cloud-upload", "Send to remote");
 }
 
+/** Up and down swap a queued job with its neighbour in run order. None on a database from before schema 6. */
+function moveButtons(j: JobRow, up: boolean, down: boolean): string {
+  if (j.priority == null) return "";
+  const btn = (where: "up" | "down", label: string) =>
+    `<button class="small icon" data-move="${esc(j.id)}:${where}" title="${label}" aria-label="${label}">${ic(`arrow-${where}`)}</button>`;
+  return (up ? btn("up", "Run earlier") : "") + (down ? btn("down", "Run later") : "");
+}
+
 function lanesSection(d: DashboardData): string {
   const cards = laneCards(d.queue, d.remotes ?? []).map((l) => {
     const j = l.running;
@@ -65,11 +73,12 @@ function queueSection(d: DashboardData): string {
       `<tr class="live-row"><td colspan="5"><div class="live" data-live="${esc(j.id)}" data-median="${esc(median(j) ?? "")}">` +
       `<span class="muted">${ic("sync~spin")}reading the log</span></div></td></tr>`;
   }).join("");
-  const queued = q.queued.map((j) => {
+  const queued = q.queued.map((j, i) => {
     const lane = laneLabel(j);
     return `<tr><td class="num">#${esc(j.id)}</td>${suite(j)}` +
-      `<td>${lane ? pill(lane, j.platform === "remote" ? "purple" : "blue", j.platform === "remote" ? "cloud" : "device-desktop") : `<span class="muted">any lane</span>`}</td>` +
-      `<td>${routeButtons(j)}</td></tr>`;
+      `<td>${lane ? pill(lane, j.platform === "remote" ? "purple" : "blue", j.platform === "remote" ? "cloud" : "device-desktop") : `<span class="muted">any lane</span>`}` +
+      `${j.priority ? pill("bumped", "orange", "arrow-up") : ""}</td>` +
+      `<td>${moveButtons(j, i > 0, i < q.queued.length - 1)}${routeButtons(j)}</td></tr>`;
   }).join("");
   return lanesSection(d) + (q.running.length ? sec("Running", "sync~spin", "green", "where each job runs") +
       card(`<table><thead><tr><th class="num">job</th><th>suite</th><th>project</th><th>where</th><th class="num">for</th></tr></thead><tbody>${running}</tbody></table>`) : "") +

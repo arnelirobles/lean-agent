@@ -85,6 +85,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   const actions: Actions = {
     openItem: (id) => itemPanel.show(store.database, id), refresh: () => void refresh(), claude: () => claude.open(), ask, send,
     answer: (id, text) => void answer(id, text), route: (id, to) => void routeJob(id, to),
+    move: (id, where) => void moveJob(id, where),
   };
   const dashboard = new DashboardPanel(ctx.extensionUri, actions);
   const itemPanel = new ItemPanel(ctx.extensionUri, actions);
@@ -118,6 +119,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     vscode.commands.registerCommand("leanBrain.sendToRemote", (arg) => route(arg, "remote")),
     vscode.commands.registerCommand("leanBrain.keepLocal", (arg) => route(arg, "local")),
     vscode.commands.registerCommand("leanBrain.anyLane", (arg) => route(arg, "any")),
+    vscode.commands.registerCommand("leanBrain.moveUp", (arg) => move(arg, "up")),
+    vscode.commands.registerCommand("leanBrain.moveDown", (arg) => move(arg, "down")),
     vscode.commands.registerCommand("leanBrain.showResume", async () => {
       const brain = findOrWarn();
       if (!brain) return;
@@ -176,6 +179,20 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const r = await cli.runBrain(brain, cli.routeArgs(id, to), dbPath(), folder);
     if (!r.ok) void vscode.window.showErrorMessage(`brain: ${r.stderr.trim()}`);
     else if (r.stderr.trim()) void vscode.window.showWarningMessage(r.stderr.trim());
+    await refresh();
+  }
+
+  /** Swap a queued job with its neighbour in run order. Reversible, so no confirmation. */
+  async function move(arg: unknown, where: "up" | "down"): Promise<void> {
+    const id = (arg as { t?: string; job?: { id?: unknown } } | undefined)?.job?.id;
+    if (typeof id === "number") await moveJob(id, where);
+  }
+
+  async function moveJob(id: number, where: "up" | "down"): Promise<void> {
+    const brain = findOrWarn();
+    if (!brain) return;
+    const r = await cli.runBrain(brain, cli.moveArgs(id, where), dbPath(), folder);
+    if (!r.ok) void vscode.window.showErrorMessage(`brain: ${r.stderr.trim()}`);
     await refresh();
   }
 

@@ -81,6 +81,11 @@ export function resumeArgs(project?: string): string[] {
 }
 
 /** Which lanes may claim a queued job: remote only, this machine only, or any. */
+/** Swap a queued job with the one before or after it in run order. */
+export function moveArgs(id: number, where: "up" | "down"): string[] {
+  return ["queue", "move", String(id), where];
+}
+
 export function routeArgs(id: number, to: "remote" | "local" | "any"): string[] {
   return ["queue", "route", String(id), "--to", to];
 }

@@ -16,7 +16,10 @@
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
             --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
             or -macos; a remote lane never claims an apple job
-  brain queue list [--cycle C] [--status S]
+  brain queue list [--cycle C] [--status S]     --status queued lists in the order the drainer takes them
+  brain queue bump ID                      a queued job, and the jobs chained after it, to the front
+  brain queue move ID up|down              swap a queued job with the one before or after it; a job never
+            moves ahead of the job it waits on
   brain queue cancel ID                    a queued job; jobs waiting on it are cancelled too
   brain queue route ID --to remote|local|any   remote: only a remote lane claims it; local: only this
             machine (platform=apple); any: whichever lane is free
@@ -529,7 +532,9 @@ def cmd_queue(a):
             if val:
                 q += f" AND {col}=?"
                 args.append(val)
-        for r in con.execute(q + " ORDER BY id", args).fetchall():
+        # Queued jobs alone list in the order the drainer takes them.
+        q += " ORDER BY priority DESC, id" if a.status == "queued" else " ORDER BY id"
+        for r in con.execute(q, args).fetchall():
             print(job_line(r))
         return 0
     if a.qcmd == "cancel":
@@ -550,14 +555,41 @@ def cmd_queue(a):
                 sys.exit(f"brain: no job #{a.id}")
             if r["status"] != "queued":
                 sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be bumped")
+            top = con.execute("SELECT COALESCE(MAX(priority), 0) + 1 FROM jobs WHERE status='queued'").fetchone()[0]
             todo, bumped = [a.id], []
             while todo:
                 job = todo.pop()
-                con.execute("UPDATE jobs SET priority=1 WHERE id=?", (job,))
+                con.execute("UPDATE jobs SET priority=? WHERE id=?", (top, job))
                 bumped.append(job)
                 todo += [d["id"] for d in con.execute(
                     "SELECT id FROM jobs WHERE status='queued' AND after_id=?", (job,)).fetchall()]
         print("bumped " + " ".join(f"#{j}" for j in sorted(bumped)))
+        return 0
+    if a.qcmd == "move":  # swaps a queued job with the one before or after it in run order
+        with con:
+            r = con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()
+            if not r:
+                sys.exit(f"brain: no job #{a.id}")
+            if r["status"] != "queued":
+                sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be moved")
+            jobs = con.execute("SELECT id, after_id FROM jobs WHERE status='queued' ORDER BY priority DESC, id").fetchall()
+            i = [j["id"] for j in jobs].index(a.id)
+            k = i - 1 if a.where == "up" else i + 1
+            if not 0 <= k < len(jobs):
+                print(f"job #{a.id} is already {'first' if a.where == 'up' else 'last'}")
+                return 0
+            first, second = (jobs[k], jobs[i]) if a.where == "up" else (jobs[i], jobs[k])
+            if second["after_id"] == first["id"]:
+                sys.exit(f"brain: job #{second['id']} waits on #{first['id']}, so it cannot run before it")
+            jobs[i], jobs[k] = jobs[k], jobs[i]
+            # The smallest priorities that give this order: from the back, a job keeps its successor's priority
+            # when its id already sorts first, else it needs one more. Untouched jobs at the back stay at 0.
+            prio = 0
+            for n in range(len(jobs) - 1, -1, -1):
+                if n < len(jobs) - 1 and jobs[n]["id"] > jobs[n + 1]["id"]:
+                    prio += 1
+                con.execute("UPDATE jobs SET priority=? WHERE id=?", (prio, jobs[n]["id"]))
+        print(f"moved job #{a.id} {a.where}")
         return 0
     if a.qcmd == "next":  # claims the oldest ready job; prints it as one line of JSON, or nothing
         con.isolation_level = None
@@ -836,6 +868,9 @@ def parser():
     q.add_argument("id", type=int)
     q = qs.add_parser("bump")
     q.add_argument("id", type=int)
+    q = qs.add_parser("move")
+    q.add_argument("id", type=int)
+    q.add_argument("where", choices=("up", "down"))
     q = qs.add_parser("next")
     q.add_argument("--peek", action="store_true")
     q.add_argument("--where", choices=("local", "remote"), default="local")
@@ -1084,6 +1119,40 @@ def self_test():
         run("queue", "cancel", b1)
         if run("queue", "bump", b1)[0] == 0:
             fails.append("only a queued job can be bumped")
+        m1, m2, m3 = (run("queue", "add", "/tmp/r", f"M{i}.csproj")[1] for i in (1, 2, 3))
+        mine = {m1, m2, m3}
+
+        def order():  # the queued jobs of this block, in the order the drainer would take them
+            lines = run("queue", "list", "--status", "queued")[1].splitlines()
+            return [i for i in (ln.split()[1][1:] for ln in lines) if i in mine]
+        if order() != [m1, m2, m3]:
+            fails.append(f"queued jobs must list in run order: {order()}")
+        rc, out, _ = run("queue", "move", m3, "up")
+        if rc != 0 or order() != [m1, m3, m2]:
+            fails.append(f"move up must swap a job with the one before it: {out!r} {order()}")
+        run("queue", "move", m3, "up")
+        if order() != [m3, m1, m2]:
+            fails.append(f"a second move up must take it to the front: {order()}")
+        run("queue", "move", m3, "down")
+        if order() != [m1, m3, m2]:
+            fails.append(f"move down must swap a job with the one after it: {order()}")
+        run("queue", "bump", m2)
+        if order() != [m2, m1, m3]:
+            fails.append(f"bump must reach the front even past moved jobs: {order()}")
+        m4 = run("queue", "add", "/tmp/r", "M4.csproj")[1]
+        mine.add(m4)
+        if order() != [m2, m1, m3, m4]:
+            fails.append(f"a new job must go to the back of a reordered queue: {order()}")
+        m5 = run("queue", "add", "/tmp/r", "M5.csproj", "--after", m4)[1]
+        mine.add(m5)
+        if run("queue", "move", m5, "up")[0] == 0 or order()[-2:] != [m4, m5]:
+            fails.append(f"a job must not move ahead of the job it waits on: {order()}")
+        if run("queue", "move", m4, "down")[0] == 0 or order()[-2:] != [m4, m5]:
+            fails.append(f"a job must not move behind a job that waits on it: {order()}")
+        for m in mine:
+            run("queue", "cancel", m)
+        if run("queue", "move", m1, "up")[0] == 0:
+            fails.append("only a queued job can be moved")
         k4 = run("queue", "add", "/tmp/r", "E.csproj", "--cycle", "q2")[1]
         out = run("resume", "--project", "r")[1]
         if f"job #{k4} queued full r E.csproj" not in out or "queued or running" not in out:

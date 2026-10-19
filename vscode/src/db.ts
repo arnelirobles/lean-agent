@@ -79,9 +79,11 @@ export function openCounts(db: Database, projects?: string[]): { counts: Counts;
 }
 
 export function queue(db: Database): QueueData {
-  const lane = (schemaVersion(db) ?? 0) >= 7 ? Q.LANE_COLUMNS : Q.NO_LANE_COLUMNS;
-  const jobs = (sql: string) => rows(db, sql.replace("%LANE%", lane))
-    .map((r) => ({ ...r, routable: Boolean(r.routable) })) as JobRow[];
+  const version = schemaVersion(db) ?? 0;
+  const lane = version >= 7 ? Q.LANE_COLUMNS : Q.NO_LANE_COLUMNS;
+  const prio = version >= 6 ? Q.PRIO_COLUMN : Q.NO_PRIO_COLUMN;
+  const jobs = (sql: string) => rows(db, sql.replace("%LANE%", lane).replace("%PRIO%", prio))
+    .map((r) => ({ ...r, routable: Boolean(r.routable), priority: r.priority == null ? null : Number(r.priority) })) as JobRow[];
   const today = rows(db, Q.LANE_TODAY.replace("%LANE%", lane))
     .map((r) => ({ host: String(r.host ?? ""), status: String(r.status), n: Number(r.n) }));
   return { running: jobs(Q.RUNNING_JOBS), queued: jobs(Q.QUEUED_JOBS), finished: jobs(Q.FINISHED_JOBS), today };

@@ -85,6 +85,16 @@
       {
         "command": "leanBrain.anyLane",
         "title": "Run on any lane"
+      },
+      {
+        "command": "leanBrain.moveUp",
+        "title": "Run earlier",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "leanBrain.moveDown",
+        "title": "Run later",
+        "icon": "$(arrow-down)"
       }
     ],
     "viewsContainers": {
@@ -186,6 +196,26 @@
           "command": "leanBrain.anyLane",
           "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(apple|remote)$/",
           "group": "0_route"
+        },
+        {
+          "command": "leanBrain.moveUp",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "group": "inline@0"
+        },
+        {
+          "command": "leanBrain.moveDown",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "leanBrain.moveUp",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "group": "1_order"
+        },
+        {
+          "command": "leanBrain.moveDown",
+          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple|remote)$/",
+          "group": "1_order"
         }
       ],
       "commandPalette": [
@@ -227,6 +257,14 @@
         },
         {
           "command": "leanBrain.anyLane",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.moveUp",
+          "when": "false"
+        },
+        {
+          "command": "leanBrain.moveDown",
           "when": "false"
         }
       ]
