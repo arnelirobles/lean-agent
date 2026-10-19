@@ -57,6 +57,8 @@ Sidecars get the same `cpus` and `memory` caps as the test container, so a job w
 
 `docker = yes` gives the job its own Docker daemon, for tests that start containers themselves (Testcontainers). A `docker:27-dind` sidecar runs privileged on the job's network as `docker`, and the test container gets `DOCKER_HOST=tcp://docker:2375`, `TESTCONTAINERS_HOST_OVERRIDE=docker` and `TESTCONTAINERS_RYUK_DISABLED=true`. Containers the tests start live inside that daemon, so they never touch containers already on the host, and they go when the sidecar goes. Pulled images stay in the `lean-dind` volume between runs; images unused for a week are pruned at the start of a run.
 
+The test command runs with `ASPNETCORE_HTTP_PORTS` and `ASPNETCORE_HTTPS_PORTS` unset. The sdk image sets the first, and `WebApplicationFactory` turns it into a `--HTTP_PORTS` argument for the app under test. A host that parses its own command line rejects it and exits before the test server starts.
+
 ## What is copied and what is not
 
 The copy is the files `git ls-files` lists (tracked and untracked, not ignored) plus `extra_paths`, minus anything matching `exclude`. Files deleted in the working tree are skipped. Nothing else leaves this machine. Secrets go only through `env_file`.

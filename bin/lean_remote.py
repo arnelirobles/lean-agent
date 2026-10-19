@@ -318,7 +318,9 @@ def run_script(r, cfg, job_id, cmd):
                    ">/dev/null 2>&1")
         denv = (" -e DOCKER_HOST=tcp://docker:2375 -e TESTCONTAINERS_HOST_OVERRIDE=docker"
                 " -e TESTCONTAINERS_RYUK_DISABLED=true")
-    inner = f'echo "{MARKER}"; exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
+    # The sdk image sets ASPNETCORE_HTTP_PORTS. WebApplicationFactory then passes --HTTP_PORTS to the app's
+    # Main, and a host that parses its own command line can exit before the test server starts.
+    inner = f'echo "{MARKER}"; unset ASPNETCORE_HTTP_PORTS ASPNETCORE_HTTPS_PORTS; exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
     out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
                f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget -v {jd}:/work -w /work{env}{denv} "
                f"{shlex.quote(r.image)} sh -c {shlex.quote(inner)}")
@@ -488,7 +490,7 @@ docker = yes
         for want in ("--label lean.job=7", "--cpus 2", "--memory 8g", "--user", "lean-remote: started",
                      "--network lean-7", "--network-alias db", "--env-file", "nice -n 19",
                      "pg_isready -h 127.0.0.1 -U postgres",
-                     "NUGET_PACKAGES=/nuget", "install -d"):
+                     "NUGET_PACKAGES=/nuget", "install -d", "unset ASPNETCORE_HTTP_PORTS ASPNETCORE_HTTPS_PORTS"):
             if want not in sc:
                 fails.append(f"run_script must contain {want!r}")
         if sc.count("docker exec lean-7-db") != 2 or "&& sleep 1 &&" not in sc:
