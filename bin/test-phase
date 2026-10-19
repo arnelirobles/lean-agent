@@ -237,6 +237,15 @@ def brain(args, stdin=None):
     return r.stdout.strip()
 
 
+def requeue_job(job_id, problem, say):
+    """Put a running job back in the queue. One retry; a loud line when it still fails. True when requeued."""
+    for _ in range(2):
+        if brain(["queue", "requeue", str(job_id), "--reason", problem[:200]]) is not None:
+            return True
+    say(f"test-phase: job #{job_id} is STUCK running: brain would not requeue it ({problem[:120]})")
+    return False
+
+
 def add_item(row, kind, ref, severity, body, run_id, ctx):
     ref = mask(ref)
     args = ["add", "--project", row["project"], "--repo", ctx["repo"], "--kind", kind, "--ref", ref,
@@ -549,8 +558,8 @@ def drain(a, run_dir, runner, lanes=None):
                 row = run_job(job, a, run_dir, runner, lane)
                 problem = row.get("lane_problem")
                 if problem:
-                    brain(["queue", "requeue", str(job["id"]), "--reason", problem[:200]])
-                    say(f"test-phase: job #{job['id']} back to queued, lane {lane.name} rests: {problem}")
+                    if requeue_job(job["id"], problem, say):
+                        say(f"test-phase: job #{job['id']} back to queued, lane {lane.name} rests: {problem}")
                     job = None
                     if not rest(lane):
                         return
@@ -715,6 +724,24 @@ def self_test():
     if "hunter2" in " ".join(seen.get("args", [])) or "hunter2" in (seen.get("stdin") or "") \
             or "-" not in seen.get("args", []) or "--body" in seen.get("args", []):
         fails.append(f"item body must be masked and sent by stdin, not argv: {seen}")
+
+    # A requeue that fails once is retried; one that keeps failing is said loudly.
+    calls, said = [], []
+    globals()["brain"] = lambda args, stdin=None: calls.append(args) or (None if len(calls) == 1 else "")
+    try:
+        ok = requeue_job(7, "ssh failed", said.append)
+    finally:
+        globals()["brain"] = real_brain
+    if not ok or len(calls) != 2 or said:
+        fails.append(f"a failed requeue must be retried once: {ok} {calls} {said}")
+    calls.clear()
+    globals()["brain"] = lambda args, stdin=None: calls.append(args) or None
+    try:
+        ok = requeue_job(7, "ssh failed", said.append)
+    finally:
+        globals()["brain"] = real_brain
+    if ok or len(calls) != 2 or not said or "job #7" not in said[0] or "STUCK running" not in said[0]:
+        fails.append(f"a requeue that keeps failing must name the stuck job: {ok} {calls} {said}")
 
     # Names come out stable and only real test lines count.
     got = [n for n, _ in Dotnet.failures(fixture("mtp-failure.log"))]
