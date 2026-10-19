@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { Database } from "sql.js";
 import * as db from "../db";
+import { canSend } from "../claude";
 import { kindLook, toneColorId, type Look } from "../style";
 import type { ItemRow } from "../types";
 
@@ -54,7 +55,7 @@ export class ItemsTree implements vscode.TreeDataProvider<Node> {
     ti.description = [i.ref !== i.title ? i.ref : "", i.severity, i.cycle, `x${i.occurrences}`, db.relativeTime(i.last_seen, now)]
       .filter(Boolean).join(" | ");
     ti.tooltip = `#${i.id} ${i.kind} ${i.project}\n${i.title}`;
-    ti.contextValue = "item";
+    ti.contextValue = canSend(i.kind) ? "item.send" : "item";
     ti.iconPath = themeIcon(kindLook(i.kind));
     ti.command = { command: "leanBrain.showItem", title: "Show item", arguments: [i.id] };
     ti.id = `item-${i.id}`;

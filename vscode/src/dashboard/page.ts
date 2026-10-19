@@ -97,7 +97,7 @@ export const STYLE = `
   .pill { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 2px 10px; font-size: 11.5px; font-weight: 700;
           white-space: nowrap; vertical-align: middle; line-height: 18px; margin: 1px 2px 1px 0; background: var(--fill, var(--cream)); color: var(--on, var(--ink)); }
   .pill .codicon { font-size: 13px; }
-  .t-blue .ico, .t-gray .ico, .t-blue.mark, .t-gray.mark { background: var(--ink); color: var(--bg); }
+  .t-blue .ico, .t-gray .ico, .t-blue .mark, .t-gray .mark, .t-blue.mark, .t-gray.mark { background: var(--ink); color: var(--bg); }
   .t-blue.pill, .t-gray.pill { box-shadow: inset 0 0 0 1px var(--line); }
   .count { display: inline-block; min-width: 28px; text-align: center; border-radius: 999px; padding: 1px 8px; font-weight: 700;
            background: var(--fill); color: var(--on); }
@@ -114,6 +114,8 @@ export const STYLE = `
            border-radius: 999px; padding: 7px 14px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
            background: transparent; color: var(--ink); border: 1.5px solid var(--ink); transition: background .15s, color .15s; }
   button:hover { background: var(--ink); color: var(--bg); }
+  button.small { padding: 4px 10px; font-size: 10.5px; border-color: var(--leaf); color: var(--leaf); }
+  button.small:hover { background: var(--leaf); color: #fff; }
   button.sun { background: var(--sun); color: #1c2321; border-color: var(--sun); box-shadow: 0 6px 16px rgba(255,205,60,.35); }
   button.sun:hover { background: var(--sun-soft); border-color: var(--sun-soft); }
   button.leaf { background: var(--leaf); color: #fff; border-color: var(--leaf); }
@@ -127,7 +129,7 @@ export const STYLE = `
 `;
 
 /** Buttons with data-copy copy text, data-open opens an item, data-refresh refreshes, data-tab switches tabs,
- *  data-claude opens Claude Code, data-ask puts an item into it. */
+ *  data-claude opens Claude Code, data-ask puts an item into it, data-send starts a session that works on it. */
 export const SCRIPT = `
   const vscode = acquireVsCodeApi();
   function showTab(name) {
@@ -140,10 +142,11 @@ export const SCRIPT = `
   const saved = (vscode.getState() || {}).tab;
   if (saved) showTab(saved);
   document.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask]');
+    const el = e.target.closest('[data-copy],[data-open],[data-refresh],[data-tab],[data-claude],[data-ask],[data-send]');
     if (!el) return;
     if (el.dataset.tab !== undefined) showTab(el.dataset.tab);
     else if (el.dataset.claude !== undefined) vscode.postMessage({ type: 'claude' });
+    else if (el.dataset.send !== undefined) vscode.postMessage({ type: 'send', id: Number(el.dataset.send) });
     else if (el.dataset.ask !== undefined) vscode.postMessage({ type: 'ask', id: Number(el.dataset.ask) });
     else if (el.dataset.copy !== undefined) vscode.postMessage({ type: 'copy', text: el.dataset.copy });
     else if (el.dataset.open !== undefined) vscode.postMessage({ type: 'open', id: Number(el.dataset.open) });

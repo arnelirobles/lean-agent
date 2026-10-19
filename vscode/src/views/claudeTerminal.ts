@@ -1,5 +1,10 @@
+import * as fs from "node:fs";
 import * as vscode from "vscode";
-import { askPrompt, type AskItem } from "../claude";
+import { askPrompt, resolveClaude, workPrompt, type AskItem } from "../claude";
+
+const isExec = (p: string) => {
+  try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
+};
 
 const NAME = "Claude Code";
 
@@ -20,8 +25,13 @@ export class ClaudeTerminal {
   }
 
   private start(prompt?: string): void {
+    const exe = resolveClaude(this.command(), process.env.PATH ?? "", isExec);
+    if (!exe) {
+      void vscode.window.showErrorMessage("Lean Brain: claude not found. Set leanBrain.claudeCommand to the absolute path of the claude executable.");
+      return;
+    }
     this.term = vscode.window.createTerminal({
-      name: NAME, shellPath: this.command(), shellArgs: prompt === undefined ? [] : [prompt], cwd: this.cwd(),
+      name: NAME, shellPath: exe, shellArgs: prompt === undefined ? [] : [prompt], cwd: this.cwd(),
       iconPath: new vscode.ThemeIcon("sparkle"), location: { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
     });
     this.term.show();
@@ -31,6 +41,11 @@ export class ClaudeTerminal {
     const t = this.live();
     if (t) t.show();
     else this.start();
+  }
+
+  /** Always a new session, so the task gets a clean context and does not land in another conversation. */
+  send(item: AskItem): void {
+    this.start(workPrompt(item));
   }
 
   /** A session this extension started gets the prompt typed in without Enter, to read and edit first. Otherwise a new one starts with it. */
