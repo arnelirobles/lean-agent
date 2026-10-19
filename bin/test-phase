@@ -99,16 +99,19 @@ class Dotnet:
 
     @classmethod
     def command(cls, mode, project, cls_filter=None, fast=False, extra=()):
+        # A filter may name several classes joined by |, with or without the FullyQualifiedName~ prefix.
+        cls = [c.strip().removeprefix("FullyQualifiedName~") for c in (cls_filter or "").split("|")]
+        cls = [c for c in cls if c]
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
             cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
-            if cls_filter:
-                # --filter-class matches the full class name; the fast tier takes a fragment, hence the wildcards.
-                cmd += ["--filter-class", f"*{cls_filter}*" if fast else cls_filter]
+            # --filter-class matches the full class name; the fast tier takes a fragment, hence the wildcards.
+            for c in cls:
+                cmd += ["--filter-class", f"*{c}*" if fast else c]
             return cmd + ["--output", "Detailed"]
         cmd = ["dotnet", "test", project] + list(extra) + ["--logger", "console;verbosity=normal"]
-        if cls_filter:
-            cmd += ["--filter", "FullyQualifiedName~" + cls_filter]
+        if cls:
+            cmd += ["--filter", "|".join("FullyQualifiedName~" + c for c in cls)]
         return cmd
 
     @staticmethod
@@ -449,6 +452,14 @@ def main(argv):
 
 def self_test():
     fails = []
+    # A fast filter of several classes joined by | runs each of them, on both runners.
+    got = Dotnet.command("mtp", "T.csproj", "ATests|FullyQualifiedName~BTests", fast=True)
+    if got != ["dotnet", "test", "--project", "T.csproj", "--", "--filter-class", "*ATests*",
+               "--filter-class", "*BTests*", "--output", "Detailed"]:
+        fails.append(f"mtp must pass one --filter-class per class: {got}")
+    got = Dotnet.command("vstest", "T.csproj", "ATests|BTests", fast=True)
+    if got[-2:] != ["--filter", "FullyQualifiedName~ATests|FullyQualifiedName~BTests"]:
+        fails.append(f"vstest must prefix every class: {got}")
     fix = os.path.join(HERE, "..", "tests", "fixtures", "test-phase")
 
     def fixture(name):
