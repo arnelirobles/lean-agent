@@ -1,0 +1,7 @@
+**
+!out/extension.js
+!out/sql-wasm.wasm
+!media/**
+!README.md
+!package.json
+!LICENSE
