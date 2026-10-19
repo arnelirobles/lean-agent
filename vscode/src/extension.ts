@@ -31,8 +31,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     dashboard.render(d, store.note);
     itemPanel.render(d);
   };
-  const dashboard = new DashboardPanel((id) => itemPanel.show(store.database, id), () => void refresh());
-  const itemPanel = new ItemPanel(() => void refresh());
+  const dashboard = new DashboardPanel(ctx.extensionUri, (id) => itemPanel.show(store.database, id), () => void refresh());
+  const itemPanel = new ItemPanel(ctx.extensionUri, () => void refresh());
 
   ctx.subscriptions.push(
     status,

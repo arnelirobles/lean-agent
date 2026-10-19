@@ -1,7 +1,13 @@
 import * as vscode from "vscode";
 import type { Database } from "sql.js";
 import * as db from "../db";
+import { kindLook, toneColorId, type Look } from "../style";
 import type { ItemRow } from "../types";
+
+export function themeIcon(look: Look): vscode.ThemeIcon {
+  const id = toneColorId(look.tone);
+  return new vscode.ThemeIcon(look.icon, id ? new vscode.ThemeColor(id) : undefined);
+}
 
 type Node =
   | { t: "project"; project: string; items: ItemRow[] }
@@ -39,6 +45,7 @@ export class ItemsTree implements vscode.TreeDataProvider<Node> {
       const ti = new vscode.TreeItem(`${label} (${node.items.length})`, node.t === "project"
         ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
       ti.contextValue = node.t;
+      ti.iconPath = node.t === "project" ? new vscode.ThemeIcon("repo", new vscode.ThemeColor("charts.blue")) : themeIcon(kindLook(node.kind));
       return ti;
     }
     const i = node.item;
@@ -48,6 +55,7 @@ export class ItemsTree implements vscode.TreeDataProvider<Node> {
       .filter(Boolean).join(" | ");
     ti.tooltip = `#${i.id} ${i.kind} ${i.project}\n${i.title}`;
     ti.contextValue = "item";
+    ti.iconPath = themeIcon(kindLook(i.kind));
     ti.command = { command: "leanBrain.showItem", title: "Show item", arguments: [i.id] };
     ti.id = `item-${i.id}`;
     return ti;

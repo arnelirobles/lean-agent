@@ -48,6 +48,27 @@ describe("dashboard html", () => {
     expect(body).toContain("stalled</title>");
   });
 
+  it("puts each section in a tab and shows the first tab without script", () => {
+    const body = dashboardBody(data);
+    for (const t of ["overview", "cycles", "suites", "flaky", "load", "hygiene"]) {
+      expect(body).toContain(`data-tab="${t}"`);
+      expect(body).toContain(`data-panel="${t}"`);
+    }
+    expect(body).toContain(`class="tab t-blue active" role="tab" data-tab="overview"`);
+    expect(body).toContain(`class="panel active" data-panel="overview"`);
+    expect(body.match(/class="panel active"/g)?.length).toBe(1);
+  });
+
+  it("uses no inline style attributes, which the CSP would block", () => {
+    expect(dashboardHtml(data, "N", "vscode-resource:")).not.toMatch(/\sstyle="/);
+  });
+
+  it("links the codicon stylesheet and allows its font", () => {
+    const html = dashboardHtml(data, "N", "vscode-resource:", "", "vscode-resource:/out/codicons/codicon.css");
+    expect(html).toContain(`<link rel="stylesheet" href="vscode-resource:/out/codicons/codicon.css">`);
+    expect(html).toContain("font-src vscode-resource:");
+  });
+
   it("hygiene button copies a read-only list command", () => {
     expect(listCommand("test-fail")).toBe("brain list --open --kind test-fail");
     expect(listCommand("a b")).toBe("brain list --open --kind 'a b'");

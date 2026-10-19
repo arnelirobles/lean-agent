@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import type { Database } from "sql.js";
 import * as db from "../db";
+import { jobLook } from "../style";
 import type { JobRow, QueueData } from "../types";
+import { themeIcon } from "./itemsTree";
 
 type Node = { t: "group"; label: string; jobs: JobRow[] } | { t: "job"; job: JobRow };
 
@@ -29,8 +31,11 @@ export class QueueTree implements vscode.TreeDataProvider<Node> {
 
   getTreeItem(node: Node): vscode.TreeItem {
     if (node.t === "group") {
-      return new vscode.TreeItem(`${node.label} (${node.jobs.length})`,
+      const g = new vscode.TreeItem(`${node.label} (${node.jobs.length})`,
         node.jobs.length ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
+      g.iconPath = themeIcon(node.label === "Running" ? jobLook("running") : node.label === "Queued" ? { icon: "list-ordered", tone: "yellow" }
+        : { icon: "history", tone: "green" });
+      return g;
     }
     const j = node.job;
     const now = Math.floor(Date.now() / 1000);
@@ -41,6 +46,7 @@ export class QueueTree implements vscode.TreeDataProvider<Node> {
     else if (j.status === "queued") parts.push("waiting " + db.relativeTime(j.enqueued_at, now).replace(" ago", ""));
     ti.description = parts.filter(Boolean).join(" | ");
     ti.tooltip = j.reason ? `${j.status}: ${j.reason}` : j.status;
+    ti.iconPath = themeIcon(jobLook(j.status));
     return ti;
   }
 }
