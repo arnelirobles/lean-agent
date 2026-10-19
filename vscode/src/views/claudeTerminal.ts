@@ -1,34 +1,41 @@
 import * as vscode from "vscode";
-import { askPrompt, claudeLine, type AskItem } from "../claude";
+import { askPrompt, type AskItem } from "../claude";
 
 const NAME = "Claude Code";
 
-/** One Claude Code terminal in an editor tab beside the dashboard. */
+/**
+ * One Claude Code terminal in an editor tab beside the dashboard. claude is the terminal's own process (shellPath),
+ * not a command typed into a shell, so the prompt is a plain argument and nothing typed later can reach a shell.
+ * When claude exits the terminal closes with it.
+ */
 export class ClaudeTerminal {
-  constructor(private readonly command: () => string, private readonly cwd: () => string | undefined) {}
+  private term?: vscode.Terminal;
 
-  private find(): vscode.Terminal | undefined {
-    return vscode.window.terminals.find((t) => t.name === NAME && t.exitStatus === undefined);
+  constructor(private readonly command: () => string, private readonly cwd: () => string | undefined) {
+    vscode.window.onDidCloseTerminal((t) => { if (t === this.term) this.term = undefined; });
+  }
+
+  private live(): vscode.Terminal | undefined {
+    return this.term && this.term.exitStatus === undefined ? this.term : undefined;
   }
 
   private start(prompt?: string): void {
-    const t = vscode.window.createTerminal({
-      name: NAME, cwd: this.cwd(), iconPath: new vscode.ThemeIcon("sparkle"),
-      location: { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
+    this.term = vscode.window.createTerminal({
+      name: NAME, shellPath: this.command(), shellArgs: prompt === undefined ? [] : [prompt], cwd: this.cwd(),
+      iconPath: new vscode.ThemeIcon("sparkle"), location: { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
     });
-    t.sendText(claudeLine(this.command(), prompt));
-    t.show();
+    this.term.show();
   }
 
   open(): void {
-    const t = this.find();
+    const t = this.live();
     if (t) t.show();
     else this.start();
   }
 
-  /** A running session gets the prompt typed in without Enter, so it can be read and edited first. A new one starts with it. */
+  /** A session this extension started gets the prompt typed in without Enter, to read and edit first. Otherwise a new one starts with it. */
   ask(item: AskItem): void {
-    const t = this.find();
+    const t = this.live();
     if (!t) return this.start(askPrompt(item));
     t.sendText(askPrompt(item), false);
     t.show();

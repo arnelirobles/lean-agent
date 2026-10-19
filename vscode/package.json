@@ -179,7 +179,7 @@
         "leanBrain.claudeCommand": {
           "type": "string",
           "default": "",
-          "description": "Command that starts Claude Code in the terminal. Empty uses claude.",
+          "description": "Path or name of the claude executable. Empty uses claude on PATH. It runs as the terminal process, not through a shell, so give the program only, no arguments.",
           "scope": "machine"
         }
       }
