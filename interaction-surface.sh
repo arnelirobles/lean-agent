@@ -1,1 +1,0 @@
-bin/interaction-surface.sh

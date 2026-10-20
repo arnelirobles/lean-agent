@@ -1,1 +1,0 @@
-bin/asset-provenance.py
