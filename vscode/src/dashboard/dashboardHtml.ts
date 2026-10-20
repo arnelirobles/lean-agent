@@ -30,6 +30,8 @@ const routeBtn = (j: JobRow, to: "remote" | "local" | "any", icon: string, label
 /** The buttons the sidebar shows for the same job: send to a remote lane, or let any lane take it. */
 function routeButtons(j: JobRow): string {
   if (!j.routable) return "";
+  // An apple job gets none: "Any lane" would clear its platform and let a remote lane claim it.
+  if (j.platform === "apple") return "";
   return j.platform === "remote" ? routeBtn(j, "any", "device-desktop", "Any lane") : routeBtn(j, "remote", "cloud-upload", "Send to remote");
 }
 

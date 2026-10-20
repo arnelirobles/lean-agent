@@ -20,8 +20,8 @@
   brain queue move ID up|down              swap a queued job with the one before or after it; a job never
             moves ahead of the job it waits on
   brain queue cancel ID                    a queued job; jobs waiting on it are cancelled too
-  brain queue route ID --to remote|local|any   remote: only a remote lane claims it; local: only this
-            machine (platform=apple); any: whichever lane is free
+  brain queue route ID --to remote|local|any [--force]   remote: only a remote lane claims it; local: only this
+            machine (platform=apple); any: whichever lane is free. remote refuses an Apple job without --force
   brain queue next [--peek] [--where local|remote] [--host NAME]   (what test-phase uses to drain)
   brain queue finish ID --status done|failed | requeue ID --reason R   (requeue puts a running job back)
   brain resume [--project P] [--max N]
@@ -181,6 +181,7 @@ def parser():
     q = qs.add_parser("route")
     q.add_argument("id", type=int)
     q.add_argument("--to", choices=("remote", "local", "any"), required=True)
+    q.add_argument("--force", action="store_true", help="send an Apple job to a remote lane anyway")
     q = qs.add_parser("requeue")
     q.add_argument("id", type=int)
     q.add_argument("--reason", required=True)

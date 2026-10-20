@@ -238,6 +238,10 @@ def cmd_queue(a):
                 sys.exit(f"brain: no job #{a.id}")
             if r["status"] != "queued":
                 sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be routed")
+            # Refuse only a job marked apple: detect_platform also says apple for a project it cannot read.
+            if a.to == "remote" and r["platform"] == "apple" and not a.force:
+                sys.exit(f"brain: job #{a.id} is marked Apple, this machine only, and would likely fail to build on a remote host; "
+                         "pass --force to send it anyway")
             con.execute("UPDATE jobs SET platform=? WHERE id=?",
                         ({"remote": "remote", "local": "apple", "any": ""}[a.to], a.id))
         if a.to == "remote" and detect_platform(r["repo_dir"], r["test_project"]) == "apple":
