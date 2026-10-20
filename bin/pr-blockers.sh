@@ -324,6 +324,14 @@ J
   $to bash "$(readlink -f "$0")" 9 -R >/dev/null 2>&1; rc=$?
   [ "$rc" = 2 ] || { echo "self-test failed: -R with no value gave exit $rc, want 2"; fails=$((fails + 1)); }
 
+  local me; me=$(readlink -f "$0")
+  for forge in "gitlab https://gitlab.com/g/r.git" "azure https://dev.azure.com/o/p/_git/r"; do
+    rm -rf "$t/clone"; git init -q "$t/clone"; git -C "$t/clone" remote add origin "${forge#* }"
+    out=$(cd "$t/clone" && $to bash "$me" 3 2>&1 >/dev/null); rc=$?
+    want="pr-blockers: this repository is on ${forge%% *}; pr-blockers reads GitHub pull requests only"
+    [ "$rc" = 2 ] && [ "$out" = "$want" ] || { echo "self-test failed: ${forge%% *} clone gave exit $rc and '$out'"; fails=$((fails + 1)); }
+  done
+
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
   return 1
 }
@@ -339,6 +347,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$pr" in ''|*[!0-9]*) echo "usage: pr-blockers.sh <pr-number> [-R owner/repo]" >&2; exit 2 ;; esac
+if [ -z "$repo" ]; then
+  # Rulesets, merge queues and branch protection are GitHub's, so another host gets one plain line.
+  kind=$(python3 "$(dirname "$(readlink -f "$0")")/../lib/forge.py" kind . 2>/dev/null) || kind=unknown
+  case "$kind" in github|unknown) ;; *) echo "pr-blockers: this repository is on $kind; pr-blockers reads GitHub pull requests only" >&2; exit 2 ;; esac
+fi
 command -v gh >/dev/null || { echo "pr-blockers: gh is not installed" >&2; exit 2; }
 
 if [ -z "$repo" ]; then
