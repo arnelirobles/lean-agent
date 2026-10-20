@@ -224,7 +224,7 @@ Every number on the dashboard links to the events behind it.
 
 Each step is its own project with its own spec and plan, shipped in this order.
 
-1. **Groundwork.** Remove the 20 stale script copies at the repo root. Split brain and test-phase into `lib/brain/`. Put every `gh` call behind a forge adapter, with GitHub only at first. No behaviour change, and the existing self-tests stay green.
+1. **Groundwork.** Split brain into `lib/brain/`. Put the `gh` reads of merged pull requests behind a forge adapter, with GitHub only at first. The 20 links at the repo root stay, so the scripts work without the plugin. test-phase and the hooks that parse `gh` commands move in steps 2 and 8. No behaviour change, and the existing self-tests stay green.
 2. **Works in any tool.** `lean check`, `lean init`, git hooks, the CI job, and the Codex and Cursor adapters.
 3. **Event log and central brain.** Local events, the sync client, the `/v1` contract and its test suite. The private barakoCMS module ships in step with this.
 4. **Trackers with write-back.** GitHub issues first, then Jira, GitLab and Azure Boards.

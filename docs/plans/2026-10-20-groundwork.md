@@ -34,6 +34,8 @@
 
 ### Task 1: Remove the stale root scripts
 
+**Reverted.** The root files were links into `bin/`, kept so the scripts work without the plugin (README, "Everything in the method still works without the plugin"). The final review caught it, and commit "put back the root links into bin" restores them.
+
 The repo root holds 20 copies of `bin/` scripts from before the plugin layout (last touched in 73dd61c and 2dbaa05). Every one differs from its `bin/` copy, and nothing runs them.
 
 **Files:**
