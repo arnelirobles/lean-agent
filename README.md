@@ -118,6 +118,8 @@ What goes where:
 
 Brain never holds secrets, tokens or passwords.
 
+brain's code lives in `lib/brain/`, and `bin/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub; GitLab and Azure DevOps come with tracker support.
+
 ## Settings
 
 Set these in the `env` block of your Claude Code settings. The defaults run the method as written.

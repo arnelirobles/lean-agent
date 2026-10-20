@@ -24,6 +24,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import forge  # noqa: E402
 import leanstats  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -287,13 +288,8 @@ def run_command(cmd, timeout=600):
 
 def fetch_changes(repo, since, run=run_command):
     """Rows for the changes table for one repository, or None when gh fails."""
-    listing = run(["gh", "pr", "list", "-R", repo, "--state", "merged", "--search", f"merged:>={since}",
-                   "--limit", "200", "--json", "number,headRefName,createdAt,mergedAt"])
-    if listing is None:
-        return None
-    try:
-        merged = json.loads(listing)
-    except ValueError:
+    merged = forge.for_repo(repo, run).merged_prs(repo, since)
+    if merged is None:
         return None
     signals = {}
     for line in (run(["bash", RETRO, "--since", since, repo]) or "").splitlines()[1:]:
@@ -303,8 +299,8 @@ def fetch_changes(repo, since, run=run_command):
     rows = []
     for pr in merged:
         fix_rounds, failed_checks, escaped_refs = signals.get(pr["number"], [None, None, None])
-        rows.append((repo, pr["number"], pr.get("headRefName") or "", pr.get("createdAt") or "",
-                     pr.get("mergedAt") or "", fix_rounds, failed_checks, escaped_refs))
+        rows.append((repo, pr["number"], pr["head_ref"], pr["created_at"], pr["merged_at"],
+                     fix_rounds, failed_checks, escaped_refs))
     return rows
 
 
@@ -316,7 +312,11 @@ def collect_changes(conn, repos, since, run=run_command, which=shutil.which):
         return 0
     stored = 0
     for repo in repos:
-        rows = fetch_changes(repo, since, run)
+        try:
+            rows = fetch_changes(repo, since, run)
+        except forge.Unsupported as e:
+            print(f"changes: skipped {repo}: {e}")
+            continue
         if rows is None:
             print(f"changes: skipped {repo}, the gh call failed")
             continue
