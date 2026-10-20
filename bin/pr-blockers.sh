@@ -324,6 +324,23 @@ J
   $to bash "$(readlink -f "$0")" 9 -R >/dev/null 2>&1; rc=$?
   [ "$rc" = 2 ] || { echo "self-test failed: -R with no value gave exit $rc, want 2"; fails=$((fails + 1)); }
 
+  local me; me=$(readlink -f "$0")
+  # A gh that knows the repository (as with a github remote or GH_REPO) and fails every other read.
+  mkdir -p "$t/fakegh"
+  printf '#!/bin/sh\ncase "$1 $2" in "repo view") echo o/r ;; *) echo "HTTP 404" >&2; exit 1 ;; esac\n' > "$t/fakegh/gh"
+  chmod +x "$t/fakegh/gh"
+  mkdir -p "$t/nogh"; printf '#!/bin/sh\nexit 1\n' > "$t/nogh/gh"; chmod +x "$t/nogh/gh"
+  for forge in "gitlab https://gitlab.com/g/r.git" "azure https://dev.azure.com/o/p/_git/r"; do
+    rm -rf "$t/clone"; git init -q "$t/clone"; git -C "$t/clone" remote add origin "${forge#* }"
+    out=$(cd "$t/clone" && PATH="$t/nogh:$PATH" $to bash "$me" 3 2>&1 >/dev/null); rc=$?
+    want="pr-blockers: this repository is on ${forge%% *}; pr-blockers reads GitHub pull requests only"
+    [ "$rc" = 2 ] && [ "$out" = "$want" ] || { echo "self-test failed: ${forge%% *} clone gave exit $rc and '$out'"; fails=$((fails + 1)); }
+  done
+  # A GitLab-first clone that gh still maps to GitHub (another remote, GH_REPO) keeps going to GitHub.
+  git -C "$t/clone" remote add github https://github.com/o/r.git
+  out=$(cd "$t/clone" && PATH="$t/fakegh:$PATH" $to bash "$me" 3 2>&1 >/dev/null)
+  case "$out" in *"this repository is on"*) echo "self-test failed: a clone gh maps to GitHub was refused: '$out'"; fails=$((fails + 1)) ;; esac
+
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
   return 1
 }
@@ -343,7 +360,12 @@ command -v gh >/dev/null || { echo "pr-blockers: gh is not installed" >&2; exit 
 
 if [ -z "$repo" ]; then
   repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || repo=""
-  [ -n "$repo" ] || { echo "pr-blockers: not in a GitHub repository; pass -R owner/repo" >&2; exit 2; }
+  if [ -z "$repo" ]; then
+    # Rulesets, merge queues and branch protection are GitHub's, so a clone of another host gets one plain line.
+    kind=$(python3 "$(dirname "$(readlink -f "$0")")/../lib/forge.py" kind . 2>/dev/null) || kind=unknown
+    case "$kind" in github|unknown) ;; *) echo "pr-blockers: this repository is on $kind; pr-blockers reads GitHub pull requests only" >&2; exit 2 ;; esac
+    echo "pr-blockers: not in a GitHub repository; pass -R owner/repo" >&2; exit 2
+  fi
 fi
 owner=${repo%%/*}; name=${repo#*/}
 
