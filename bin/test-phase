@@ -305,6 +305,18 @@ def tier_note(rc):
     return {0: "pass", 75: "busy", 76: "stalled"}.get(rc, "fail")
 
 
+def matched_none(rc, text):
+    """A filtered run that ran no test: MTP exit 8, VSTest's no-match line, or a summary of zero tests."""
+    if rc == 8:
+        return True
+    if rc != 0:
+        return False
+    text = ANSI.sub("", text)
+    if "No test matches the given testcase filter" in text:
+        return True
+    return bool(re.search(r"Failed:\s*\d+,\s*Passed:\s*\d+,\s*Skipped:\s*\d+", text)) and sum(Dotnet.counts(text)) == 0
+
+
 def lane_problem(rc, text):
     """Why a remote command never really ran, or "". No marker line means the test command never started."""
     if not re.search("^" + re.escape(lr.MARKER) + r"\s*$", text, re.M):
@@ -414,6 +426,11 @@ def _run_job(job, a, run_dir, runner, lane):
                  f"no test progress for {a.stall} s, stopped by heavy.sh. Log: {stem}.log", run_id, ctx)
     elif rc == 75:
         row["notes"].append("lane busy, nothing ran")
+    elif job["filter"] and not failing and matched_none(rc, text):
+        row["result"] = "fail"
+        row["notes"].append("filter matched no test")
+        add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
+                 f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
     elif rc != 0 and not failing:
         tail = "\n".join(text.splitlines()[-15:])
         add_item(row, "test-fail", f"run-failed: {project}", "important",
@@ -925,6 +942,22 @@ echo "Passed!  - Failed: 0"; exit 0
         if calls[0] != "test --project tests/T/T.csproj -- --filter-class *Mtp* --output Detailed" or \
            "test --project tests/T/T.csproj -- --filter-class Acme.MtpTests --output Detailed" not in calls:
             fails.append(f"mtp fast tier needs wildcards, reruns the exact class: {calls}")
+
+        # A filter that matches no test is a failure, not a pass: VSTest exits 0 with no summary, MTP exits 8.
+        put("full", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        put("class-Empty", "No test matches the given testcase filter `FullyQualifiedName~Empty` in T.dll\n", 0)
+        put("class-Good", "  Passed Acme.GoodTests.A [1 ms]\nPassed!  - Failed: 0, Passed: 3, Skipped: 0, Total: 3\n", 0)
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj Empty\n")
+        if rc != 1 or "filter matched no test" not in out or "filter-matched-no-test: tests/T/T.csproj" not in brain_list():
+            fails.append(f"vstest exit 0 with a filter that matched nothing must fail with an item ({rc}): {out} {brain_list()!r}")
+        os.remove(os.path.join(d, "class-Empty"))
+        put("class-*Empty*", "", 8)
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj Empty\n")
+        if rc != 1 or "filter matched no test" not in out:
+            fails.append(f"mtp exit 8 with a filter must fail as matched no test ({rc}): {out}")
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj Good\n")
+        if rc != 0 or "filter matched no test" in out:
+            fails.append(f"a filtered run with tests must still pass ({rc}): {out}")
 
         # A build error: nonzero exit, no failing test named. It must not look like a pass.
         os.remove(os.path.join(d, "class-Acme.MtpTests"))
