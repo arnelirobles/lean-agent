@@ -548,9 +548,9 @@ def drain(a, run_dir, runner, lanes=None):
         """No job for this lane. Wait while another lane works; False when the drain ended."""
         with lock:
             state[lane.name], seen[lane.name] = "idle", count
-            if quiet():
+            if quiet():  # wake the others only to end; waking them on every poll makes idle lanes spin
                 stop.set()
-            wake.notify_all()
+                wake.notify_all()
             if not stop.is_set():
                 wake.wait(poll_seconds())
             ended = stop.is_set() and count == done[0]
