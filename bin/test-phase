@@ -483,6 +483,13 @@ def rest_seconds():
         return 600.0
 
 
+def poll_seconds():
+    try:
+        return float(os.environ.get("TEST_PHASE_POLL", "3"))
+    except ValueError:
+        return 3.0
+
+
 def running_ids():
     return [int(x) for x in re.findall(r"^job #(\d+) running", brain(["queue", "list", "--status", "running"]) or "", re.M)]
 
@@ -516,8 +523,11 @@ def drain(a, run_dir, runner, lanes=None):
             brain(["queue", "finish", m.group(1), "--status", "failed", "--reason", "drainer died"])
     rows = []
     lock = threading.Lock()  # guards printing, rows and state
+    wake = threading.Condition(lock)  # an idle lane waits on it, a finished job wakes it
     stop = threading.Event()  # set when no lane is working, so a resting lane wakes and ends
     state = {l.name: "work" for l in lanes}
+    seen = {}  # idle lane: the finish count its last empty poll saw
+    done = [0]  # jobs finished or put back; an idle lane polls again when it moved
 
     def say(msg):
         with lock:
@@ -526,8 +536,32 @@ def drain(a, run_dir, runner, lanes=None):
     def settle(lane, st):
         with lock:
             state[lane.name] = st
-            if all(v != "work" for v in state.values()):
+            if quiet():
                 stop.set()
+            wake.notify_all()
+
+    def quiet():  # call with the lock held: nobody works and no idle lane missed a finished job
+        return all(v != "work" for v in state.values()) \
+            and all(seen[n] == done[0] for n, v in state.items() if v == "idle")
+
+    def idle(lane, count):
+        """No job for this lane. Wait while another lane works; False when the drain ended."""
+        with lock:
+            state[lane.name], seen[lane.name] = "idle", count
+            if quiet():  # wake the others only to end; waking them on every poll makes idle lanes spin
+                stop.set()
+                wake.notify_all()
+            if not stop.is_set():
+                wake.wait(poll_seconds())
+            ended = stop.is_set() and count == done[0]
+            if not ended:
+                state[lane.name] = "work"
+            return not ended
+
+    def finished():
+        with lock:
+            done[0] += 1
+            wake.notify_all()
 
     def rest(lane):
         """Rest after a lane problem. False when the drain ended meanwhile."""
@@ -553,9 +587,12 @@ def drain(a, run_dir, runner, lanes=None):
                             return
                         continue
                     last_why = None
+                count = done[0]
                 out = brain(["queue", "next", "--where", lane.where]
                             + (["--host", lane.remote.name] if lane.remote else []))
                 if not out:
+                    if idle(lane, count):
+                        continue
                     return
                 job = json.loads(out)
                 say(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})"
@@ -566,6 +603,7 @@ def drain(a, run_dir, runner, lanes=None):
                     if requeue_job(job["id"], problem, say):
                         say(f"test-phase: job #{job['id']} back to queued, lane {lane.name} rests: {problem}")
                     job = None
+                    finished()
                     if not rest(lane):
                         return
                     continue
@@ -577,6 +615,7 @@ def drain(a, run_dir, runner, lanes=None):
                       + (["--run-id", str(row["run_id"])] if row["run_id"] else [])
                       + (["--reason", reason] if reason else []))
                 job = None
+                finished()
                 if row.get("lane_rest"):
                     say(f"test-phase: lane {lane.name} rests: {row['lane_rest']}")
                     if not rest(lane):
@@ -1151,6 +1190,32 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"apple job local, plain job remote: {runs_of('Apple.csproj')} {runs_of('Plain.csproj')} {out}")
         if any("Apple.csproj" in l and not l.startswith("rrepo ") for l in rlog("where.log").splitlines()):
             fails.append(f"a remote lane ran an apple job: {rlog('where.log')!r}")
+
+        # An idle lane keeps polling while another lane works: the local lane finds nothing, then an apple job
+        # arrives while the remote lane is still on its job, and the drain still ends.
+        slow = qadd(rrepo, "tests/Apple/Apple.csproj", "--platform", "none", "--cycle", "r2b")
+        subprocess.run([sys.executable, BRAIN, "queue", "route", slow, "--to", "remote"], env=env, capture_output=True)
+        reset()
+        proc = subprocess.Popen([sys.executable, os.path.realpath(__file__)], env=dict(renv, TEST_PHASE_POLL="0.3"),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(1.5)
+        late = qadd(rrepo, "tests/TPlain/TPlain.csproj", "--platform", "apple", "--cycle", "r2b")
+        try:
+            out = proc.communicate(timeout=30)[0]
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out = proc.communicate()[0] + " (killed, the drain did not end)"
+        c = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        started = c.execute("SELECT started_at FROM jobs WHERE id=?", (int(late),)).fetchone()[0] or ""
+        ended = c.execute("SELECT ended_at FROM jobs WHERE id=?", (int(slow),)).fetchone()[0] or ""
+        c.close()
+        # The drainer looks at the queue again once a drain ends, so the late job runs either way; with the
+        # fix it starts while the remote job still runs. The slow job takes over 3 s, so whole seconds tell.
+        if proc.returncode != 0 or f"job #{slow} done" not in qlist("--cycle", "r2b") \
+                or f"job #{late} done" not in qlist("--cycle", "r2b") or runs_of("TPlain.csproj") != [("full", "")] \
+                or not started or not started < ended:
+            fails.append(f"an idle lane must pick up a job queued while another lane works ({proc.returncode}): "
+                         f"{started} !< {ended} {qlist('--cycle', 'r2b')} {out}")
 
         # A lost connection puts the job back in the queue, is not a test failure, and does not hold the drain.
         open(os.path.join(d, "ssh-fail-run"), "w").close()
