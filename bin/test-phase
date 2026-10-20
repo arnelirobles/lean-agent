@@ -1205,10 +1205,17 @@ echo "Passed!  - Failed: 0"; exit 0
         except subprocess.TimeoutExpired:
             proc.kill()
             out = proc.communicate()[0] + " (killed, the drain did not end)"
+        c = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        started = c.execute("SELECT started_at FROM jobs WHERE id=?", (int(late),)).fetchone()[0] or ""
+        ended = c.execute("SELECT ended_at FROM jobs WHERE id=?", (int(slow),)).fetchone()[0] or ""
+        c.close()
+        # The drainer looks at the queue again once a drain ends, so the late job runs either way; with the
+        # fix it starts while the remote job still runs. The slow job takes over 3 s, so whole seconds tell.
         if proc.returncode != 0 or f"job #{slow} done" not in qlist("--cycle", "r2b") \
-                or f"job #{late} done" not in qlist("--cycle", "r2b") or runs_of("TPlain.csproj") != [("full", "")]:
+                or f"job #{late} done" not in qlist("--cycle", "r2b") or runs_of("TPlain.csproj") != [("full", "")] \
+                or not started or not started < ended:
             fails.append(f"an idle lane must pick up a job queued while another lane works ({proc.returncode}): "
-                         f"{qlist('--cycle', 'r2b')} {out}")
+                         f"{started} !< {ended} {qlist('--cycle', 'r2b')} {out}")
 
         # A lost connection puts the job back in the queue, is not a test failure, and does not hold the drain.
         open(os.path.join(d, "ssh-fail-run"), "w").close()
