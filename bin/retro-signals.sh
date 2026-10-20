@@ -10,8 +10,10 @@
 # If REVIEW_LOG points at the adversarial review log, rows for pull requests with no log entry are
 # counted, because a review nobody logged is a loop that is not running.
 #
-# It reports and never writes anywhere but stdout. Needs gh and jq.
+# It reports and never writes anywhere but stdout. Needs gh, and jq for the day count. The gh reads go
+# through lib/forge.py, so a repository on another host stops with one line naming it.
 set -euo pipefail
+lib="$(cd "$(dirname "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")")/../lib" && pwd)"
 
 row() { # repo pr opened merged first_review_at commits_after failed_checks
   local days
@@ -34,23 +36,19 @@ since=$2; shift 2
 
 printf 'repo\tpr\tfix_rounds\tfailed_checks\tdays_to_merge\tescaped_refs\tlogged_review\n'
 for repo in "$@"; do
-  gh pr list -R "$repo" --state merged --search "merged:>=$since" --limit 200 \
-    --json number,createdAt,mergedAt,headRefOid > /tmp/retro.$$.json
-  for n in $(jq -r '.[].number' /tmp/retro.$$.json); do
-    opened=$(jq -r ".[] | select(.number==$n) | .createdAt" /tmp/retro.$$.json)
-    merged=$(jq -r ".[] | select(.number==$n) | .mergedAt" /tmp/retro.$$.json)
-    # Reviews here mostly happen outside GitHub's review feature, so a fix round is a commit pushed
-    # after the pull request opened, not counting merges of the default branch.
+  prs=$(python3 "$lib/forge.py" merged-prs "$repo" "$since")
+  while IFS=$'\t' read -r n opened merged head; do
+    [ -n "$n" ] || continue
     first_review=$opened
-    after=$(gh api "repos/$repo/pulls/$n/commits" --paginate -q "[.[] | select(.commit.committer.date > \"$opened\") | select(.commit.message | startswith(\"Merge\") | not)] | length" 2>/dev/null | awk '{s+=$1} END{print s+0}')
-    head=$(jq -r ".[] | select(.number==$n) | .headRefOid" /tmp/retro.$$.json)
-    failed=$(gh api "repos/$repo/commits/$head/check-runs" -q '[.check_runs[] | select(.conclusion=="failure")] | length' 2>/dev/null || echo 0)
-    escaped=$(gh search issues "repo:$repo \"#$n\" fix in:body created:>$merged" --json number -q 'length' 2>/dev/null || echo 0)
+    after=$(python3 "$lib/forge.py" commits-after "$repo" "$n" "$opened")
+    failed=$(python3 "$lib/forge.py" failed-checks "$repo" "$head")
+    escaped=$(python3 "$lib/forge.py" escaped-refs "$repo" "$n" "$merged")
     logged=unknown
     if [ -n "${REVIEW_LOG:-}" ] && [ -f "$REVIEW_LOG" ]; then
       if awk -F'\t' -v r="$repo" -v p="$n" '$0 ~ r && $0 ~ ("\t" p "\t") {f=1} END{exit !f}' "$REVIEW_LOG"; then logged=yes; else logged=no; fi
     fi
     printf '%s\t%s\n' "$(row "$repo" "$n" "$opened" "$merged" "$first_review" "$after" "$failed")" "$escaped	$logged"
-  done
+  done <<EOF_PRS
+$prs
+EOF_PRS
 done
-rm -f /tmp/retro.$$.json
