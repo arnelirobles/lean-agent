@@ -182,9 +182,9 @@ export function stale(db: Database, now: number): StaleRow[] {
   return rows(db, Q.STALE, [isoAt(now - STALE_DAYS * 86400)]) as StaleRow[];
 }
 
-/** The newest activity. A database before schema 8 has no activities table. */
+/** The newest activity. The table is made by the first `brain activity` command, not by a migration, so look for it. */
 export function activity(db: Database): ActivityRow[] {
-  if ((schemaVersion(db) ?? 0) < 8) return [];
+  if (!one(db, Q.HAS_ACTIVITIES)) return [];
   return rows(db, Q.ACTIVITY).map((r) => ({
     ...r, ok: Number(r.ok) === 1, duration_ms: r.duration_ms == null ? null : Number(r.duration_ms),
   })) as ActivityRow[];

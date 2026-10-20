@@ -148,6 +148,25 @@ describe("dashboard activity tab", () => {
     expect(panel).toContain("failed");
     expect(panel).not.toContain("<script>");
     expect(panel).toContain("&lt;b&gt;x&lt;/b&gt;");
+    for (const raw of ["<i>h</i>", "<p>", "<t>"]) {
+      expect(panel).not.toContain(raw);
+      expect(panel).toContain(esc(raw));
+    }
+  });
+
+  it("marks only failed rows and counts them in the badge", () => {
+    const html = dashboardBody(data);
+    const panel = html.slice(html.indexOf(`data-panel="activity"`), html.indexOf(`data-panel="cycles"`));
+    expect(panel.match(/<tr class="failed">/g)).toHaveLength(1);
+    expect(panel.match(/<tr>/g)).toHaveLength(4);
+    const tab = html.slice(html.indexOf(`data-tab="activity"`), html.indexOf(`data-tab="cycles"`));
+    expect(tab).toContain(`<span class="badge">1</span>`);
+  });
+
+  it("escapes a hostile timestamp", () => {
+    const d = { ...data, activity: [{ ...data.activity[0], ts: `"><img src=x>` }] };
+    const html = dashboardBody(d);
+    expect(html).not.toContain("<img src=x>");
   });
 
   it("says when there is no activity", () => {

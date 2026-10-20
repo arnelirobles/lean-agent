@@ -65,11 +65,11 @@ export async function sqlJs() {
   return initSqlJs({ wasmBinary: wasm as unknown as ArrayBuffer });
 }
 
-/** schema 8 by default; 7 is from before activities, 5 from before platform and host. */
-export async function emptyDb(version: 5 | 7 | 8 = 8): Promise<Database> {
+/** schema 7 by default, with the activities table a `brain activity` command makes; 5 is from before platform and host and has no activities. */
+export async function emptyDb(version: 5 | 7 = 7): Promise<Database> {
   const SQL = await sqlJs();
   const db = new SQL.Database();
-  for (const s of version === 8 ? [...SCHEMA, ...LATER, ...ACTIVITY] : version === 7 ? [...SCHEMA, ...LATER] : SCHEMA) db.run(s);
+  for (const s of version === 7 ? [...SCHEMA, ...LATER, ...ACTIVITY] : SCHEMA) db.run(s);
   db.run(`INSERT INTO meta VALUES ('schema_version','${version}')`);
   return db;
 }
@@ -119,9 +119,10 @@ export async function seededDb(): Promise<Database> {
   const act = (ago: number, action: string, ok: number, error = "", extra: Record<string, string | number> = {}) =>
     db.run(`INSERT INTO activities (source, ts, action, project, target, ok, duration_ms, error, host, raw, imported_at)
             VALUES ('baryovm',?,?,?,?,?,?,?,?,'{}',?)`,
-      [iso(ago), action, String(extra.project ?? "app"), String(extra.target ?? "oci1"), ok, 1200, error, "mac", iso(0)]);
+      [iso(ago), action, String(extra.project ?? "app"), String(extra.target ?? "oci1"), ok, 1200, error, String(extra.host ?? "mac"), iso(0)]);
   act(7200, "stack release", 1);
   act(60, "vm exec <b>x</b>", 0, "exit 1 <script>");
   act(DAY * 3, "deploy", 1);
+  act(DAY * 5, "odd", 1, "", { project: "<p>", target: "<t>", host: "<i>h</i>" });
   return db;
 }

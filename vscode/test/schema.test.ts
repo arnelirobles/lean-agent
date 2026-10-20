@@ -54,6 +54,6 @@ describe("fixture schema matches bin/brain", () => {
   it("is at the schema version the fixture says", () => {
     const text = fs.readFileSync(BRAIN, "utf8");
     const n = /MIGRATIONS = \[(.*)\]/.exec(text)![1].split(",").length;
-    expect(n).toBe(8);
+    expect(n).toBe(7);
   });
 });

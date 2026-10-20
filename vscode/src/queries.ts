@@ -32,6 +32,8 @@ export const FINISHED_JOBS = `
   SELECT id, cycle, project, test_project, status, tier, enqueued_at, started_at, ended_at, reason%LANE%%PRIO%
   FROM jobs WHERE status IN ('done','failed','cancelled') ORDER BY COALESCE(ended_at, enqueued_at) DESC, id DESC LIMIT 10`;
 
+export const HAS_ACTIVITIES = `SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name='activities'`;
+
 export const ACTIVITY = `
   SELECT id, source, ts, action, project, target, ok, duration_ms, error, host
   FROM activities ORDER BY ts DESC, id DESC LIMIT 100`;
