@@ -1,0 +1,1 @@
+bin/bump-version.sh

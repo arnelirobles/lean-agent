@@ -1,0 +1,1 @@
+bin/check-pinned-values.sh
