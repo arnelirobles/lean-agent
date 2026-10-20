@@ -312,9 +312,10 @@ def matched_none(rc, text):
     if rc != 0:
         return False
     text = ANSI.sub("", text)
-    if "No test matches the given testcase filter" in text:
-        return True
-    return bool(re.search(r"Failed:\s*\d+,\s*Passed:\s*\d+,\s*Skipped:\s*\d+", text)) and sum(Dotnet.counts(text)) == 0
+    if sum(Dotnet.counts(text)):  # a multi-target run can miss on one framework and run tests on another
+        return False
+    return "No test matches the given testcase filter" in text \
+        or bool(re.search(r"Failed:\s*\d+,\s*Passed:\s*\d+,\s*Skipped:\s*\d+", text))
 
 
 def lane_problem(rc, text):
@@ -958,6 +959,11 @@ echo "Passed!  - Failed: 0"; exit 0
         rc, out, calls = run(f"{repo_v} tests/T/T.csproj Good\n")
         if rc != 0 or "filter matched no test" in out:
             fails.append(f"a filtered run with tests must still pass ({rc}): {out}")
+        put("class-Multi", "No test matches the given testcase filter `FullyQualifiedName~Multi` in T.dll (net8.0)\n"
+            "Passed!  - Failed: 0, Passed: 2, Skipped: 0, Total: 2 - T.dll (net10.0)\n", 0)
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj Multi\n")
+        if rc != 0 or "filter matched no test" in out:
+            fails.append(f"a multi-target run with tests on one framework must pass ({rc}): {out}")
 
         # A build error: nonzero exit, no failing test named. It must not look like a pass.
         os.remove(os.path.join(d, "class-Acme.MtpTests"))
