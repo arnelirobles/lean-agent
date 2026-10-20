@@ -19,3 +19,20 @@ jobs:
           fetch-depth: 0
       - run: git config --global user.email ci@example.com && git config --global user.name ci
       - run: bash tests/run-all.sh
+
+  extension:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npx vitest run
