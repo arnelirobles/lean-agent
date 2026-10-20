@@ -326,8 +326,13 @@ def run(brain_cli):
         # route: send a queued job to a remote lane, back to the Mac, or to whichever lane is free.
         ra = run("queue", "add", rp, "Apple.Tests")[1]
         rc, out, err = run("queue", "route", ra, "--to", "remote")
+        if rc == 0 or "Apple" not in err or "--force" not in err:
+            fails.append(f"route --to remote on an apple project must be refused without --force: {rc} {out!r} {err!r}")
+        if nxt("--where", "remote", "--peek") is not None or nxt("--where", "local", "--peek") is None:
+            fails.append("a refused route must leave the platform unchanged")
+        rc, out, err = run("queue", "route", ra, "--to", "remote", "--force")
         if rc != 0 or f"job #{ra} queued" not in out or "platform=remote" not in out or "Apple" not in err:
-            fails.append(f"route --to remote must mark the job and warn about an apple project: {rc} {out!r} {err!r}")
+            fails.append(f"route --to remote --force must mark the job and warn about an apple project: {rc} {out!r} {err!r}")
         if nxt("--where", "local", "--peek") is not None:
             fails.append("the local lane must not claim a job routed to a remote lane")
         rb = run("queue", "add", rp, "Plain.Tests", "--after", ra)[1]
