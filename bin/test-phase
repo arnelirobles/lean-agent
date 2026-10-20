@@ -1011,7 +1011,7 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"an empty queue should be a quiet 0 ({rc}): {out} {calls}")
 
         # A job routed to a remote lane, with no remote lane: the Mac leaves it queued and says so.
-        jr = qadd(repo_v, "tests/T/R.csproj", "--cycle", "qr")
+        jr = qadd(repo_v, "tests/T/R.csproj", "--platform", "none", "--cycle", "qr")
         subprocess.run([sys.executable, BRAIN, "queue", "route", jr, "--to", "remote"], env=env, capture_output=True)
         rc, out, calls = drain()
         if rc != 0 or calls or "1 job waits for a remote lane" not in out \
@@ -1035,7 +1035,7 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"the job should run once the lock is free: {qlist('--cycle', 'ql')} {out}")
 
         # A job left running by a dead drainer is failed, and its dependent cancelled.
-        jr = qadd(repo_v, "tests/T/R.csproj", "--cycle", "qr")
+        jr = qadd(repo_v, "tests/T/R.csproj", "--platform", "none", "--cycle", "qr")
         jr2 = qadd(repo_v, "tests/T/R2.csproj", "--after", jr, "--cycle", "qr")
         subprocess.run([sys.executable, BRAIN, "queue", "next"], env=env, capture_output=True, text=True)
         # that claimed an older ready job, if any; claim until jr is running

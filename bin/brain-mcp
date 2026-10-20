@@ -357,6 +357,9 @@ def self_test():
                 if not err:
                     fails.append(f"brain_queue_add must refuse a folder that is not a git top folder: {not_top}")
             d = repo
+            os.makedirs(os.path.join(d, "tests"))
+            with open(os.path.join(d, "tests", "A.csproj"), "w") as f:
+                f.write("<Project><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>")
             err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
             if err:
                 fails.append(f"brain_queue_add: {text!r}")
@@ -373,6 +376,10 @@ def self_test():
             err, text = call("brain_queue_route", id=1, to="remote")
             if err or "platform=remote" not in text:
                 fails.append(f"brain_queue_route must send a queued job to a remote lane: {err} {text!r}")
+            call("brain_queue_add", repo_dir=d, test_project="tests/Mac.csproj")  # unreadable, so queued as apple
+            err, text = call("brain_queue_route", id=2, to="remote")
+            if not err or "--force" not in text:
+                fails.append(f"brain_queue_route must refuse sending an apple job to a remote lane: {err} {text!r}")
             for bad in ({"id": 1, "to": "vm"}, {"id": 1, "to": "--help"}, {"id": 1}):
                 err, text = call("brain_queue_route", **bad)
                 if not err:
