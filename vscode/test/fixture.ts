@@ -47,6 +47,15 @@ export const LATER = [
   `ALTER TABLE runs ADD COLUMN host TEXT NOT NULL DEFAULT ''`,
 ];
 
+export const ACTIVITY = [
+  `CREATE TABLE activities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, ts TEXT NOT NULL, action TEXT NOT NULL,
+        project TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', ok INTEGER NOT NULL DEFAULT 1,
+        duration_ms INTEGER, error TEXT NOT NULL DEFAULT '', host TEXT NOT NULL DEFAULT '',
+        raw TEXT NOT NULL DEFAULT '', imported_at TEXT NOT NULL)`,
+  `CREATE INDEX activities_ts ON activities (ts)`,
+];
+
 export const NOW = Date.UTC(2026, 9, 19, 12, 0, 0) / 1000;
 export const iso = (secondsAgo: number) => new Date((NOW - secondsAgo) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
 const DAY = 86400;
@@ -56,11 +65,11 @@ export async function sqlJs() {
   return initSqlJs({ wasmBinary: wasm as unknown as ArrayBuffer });
 }
 
-/** schema 7 by default; 5 gives a database from before platform and host. */
+/** schema 7 by default, with the activities table a `brain activity` command makes; 5 is from before platform and host and has no activities. */
 export async function emptyDb(version: 5 | 7 = 7): Promise<Database> {
   const SQL = await sqlJs();
   const db = new SQL.Database();
-  for (const s of version === 7 ? [...SCHEMA, ...LATER] : SCHEMA) db.run(s);
+  for (const s of version === 7 ? [...SCHEMA, ...LATER, ...ACTIVITY] : SCHEMA) db.run(s);
   db.run(`INSERT INTO meta VALUES ('schema_version','${version}')`);
   return db;
 }
@@ -106,5 +115,14 @@ export async function seededDb(): Promise<Database> {
   job("done", "tests/A.Tests/A.Tests.csproj", 900, 800, 700);
   job("running", "tests/B.Tests/B.Tests.csproj", 400, 300, null);
   job("queued", "tests/C.Tests/C.Tests.csproj", 100, null, null);
+
+  const act = (ago: number, action: string, ok: number, error = "", extra: Record<string, string | number> = {}) =>
+    db.run(`INSERT INTO activities (source, ts, action, project, target, ok, duration_ms, error, host, raw, imported_at)
+            VALUES ('baryovm',?,?,?,?,?,?,?,?,'{}',?)`,
+      [iso(ago), action, String(extra.project ?? "app"), String(extra.target ?? "oci1"), ok, 1200, error, String(extra.host ?? "mac"), iso(0)]);
+  act(7200, "stack release", 1);
+  act(60, "vm exec <b>x</b>", 0, "exit 1 <script>");
+  act(DAY * 3, "deploy", 1);
+  act(DAY * 5, "odd", 1, "", { project: "<p>", target: "<t>", host: "<i>h</i>" });
   return db;
 }

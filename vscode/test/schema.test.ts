@@ -3,10 +3,14 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { emptyDb } from "./fixture";
 
-const BRAIN = path.join(__dirname, "..", "..", "bin", "brain");
-const TABLES = ["meta", "runs", "items", "tags", "jobs", "sessions"];
+const BRAIN_LIB = path.join(__dirname, "..", "..", "lib", "brain");
+/** brain's source: bin/brain only starts the package in lib/brain. */
+const brainSource = () =>
+  fs.readdirSync(BRAIN_LIB).filter((f) => f.endsWith(".py")).sort()
+    .map((f) => fs.readFileSync(path.join(BRAIN_LIB, f), "utf8")).join("\n");
+const TABLES = ["meta", "runs", "items", "tags", "jobs", "sessions", "activities"];
 
-/** Column names per table as written in bin/brain: CREATE TABLE blocks plus ALTER TABLE ... ADD COLUMN. */
+/** Column names per table as written in lib/brain: CREATE TABLE blocks plus ALTER TABLE ... ADD COLUMN. */
 function brainColumns(text: string): Record<string, string[]> {
   const src = text.replace(/"\s*\n\s*"/g, ""); // join python string pieces
   const out: Record<string, string[]> = {};
@@ -38,9 +42,9 @@ function brainColumns(text: string): Record<string, string[]> {
   return out;
 }
 
-describe("fixture schema matches bin/brain", () => {
+describe("fixture schema matches lib/brain", () => {
   it("has the same columns for every table", async () => {
-    const theirs = brainColumns(fs.readFileSync(BRAIN, "utf8"));
+    const theirs = brainColumns(brainSource());
     expect(Object.keys(theirs).sort()).toEqual([...TABLES].sort());
     const db = await emptyDb();
     for (const t of TABLES) {
@@ -52,7 +56,7 @@ describe("fixture schema matches bin/brain", () => {
   });
 
   it("is at the schema version the fixture says", () => {
-    const text = fs.readFileSync(BRAIN, "utf8");
+    const text = brainSource();
     const n = /MIGRATIONS = \[(.*)\]/.exec(text)![1].split(",").length;
     expect(n).toBe(7);
   });

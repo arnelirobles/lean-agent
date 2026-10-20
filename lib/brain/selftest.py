@@ -535,6 +535,147 @@ def run(brain_cli):
             fails.append("only questions closed as answered are answers")
         if run("answers", "--session", "other")[1] != "":
             fails.append("answers go only to the session that asked")
+        # Activity: tools such as BaryoVM append JSON lines; brain imports each line once.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "activity.db")
+        log = os.path.join(d, "activity.jsonl")
+
+        def jl(**kw):
+            base = {"ts": "2026-10-19T08:00:00Z", "version": "1.2.0", "action": "stack release", "stack": "app",
+                    "vm": "oci1", "ok": True, "duration_ms": 1200, "host": "mac"}
+            base.update(kw)
+            return json.dumps(base)
+
+        with open(log, "w") as f:
+            f.write(jl() + "\n" + jl(ok=False, error="exit 1", action="vm exec") + "\n")
+        rc, out, _ = run("activity", "import-baryovm", "--file", log)
+        if rc != 0 or "imported 2" not in out or "skipped 0" not in out:
+            fails.append(f"import-baryovm first run: {rc} {out!r}")
+        rc, out, _ = run("activity", "import-baryovm", "--file", log)
+        if "imported 0" not in out or run("activity", "list")[1].count("\n") != 1:
+            fails.append(f"a second import must add nothing: {out!r}")
+        with open(log, "a") as f:
+            f.write(jl(action="deploy") + "\n")
+        run("activity", "import-baryovm", "--file", log)
+        if run("activity", "list")[1].count("\n") != 2:
+            fails.append("an appended line must be imported once")
+        with open(log, "w") as f:
+            f.write(jl(action="rotated") + "\n")
+        rc, out, _ = run("activity", "import-baryovm", "--file", log)
+        if "imported 1" not in out or "rotated" not in run("activity", "list")[1]:
+            fails.append(f"a file that shrank must be read from the start: {out!r}")
+        with open(log, "a") as f:
+            f.write("not json\n" + jl(token="abc") + "\n" + jl(ok="yes") + "\n" + jl(action="after-bad") + "\n")
+            f.write(jl(action="half"))  # no newline yet: a write in progress
+        rc, out, _ = run("activity", "import-baryovm", "--file", log)
+        if rc != 0 or "imported 1" not in out or "skipped 3" not in out:
+            fails.append(f"bad lines are skipped and counted, not fatal: {rc} {out!r}")
+        listing = run("activity", "list")[1]
+        if "after-bad" not in listing or "half" in listing or "abc" in listing:
+            fails.append(f"a line with unknown fields must not be stored, a partial line waits: {listing!r}")
+        with open(log, "a") as f:
+            f.write("\n")
+        run("activity", "import-baryovm", "--file", log)
+        if "half" not in run("activity", "list")[1]:
+            fails.append("a partial line must be read once it is complete")
+        rc, out, _ = run("activity", "import-baryovm", "--file", os.path.join(d, "missing.jsonl"))
+        if rc != 0:
+            fails.append(f"a missing activity file is not an error: {rc} {out!r}")
+        run("activity", "add", "--source", "agent", "--action", "build", "--project", "p", "--ok", "0",
+            "--error", "boom", "--ts", "2020-01-01T00:00:00Z")
+        failed = run("activity", "list", "--failed")[1]
+        if failed.count("\n") != 1 or "build" not in failed or "boom" not in failed or "after-bad" in failed:
+            fails.append(f"--failed lists only failures: {failed!r}")
+        if "build" in run("activity", "list", "--since", "24h")[1]:
+            fails.append("--since must drop old rows")
+        if "build" not in run("activity", "list", "--since", "9999d")[1]:
+            fails.append("--since keeps rows inside the window")
+        if run("activity", "list", "--source", "agent")[1].count("\n") != 0 \
+                or "build" not in run("activity", "list", "--source", "agent")[1] \
+                or run("activity", "list", "--project", "nope")[1]:
+            fails.append("--source and --project filter")
+
+        # No schema bump: a database the activity commands touched still opens with the previous brain.
+        # bin/brain needs lib/brain next to it, so take both.
+        old_root = os.path.join(d, "brain-main")
+        os.makedirs(old_root)
+        tar = subprocess.run(["git", "archive", "origin/main", "bin/brain", "lib/brain"], capture_output=True,
+                             cwd=os.path.dirname(os.path.dirname(me)), check=True).stdout
+        subprocess.run(["tar", "-x", "-C", old_root], input=tar, check=True)
+        old_brain = os.path.join(old_root, "bin", "brain")
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "shared.db")
+        run("add", "--project", "keepme", "--kind", "k", "--ref", "r")
+        run("activity", "add", "--source", "agent", "--action", "x")
+        con = sq.connect(env["LEAN_BRAIN_DB"])
+        ver = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        con.close()
+        if ver != "7":
+            fails.append(f"activity commands must not bump the schema version: {ver}")
+        for args in (["list"], ["queue", "list"], ["queue", "next", "--peek"], ["stats"]):
+            r = subprocess.run([sys.executable, old_brain, *args], env=env, capture_output=True, text=True)
+            if r.returncode != 0:
+                fails.append(f"previous brain {args} after activity use: {r.returncode} {r.stderr!r}")
+        r = subprocess.run([sys.executable, old_brain, "list"], env=env, capture_output=True, text=True)
+        if "keepme" not in r.stdout:
+            fails.append(f"previous brain lost the item: {r.stdout!r}")
+
+        # Rotated file that regrows past the stored offset is read from the start.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "rot.db")
+        rlog = os.path.join(d, "rot.jsonl")
+        with open(rlog, "w") as f:
+            f.write("".join(jl(action=f"old{n}") + "\n" for n in range(2)))
+        run("activity", "import-baryovm", "--file", rlog)
+        with open(rlog, "w") as f:
+            f.write("".join(jl(action=f"new{n}", ts=f"2026-10-20T08:00:0{n}Z") + "\n" for n in range(6)))
+        rc, out, _ = run("activity", "import-baryovm", "--file", rlog)
+        if "imported 6" not in out or "skipped 0" not in out:
+            fails.append(f"a regrown rotated file must be read whole: {out!r}")
+
+        # A symlink to the same file is the same file.
+        link = os.path.join(d, "link.jsonl")
+        os.symlink(rlog, link)
+        if "imported 0" not in run("activity", "import-baryovm", "--file", link)[1]:
+            fails.append("a symlinked path must share the offset")
+
+        # One bad row never blocks the import.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "bad.db")
+        blog = os.path.join(d, "bad.jsonl")
+        with open(blog, "w") as f:
+            f.write(jl(duration_ms=2 ** 70) + "\n" + jl(duration_ms=-1) + "\n" + jl(duration_ms="5") + "\n"
+                    + jl(duration_ms=True) + "\n" + jl(vm=1) + "\n" + jl(stack=None) + "\n" + jl(error=3) + "\n"
+                    + jl(host=[]) + "\n" + jl(ts="2026-10-19 08:00:00") + "\n" + jl(ts="2026-10-19T08:00:00+02:00")
+                    + "\n" + jl(action="good") + "\n")
+            f.write(b"\xff\xfe bad bytes\n".decode("latin-1") + "\n")
+        with open(blog, "ab") as f:
+            f.write(b'{"ts":"2026-10-19T08:00:00Z","action":"\xff","ok":true}\n')
+        rc, out, _ = run("activity", "import-baryovm", "--file", blog)
+        if rc != 0 or "imported 1," not in out or "skipped 12" not in out:
+            fails.append(f"each bad row is skipped, the good one imported: {rc} {out!r}")
+        rc, out, _ = run("activity", "import-baryovm", "--file", blog)
+        if "imported 0, skipped 0" not in out:
+            fails.append(f"offset must pass the bad rows: {out!r}")
+        con = sq.connect(env["LEAN_BRAIN_DB"])
+        raw = con.execute("SELECT raw FROM activities").fetchone()[0]
+        con.close()
+        if raw != jl(action="good"):
+            fails.append(f"raw is the line as written: {raw!r}")
+
+        # Unreadable paths say so.
+        for bad in (d, os.path.join(d, "nope", "x")):
+            rc, out, err = run("activity", "import-baryovm", "--file", bad)
+            if bad == d and (rc != 1 or "Traceback" in err or not err):
+                fails.append(f"a directory as --file: {rc} {err!r}")
+        # add checks --ts like the importer
+        rc, _, err = run("activity", "add", "--source", "a", "--action", "b", "--ts", "yesterday")
+        if rc == 0 or "Traceback" in err:
+            fails.append(f"activity add must refuse a bad --ts: {rc} {err!r}")
+
+        # list is newest first by ts, not by id
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "order.db")
+        for ts, name in (("2026-01-02T00:00:00Z", "mid"), ("2026-01-03T00:00:00Z", "new"), ("2026-01-01T00:00:00Z", "old")):
+            run("activity", "add", "--source", "s", "--action", name, "--ts", ts)
+        names = [ln.split()[4] for ln in run("activity", "list")[1].splitlines()]
+        if names != ["new", "mid", "old"]:
+            fails.append(f"list is newest first by ts: {names}")
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

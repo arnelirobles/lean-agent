@@ -24,6 +24,11 @@
             machine (platform=apple); any: whichever lane is free. remote refuses an Apple job without --force
   brain queue next [--peek] [--where local|remote] [--host NAME]   (what test-phase uses to drain)
   brain queue finish ID --status done|failed | requeue ID --reason R   (requeue puts a running job back)
+  brain activity add --source S --action A [--ts T] [--project P] [--target T] [--ok 0|1] [--duration-ms N]
+            [--error E] [--host H]
+  brain activity list [--source S] [--project P] [--since 24h] [--failed] [--limit N]      newest first
+  brain activity import-baryovm [--file PATH]   reads BaryoVM's activity.jsonl from where the last import
+            stopped, so a rerun adds nothing; a file that shrank is read from the start
   brain resume [--project P] [--max N]
   brain stats [--json]
   brain export [--format md|json] [--project P] [--status S]
@@ -67,10 +72,12 @@ Memory files keep standing preferences. Run logs are scratch and can expire once
 brain. A ledger points to open items with a line like "open items: brain list --project X --status open".
 """
 import argparse
+import socket
 import os
 
 from .store import MODEL, PHASE, RESOLUTION, RUNNERS, SEVERITY, SOURCE, STATUS, TIERS
 from .items import cmd_add, cmd_answers, cmd_close, cmd_list, cmd_reopen, cmd_run_add, cmd_session, cmd_show
+from .activity import cmd_activity
 from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
 from .report import cmd_export, cmd_resume, cmd_stats
 
@@ -191,6 +198,27 @@ def parser():
     q.add_argument("--run-id", type=int)
     q.add_argument("--reason", default="")
     s.set_defaults(fn=cmd_queue)
+    s = sub.add_parser("activity")
+    acs = s.add_subparsers(dest="acmd", required=True)
+    q = acs.add_parser("add")
+    q.add_argument("--source", required=True)
+    q.add_argument("--action", required=True)
+    q.add_argument("--ts", default="")
+    q.add_argument("--project", default="")
+    q.add_argument("--target", default="")
+    q.add_argument("--ok", type=int, choices=(0, 1), default=1)
+    q.add_argument("--duration-ms", type=int)
+    q.add_argument("--error", default="")
+    q.add_argument("--host", default=socket.gethostname())
+    q = acs.add_parser("list")
+    q.add_argument("--source")
+    q.add_argument("--project")
+    q.add_argument("--since", help="like 24h, 7d, 30m")
+    q.add_argument("--failed", action="store_true")
+    q.add_argument("--limit", type=int, default=50)
+    q = acs.add_parser("import-baryovm")
+    q.add_argument("--file", help="default $BARYOVM_HOME/activity.jsonl, or ~/.baryovm/activity.jsonl")
+    s.set_defaults(fn=cmd_activity)
     s = sub.add_parser("resume")
     s.add_argument("--project")
     s.add_argument("--max", type=int, default=40)

@@ -89,6 +89,18 @@ function queueSection(d: DashboardData): string {
       card(`<table><thead><tr><th class="num">job</th><th>suite</th><th>project</th><th>lanes</th><th></th></tr></thead><tbody>${queued}</tbody></table>`) : "");
 }
 
+function activitySection(d: DashboardData): string {
+  if (!d.activity.length) return empty("No activity recorded yet.", "info");
+  const rows = d.activity.map((a) =>
+    `<tr${a.ok ? "" : ` class="failed"`}><td>${a.ok ? pill("ok", "green", "check") : pill("failed", "red", "error")}</td>` +
+    `<td class="muted" title="${esc(a.ts)}">${esc(relativeTime(a.ts, d.generatedAt))}</td>` +
+    `<td>${pill(a.source, "blue", "tools")}</td><td>${esc(a.action)}${a.error ? `<div class="muted">${esc(a.error)}</div>` : ""}</td>` +
+    `<td class="muted">${esc([a.project, a.target].filter(Boolean).join(" "))}</td>` +
+    `<td class="num">${a.duration_ms == null ? "" : esc(formatDuration(a.duration_ms / 1000))}</td>` +
+    `<td class="muted">${esc(a.host)}</td></tr>`).join("");
+  return card(`<table><thead><tr><th></th><th>when</th><th>source</th><th>action</th><th>where</th><th class="num">took</th><th>host</th></tr></thead><tbody>${rows}</tbody></table>`);
+}
+
 function headlineSection(d: DashboardData): string {
   const h = d.headline;
   const tile = (label: string, value: string, icon: string, tone: Tone) =>
@@ -189,6 +201,8 @@ export function dashboardBody(d: DashboardData, note = "", media = ""): string {
         sec("Numbers", "graph", "blue") + headlineSection(d) },
     { id: "queue", label: "Queue", icon: "list-ordered", tone: "green", badge: d.queue.running.length + d.queue.queued.length,
       body: queueSection(d) },
+    { id: "activity", label: "Activity", icon: "tools", tone: "blue", badge: d.activity.filter((a) => !a.ok).length,
+      body: sec("Activity", "tools", "blue", "what other tools did, newest first") + activitySection(d) },
     { id: "cycles", label: "Cycles", icon: "history", tone: "green", badge: d.cycles.length,
       body: sec("Cycles", "history", "green", "one row per test cycle") + cyclesSection(d) },
     { id: "suites", label: "Suites", icon: "beaker", tone: "purple",
