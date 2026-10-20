@@ -1,7 +1,7 @@
 import type { Database } from "sql.js";
 import * as Q from "./queries";
 import type {
-  Counts, CycleRow, DashboardData, Headline, ItemFull, ItemRow, JobRow, LoadPoint, QueueData, StaleRow, SuiteRow,
+  ActivityRow, Counts, CycleRow, DashboardData, Headline, ItemFull, ItemRow, JobRow, LoadPoint, QueueData, StaleRow, SuiteRow,
 } from "./types";
 
 // Pure functions over a sql.js Database. Nothing here imports vscode.
@@ -182,6 +182,14 @@ export function stale(db: Database, now: number): StaleRow[] {
   return rows(db, Q.STALE, [isoAt(now - STALE_DAYS * 86400)]) as StaleRow[];
 }
 
+/** The newest activity. A database before schema 8 has no activities table. */
+export function activity(db: Database): ActivityRow[] {
+  if ((schemaVersion(db) ?? 0) < 8) return [];
+  return rows(db, Q.ACTIVITY).map((r) => ({
+    ...r, ok: Number(r.ok) === 1, duration_ms: r.duration_ms == null ? null : Number(r.duration_ms),
+  })) as ActivityRow[];
+}
+
 export function dashboard(db: Database, now: number): DashboardData {
   return {
     schemaVersion: schemaVersion(db),
@@ -193,6 +201,7 @@ export function dashboard(db: Database, now: number): DashboardData {
     load: loadPoints(db),
     stale: stale(db, now),
     queue: queue(db),
+    activity: activity(db),
     generatedAt: now,
   };
 }

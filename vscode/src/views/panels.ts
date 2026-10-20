@@ -54,7 +54,7 @@ function wire(panel: vscode.WebviewPanel, a: Actions): void {
 function emptyData(): DashboardData {
   return {
     schemaVersion: null, waiting: [], headline: { realOpen: 0, flakyOpen: 0, closed7d: 0, runs7d: 0, testSeconds7d: 0 },
-    cycles: [], suites: [], flakiest: [], load: [], stale: [], queue: { running: [], queued: [], finished: [], today: [] }, generatedAt: Math.floor(Date.now() / 1000),
+    cycles: [], suites: [], flakiest: [], load: [], stale: [], queue: { running: [], queued: [], finished: [], today: [] }, activity: [], generatedAt: Math.floor(Date.now() / 1000),
   };
 }
 

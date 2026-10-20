@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { emptyDb } from "./fixture";
 
 const BRAIN = path.join(__dirname, "..", "..", "bin", "brain");
-const TABLES = ["meta", "runs", "items", "tags", "jobs", "sessions"];
+const TABLES = ["meta", "runs", "items", "tags", "jobs", "sessions", "activities"];
 
 /** Column names per table as written in bin/brain: CREATE TABLE blocks plus ALTER TABLE ... ADD COLUMN. */
 function brainColumns(text: string): Record<string, string[]> {
@@ -54,6 +54,6 @@ describe("fixture schema matches bin/brain", () => {
   it("is at the schema version the fixture says", () => {
     const text = fs.readFileSync(BRAIN, "utf8");
     const n = /MIGRATIONS = \[(.*)\]/.exec(text)![1].split(",").length;
-    expect(n).toBe(7);
+    expect(n).toBe(8);
   });
 });

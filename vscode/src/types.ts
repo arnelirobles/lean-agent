@@ -20,6 +20,10 @@ export interface JobRow {
 }
 export interface Counts { real: number; flaky: number }
 /** Jobs a lane finished in the last 24 hours, by status. host is the remote's name, empty for this machine. */
+export interface ActivityRow {
+  id: number; source: string; ts: string; action: string; project: string; target: string; ok: boolean;
+  duration_ms: number | null; error: string; host: string;
+}
 export interface LaneCount { host: string; status: string; n: number }
 export interface QueueData { running: JobRow[]; queued: JobRow[]; finished: JobRow[]; today: LaneCount[] }
 /** A [remote NAME] section of remotes.ini, as far as the dashboard shows it. */
@@ -44,6 +48,7 @@ export interface DashboardData {
   load: LoadPoint[];
   stale: StaleRow[];
   queue: QueueData;
+  activity: ActivityRow[];
   generatedAt: number;
   /** Remote lanes from remotes.ini; the panel fills it, the database does not know them. */
   remotes?: RemoteLane[];

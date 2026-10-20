@@ -20,7 +20,19 @@ describe("db queries", () => {
   });
 
   it("reads the schema version", () => {
-    expect(db.schemaVersion(d)).toBe(7);
+    expect(db.schemaVersion(d)).toBe(8);
+  });
+
+  it("lists activity newest first and says which failed", () => {
+    const a = db.activity(d);
+    expect(a.map((r) => r.action)).toEqual(["vm exec <b>x</b>", "stack release", "deploy"]);
+    expect(a[0].ok).toBe(false);
+    expect(a[0].error).toBe("exit 1 <script>");
+    expect(a[1].ok).toBe(true);
+  });
+
+  it("reads no activity from a database before schema 8", async () => {
+    expect(db.activity(await emptyDb(7))).toEqual([]);
   });
 
   it("lists open items only, and the fixture is not empty", () => {

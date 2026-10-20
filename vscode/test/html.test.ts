@@ -136,6 +136,25 @@ describe("item html", () => {
   });
 });
 
+describe("dashboard activity tab", () => {
+  it("sits next to Queue and lists newest first with failures marked", () => {
+    const html = dashboardBody(data);
+    const at = (t: string) => html.indexOf(`data-tab="${t}"`);
+    expect(at("queue")).toBeGreaterThan(-1);
+    expect(at("activity")).toBeGreaterThan(at("queue"));
+    expect(at("activity")).toBeLessThan(at("cycles"));
+    const panel = html.slice(html.indexOf(`data-panel="activity"`), html.indexOf(`data-panel="cycles"`));
+    expect(panel.indexOf("stack release")).toBeGreaterThan(panel.indexOf("vm exec"));
+    expect(panel).toContain("failed");
+    expect(panel).not.toContain("<script>");
+    expect(panel).toContain("&lt;b&gt;x&lt;/b&gt;");
+  });
+
+  it("says when there is no activity", () => {
+    expect(dashboardBody({ ...data, activity: [] })).toContain("No activity recorded yet.");
+  });
+});
+
 describe("dashboard queue tab", () => {
   const job = (id: number, status: string, platform: string, host: string, routable = true, priority: number | null = 0) => ({
     id, cycle: "c", project: "core", test_project: "Core.Tests/Core.Tests.csproj", status, tier: "full",
