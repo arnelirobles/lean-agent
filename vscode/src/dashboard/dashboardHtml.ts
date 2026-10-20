@@ -30,7 +30,8 @@ const routeBtn = (j: JobRow, to: "remote" | "local" | "any", icon: string, label
 /** The buttons the sidebar shows for the same job: send to a remote lane, or let any lane take it. */
 function routeButtons(j: JobRow): string {
   if (!j.routable) return "";
-  return j.platform === "remote" ? routeBtn(j, "any", "device-desktop", "Any lane") : routeBtn(j, "remote", "cloud-upload", "Send to remote");
+  if (j.platform === "remote" || j.platform === "apple") return routeBtn(j, "any", "device-desktop", "Any lane");
+  return routeBtn(j, "remote", "cloud-upload", "Send to remote");
 }
 
 /** Up and down swap a queued job with its neighbour in run order. None on a database from before schema 6,

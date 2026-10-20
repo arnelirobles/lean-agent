@@ -21,8 +21,8 @@
   brain queue move ID up|down              swap a queued job with the one before or after it; a job never
             moves ahead of the job it waits on
   brain queue cancel ID                    a queued job; jobs waiting on it are cancelled too
-  brain queue route ID --to remote|local|any   remote: only a remote lane claims it; local: only this
-            machine (platform=apple); any: whichever lane is free
+  brain queue route ID --to remote|local|any [--force]   remote: only a remote lane claims it; local: only this
+            machine (platform=apple); any: whichever lane is free. remote refuses an Apple job without --force
   brain queue next [--peek] [--where local|remote] [--host NAME]   (what test-phase uses to drain)
   brain queue finish ID --status done|failed | requeue ID --reason R   (requeue puts a running job back)
   brain resume [--project P] [--max N]
@@ -616,9 +616,14 @@ def cmd_queue(a):
                 sys.exit(f"brain: no job #{a.id}")
             if r["status"] != "queued":
                 sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be routed")
+            needs_apple = a.to == "remote" and (
+                r["platform"] == "apple" or detect_platform(r["repo_dir"], r["test_project"]) == "apple")
+            if needs_apple and not a.force:
+                sys.exit(f"brain: job #{a.id} needs an Apple platform and would likely fail to build on a remote host; "
+                         "pass --force to send it anyway")
             con.execute("UPDATE jobs SET platform=? WHERE id=?",
                         ({"remote": "remote", "local": "apple", "any": ""}[a.to], a.id))
-        if a.to == "remote" and detect_platform(r["repo_dir"], r["test_project"]) == "apple":
+        if needs_apple:
             print(f"brain: job #{a.id} may need an Apple platform; it can fail to build on a remote host",
                   file=sys.stderr)
         print(job_line(con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()))
@@ -878,6 +883,7 @@ def parser():
     q = qs.add_parser("route")
     q.add_argument("id", type=int)
     q.add_argument("--to", choices=("remote", "local", "any"), required=True)
+    q.add_argument("--force", action="store_true", help="send an Apple job to a remote lane anyway")
     q = qs.add_parser("requeue")
     q.add_argument("id", type=int)
     q.add_argument("--reason", required=True)
@@ -1219,8 +1225,13 @@ def self_test():
         # route: send a queued job to a remote lane, back to the Mac, or to whichever lane is free.
         ra = run("queue", "add", rp, "Apple.Tests")[1]
         rc, out, err = run("queue", "route", ra, "--to", "remote")
+        if rc == 0 or "Apple" not in err or "--force" not in err:
+            fails.append(f"route --to remote on an apple project must be refused without --force: {rc} {out!r} {err!r}")
+        if nxt("--where", "remote", "--peek") is not None or nxt("--where", "local", "--peek") is None:
+            fails.append("a refused route must leave the platform unchanged")
+        rc, out, err = run("queue", "route", ra, "--to", "remote", "--force")
         if rc != 0 or f"job #{ra} queued" not in out or "platform=remote" not in out or "Apple" not in err:
-            fails.append(f"route --to remote must mark the job and warn about an apple project: {rc} {out!r} {err!r}")
+            fails.append(f"route --to remote --force must mark the job and warn about an apple project: {rc} {out!r} {err!r}")
         if nxt("--where", "local", "--peek") is not None:
             fails.append("the local lane must not claim a job routed to a remote lane")
         rb = run("queue", "add", rp, "Plain.Tests", "--after", ra)[1]

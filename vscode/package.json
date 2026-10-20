@@ -174,7 +174,7 @@
         },
         {
           "command": "leanBrain.sendToRemote",
-          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple)$/",
+          "when": "view == leanBrain.queue && viewItem == job.queued.any",
           "group": "inline"
         },
         {
@@ -184,7 +184,7 @@
         },
         {
           "command": "leanBrain.sendToRemote",
-          "when": "view == leanBrain.queue && viewItem =~ /^job\\.queued\\.(any|apple)$/",
+          "when": "view == leanBrain.queue && viewItem == job.queued.any",
           "group": "0_route"
         },
         {

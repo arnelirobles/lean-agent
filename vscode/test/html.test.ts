@@ -158,7 +158,8 @@ describe("dashboard queue tab", () => {
     expect(html).not.toContain(`data-route="3:any"`);
     expect(html).toContain(`data-route="4:any"`);
     expect(html).not.toContain(`data-route="4:remote"`);
-    expect(html).toContain(`data-route="5:remote"`);
+    expect(html).not.toContain(`data-route="5:remote"`);
+    expect(html).toContain(`data-route="5:any"`);
     expect(html).toMatch(/#4<\/td>.*?remote only/s);
   });
 
