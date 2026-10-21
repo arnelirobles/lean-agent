@@ -131,6 +131,11 @@ def cmd_queue(a):
             sys.exit("brain: --again needs a reason")
         repo = os.path.abspath(a.repo_dir)
         commit = git_out(repo, "rev-parse", "HEAD") or ""
+        # Everything that runs git or reads files happens before the write lock is taken.
+        project = a.project or project_of(repo)
+        platform = detect_platform(repo, a.test_project) if a.platform == "auto" else ("apple" if a.platform == "apple" else "")
+        st = subprocess.run(["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True) \
+            if a.tier == "full" and commit and not again else None
         # The checks and the insert are one transaction, so parallel adds of one job make one job.
         con.isolation_level = None
         con.execute("BEGIN IMMEDIATE")
@@ -153,7 +158,6 @@ def cmd_queue(a):
                     return 0
                 # One full run per commit: the suite runs once, as the final check. A filtered full job is not it.
                 if a.tier == "full" and commit and not again:
-                    project = a.project or project_of(repo)
                     prior = con.execute(
                         "SELECT id, status FROM jobs WHERE tier='full' AND COALESCE(filter,'')='' AND project=? AND test_project=?"
                         " AND commit_hash=? AND status IN ('queued','running','done') ORDER BY id LIMIT 1",
@@ -161,7 +165,6 @@ def cmd_queue(a):
                     if prior:
                         sys.exit(f"brain: a full run of {project} {a.test_project} at {commit[:8]} already exists as job "
                                  f"#{prior['id']} ({prior['status']}); pass --again \"reason\" to run it again")
-                    st = subprocess.run(["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True)
                     if st.returncode != 0:
                         sys.exit(f"brain: git status failed in {repo}, so the tree cannot be checked: "
                                  f"{st.stderr.strip()}; pass --again \"reason\" to queue anyway")
@@ -173,12 +176,11 @@ def cmd_queue(a):
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
                 " enqueued_at, status, reason, ended_at, args, platform, commit_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (a.cycle, a.project or project_of(repo), repo, a.test_project, a.filter, a.tier, a.after,
+                (a.cycle, project, repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
                  f"dependency #{a.after} {dep['status']}" if dead else
                  (f"again: {again}" if again else ""), now() if dead else None, a.args,
-                 detect_platform(repo, a.test_project) if a.platform == "auto" else
-                 ("apple" if a.platform == "apple" else ""), commit))
+                 platform, commit))
             con.execute("COMMIT")
         except BaseException:
             if con.in_transaction:

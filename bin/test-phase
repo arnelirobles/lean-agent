@@ -475,6 +475,7 @@ def _run_job(job, a, run_dir, runner, lane):
 
 
 def enqueue(entries, a, cycle):
+    queued = []
     for repo, project, fast, extra, again in entries:
         base = ["queue", "add", repo, project, "--cycle", cycle, "--by", "test-phase"]
         if extra:
@@ -491,11 +492,16 @@ def enqueue(entries, a, cycle):
             r = subprocess.run([sys.executable, BRAIN] + base + tier_args, capture_output=True, text=True)
             if tier_args[1] == "fast" and r.returncode == 0 and "joined" not in r.stderr:
                 fast_id = r.stdout.strip()
+                queued.append(fast_id)
+            elif r.returncode == 0 and r.stdout.strip().isdigit():
+                queued.append(r.stdout.strip())
             if r.returncode != 0:
                 if fast_id.isdigit():
                     brain(["queue", "cancel", fast_id])
+                    queued.remove(fast_id)
+                kept = f"jobs from earlier plan lines stay queued: {', '.join('#' + i for i in queued)}. " if queued else ""
                 sys.exit(f"test-phase: could not queue {project} ({tier_args[1]}): {r.stderr.strip()}\n"
-                         f"test-phase: nothing more was queued. Fix that, or add again=REASON to the plan line to run it anyway.")
+                         f"test-phase: the rest of the plan was not queued; {kept}Fix that, or add again=REASON to the plan line to run it anyway.")
 
 
 def cancelled_ids():
