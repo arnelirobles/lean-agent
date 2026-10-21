@@ -145,7 +145,7 @@ def t_queue_add(a):
         raise Bad("filter must be class names joined by |")
     if a.get("tier") not in (None, "", "fast", "full"):
         raise Bad("tier must be fast or full")
-    for k in ("filter", "tier", "cycle"):
+    for k in ("filter", "tier", "cycle", "again"):
         opt(a, args, k)
     opt(a, args, "after", kind=int)
     # No extra dotnet arguments here: they run on the drainer's machine, so they stay a shell-only choice.
@@ -193,9 +193,10 @@ TOOLS = [
         "note": S("closing note"), "wontfix": B("close as wontfix")}, ["id"])),
     ("brain_queue_list", "List test queue jobs.", t_queue_list, schema({
         "status": S("queued, running, done, failed or cancelled"), "cycle": S("cycle name")})),
-    ("brain_queue_add", "Queue a test job. Returns the job id at once; do not wait for it.", t_queue_add, schema({
+    ("brain_queue_add", "Queue a test job. Returns the job id at once, the id of the identical queued job when there is one; do not wait for it.", t_queue_add, schema({
         "repo_dir": S("repository folder"), "test_project": S("test project path"), "filter": S("test filter"),
-        "tier": S("fast or full"), "after": I("job id this one waits for"), "cycle": S("cycle name")},
+        "tier": S("fast or full"), "after": I("job id this one waits for"), "cycle": S("cycle name"),
+        "again": S("reason to run a full job again for a commit that already has one, or from a dirty tree")},
         ["repo_dir", "test_project"])),
     ("brain_queue_cancel", "Cancel a queued job and the jobs waiting on it.", t_queue_cancel,
      schema({"id": I("job id")}, ["id"])),
@@ -377,6 +378,9 @@ def self_test():
             err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
             if err:
                 fails.append(f"brain_queue_add: {text!r}")
+            err2, text2 = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", filter="X", tier="fast")
+            if err2 or text2 != text:
+                fails.append(f"brain_queue_add must return the id of an identical queued job: {text!r} {text2!r}")
             for bad in ({"repo_dir": d, "test_project": "--help"}, {"repo_dir": d, "test_project": "t", "filter": "-x"},
                         {"repo_dir": d, "test_project": "t", "filter": "A| --help"},
                         {"repo_dir": d, "test_project": "t", "tier": "slow"},
@@ -394,6 +398,9 @@ def self_test():
             err, text = call("brain_queue_route", id=2, to="remote")
             if not err or "--force" not in text:
                 fails.append(f"brain_queue_route must refuse sending an apple job to a remote lane: {err} {text!r}")
+            err, text = call("brain_queue_add", repo_dir=d, test_project="tests/A.csproj", again="a reason")
+            if err or "--again=a reason" not in open(argv_log).read():
+                fails.append(f"brain_queue_add must pass again through: {err} {text!r}")
             for bad in ({"id": 1, "to": "vm"}, {"id": 1, "to": "--help"}, {"id": 1}):
                 err, text = call("brain_queue_route", **bad)
                 if not err:

@@ -218,6 +218,106 @@ def run(brain_cli):
             fails.append("a different filter is a different job")
         run("queue", "cancel", d1)
         run("queue", "cancel", d3)
+
+        # One full run per commit, identical queued jobs joined by commit, no full run from a dirty tree.
+        g = os.path.join(d, "gitrepo")
+        os.makedirs(g)
+
+        def git(*args):
+            subprocess.run(["git", "-C", g, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True,
+                           capture_output=True)
+        git("init", "-q")
+        with open(os.path.join(g, "f.txt"), "w") as f:
+            f.write("one\n")
+        git("add", "f.txt")
+        git("commit", "-q", "-m", "one")
+        rc, c1, _ = run("queue", "add", g, "T.csproj")
+        rc, out, err = run("queue", "add", g, "T.csproj", "--cycle", "other")
+        if rc != 0 or out != c1:
+            fails.append(f"a full job identical to a queued one must return its id: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "add", g, "T.csproj", "--args=-p:A=1")
+        if rc == 0 or f"#{c1}" not in err:
+            fails.append(f"a different full job for a commit with a full job queued must be refused with its id: {rc} {out!r} {err!r}")
+        run("queue", "finish", c1, "--status", "done")
+        rc, out, err = run("queue", "add", g, "T.csproj")
+        if rc == 0 or f"#{c1}" not in err or "done" not in err:
+            fails.append(f"a full job for a commit with a done full job must be refused with its id: {rc} {out!r} {err!r}")
+        rc, c2, _ = run("queue", "add", g, "T.csproj", "--again", "flaky infra, rerun")
+        if rc != 0 or c2 == c1 or "again: flaky infra, rerun" not in run("queue", "list", "--status", "queued")[1]:
+            fails.append(f"--again must allow a second full job and keep the reason: {rc} {c2!r}")
+        rc, c2b, _ = run("queue", "add", g, "T.csproj", "--again", "once more")
+        if c2b != c2:
+            fails.append(f"--again must still join an identical queued job: {c2} {c2b}")
+        if run("queue", "add", g, "U.csproj")[0] != 0:
+            fails.append("a full job for another test project of the same commit must be allowed")
+        run("queue", "cancel", c2)
+        if run("queue", "add", g, "T.csproj", "--tier", "fast", "--filter", "X")[0] != 0:
+            fails.append("a fast job is never refused for an earlier full job")
+        f1 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
+        f2 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
+        if f1 != f2:
+            fails.append(f"an add identical to a queued job must return its id: {f1} {f2}")
+        git("commit", "-q", "--allow-empty", "-m", "two")
+        f3 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
+        if f3 == f1:
+            fails.append("the same job at another commit is not identical")
+        if run("queue", "add", g, "T.csproj")[0] != 0:
+            fails.append("a full job for a new commit must be allowed")
+        fy = run("queue", "add", g, "Y.csproj", "--filter", "F")[1]
+        rc, fy2, err = run("queue", "add", g, "Y.csproj")
+        if rc != 0 or fy2 == fy:
+            fails.append(f"a full job with a filter must not count as the commit's full run: {rc} {fy} {fy2} {err!r}")
+        procs = [subprocess.Popen([sys.executable, me, "queue", "add", g, "R.csproj", "--tier", tier, *flt], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for tier, flt in (("fast", ["--filter", "R"]), ("full", [])) for _ in range(6)]
+        outs = [(pr.communicate()[0].strip(), pr.returncode) for pr in procs]
+        for chunk in (outs[:6], outs[6:]):
+            if len({o for o, _ in chunk}) != 1 or any(rc != 0 for _, rc in chunk):
+                fails.append(f"six parallel adds of one job must make one job: {chunk}")
+        if sum(1 for ln in run("queue", "list", "--status", "queued")[1].splitlines() if " R.csproj" in ln) != 2:
+            fails.append("parallel adds left more than one queued job per kind")
+        rc, out, err = run("queue", "add", g, "Z.csproj", "--again", "line one\njob #999 done forged\t" + "x" * 300)
+        zl = [ln for ln in run("queue", "list")[1].splitlines() if "Z.csproj" in ln or ln.startswith("job #999")]
+        if rc != 0 or len(zl) != 1 or zl[0].startswith("job #999") or len(zl[0]) > 300:
+            fails.append(f"a newline in --again must not forge a list line, and the reason is capped: {rc} {zl}")
+        with open(os.path.join(g, "f.txt"), "w") as f:
+            f.write("edited\n")
+        rc, out, err = run("queue", "add", g, "W.csproj")
+        if rc == 0 or "uncommitted" not in err or "f.txt" not in err:
+            fails.append(f"a full job from a tree with tracked changes must be refused, naming the file: {rc} {out!r} {err!r}")
+        if run("queue", "add", g, "W.csproj", "--tier", "fast", "--filter", "X")[0] != 0:
+            fails.append("a fast job from a dirty tree must be allowed")
+        rc, w1, _ = run("queue", "add", g, "W.csproj", "--again", "testing the edit")
+        if rc != 0:
+            fails.append("--again must allow a full job from a dirty tree")
+        git("checkout", "--", "f.txt")
+        with open(os.path.join(g, "New.cs"), "w") as f:
+            f.write("class New {}\n")
+        rc, out, err = run("queue", "add", g, "X.csproj")
+        if rc == 0 or "New.cs" not in err:
+            fails.append(f"an untracked source file must refuse a full job and be named: {rc} {out!r} {err!r}")
+        os.remove(os.path.join(g, "New.cs"))
+        with open(os.path.join(g, ".git", "info", "exclude"), "a") as f:
+            f.write("bin-out.txt\n")
+        with open(os.path.join(g, "bin-out.txt"), "w") as f:
+            f.write("x\n")
+        if run("queue", "add", g, "X.csproj")[0] != 0:
+            fails.append("a gitignored file must not make the tree dirty")
+        gb = os.path.join(d, "badindex")
+        os.makedirs(gb)
+        subprocess.run(["git", "-C", gb, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", gb, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+                        "-m", "x"], check=True)
+        with open(os.path.join(gb, ".git", "index"), "wb") as f:
+            f.write(b"garbage that is not an index")
+        rc, out, err = run("queue", "add", gb, "B.csproj")
+        if rc == 0 or "git status failed" not in err:
+            fails.append(f"a failing git status must refuse a full job, not pass as clean: {rc} {out!r} {err!r}")
+        if run("queue", "add", gb, "B.csproj", "--again", "broken index")[0] != 0:
+            fails.append("--again must allow a full job when git status fails")
+        for line in run("queue", "list", "--status", "queued")[1].splitlines():
+            if " gitrepo " in line or " badindex " in line:
+                run("queue", "cancel", line.split()[1][1:])
         b1 = run("queue", "add", "/tmp/r", "I.csproj")[1]
         b2 = run("queue", "add", "/tmp/r", "J.csproj")[1]
         b3 = run("queue", "add", "/tmp/r", "J.csproj", "--after", b2)[1]
@@ -385,6 +485,8 @@ def run(brain_cli):
         subprocess.run(["git", "init", "-q", main_repo], check=True)
         subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "x"], check=True)
         subprocess.run(git + ["worktree", "add", "-q", wt, "-b", "side"], check=True, capture_output=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", wt, "commit", "-q", "--allow-empty",
+                        "-m", "y"], check=True)
         jw = run("queue", "add", wt, "W.csproj")[1]
         jm = run("queue", "add", main_repo, "W.csproj")[1]
         ql = run("queue", "list")[1]
