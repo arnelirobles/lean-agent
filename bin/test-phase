@@ -1234,6 +1234,9 @@ echo "Passed!  - Failed: 0"; exit 0
         # A job whose failures are all flaky is done: its dependent runs and the exit is 0.
         put("full", "  Failed Fl.FlakyOnly.A [1 ms]\nFailed!  - Failed: 1, Passed: 2, Skipped: 0, Total: 3\n", 1)
         put("class-Fl.FlakyOnly", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        # F2 fails a test of its own: the same name in two test projects is one test to brain.
+        put("full-F2.csproj", "  Failed Fl.OtherFlaky.A [1 ms]\nFailed!  - Failed: 1, Passed: 2, Skipped: 0, Total: 3\n", 1)
+        put("class-Fl.OtherFlaky", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
         jf1 = qadd(repo_v, "tests/T/F1.csproj", "--cycle", "qf")
         jf2 = qadd(repo_v, "tests/T/F2.csproj", "--after", jf1, "--cycle", "qf")
         rc, out, calls = drain()
@@ -1308,19 +1311,22 @@ echo "Passed!  - Failed: 0"; exit 0
         free, stop = [], threading.Event()
 
         def competitor():
-            while not stop.is_set():
+            end = time.monotonic() + 120  # never outlives the test, whatever happens to the drain
+            while not stop.is_set() and time.monotonic() < end:
                 if os.path.exists(first) and not os.path.exists(last) and hl.probe(lockfile) == 0:
                     free.append(1)
                 time.sleep(0.002)
 
-        thread = threading.Thread(target=competitor)
+        thread = threading.Thread(target=competitor, daemon=True)
         env["FAKE_SLEEP"] = "0.3"
         thread.start()
-        qadd(repo_v, "tests/T/Hd.csproj", "--cycle", "qh")
-        rc, out, calls = drain()
-        env.pop("FAKE_SLEEP")
-        stop.set()
-        thread.join()
+        try:
+            qadd(repo_v, "tests/T/Hd.csproj", "--cycle", "qh")
+            rc, out, calls = drain()
+        finally:
+            env.pop("FAKE_SLEEP")
+            stop.set()
+            thread.join(10)
         if len([c for c in calls if "FullyQualifiedName~Hd.C" in c]) != 2 or free:
             fails.append(f"the lane must stay held from a job's full run to its last rerun ({len(free)} free polls): {calls}")
 
