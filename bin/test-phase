@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Drain the test queue: every queued test run once, in the heavy lane, failures sorted into brain.
 
-usage: test-phase [PLAN] [--cycle C] [--lane L] [--stall S] [--run-dir D] [--project NAME] [--branch B]
+usage: test-phase [PLAN] [--cycle C] [--lane L] [--stall S] [--fail-stall S] [--isolation-over N] [--run-dir D]
+       [--project NAME] [--branch B]
        test-phase --self-test
 
 The cycle this serves: code everything with builds only, queue the test runs, drain the queue once,
@@ -33,13 +34,28 @@ For each job: run it, list the failing tests, run each failing class alone, and 
 it passes alone (exit 0, or passed tests and the name absent) or real if it fails again. It is unverified
 when the rerun was cut off or failed without naming the test or passing anything. Real and unverified
 go to brain as test-fail, flaky as flaky. A job that fails without naming a failing test (a build error)
-goes in as test-fail too. A stall is only a note, because the watchdog says it is likely load, not code.
+goes in as test-fail too. A stall is only a note, because the watchdog says it is likely load, not code;
+the note carries the passed and failed counts and the last test seen.
+
+A job holds its lane from its first command to its last, so its alone reruns are not queued behind another
+session. A command that ends by a signal (exit 128 + n) is recorded as killed: no test-fail or flaky item is
+filed from it, and the job goes back to the queue once; a second kill fails it. A run that adds only
+failures, no passes, for --fail-stall seconds is stopped and recorded as stalled-failing with the counts.
+
+When more than --isolation-over tests (default 10) fail in one run and every one passes alone, one
+isolation item lists them and no flaky items are filed: that is a leak between tests. In a full run, a test
+that fails and passes alone again on a branch that already has an open flaky item for it becomes a
+test-fail tagged order-dependent. A passing full run runs `brain flaky-clear`, which closes flaky items
+with no new occurrence in 5 passing full runs, resolution flaky-cleared.
 Logs are under the run directory: ${LEAN_TEST_PHASE_DIR:-~/.local/share/lean/test-phase}/<timestamp>.
 
   --cycle      cycle label for a plan's jobs, runs and items (default: the run directory's name)
   --lane       heavy.sh lane (default dotnet)
   --stall      seconds without test progress before a command is stopped (default 600, 0 is off);
                it starts when the command starts, so keep it above the build time
+  --fail-stall seconds of failures with no test passing before a command is stopped as stalled-failing
+               (default 1200, 0 is off; TEST_PHASE_FAIL_STALL)
+  --isolation-over  how many tests may fail together and pass alone before they are one isolation item (10)
   --project    brain project name for a plan's jobs (default: the main repository's name, so worktrees share it)
   --branch     brain branch (default: the repo's current branch)
 
@@ -76,6 +92,11 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+try:
+    import heavy_lock as hl
+except ImportError:  # without the helper a job takes the lane command by command, as before
+    hl = None
 try:
     import lean_remote as lr
 except ImportError:  # a copy of test-phase without its module still drains the local lane
@@ -183,7 +204,31 @@ class Lane:
 LOCAL = Lane("local", "local")
 
 
-def heavy(lane, cmd, cwd, log, stall, header=None):
+class Hold:
+    """A job's claim on its heavy.sh lane: taken at its first command and kept to its last, so the alone
+    reruns are not queued behind another session's run."""
+
+    def __init__(self, lane):
+        self.lane, self.fd = lane, None
+        self.ok = bool(hl) and bool(re.fullmatch(r"[A-Za-z0-9._-]+", lane))
+
+    def take(self, wait):
+        """Seconds spent waiting (0 once held), or None when the lane stayed busy for wait seconds."""
+        if self.fd is not None:
+            return 0.0
+        d = os.environ.get("HEAVY_LOCK_DIR") or "/tmp/heavy-locks"
+        os.makedirs(d, exist_ok=True)
+        t0 = time.monotonic()
+        self.fd = hl.acquire(os.path.join(d, self.lane + ".lock"), wait)
+        return None if self.fd is None else time.monotonic() - t0
+
+    def release(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0):
     """Run cmd in the lane. Returns (exit code, output, started, ended, seconds spent waiting for the lane)."""
     env = dict(os.environ)
     env.setdefault("HEAVY_WAIT", "3600")
@@ -191,9 +236,24 @@ def heavy(lane, cmd, cwd, log, stall, header=None):
         env["HEAVY_STALL"] = str(stall)
     else:
         env.pop("HEAVY_STALL", None)
+    if fail_stall:
+        env["HEAVY_FAIL_STALL"] = str(fail_stall)
+    else:
+        env.pop("HEAVY_FAIL_STALL", None)
+    env.pop("HEAVY_HELD", None)
     timing = log + ".wait"
     env["HEAVY_TIMING_FILE"] = timing
     started = int(time.time())
+    held = hold if hold and hold.ok and env["HEAVY_WAIT"].isdigit() else None
+    waited = None
+    if held:
+        waited = held.take(int(env["HEAVY_WAIT"]))
+        if waited is None:  # what heavy.sh itself says when the lane stays busy, so a busy job reads the same
+            text = (header if header is not None else "$ " + " ".join(shlex.quote(c) for c in cmd) + "\n") \
+                + f"heavy.sh: timed out after {env['HEAVY_WAIT']}s waiting for lane '{lane}'. Nothing ran.\n"
+            open(log, "w").write(text)
+            return 75, text, started, int(time.time()), float(env["HEAVY_WAIT"])
+        env["HEAVY_HELD"] = "1"
     with open(log, "w") as fh:
         # The header is always one line, so what follows it is the command's own output.
         fh.write(header if header is not None else "$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
@@ -206,6 +266,8 @@ def heavy(lane, cmd, cwd, log, stall, header=None):
         os.remove(timing)
     except (OSError, ValueError):
         wait = None
+    if held:
+        wait = waited
     return rc, open(log, errors="replace").read(), started, ended, wait
 
 
@@ -248,7 +310,7 @@ def requeue_job(job_id, problem, say):
     return False
 
 
-def add_item(row, kind, ref, severity, body, run_id, ctx):
+def add_item(row, kind, ref, severity, body, run_id, ctx, tags=()):
     ref = mask(ref)
     args = ["add", "--project", row["project"], "--repo", ctx["repo"], "--kind", kind, "--ref", ref,
             "--title", ref, "--body-file", "-", "--severity", severity, "--phase", "test", "--source", "test-phase",
@@ -257,6 +319,8 @@ def add_item(row, kind, ref, severity, body, run_id, ctx):
         args += ["--branch", ctx["branch"]]
     if run_id:
         args += ["--run-id", str(run_id)]
+    for t in tags:
+        args += ["--tag", t]
     brain(args, stdin=mask(body))  # the body goes by stdin, not argv, where any user's ps could read it
 
 
@@ -266,7 +330,7 @@ def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start,
     out = brain(["run-add", "--cycle", ctx["cycle"], "--project", row["project"], "--repo", ctx["repo"],
                  "--test-project", os.path.basename(project), "--runner", mode, "--tier", tier,
                  "--started", str(started), "--ended", str(ended), "--passed", str(passed),
-                 "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc == 76 else "0",
+                 "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc in (76, 78) else "0",
                  "--exit-code", str(rc)]
                 + (["--host", lane.remote.name] if lane.remote else [])
                 + (["--lane-wait", str(wait)] if wait is not None else [])
@@ -302,7 +366,66 @@ def safe(s):
 
 
 def tier_note(rc):
-    return {0: "pass", 75: "busy", 76: "stalled"}.get(rc, "fail")
+    return {0: "pass", 75: "busy", 76: "stalled", 78: "stalled-failing"}.get(rc, "fail")
+
+
+def signal_of(rc):
+    """The signal that ended a command, or 0. heavy.sh reports a kill as 128 + n; a negative code is a bash that
+    was itself killed."""
+    if rc < 0:
+        return -rc
+    return rc - 128 if 129 <= rc <= 159 else 0
+
+
+STALL_FACTS = re.compile(r"^heavy\.sh: stalled(?:-failing)?: .*\(passed (\d+), failed (\d+), last test: (.*)\)\s*$", re.M)
+
+
+def stall_facts(text):
+    """(passed, failed, last test) from heavy.sh's stall message, or None."""
+    found = STALL_FACTS.findall(text)
+    return (int(found[-1][0]), int(found[-1][1]), found[-1][2]) if found else None
+
+
+def earlier_items(row, ctx):
+    """Item ids by test name: this branch's open flaky items, and its open order-dependent test-fails."""
+    where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
+    out = {"flaky": {}, "order": {}}
+    for kind, key, extra in (("flaky", "flaky", []), ("test-fail", "order", ["--tag", "order-dependent"])):
+        text = brain(["list", "--open", "--kind", kind, "--project", row["project"]] + extra) or ""
+        for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important) occ=\d+ last=", text, re.M):
+            if m.group(2) == where:
+                out[key][m.group(3)] = int(m.group(1))
+    return out
+
+
+def file_results(row, labelled, a, run_id, ctx, stem):
+    """File what the reruns showed. Many tests that failed together and passed alone are one isolation item."""
+    project = row["test"]
+    flaky = [n for n, label, _ in labelled if label == "flaky"]
+    isolated = len(flaky) > a.isolation_over
+    if isolated:
+        row["notes"].append(f"isolation: {len(flaky)} tests failed together and passed alone")
+        add_item(row, "isolation", f"isolation: {project}", "important",
+                 f"{len(flaky)} tests failed in one run and every one passed alone, more than {a.isolation_over}. "
+                 f"That is a leak between tests, not {len(flaky)} flaky tests. Log: {stem}.log\n" + "\n".join(flaky),
+                 run_id, ctx)
+    earlier = earlier_items(row, ctx) if flaky and not isolated and row["tier"] == "full" else {"flaky": {}, "order": {}}
+    for name, label, body in labelled:
+        if label != "flaky":
+            row["real"] += 1
+            add_item(row, "test-fail", name, "important", body, run_id, ctx)
+        elif isolated:
+            row["flaky"] += 1
+        elif mask(name) in earlier["flaky"] or mask(name) in earlier["order"]:
+            row["real"] += 1  # failed in a full run and passed alone, again: it depends on what ran before it
+            add_item(row, "test-fail", name, "important", "order-dependent; " + body, run_id, ctx,
+                     tags=["order-dependent"])
+            if mask(name) in earlier["flaky"]:
+                brain(["close", str(earlier["flaky"][mask(name)]), "--resolution", "duplicate", "--note",
+                       "failed in a full run and passed alone again; filed as an order-dependent test-fail"])
+        else:
+            row["flaky"] += 1
+            add_item(row, "flaky", name, "minor", body, run_id, ctx)
 
 
 def matched_none(rc, text):
@@ -340,14 +463,16 @@ def clean_remote(remote, job_id):
 
 
 def run_job(job, a, run_dir, runner, lane=LOCAL):
+    hold = Hold(f"remote-{lane.remote.name}" if lane.remote else a.lane)
     try:
-        return _run_job(job, a, run_dir, runner, lane)
+        return _run_job(job, a, run_dir, runner, lane, hold)
     finally:
+        hold.release()
         if lane.remote:
             clean_remote(lane.remote, job["id"])
 
 
-def _run_job(job, a, run_dir, runner, lane):
+def _run_job(job, a, run_dir, runner, lane, hold):
     repo, project = job["repo_dir"], job["test_project"]
     remote = lane.remote
     cfg = lane.repos.get(job["project"]) if remote else None
@@ -403,13 +528,14 @@ def _run_job(job, a, run_dir, runner, lane):
             before = lr.remote_load(remote)
             ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd))
             rc, text, started, ended, wait = heavy(f"remote-{remote.name}", ssh, repo, log, a.stall,
-                                                   header=f"$ ssh {remote.name} <script for job {job['id']}>\n")
+                                                   header=f"$ ssh {remote.name} <script for job {job['id']}>\n",
+                                                   hold=hold, fail_stall=a.fail_stall)
             problem = lane_problem(rc, text)
             if problem:
                 raise LaneProblem(problem)
         else:
             before = load1()
-            rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall)
+            rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall, hold=hold, fail_stall=a.fail_stall)
         return rc, text, record_run(row, ctx, name, mode, rc, text, started, ended, wait, before, project, lane)
 
     try:
@@ -419,12 +545,24 @@ def _run_job(job, a, run_dir, runner, lane):
         return row
     row["rc"], row["run_id"] = rc, run_id
     row["result"] = tier_note(rc)
+    if signal_of(rc):  # killed from outside: what it printed before that says nothing about the tests
+        row["result"] = "killed"
+        row["notes"].append(f"killed by signal {signal_of(rc)}, nothing filed")
+        return row
     for name, detail in runner.failures(text):
         failing.setdefault(name, detail)
+    facts = stall_facts(text) if rc in (76, 78) else None
+    seen = f"passed {facts[0]}, failed {facts[1]}, last test: {facts[2]}" if facts else "no counts in the log"
     if rc == 76:
-        row["notes"].append("stalled, likely load")
+        row["notes"].append("stalled, likely load" + (f" ({facts[0]} passed, {facts[1]} failed)" if facts else ""))
         add_item(row, "note", f"stalled: {project}", "info",
-                 f"no test progress for {a.stall} s, stopped by heavy.sh. Log: {stem}.log", run_id, ctx)
+                 f"no test progress for {a.stall} s, stopped by heavy.sh. {seen}. Log: {stem}.log", run_id, ctx)
+    elif rc == 78:
+        row["notes"].append(f"stalled-failing: only failures for {a.fail_stall} s"
+                            + (f" ({facts[0]} passed, {facts[1]} failed)" if facts else ""))
+        add_item(row, "note", f"stalled-failing: {project}", "important",
+                 f"only failures, no test passed, for {a.fail_stall} s, stopped by heavy.sh. {seen}. "
+                 f"Log: {stem}.log", run_id, ctx)
     elif rc == 75:
         row["notes"].append("lane busy, nothing ran")
     elif job["filter"] and not failing and matched_none(rc, text):
@@ -441,7 +579,13 @@ def _run_job(job, a, run_dir, runner, lane):
     for name in failing:
         by_class.setdefault(runner.class_of(name), []).append(name)
     row["failing"] = len(failing)
+    if rc == 0 and job["tier"] == "full" and not failing:
+        cleared = (brain(["flaky-clear", "--project", row["project"], "--test-project", os.path.basename(project)])
+                   or "").splitlines()
+        if cleared:
+            row["notes"].append(f"{len(cleared)} flaky closed after 5 passing runs")
     lost = None
+    labelled = []  # (name, label, body), filed once every rerun is in, so a job killed on the way files none
     for cls, names in by_class.items():
         log = f"{stem}-class-{safe(cls)}.log"
         rrc, rtext = 75, ""  # a rerun that could not run proves nothing: unverified
@@ -451,6 +595,10 @@ def _run_job(job, a, run_dir, runner, lane):
             except LaneProblem as e:
                 lost = row["lane_rest"] = str(e)
                 row["notes"].append(f"rerun not run: {lost}")
+        if signal_of(rrc):
+            row["result"] = "killed"
+            row["notes"].append(f"killed by signal {signal_of(rrc)} in a rerun, nothing filed")
+            return row
         again = {n for n, _ in runner.failures(rtext)}
         rpassed = runner.counts(rtext)[0]
         for name in names:
@@ -463,13 +611,8 @@ def _run_job(job, a, run_dir, runner, lane):
                 label = "unverified"
             else:
                 label = "real"
-            body = f"{label}; alone: {tier_note(rrc)}. Log: {log}\n{failing[name]}"
-            if label == "flaky":
-                row["flaky"] += 1
-                add_item(row, "flaky", name, "minor", body, run_id, ctx)
-            else:
-                row["real"] += 1
-                add_item(row, "test-fail", name, "important", body, run_id, ctx)
+            labelled.append((name, label, f"{label}; alone: {tier_note(rrc)}. Log: {log}\n{failing[name]}"))
+    file_results(row, labelled, a, run_id, ctx, stem)
     return row
 
 
@@ -544,6 +687,7 @@ def drain(a, run_dir, runner, lanes=None):
     wake = threading.Condition(lock)  # an idle lane waits on it, a finished job wakes it
     stop = threading.Event()  # set when no lane is working, so a resting lane wakes and ends
     state = {l.name: "work" for l in lanes}
+    retried = set()  # jobs put back once after a kill
     seen = {}  # idle lane: the finish count its last empty poll saw
     done = [0]  # jobs finished or put back; an idle lane polls again when it moved
 
@@ -625,6 +769,15 @@ def drain(a, run_dir, runner, lanes=None):
                     if not rest(lane):
                         return
                     continue
+                if row["result"] == "killed":
+                    if job["id"] not in retried:
+                        retried.add(job["id"])
+                        if requeue_job(job["id"], "; ".join(row["notes"]) + "; retried once", say):
+                            say(f"test-phase: job #{job['id']} was killed by a signal, back to queued once")
+                        job = None
+                        finished()
+                        continue
+                    row["notes"].append("killed again, not retried")
                 with lock:
                     rows.append(row)
                 reason = "; ".join(row["notes"])
@@ -673,7 +826,7 @@ def table(rows, show_host=False):
 
 
 def is_bad(r):
-    if r["result"] in ("stalled", "busy", "error"):
+    if r["result"] in ("stalled", "stalled-failing", "killed", "busy", "error"):
         return True
     if r["real"]:
         return True
@@ -685,6 +838,8 @@ def main(argv):
     p.add_argument("plan", nargs="?")
     p.add_argument("--lane", default="dotnet")
     p.add_argument("--stall", type=int, default=int(os.environ.get("TEST_PHASE_STALL", "600")))
+    p.add_argument("--fail-stall", type=int, default=int(os.environ.get("TEST_PHASE_FAIL_STALL", "1200")))
+    p.add_argument("--isolation-over", type=int, default=10)
     p.add_argument("--run-dir")
     p.add_argument("--project")
     p.add_argument("--branch")
@@ -856,6 +1011,14 @@ def self_test():
         with open(shim, "w") as fh:
             fh.write('''#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
+: > "$FAKE_DIR/first-call"
+[ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
+for k in kill-once kill-always; do
+  if [ -f "$FAKE_DIR/$k" ]; then
+    [ "$k" = kill-once ] && rm -f "${FAKE_DIR:?}/${k:?}"
+    echo "failed K.Tests.A (1ms)"; kill -TERM $$
+  fi
+done
 case "$*" in
   *Canceller.csproj*) python3 "$FAKE_BRAIN" queue cancel "$FAKE_CANCEL" >/dev/null ;;
 esac
@@ -863,10 +1026,14 @@ case "$*" in
   *"--filter-class "*|*"FullyQualifiedName~"*)
     all="$*"; cls=${all##*--filter-class }; [ "$cls" = "$all" ] && cls=${all##*FullyQualifiedName~}
     cls=${cls%% *}
+    : > "$FAKE_DIR/rerun-$cls"
     f=$FAKE_DIR/class-$cls
+    if [ -f "$f.kill" ]; then rm -f "${f:?}.kill"; kill -TERM $$; fi
     if [ -f "$f" ]; then cat "$f"; [ -f "$f.rc" ] && exit "$(cat "$f.rc")"; exit 0; fi
     echo "passed $cls.Any (1ms)"; exit 0 ;;
 esac
+pf=$FAKE_DIR/full-$(basename "$2")
+if [ -f "$pf" ]; then cat "$pf"; exit "$(cat "$pf.rc")"; fi
 if [ -f "$FAKE_DIR/full" ]; then cat "$FAKE_DIR/full"; exit "$(cat "$FAKE_DIR/full.rc")"; fi
 echo "Passed!  - Failed: 0"; exit 0
 ''')
@@ -954,8 +1121,12 @@ echo "Passed!  - Failed: 0"; exit 0
         # The same failure again is one brain row with a higher seen count.
         run(f"{repo_v} tests/T/T.csproj\n")
         lst = brain_list("--kind", "test-fail")
-        if len(lst.splitlines()) != 1 or "occ=2" not in lst:
+        breaks = [l for l in lst.splitlines() if "Acme.RealTests.Breaks" in l]
+        if len(breaks) != 1 or "occ=2" not in breaks[0]:
             fails.append(f"a repeat run must dedupe in brain: {lst!r}")
+        odd = [l for l in lst.splitlines() if "Acme.FlakyTests.Sometimes" in l]
+        if len(lst.splitlines()) != 2 or len(odd) != 1 or "tags=order-dependent" not in odd[0]:
+            fails.append(f"a test that failed in a full run and passed alone twice is order-dependent: {lst!r}")
 
         # MTP repo, with ANSI colour and a passing project: exit 0, MTP syntax.
         os.remove(os.path.join(d, "full"))
@@ -1126,6 +1297,126 @@ echo "Passed!  - Failed: 0"; exit 0
         if f"job #{jr} failed" not in ql or "drainer died" not in ql or f"job #{jr2} cancelled" not in ql:
             fails.append(f"stale running job not failed: {ql}")
 
+        # A job holds its lane from its full run to its last rerun: a competitor polling the lane never finds it free.
+        lockfile = os.path.join(d, "locks", "dotnet.lock")
+        first, last = os.path.join(d, "first-call"), os.path.join(d, "rerun-Hd.C2")
+        for f in (first, last):
+            if os.path.exists(f):
+                os.remove(f)
+        put("full-Hd.csproj", "  Failed Hd.C1.T [1 ms]\n  Failed Hd.C2.T [1 ms]\n"
+            "Failed!  - Failed: 2, Passed: 1, Skipped: 0, Total: 3\n", 1)
+        free, stop = [], threading.Event()
+
+        def competitor():
+            while not stop.is_set():
+                if os.path.exists(first) and not os.path.exists(last) and hl.probe(lockfile) == 0:
+                    free.append(1)
+                time.sleep(0.002)
+
+        thread = threading.Thread(target=competitor)
+        env["FAKE_SLEEP"] = "0.3"
+        thread.start()
+        qadd(repo_v, "tests/T/Hd.csproj", "--cycle", "qh")
+        rc, out, calls = drain()
+        env.pop("FAKE_SLEEP")
+        stop.set()
+        thread.join()
+        if len([c for c in calls if "FullyQualifiedName~Hd.C" in c]) != 2 or free:
+            fails.append(f"the lane must stay held from a job's full run to its last rerun ({len(free)} free polls): {calls}")
+
+        # A command ended by a signal is killed: nothing is filed from it, and the job runs again once.
+        put("full-K.csproj", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        open(os.path.join(d, "kill-once"), "w").close()
+        jk = qadd(repo_v, "tests/T/K.csproj", "--cycle", "qk")
+        rc, out, calls = drain()
+        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        killed_rows = con.execute("SELECT COUNT(*) FROM runs WHERE test_project='K.csproj' AND exit_code=143").fetchone()[0]
+        con.close()
+        if len([c for c in calls if "K.csproj" in c]) != 2 or f"job #{jk} done" not in qlist("--cycle", "qk") or rc != 0 \
+                or "K.Tests.A" in brain_list() or "back to queued once" not in out or killed_rows != 1:
+            fails.append(f"a killed run must file nothing and run again once ({rc}): {calls} {qlist('--cycle', 'qk')} {out}")
+        open(os.path.join(d, "kill-always"), "w").close()
+        jk2 = qadd(repo_v, "tests/T/K2.csproj", "--cycle", "qk2")
+        rc, out, calls = drain()
+        os.remove(os.path.join(d, "kill-always"))
+        if len([c for c in calls if "K2.csproj" in c]) != 2 or f"job #{jk2} failed" not in qlist("--cycle", "qk2") \
+                or rc != 1 or "K.Tests.A" in brain_list():
+            fails.append(f"a second kill must fail the job, not loop ({rc}): {calls} {qlist('--cycle', 'qk2')}")
+        put("full-Kr.csproj", "  Failed Kr.C1.T [1 ms]\nFailed!  - Failed: 1, Passed: 1, Skipped: 0, Total: 2\n", 1)
+        open(os.path.join(d, "class-Kr.C1.kill"), "w").close()
+        qadd(repo_v, "tests/T/Kr.csproj", "--cycle", "qkr")
+        rc, out, calls = drain()
+        kr = [l for l in brain_list("--kind", "flaky").splitlines() if "Kr.C1.T" in l]
+        if len([c for c in calls if "Kr.csproj" in c and "FullyQualifiedName" not in c]) != 2 \
+                or len(kr) != 1 or "occ=1" not in kr[0]:
+            fails.append(f"a rerun killed on the way must file nothing from that attempt: {calls} {kr}")
+
+        # Many tests that fail together and pass alone are one isolation item, not flaky items.
+        put("full-Iso.csproj", "".join(f"  Failed Iso.C{i}.T [1 ms]\n" for i in range(1, 12))
+            + "Failed!  - Failed: 11, Passed: 1, Skipped: 0, Total: 12\n", 1)
+        qadd(repo_v, "tests/T/Iso.csproj", "--cycle", "qi")
+        rc, out, calls = drain()
+        iso = brain_list("--kind", "isolation")
+        if len(iso.splitlines()) != 1 or "isolation: tests/T/Iso.csproj" not in iso or "Iso.C" in brain_list("--kind", "flaky"):
+            fails.append(f"11 tests that pass alone must be one isolation item and no flaky items ({rc}): {iso!r}")
+        shown = subprocess.run([sys.executable, BRAIN, "show", iso.split()[0].lstrip("#")], env=env, capture_output=True,
+                               text=True).stdout if iso else ""
+        if "Iso.C1.T" not in shown or "Iso.C11.T" not in shown or ".log" not in shown:
+            fails.append(f"the isolation item must list the tests and the log: {shown!r}")
+        # The limit is a flag: exactly the limit is still flaky, one more is isolation.
+        put("full-Is3.csproj", "".join(f"  Failed Is3.C{i}.T [1 ms]\n" for i in range(1, 4))
+            + "Failed!  - Failed: 3, Passed: 1, Skipped: 0, Total: 4\n", 1)
+        qadd(repo_v, "tests/T/Is3.csproj", "--cycle", "qi3")
+        drain("--isolation-over", "3")
+        if brain_list("--kind", "flaky").count("Is3.C") != 3 or "Is3" in brain_list("--kind", "isolation"):
+            fails.append(f"as many failures as the limit are flaky items, not isolation: {brain_list()!r}")
+        put("full-Is4.csproj", "".join(f"  Failed Is4.C{i}.T [1 ms]\n" for i in range(1, 4))
+            + "Failed!  - Failed: 3, Passed: 1, Skipped: 0, Total: 4\n", 1)
+        qadd(repo_v, "tests/T/Is4.csproj", "--cycle", "qi4")
+        drain("--isolation-over", "2")
+        if "isolation: tests/T/Is4.csproj" not in brain_list("--kind", "isolation") or "Is4.C" in brain_list("--kind", "flaky"):
+            fails.append(f"more failures than --isolation-over must be an isolation item: {brain_list()!r}")
+
+        # A test that fails in a full run and passes alone again, on the same branch, is order-dependent.
+        put("full-Od.csproj", "  Failed Od.C1.T [1 ms]\nFailed!  - Failed: 1, Passed: 1, Skipped: 0, Total: 2\n", 1)
+        qadd(repo_v, "tests/T/Od.csproj", "--cycle", "qo1")
+        drain("--branch", "feat")
+        if "flaky vrepo@feat Od.C1.T" not in brain_list("--open") or "Od.C1.T" in brain_list("--kind", "test-fail"):
+            fails.append(f"the first sighting is flaky: {brain_list()!r}")
+        qadd(repo_v, "tests/T/Od.csproj", "--cycle", "qo2")
+        rc, out, calls = drain("--branch", "feat")
+        odd = [l for l in brain_list("--kind", "test-fail", "--open").splitlines() if "Od.C1.T" in l]
+        if rc != 1 or len(odd) != 1 or "tags=order-dependent" not in odd[0] or "vrepo@feat" not in odd[0] \
+                or "flaky vrepo@feat Od.C1.T" in brain_list("--open"):
+            fails.append(f"the second sighting on the branch is an order-dependent test-fail, the flaky item closed ({rc}): {brain_list()!r}")
+        qadd(repo_v, "tests/T/Od.csproj", "--cycle", "qo3")
+        drain("--branch", "feat")
+        odd = [l for l in brain_list("--kind", "test-fail", "--open").splitlines() if "Od.C1.T" in l]
+        if len(odd) != 1 or "occ=2" not in odd[0] or "flaky vrepo@feat Od.C1.T" in brain_list("--open"):
+            fails.append(f"it stays one order-dependent item and does not turn flaky again: {brain_list()!r}")
+        qadd(repo_v, "tests/T/Od.csproj", "--cycle", "qo4")
+        drain("--branch", "other")
+        if "flaky vrepo@other Od.C1.T" not in brain_list("--open"):
+            fails.append(f"a different branch starts as flaky again: {brain_list()!r}")
+
+        # A flaky item with no new occurrence in 5 passing full runs closes as flaky-cleared.
+        put("full-Fc.csproj", "  Failed Fc.C1.T [1 ms]\nFailed!  - Failed: 1, Passed: 1, Skipped: 0, Total: 2\n", 1)
+        qadd(repo_v, "tests/T/Fc.csproj", "--cycle", "qf0")
+        drain()
+        put("full-Fc.csproj", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        for i in range(1, 5):
+            qadd(repo_v, "tests/T/Fc.csproj", "--cycle", f"qf{i}")
+            drain()
+        if "flaky vrepo Fc.C1.T" not in brain_list("--open"):
+            fails.append(f"4 passing runs must not clear it: {brain_list()!r}")
+        qadd(repo_v, "tests/T/Fc.csproj", "--cycle", "qf5")
+        drain()
+        closed = [l for l in brain_list("--kind", "flaky", "--status", "closed").splitlines() if "Fc.C1.T" in l]
+        shown = subprocess.run([sys.executable, BRAIN, "show", closed[0].split()[0].lstrip("#")], env=env,
+                               capture_output=True, text=True).stdout if closed else ""
+        if "resolution: flaky-cleared" not in shown:
+            fails.append(f"the 5th passing run must close the flaky item as flaky-cleared: {closed} {shown!r}")
+
         # A stall: a silent hang is stopped and only noted, not logged as a failing test.
         put("full", "", 0)
         with open(shim, "w") as fh:
@@ -1133,6 +1424,30 @@ echo "Passed!  - Failed: 0"; exit 0
         rc, out, calls = run(f"{repo_m} tests/T/T.csproj\n", "--stall", "2")
         if rc != 1 or "stalled" not in out or "stalled: tests/T/T.csproj" not in brain_list("--kind", "note"):
             fails.append(f"stall not handled ({rc}): {out}")
+        note = [l for l in brain_list("--kind", "note").splitlines() if "stalled: tests/T/T.csproj" in l]
+        shown = subprocess.run([sys.executable, BRAIN, "show", note[0].split()[0].lstrip("#")], env=env,
+                               capture_output=True, text=True).stdout if note else ""
+        if "passed 1, failed 0" not in shown:
+            fails.append(f"a stall note must carry the passed and failed counts: {shown!r}")
+        # Only failures for --fail-stall seconds: stopped as stalled-failing with the counts.
+        with open(shim, "w") as fh:
+            fh.write('#!/bin/sh\nwhile :; do echo "failed Sf"; sleep 0.3; done\n')
+        rc, out, calls = run(f"{repo_m} tests/T/Sf.csproj\n", "--stall", "0", "--fail-stall", "2")
+        sf = [l for l in brain_list("--kind", "note").splitlines() if "stalled-failing: tests/T/Sf.csproj" in l]
+        shown = subprocess.run([sys.executable, BRAIN, "show", sf[0].split()[0].lstrip("#")], env=env,
+                               capture_output=True, text=True).stdout if sf else ""
+        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        sfrun = con.execute("SELECT stalled FROM runs WHERE test_project='Sf.csproj' AND exit_code=78").fetchall()
+        con.close()
+        if rc != 1 or "stalled-failing" not in out or "passed 0, failed " not in shown or "last test: failed Sf" not in shown \
+                or sfrun != [(1,)]:
+            fails.append(f"a failures-only run must be stopped as stalled-failing with counts ({rc}): {out} {shown!r} {sfrun}")
+        # The same failures with passes between are left alone.
+        with open(shim, "w") as fh:
+            fh.write('#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8; do echo "failed Sp"; echo "passed Sp.T$i (1ms)"; sleep 0.4; done\n')
+        rc, out, calls = run(f"{repo_m} tests/T/Sp.csproj\n", "--stall", "0", "--fail-stall", "2")
+        if "stalled" in out or "stalled-failing: tests/T/Sp.csproj" in brain_list("--kind", "note"):
+            fails.append(f"a run that keeps passing tests must not be stopped ({rc}): {out}")
         # No plan lines means nothing ran, which must not read as success.
         pf = os.path.join(d, "empty.txt")
         open(pf, "w").write("# nothing\n")
