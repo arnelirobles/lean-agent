@@ -25,7 +25,7 @@ BLOCK_HEADING = "## Scripts on PATH"
 NOT_COMMANDS = {"brain-mcp", "lean_remote.py"}
 
 PATH_PATTERNS = [
-    re.compile(r"\$\{?CLAUDE_PLUGIN_ROOT\}?/bin/"),
+    re.compile(r"\$\{?CLAUDE_PLUGIN_ROOT\}?\"?/bin/"),
     re.compile(r"lean-agent/\d+\.\d+\.\d+/"),
     re.compile(r"plugins/cache/"),
 ]
@@ -95,6 +95,8 @@ def self_test():
 
     expect("plugin root bin path", len(path_problems("x", "run ${CLAUDE_PLUGIN_ROOT}/bin/brain list")), 1)
     expect("unbraced plugin root bin path", len(path_problems("x", "$CLAUDE_PLUGIN_ROOT/bin/brain")), 1)
+    expect("quoted braced form", len(path_problems("x", 'run "${CLAUDE_PLUGIN_ROOT}"/bin/brain')), 1)
+    expect("quoted unbraced form", len(path_problems("x", 'run "$CLAUDE_PLUGIN_ROOT"/bin/brain')), 1)
     expect("versioned path", len(path_problems("x", "~/.claude/plugins/cache/x/lean-agent/1.9.0/bin/brain")), 1)
     expect("bare name", path_problems("x", "run brain list"), [])
     expect("skill path is not a bin path", path_problems("x", "${CLAUDE_PLUGIN_ROOT}/skills/method/full-text.md"), [])

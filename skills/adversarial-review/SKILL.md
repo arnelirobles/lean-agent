@@ -150,7 +150,7 @@ If nothing survives, say so, and list what was checked. A clean review is a resu
   only for something that needs a different repository or a decision nobody in the change can make.
 
 Before a review body goes out with `gh ... --body-file`, put the file in the checkout and run
-`style-scan`. It reads added lines and untracked files, so it catches dashes and slop in the body.
+`style-scan`. It reads added lines and untracked files, so it catches dashes and slop in the body. Delete the file right after the scan so it is never committed.
 
 ## 7. Record
 
