@@ -29,6 +29,30 @@ TIERS = ("fast", "full", "rerun")
 RUNNERS = ("mtp", "vstest", "")
 
 
+KIND = ("test-fail flaky minor question ticket security pending blocker agent note failure risk ruling bug "
+        "review-finding isolation").split()
+
+
+KIND_ALIAS = {"todo": "pending", "task": "pending", "open-question": "question", "finding": "review-finding",
+              "running": "agent", "running-agent": "agent", "test-failure": "test-fail"}
+
+
+# Kinds seen in old data that no alias covers; anything else unknown becomes note.
+KIND_OLD = {"82-tests-to-run": "pending", "82-fonts-tests": "pending", "open": "pending", "test": "note",
+            "defect": "bug"}
+
+
+def norm_project(name):
+    return (name or "").strip().lower()
+
+
+def canon_kind(kind):
+    """The allowed kind for a name or an alias, or None."""
+    k = (kind or "").strip().lower()
+    k = KIND_ALIAS.get(k, k)
+    return k if k in KIND else None
+
+
 ITEM_COLS = ("id project repo branch kind ref title body status resolution severity phase source model "
              "cycle commit_hash link run_id occurrences first_seen last_seen closed_at").split()
 
@@ -113,10 +137,46 @@ def migrate_7(con):  # which platform a job needs, and which host ran a job or a
     con.execute("UPDATE jobs SET platform='apple' WHERE status IN ('queued','running')")
 
 
-MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7]
+def migrate_8(con):  # the repo HEAD a job was queued at, so a full run is not repeated for one commit
+    con.execute("ALTER TABLE jobs ADD COLUMN commit_hash TEXT NOT NULL DEFAULT ''")
 
 
-def connect():
+def migrate_9(con):  # lower case projects, a fixed list of kinds, and the session that queued a job
+    for table in ("items", "runs", "jobs"):  # in Python, because SQLite LOWER() leaves non-ASCII letters alone
+        for r in con.execute(f"SELECT DISTINCT project FROM {table}").fetchall():
+            if norm_project(r["project"]) != r["project"]:
+                con.execute(f"UPDATE {table} SET project=? WHERE project=?", (norm_project(r["project"]), r["project"]))
+    for r in con.execute("SELECT DISTINCT kind FROM items").fetchall():
+        new = canon_kind(r["kind"]) or KIND_OLD.get(r["kind"].strip().lower(), "note")
+        if new != r["kind"]:
+            con.execute("UPDATE items SET kind=? WHERE kind=?", (new, r["kind"]))
+    # Open items that now share project, kind and ref are one item: the oldest row keeps the count and the tags.
+    groups = con.execute("SELECT project, kind, ref FROM items WHERE status='open' GROUP BY project, kind, ref"
+                         " HAVING COUNT(*) > 1").fetchall()
+    for g in groups:
+        rows = con.execute("SELECT * FROM items WHERE status='open' AND project=? AND kind=? AND ref=? ORDER BY id",
+                           (g["project"], g["kind"], g["ref"])).fetchall()
+        keep, rest = rows[0], rows[1:]
+        con.execute("UPDATE items SET occurrences=?, first_seen=?, last_seen=? WHERE id=?",
+                    (sum(r["occurrences"] for r in rows), min(r["first_seen"] for r in rows),
+                     max(r["last_seen"] for r in rows), keep["id"]))
+        for r in rest:
+            con.execute("INSERT OR IGNORE INTO tags (item_id, tag) SELECT ?, tag FROM tags WHERE item_id=?",
+                        (keep["id"], r["id"]))
+            con.execute("DELETE FROM tags WHERE item_id=?", (r["id"],))
+            for col in ("body", "session_id", "session_cwd", "link", "severity"):
+                if not keep[col] and r[col]:
+                    con.execute(f"UPDATE items SET {col}=? WHERE id=?", (r[col], keep["id"]))
+            con.execute("DELETE FROM items WHERE id=?", (r["id"],))
+    con.execute("ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+    con.execute("ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''")
+
+
+
+MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7, migrate_8, migrate_9]
+
+
+def connect(migrate=True):
     path = db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     con = sqlite3.connect(path, timeout=30, isolation_level=None)
@@ -132,7 +192,7 @@ def connect():
             sys.exit(f"brain: {path} has schema version {version}, newer than this brain knows")
         return version
 
-    if current() < len(MIGRATIONS):
+    if migrate and current() < len(MIGRATIONS):
         # One writer migrates; a second opener waits for the lock, then sees the new version and does nothing.
         # SQLite DDL is transactional, so a migration that fails leaves the old version and no half-built tables.
         con.execute("BEGIN IMMEDIATE")

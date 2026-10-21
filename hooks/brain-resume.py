@@ -97,8 +97,8 @@ def self_test():
         out = hook()[1]
         if len(out.encode()) > 2600:
             fails.append(f"the digest must stay small with 300 blockers: {len(out.encode())} bytes")
-        subprocess.run([sys.executable, BRAIN, "close", "1"], env=env, capture_output=True)
-        subprocess.run([sys.executable, BRAIN, "close", "2"], env=env, capture_output=True)
+        subprocess.run([sys.executable, BRAIN, "close", "1", "--resolution", "fixed"], env=env, capture_output=True)
+        subprocess.run([sys.executable, BRAIN, "close", "2", "--resolution", "fixed"], env=env, capture_output=True)
         con = sqlite3.connect(env["LEAN_BRAIN_DB"], isolation_level=None)
         con.execute("UPDATE items SET status='closed' WHERE lower(project)='myproj'")
         con.execute("UPDATE jobs SET status='done'")

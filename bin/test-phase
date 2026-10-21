@@ -15,7 +15,7 @@ of loading the database together; ask whether the lane is free with `heavy.sh st
 PLAN is optional. When given, its lines are enqueued first. One project per line, blank lines and lines
 starting with # are skipped:
 
-    <repo-dir> <test project path> [fast-filter] [args=EXTRA]
+    <repo-dir> <test project path> [fast-filter] [args=EXTRA] [again=REASON]
 
 The project path is relative to repo-dir. Quote a field that holds spaces. A fast filter is a class
 name or a fragment of one (for MTP the fast tier passes *fragment* to --filter-class, and a rerun passes
@@ -177,7 +177,8 @@ class Lane:
     """One place jobs run: the local machine, or one SSH host."""
 
     def __init__(self, name, where, remote=None, repos=None):
-        self.name, self.where, self.remote, self.repos = name, where, remote, repos or {}
+        self.name, self.where, self.remote = name, where, remote
+        self.repos = {k.lower(): v for k, v in (repos or {}).items()}
 
 
 LOCAL = Lane("local", "local")
@@ -253,6 +254,8 @@ def add_item(row, kind, ref, severity, body, run_id, ctx):
     args = ["add", "--project", row["project"], "--repo", ctx["repo"], "--kind", kind, "--ref", ref,
             "--title", ref, "--body-file", "-", "--severity", severity, "--phase", "test", "--source", "test-phase",
             "--cycle", ctx["cycle"]]
+    if row.get("session"):
+        args += ["--session", row["session"], "--session-cwd", row.get("session_cwd", "")]
     if ctx["branch"]:
         args += ["--branch", ctx["branch"]]
     if run_id:
@@ -288,10 +291,11 @@ def parse_plan(path):
             continue
         parts = shlex.split(raw)
         extra = [x[len("args="):] for x in parts[2:] if x.startswith("args=")]
-        parts = parts[:2] + [x for x in parts[2:] if not x.startswith("args=")]
-        if len(parts) not in (2, 3) or len(extra) > 1:
-            sys.exit(f"test-phase: {path} line {n}: want <repo-dir> <test project path> [fast-filter] [args=EXTRA]")
-        entries.append(parts + [None] * (3 - len(parts)) + [extra[0] if extra else ""])
+        again = [x[len("again="):] for x in parts[2:] if x.startswith("again=")]
+        parts = parts[:2] + [x for x in parts[2:] if not x.startswith(("args=", "again="))]
+        if len(parts) not in (2, 3) or len(extra) > 1 or len(again) > 1:
+            sys.exit(f"test-phase: {path} line {n}: want <repo-dir> <test project path> [fast-filter] [args=EXTRA] [again=REASON]")
+        entries.append(parts + [None] * (3 - len(parts)) + [extra[0] if extra else "", again[0] if again else ""])
     if not entries:
         sys.exit(f"test-phase: {path} lists no projects, so nothing would run")
     return entries
@@ -350,10 +354,11 @@ def run_job(job, a, run_dir, runner, lane=LOCAL):
 def _run_job(job, a, run_dir, runner, lane):
     repo, project = job["repo_dir"], job["test_project"]
     remote = lane.remote
-    cfg = lane.repos.get(job["project"]) if remote else None
+    cfg = lane.repos.get(job["project"].lower()) if remote else None
     row = {"job": job["id"], "project": job["project"], "test": project, "tier": job["tier"],
            "result": "", "failing": 0, "real": 0, "flaky": 0, "notes": [], "run_id": None, "rc": 1,
-           "host": remote.name if remote else ""}
+           "host": remote.name if remote else "", "session": job.get("session_id", ""),
+           "session_cwd": job.get("session_cwd", "")}
     if not os.path.isdir(repo):
         row["result"] = "error"
         row["notes"].append("no such directory")
@@ -474,15 +479,33 @@ def _run_job(job, a, run_dir, runner, lane):
 
 
 def enqueue(entries, a, cycle):
-    for repo, project, fast, extra in entries:
+    queued = []
+    for repo, project, fast, extra, again in entries:
         base = ["queue", "add", repo, project, "--cycle", cycle, "--by", "test-phase"]
         if extra:
             base.append("--args=" + extra)
         if a.project:
             base += ["--project", a.project]
-        if fast:
-            brain(base + ["--tier", "fast", "--filter", fast])
-        brain(base + ["--tier", "full"])
+        fast_id = ""
+        for tier_args in ((["--tier", "fast", "--filter", fast] if fast else []), ["--tier", "full"]):
+            if not tier_args:
+                continue
+            # A refused add stops the plan: going on would run the fast slice and silently drop the full run.
+            if tier_args[1] == "full" and again:
+                tier_args = tier_args + ["--again=" + again]
+            r = subprocess.run([sys.executable, BRAIN] + base + tier_args, capture_output=True, text=True)
+            if tier_args[1] == "fast" and r.returncode == 0 and "joined" not in r.stderr:
+                fast_id = r.stdout.strip()
+                queued.append(fast_id)
+            elif r.returncode == 0 and r.stdout.strip().isdigit():
+                queued.append(r.stdout.strip())
+            if r.returncode != 0:
+                if fast_id.isdigit():
+                    brain(["queue", "cancel", fast_id])
+                    queued.remove(fast_id)
+                kept = f"jobs from earlier plan lines stay queued: {', '.join('#' + i for i in queued)}. " if queued else ""
+                sys.exit(f"test-phase: could not queue {project} ({tier_args[1]}): {r.stderr.strip()}\n"
+                         f"test-phase: the rest of the plan was not queued; {kept}Fix that, or add again=REASON to the plan line to run it anyway.")
 
 
 def cancelled_ids():
@@ -803,6 +826,19 @@ def self_test():
             or "-" not in seen.get("args", []) or "--body" in seen.get("args", []):
         fails.append(f"item body must be masked and sent by stdin, not argv: {seen}")
 
+    globals()["brain"] = lambda args, stdin=None: seen.update(args=args, stdin=stdin)
+    try:
+        add_item({"project": "p", "session": "s-1", "session_cwd": "/w"}, "flaky", "T.b", "minor", "x", None,
+                 {"repo": "r", "cycle": "c", "branch": ""})
+    finally:
+        globals()["brain"] = real_brain
+    a = seen.get("args", [])
+    if "--session" not in a or a[a.index("--session") + 1] != "s-1":
+        fails.append(f"an item must carry the session that queued the job: {a}")
+
+    if Lane("r", "remote", None, {"MixedCase": {"dir": "/x"}}).repos.get("mixedcase") != {"dir": "/x"}:
+        fails.append("a lane must find a repository config by its project name in any case")
+
     # A remote job's log opens with a one-line header, so the reason is never script text.
     head = "$ ssh dev <script for job 9>\n"
     why = lane_problem(255, head + "ssh: connect refused\n")
@@ -998,6 +1034,34 @@ echo "Passed!  - Failed: 0"; exit 0
         rc, out, calls = run(f"{repo_v} tests/T/T.csproj Good\n")
         if rc != 0 or "filter matched no test" in out:
             fails.append(f"a filtered run with tests must still pass ({rc}): {out}")
+
+        # A refused full add stops the plan loudly; again=REASON on the plan line goes through as --again.
+        def gitrepo(name, dirty=False):
+            g = os.path.join(d, name)
+            os.makedirs(os.path.join(g, "tests", "T"))
+            with open(os.path.join(g, "f.txt"), "w") as fh:
+                fh.write("x\n")
+            for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]):
+                subprocess.run(["git", "-C", g] + cmd, check=True, capture_output=True)
+            if dirty:
+                with open(os.path.join(g, "f.txt"), "w") as fh:
+                    fh.write("changed\n")
+            return g
+        put("full", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        gclean, gdirty = gitrepo("gclean"), gitrepo("gdirty", dirty=True)
+        rc, out, calls = run(f"{gdirty} tests/T/T.csproj Fast\n")
+        if rc == 0 or "uncommitted" not in out or "again=" not in out or calls:
+            fails.append(f"a refused full add must fail the plan before any job runs ({rc}): {out} {calls}")
+        rc, out, calls = run(f"{gdirty} tests/T/T.csproj \"again=testing the edit\"\n")
+        if rc != 0 or not calls:
+            fails.append(f"again=REASON must let a dirty tree run ({rc}): {out} {calls}")
+        rc, out, calls = run(f"{gclean} tests/T/T.csproj\n")
+        rc, out, calls = run(f"{gclean} tests/T/T.csproj Fast\n")
+        if rc == 0 or "already exists" not in out:
+            fails.append(f"a second full run of one commit must fail the plan ({rc}): {out} {calls}")
+        rc, out, calls = run(f"{gclean} tests/T/T.csproj again=redo\n")
+        if rc != 0 or not calls:
+            fails.append(f"again=REASON must allow a second full run ({rc}): {out} {calls}")
         put("class-Multi", "No test matches the given testcase filter `FullyQualifiedName~Multi` in T.dll (net8.0)\n"
             "Passed!  - Failed: 0, Passed: 2, Skipped: 0, Total: 2 - T.dll (net10.0)\n", 0)
         rc, out, calls = run(f"{repo_v} tests/T/T.csproj Multi\n")
