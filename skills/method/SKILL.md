@@ -53,6 +53,7 @@ The plugin's `bin/` is on PATH, so call these by name, not by a path. Use them i
 - `needs-review.sh`: prints the review rules a diff fires.
 - `agent-hygiene.sh`: reports what parallel agents left behind.
 - `check-conflict-markers.sh`, `check-top-level-md.sh`, `check-workflow-keys.py`, `check-runtime.sh`: cheap repository checks, run them in the preflight.
+- `script-repeats [--days N]`: counts the commands agents wrote by hand in recent transcripts, per family, with the script that covers each. The retro runs it.
 - `retro-signals.sh`, `lean-stats`, `workflow-cost.py`: the retro's facts and what a run cost.
 
 ## Tests and brain
