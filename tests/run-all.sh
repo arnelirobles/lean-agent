@@ -14,7 +14,7 @@ cd "$root" || exit 2
 
 # A while-read loop rather than mapfile, which macOS's bash 3.2 does not have.
 scripts=()
-while IFS= read -r s; do scripts+=("$s"); done < <(grep -l -- '--self-test' bin/* hooks/*.py lib/*.py skills/*/*.sh skills/*/*.py 2>/dev/null | sort -u)
+while IFS= read -r s; do scripts+=("$s"); done < <(grep -l -- '--self-test' bin/* hooks/*.py lib/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
 if [ "${#scripts[@]}" -eq 0 ]; then
   echo "run-all: found no scripts with a --self-test" >&2
   exit 1
