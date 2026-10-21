@@ -16,8 +16,10 @@
             --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
             or -macos; a remote lane never claims an apple job
             The job records the repo HEAD. A full job for a project, test project and commit that already has a
-            queued, running or done full job is refused with that job's id, and so is a full job from a tree with
-            uncommitted tracked changes; --again REASON allows either. An add identical to a queued job prints
+            queued, running or done full job (one without a filter) is refused with that job's id, and so is a
+            full job from a tree with uncommitted or untracked files (the refusal names up to 5 paths) or
+            where git status fails; --again REASON allows any of these (one line, 200 characters at most).
+            A folder that is not a git repo, or has no commit yet, gets neither check. An add identical to a queued job prints
             that job's id instead of adding one.
   brain queue list [--cycle C] [--status S]     --status queued lists in the order the drainer takes them
   brain queue bump ID                      a queued job, and the jobs chained after it, to the front
