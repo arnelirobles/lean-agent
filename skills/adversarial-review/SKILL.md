@@ -90,6 +90,12 @@ member with a non-null initializer) and run the smallest check for every kind th
 cover. A rule tested with one kind and shipped for all of them is the usual way a correct-looking
 change breaks.
 
+**The sibling question (always):** for each check, filter or rule the diff adds or changes, find
+every other route, job, message handler or write path that reads or writes the same field or rule.
+Does each one apply the same check, in the same order relative to hooks and transactions? A rule
+enforced on the route in the ticket and skipped on its sibling is the most common surviving
+finding.
+
 **The rules file (always):** every rule in it, answered yes or no with a line.
 
 **Broad passes (full review):** use the general reviewer skill if one is installed. Otherwise run
