@@ -39,6 +39,7 @@ Only the lines that apply, each with a check under Done when:
 - Bounds (rows, calls, memory, time, cache) and what happens past them, never silently
 - Writes that must commit together; what a crash midway or a second run does
 - Two runs or writers overlapping
+- Every other route, job or message that reads or writes the same field or rule: list them, each gets a test
 - Existing dependents: published packages, stored data, defaults, contract version
 - The real target environment (ownership, network, versions), not only a copy
 
@@ -51,7 +52,7 @@ What not to touch.
 
 ## 4. Spec review for bigger tickets
 
-For a ticket that touches more than one area or anything in Risks, have one fresh agent read the ticket and the code it names and list what could go wrong. Add what it finds to Risks and Done when. It reads; it does not build.
+For a ticket that touches more than one area or anything in Risks, have one fresh agent read the ticket and the code it names and list what could go wrong. It greps for every writer and reader of each field or rule the ticket touches and names the ones the ticket misses. Add what it finds to Risks and Done when. It reads; it does not build.
 
 ## Style
 
