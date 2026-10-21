@@ -96,19 +96,30 @@ def opt(a, args, key, flag=None, kind=str):
 
 
 DEFAULT_LIMIT = 50
+MAX_LIMIT = 1000
+MAX_BYTES = 8000
 
 
 def limit_of(a):
-    v = a.get("limit", DEFAULT_LIMIT)
+    v = a.get("limit")
+    if v is None:
+        return DEFAULT_LIMIT
     if isinstance(v, bool) or not isinstance(v, int) or v < 1:
         raise Bad("limit must be a positive integer")
-    return v
+    return min(v, MAX_LIMIT)
 
 
-def cut(lines, limit, what):
-    if len(lines) <= limit:
+def cut(lines, limit, what, max_bytes=MAX_BYTES):
+    """The first lines that fit the line limit and the byte cap, then a line that says how many were left out."""
+    kept, size = [], 0
+    for ln in lines:
+        size += len(ln.encode()) + 1
+        if len(kept) >= limit or size > max_bytes:
+            break
+        kept.append(ln)
+    if len(kept) == len(lines):
         return "\n".join(lines)
-    return "\n".join(lines[:limit] + [f"... {len(lines) - limit} more {what}; narrow the filters or pass a bigger limit"])
+    return "\n".join(kept + [f"... {len(lines) - len(kept)} more {what}; narrow the filters or pass a bigger limit"])
 
 
 def after_list(a, text):
@@ -117,16 +128,28 @@ def after_list(a, text):
 
 
 def after_queue_list(a, text):
+    status = a.get("status")
+    if not status:
+        # Running jobs, then queued ones in the order the drainer takes them, so a cut drops the last to run.
+        extra = ["--cycle=" + a["cycle"]] if a.get("cycle") else []
+        rc, out, _ = run_brain(["queue", "list", "--status=queued", *extra], None)
+        lines = text.splitlines() + (out.splitlines() if rc == 0 else [])
+    elif status in ("queued", "running"):
+        lines = text.splitlines()
+    else:
+        lines = list(reversed(text.splitlines()))
+    return cut(lines, limit_of(a), "jobs") or (f"no {status} jobs" if status else "no queued or running jobs")
+
+
+def after_stats(a, text):
     lines = text.splitlines()
-    if not a.get("status"):
-        lines = [ln for ln in lines if ln.split()[2:3] in (["queued"], ["running"])]
-    return cut(list(reversed(lines)), limit_of(a), "jobs") or "no queued or running jobs"
+    return cut(lines, len(lines), "lines")
 
 
 def t_list(a):
     limit_of(a)
     args = ["list"]
-    if a.get("open") is True or (a.get("open") is not False and not a.get("status")):
+    if a.get("open") is True or (a.get("open") is None and not a.get("status") and not a.get("cycle")):
         args.append("--open")
     for k in ("status", "project", "kind", "tag", "cycle"):
         opt(a, args, k)
@@ -163,6 +186,8 @@ def t_close(a):
 def t_queue_list(a):
     limit_of(a)
     args = ["queue", "list"]
+    if not a.get("status"):
+        args.append("--status=running")  # after_queue_list adds the queued jobs in drainer order
     opt(a, args, "status")
     opt(a, args, "cycle")
     return args, None
@@ -256,7 +281,7 @@ TOOLS = [
     ("brain_stats", "Run counts, flaky rate and durations as JSON.", t_stats, schema({})),
 ]
 BY_NAME = {n: f for n, _, f, _ in TOOLS}
-AFTER = {"brain_list": after_list, "brain_queue_list": after_queue_list}
+AFTER = {"brain_list": after_list, "brain_queue_list": after_queue_list, "brain_stats": after_stats}
 
 
 def run_brain(args, stdin):
@@ -389,6 +414,24 @@ def digest_and_size_tests(fails, call, db):
     err, text = call("brain_queue_list")
     if err or "Running.csproj" not in text or "Done" in text or "tests/A.csproj" not in text:
         fails.append(f"brain_queue_list default must be queued and running jobs only: {err} {text[:300]!r}")
+    err, text = call("brain_queue_bump", id=2)
+    err, text = call("brain_queue_list", status="queued", limit=1)
+    if err or not text.startswith("job #2 "):
+        fails.append(f"a cut brain_queue_list must keep the next job to run first: {err} {text!r}")
+    err, text = call("brain_queue_list", limit=None)
+    if err or not text.splitlines()[0].startswith("job ") or "Running.csproj" not in text.splitlines()[0]:
+        fails.append(f"a null limit means no limit given, and running jobs come first: {err} {text[:200]!r}")
+    err, text = call("brain_queue_list", status="cancelled")
+    if err or text != "no cancelled jobs":
+        fails.append(f"an empty brain_queue_list must name the status asked for: {err} {text!r}")
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO items (project, kind, ref, title, status, cycle, first_seen, last_seen) "
+                "VALUES ('Cyc', 'test-fail', 'c1', 't', 'closed', 'c9', ?, ?)", (now, now))
+    con.commit()
+    con.close()
+    err, text = call("brain_list", cycle="c9")
+    if err or " closed " not in text:
+        fails.append(f"brain_list with a cycle must not default to open items: {err} {text!r}")
     err, text = call("brain_queue_list", status="done")
     if err or "Done299.csproj" not in text or len(text.splitlines()) != 51 or "more jobs" not in text.splitlines()[-1]:
         fails.append(f"brain_queue_list status done must list done jobs, cut at 50: {err} {len(text.splitlines())}")
@@ -399,6 +442,29 @@ def digest_and_size_tests(fails, call, db):
     err, text = call("brain_digest", all=True)
     if err or len(text.encode()) > 2048 or "big0" not in text:
         fails.append(f"brain_digest all on 2000 items must stay under 2 KB: {err} {len(text.encode())} bytes")
+
+
+def long_title_tests(fails, call, db):
+    import sqlite3
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    con = sqlite3.connect(db)
+    con.executemany("INSERT INTO items (project, kind, ref, title, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
+                    [("Long", "test-fail", ("r%d-" % i) + "x" * 190, "t", now, now) for i in range(100)])
+    con.executemany("INSERT INTO items (project, kind, ref, first_seen, last_seen) VALUES (?,?,?,?,?)",
+                    [("Stat%d" % i, "test-fail", "s", now, now) for i in range(400)])
+    con.commit()
+    con.close()
+    err, text = call("brain_list", project="Long")
+    lines = text.splitlines()
+    if err or len(text.encode()) > 8200 or len(lines) >= 50 or "more items" not in lines[-1]:
+        fails.append(f"brain_list must stop at 8 KB when lines are long: {err} {len(text.encode())} bytes "
+                     f"{len(lines)} lines")
+    err, text = call("brain_stats")
+    if err or len(text.encode()) > 8200 or "more lines" not in text.splitlines()[-1]:
+        fails.append(f"brain_stats must stop at 8 KB: {err} {len(text.encode())} bytes")
+    err, text = call("brain_list", limit=100000, status="closed")
+    if err or len(text.splitlines()) > 1001:
+        fails.append(f"limit is capped at 1000: {err} {len(text.splitlines())}")
 
 
 def self_test():
@@ -497,6 +563,7 @@ def self_test():
             if err or "tests/A.csproj" not in text:
                 fails.append(f"brain_queue_list must show the job: {err} {text!r}")
             digest_and_size_tests(fails, call, os.path.join(d_root, "brain.db"))
+            long_title_tests(fails, call, os.path.join(d_root, "brain.db"))
             err, text = call("brain_stats")
             if err or not text.lstrip().startswith(("{", "[")):
                 fails.append(f"brain_stats must return json: {err} {text!r}")

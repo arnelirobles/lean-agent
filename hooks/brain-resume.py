@@ -79,12 +79,17 @@ def self_test():
                         "--title", "worker in the mcp worktree"], env=env, capture_output=True)
         subprocess.run([sys.executable, BRAIN, "add", "--project", "elsewhere", "--kind", "pending", "--ref", "p",
                         "--title", "pending for another folder"], env=env, capture_output=True)
+        con = sqlite3.connect(env["LEAN_BRAIN_DB"], isolation_level=None)
+        con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                    "VALUES ('MyProj', '/x', 't/Queued.csproj', 'queued', '2026-01-01T00:00:00Z')")
+        con.close()
         startup = hook('{"cwd": "%s", "source": "startup"}' % proj)[1]
         compact = hook('{"cwd": "%s", "source": "compact"}' % proj)[1]
-        if "migration" in startup or "worker in the mcp" in startup:
+        if "migration" in startup or "worker in the mcp" in startup or "t/Queued.csproj" in startup:
             fails.append(f"startup must print the digest only: {startup!r}")
         if "next step is the migration" not in compact or "worker in the mcp worktree" not in compact \
-                or "another folder" in compact or "waiting on the user" not in compact:
+                or "another folder" in compact or "waiting on the user" not in compact \
+                or "job #" not in compact or "t/Queued.csproj" not in compact:
             fails.append(f"compact must add this project's open agent and pending items to the digest: {compact!r}")
         for i in range(300):
             subprocess.run([sys.executable, BRAIN, "add", "--project", "myproj", "--kind", "blocker",
@@ -96,6 +101,7 @@ def self_test():
         subprocess.run([sys.executable, BRAIN, "close", "2"], env=env, capture_output=True)
         con = sqlite3.connect(env["LEAN_BRAIN_DB"], isolation_level=None)
         con.execute("UPDATE items SET status='closed' WHERE lower(project)='myproj'")
+        con.execute("UPDATE jobs SET status='done'")
         con.close()
         if hook() != (0, "", ""):
             fails.append("nothing open must be silent")

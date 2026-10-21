@@ -9,6 +9,9 @@ from .store import MIGRATIONS, connect, migrate_1
 from .queue import detect_platform, project_of
 
 
+DIGEST_MAX = 2048
+
+
 def digest_tests(fails, me, d):
     import sqlite3
     db = os.path.join(d, "digest.db")
@@ -23,9 +26,13 @@ def digest_tests(fails, me, d):
         r = subprocess.run([sys.executable, me, *args], env=env, capture_output=True, text=True, cwd=cwd)
         return r.returncode, r.stdout
 
+    if brain("digest", "--all") != (0, "") or os.path.exists(db):
+        fails.append("digest must print nothing and make no database when there is none")
+    brain("add", "--project", "x", "--kind", "minor", "--ref", "r")
+    brain("close", "1")
     rc, out = brain("digest", "--all")
     if rc != 0 or "nothing open" not in out:
-        fails.append(f"digest on an empty brain: {rc} {out!r}")
+        fails.append(f"digest on a brain with nothing open: {rc} {out!r}")
     if brain("digest", "--quiet", cwd=repo) != (0, ""):
         fails.append("digest --quiet must print nothing when nothing is open")
     old = "2020-01-01T00:00:00Z"
@@ -44,6 +51,13 @@ def digest_tests(fails, me, d):
                 "VALUES ('Demo', '/x', 't/A.csproj', 'running', ?)", (now,))
     con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
                 "VALUES ('demo', '/x', 't/B.csproj', 'done', ?)", (now,))
+    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                "VALUES ('DEMO', '/x', 't/Q.csproj', 'queued', ?)", (now,))
+    rows = [("deep", "blocker", "d%d" % i, "deep blocker %d" % i, "open", now, now) for i in range(10)]
+    rows += [("wide", k, "w%s%d" % (k, i), "wide %s %d %s" % (k, i, "y" * 80), "open", old if k == "agent" else now,
+              old if k == "agent" else now) for k in ("blocker", "question", "agent") for i in range(8)]
+    con.executemany("INSERT INTO items (project, kind, ref, title, status, first_seen, last_seen) "
+                    "VALUES (?,?,?,?,?,?,?)", [r[:5] + (r[5], r[6]) for r in rows])
     con.commit()
     con.close()
     rc, out = brain("digest", cwd=repo)
@@ -57,11 +71,26 @@ def digest_tests(fails, me, d):
         fails.append(f"digest must show running jobs only: {out!r}")
     if "demo:" not in out or "blocker 1" not in out:
         fails.append(f"digest must count by project and kind, with the project in one case: {out!r}")
+    if "1 queued jobs" not in out or "t/Q.csproj" in out:
+        fails.append(f"digest counts queued jobs without listing them: {out!r}")
+    rc, rec = brain("digest", "--recover", cwd=repo)
+    if "job #" not in rec or "t/Q.csproj" not in rec or "queued jobs" in rec or rec.count("stale agent here") != 1 \
+            or "fresh agent here" not in rec:
+        fails.append(f"--recover must list queued jobs and open agents once, not repeat the digest: {rec!r}")
+    rc, rec = brain("digest", "--project", "deep", "--recover")
+    plain = brain("digest", "--project", "deep")[1]
+    if "deep blocker 0" not in rec or "deep blocker 9" not in rec or "deep blocker 0" in plain:
+        fails.append(f"--recover lists every open blocker, the digest only 8: {rec!r}")
+    if len(rec.encode()) > 4000:
+        fails.append(f"--recover stays under 4 KB: {len(rec.encode())}")
+    wide = brain("digest", "--project", "wide")[1]
+    if "... cut, see brain list" not in wide or len(wide.encode()) > DIGEST_MAX or "stale agent" not in wide:
+        fails.append(f"digest over 2 KB must cut the blockers and questions, not the stale agents: {len(wide)} {wide!r}")
     rc, out = brain("digest", "--project", "DEMO")
     if "waiting on a key" not in out:
         fails.append(f"--project must match without regard to case: {out!r}")
     rc, out = brain("digest", "--all")
-    if len(out.encode()) > 2048 or "other project blocker" not in out or "bulk0" not in out:
+    if len(out.encode()) > 2048 or "bulk0" not in out or "stale agent" not in out:
         fails.append(f"digest --all on 2000 items: {len(out.encode())} bytes, {out[:300]!r}")
     if brain("digest", "--all", "--project", "x")[0] == 0:
         fails.append("digest must refuse --all with --project")
