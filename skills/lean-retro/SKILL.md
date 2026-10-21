@@ -25,7 +25,7 @@ is a gap in what was recorded, not a zero: say so in the retro and do not reason
 row per pull request, run
 `REVIEW_LOG=<path to review-log.tsv> retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
 
-`retro-signals.sh` ends with a script repeats section from `script-repeats --days 7`: per family of hand-written commands, the uses, transcripts and projects, and the script that covers it. It prints counts and family names only. Run `script-repeats` alone to change the window.
+`retro-signals.sh` ends with a script repeats section from `script-repeats --days 7`: per family of hand-written commands, the uses, transcripts and projects, and the script that covers it. It prints family names, counts and normalised command shapes (quoted strings, paths, numbers, hashes and unfamiliar words replaced), never transcript text. Run `script-repeats` alone to change the window.
 
 Also gather, from the session or the coordinator's notes:
 - the adversarial review findings of the batch, by category (the review reports, or `review-log.tsv`);

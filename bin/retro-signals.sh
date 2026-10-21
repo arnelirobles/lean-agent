@@ -27,8 +27,12 @@ row() { # repo pr opened merged first_review_at commits_after failed_checks
 }
 
 repeats_section() {
+  local bound=""
+  # macOS has no timeout unless coreutils is installed, as gtimeout. Without either it runs unbounded.
+  if command -v timeout >/dev/null 2>&1; then bound="timeout 120"
+  elif command -v gtimeout >/dev/null 2>&1; then bound="gtimeout 120"; fi
   printf '\n# script repeats\n'
-  python3 -I "$lib/../bin/script-repeats" --days "${SCRIPT_REPEATS_DAYS:-7}" ${SCRIPT_REPEATS_ROOT:+--root "$SCRIPT_REPEATS_ROOT"} \
+  $bound python3 -I "$lib/../bin/script-repeats" --days "${SCRIPT_REPEATS_DAYS:-7}" ${SCRIPT_REPEATS_ROOT:+--root "$SCRIPT_REPEATS_ROOT"} \
     || echo "script-repeats failed"
 }
 

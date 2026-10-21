@@ -7,19 +7,28 @@
 Reads every *.jsonl under DIR (default ~/.claude/projects) modified in the last N days
 (default 7), pulls out the Bash commands, and matches them against lib/script_families.json.
 Prints, per family, the uses, transcripts and projects, and the covering script or none.
-Then two flags that mirror the retro triggers:
+Then flags that mirror the retro triggers:
 
   needs a script      no covering script, used in 3 or more projects
   hand-rolled         a covering script exists and the command was written by hand anyway
+  method text         the method names the script, agents still use a path
 
 Last, the top unmatched shapes that repeat. A shape is the first words of a command with
-quoted strings, paths, numbers, hashes and unknown words replaced, so it holds no client text.
+quoted strings, paths, numbers, hashes, attached flag values and any word outside a fixed
+list of common tools replaced, so it holds no client text.
 
 Privacy: the report holds family names, counts and those shapes. Nothing from a transcript
-is written anywhere else. Lines without "Bash" are skipped before parsing.
+is written anywhere else. Lines without "Bash" are skipped before parsing. A command is cut
+to its first 20000 characters before it is matched.
 
-A project is the first directory under DIR (a transcript's parent directory, with
-subagent folders folded into their project).
+Families match the code of a command: quoted strings and heredoc bodies are dropped first
+(a heredoc fed to python, node, ruby or perl is kept, since that is the code), unless the
+family says raw.
+
+A project is the first directory under DIR (a transcript's parent directory, with subagent
+folders folded into their project). A file directly under DIR is project "(root)".
+
+Exit 2 when DIR cannot be read.
 
 Python 3 standard library, runs under python3 -I.
 """
@@ -34,17 +43,35 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-FAMILIES_FILE = os.path.join(HERE, "..", "lib", "script_families.json")
+REPO = os.path.realpath(os.path.join(HERE, ".."))
+FAMILIES_FILE = os.path.join(REPO, "lib", "script_families.json")
+CAP = 20000
 
-# Commands whose second word is a subcommand worth keeping in a shape.
-TOOLS = {
+# Command names a shape may keep. Anything else becomes W.
+KNOWN = {
+    "git", "gh", "curl", "dotnet", "npm", "npx", "pnpm", "yarn", "python3", "python", "pip",
+    "pip3", "node", "grep", "rg", "sed", "awk", "find", "docker", "make", "brain", "test-phase",
+    "cargo", "go", "brew", "kubectl", "jq", "ls", "cat", "head", "tail", "echo", "cd", "bash",
+    "sh", "xargs", "wc", "sort", "diff", "mkdir", "rm", "cp", "mv", "touch", "chmod", "open",
+    "tar", "unzip", "ssh", "scp", "rsync", "sleep", "kill", "ps", "pgrep", "wget", "env",
+    "style-scan", "holdout.sh", "replace", "pr-blockers.sh", "why-red.sh", "assert-ran.sh",
+    "check-deployed-sha.sh", "heavy.sh", "sync-default.sh", "needs-review.sh",
+    "agent-hygiene.sh", "retro-signals.sh", "lean-stats", "script-repeats", "workflow-cost.py",
+}
+# Of those, the ones whose second word is a subcommand, not a name.
+SUBCOMMAND = {
     "git", "gh", "docker", "dotnet", "npm", "npx", "pnpm", "yarn", "cargo", "go", "brew",
-    "kubectl", "pip", "pip3", "python3", "python", "node", "bash", "curl", "brain", "make",
+    "kubectl", "pip", "pip3", "brain",
 }
 HASH = re.compile(r"^[0-9a-f]{7,}$")
-FLAG = re.compile(r"^--?[A-Za-z][\w-]*")
+FLAG = re.compile(r"^(--[A-Za-z][\w-]*|-[A-Za-z])")
 WORD = re.compile(r"^[a-z][a-z-]{0,19}$")
 LEAD = re.compile(r"^\s*(cd\s+\S+\s*(&&|;)\s*|[A-Za-z_]\w*=\S*\s+)+")
+QUOTED = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
+HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*[\"']?(\w+)[\"']?")
+INTERPRETER = re.compile(r"\b(python3?|node|ruby|perl)\b")
+INLINE_CODE = re.compile(r"\b(python3?\s+-c|node\s+-e|perl\s+-e|ruby\s+-e)\b")
+SEGMENT = re.compile(r"\|\||&&|;|\||\n")
 
 
 def load_families(path=FAMILIES_FILE):
@@ -55,15 +82,62 @@ def load_families(path=FAMILIES_FILE):
         out.append({
             "name": fam["name"],
             "re": re.compile(fam["regex"]),
+            "code": re.compile(fam["code"]) if fam.get("code") else None,
             "exclude": re.compile(fam["exclude"]) if fam.get("exclude") else None,
+            "raw": bool(fam.get("raw")),
+            "per_segment": bool(fam.get("per_segment")),
+            "kind": fam.get("kind", "script"),
             "covered_by": fam.get("covered_by", "none"),
         })
     return out
 
 
+def strip_prose(cmd):
+    """The command with heredoc bodies and quoted strings dropped."""
+    out = []
+    tag = None
+    for line in cmd.split("\n"):
+        if tag is not None:
+            if line.strip() == tag:
+                tag = None
+            continue
+        m = HEREDOC.search(line)
+        if m and not INTERPRETER.search(line[:m.start()]):
+            tag = m.group(1)
+            out.append(line[:m.start()])
+            continue
+        out.append(line)
+    text = "\n".join(out)
+    if INLINE_CODE.search(text):
+        return text
+    return QUOTED.sub('""', text)
+
+
+def classify(cmd, families):
+    """Names of the families a command belongs to."""
+    raw = cmd[:CAP]
+    code = strip_prose(raw)
+    segments = None
+    hits = []
+    for fam in families:
+        if fam["code"] and not fam["code"].search(code):
+            continue
+        if fam["per_segment"]:
+            if segments is None:
+                segments = SEGMENT.split(code)
+            ok = any(fam["re"].search(s) and not (fam["exclude"] and fam["exclude"].search(s))
+                     for s in segments)
+        else:
+            text = raw if fam["raw"] else code
+            ok = bool(fam["re"].search(text)) and not (fam["exclude"] and fam["exclude"].search(text))
+        if ok:
+            hits.append(fam["name"])
+    return hits
+
+
 def shape(cmd):
     """First words of a command with everything specific replaced."""
-    lines = [l for l in cmd.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    lines = [l for l in cmd[:CAP].splitlines() if l.strip() and not l.lstrip().startswith("#")]
     if not lines:
         return ""
     first = LEAD.sub("", lines[0])
@@ -71,9 +145,10 @@ def shape(cmd):
     out = []
     for i, tok in enumerate(first.split()[:4]):
         if i == 0:
-            out.append(tok if re.match(r"^[a-z][\w.-]{0,24}$", tok) else "X")
+            base = os.path.basename(tok) if "/" in tok else tok
+            out.append(base if base in KNOWN else ("P" if "/" in tok else "W"))
         elif FLAG.match(tok):
-            out.append(FLAG.match(tok).group(0))
+            out.append(FLAG.match(tok).group(1))
         elif tok == "S":
             out.append("S")
         elif "/" in tok or tok.startswith(("~", ".")):
@@ -82,7 +157,7 @@ def shape(cmd):
             out.append("N")
         elif HASH.match(tok):
             out.append("H")
-        elif i == 1 and out[0] in TOOLS and WORD.match(tok):
+        elif i == 1 and out[0] in SUBCOMMAND and WORD.match(tok):
             out.append(tok)
         else:
             out.append("W")
@@ -117,18 +192,22 @@ def bash_commands(path):
 
 
 def project_of(root, path):
-    rel = os.path.relpath(path, root)
-    parts = rel.split(os.sep)
-    return parts[0] if len(parts) > 1 else os.path.basename(os.path.dirname(path))
+    parts = os.path.relpath(path, root).split(os.sep)
+    return parts[0] if len(parts) > 1 else "(root)"
 
 
-def scan(root, days, families):
+def scan(root, days, families, errors=None):
     cutoff = time.time() - days * 86400
     fam_stats = {f["name"]: {"uses": 0, "files": set(), "projects": set()} for f in families}
     shapes = collections.defaultdict(lambda: {"uses": 0, "files": set()})
-    files = projects = commands = 0
+    files = commands = 0
     seen_projects = set()
-    for dirpath, _dirs, names in os.walk(root):
+
+    def onerror(e):
+        if errors is not None:
+            errors.append(str(e))
+
+    for dirpath, _dirs, names in os.walk(root, onerror=onerror):
         for name in names:
             if not name.endswith(".jsonl"):
                 continue
@@ -143,15 +222,13 @@ def scan(root, days, families):
             seen_projects.add(proj)
             for cmd in bash_commands(path):
                 commands += 1
-                hit = False
-                for fam in families:
-                    if fam["re"].search(cmd) and not (fam["exclude"] and fam["exclude"].search(cmd)):
-                        st = fam_stats[fam["name"]]
-                        st["uses"] += 1
-                        st["files"].add(path)
-                        st["projects"].add(proj)
-                        hit = True
-                if not hit:
+                names_hit = classify(cmd, families)
+                for n in names_hit:
+                    st = fam_stats[n]
+                    st["uses"] += 1
+                    st["files"].add(path)
+                    st["projects"].add(proj)
+                if not names_hit:
                     sh = shape(cmd)
                     if sh:
                         shapes[sh]["uses"] += 1
@@ -170,16 +247,19 @@ def render(res, families, days, top=10):
     for fam in families:
         st = res["families"][fam["name"]]
         if st["uses"]:
-            rows.append((fam["name"], st["uses"], len(st["files"]), len(st["projects"]), fam["covered_by"]))
+            rows.append((fam["name"], st["uses"], len(st["files"]), len(st["projects"]),
+                         fam["covered_by"], fam["kind"]))
     rows.sort(key=lambda r: (-r[1], r[0]))
     for r in rows:
-        out.append("%s\t%d\t%d\t%d\t%s" % r)
+        out.append("%s\t%d\t%d\t%d\t%s" % r[:5])
     if not rows:
         out.append("(no family matched)")
     need = [r for r in rows if r[4] == "none" and r[3] >= 3]
-    hand = [r for r in rows if r[4] != "none"]
+    hand = [r for r in rows if r[4] != "none" and r[5] == "script"]
+    method = [r for r in rows if r[5] == "method"]
     out.append("needs a script (no cover, 3 or more projects): " + (", ".join(r[0] for r in need) or "none"))
     out.append("hand-rolled despite a script: " + (", ".join("%s (%s)" % (r[0], r[4]) for r in hand) or "none"))
+    out.append("method text names it, agents use a path: " + (", ".join(r[0] for r in method) or "none"))
     rep = sorted(((s, v) for s, v in res["shapes"].items() if v["uses"] >= 2),
                  key=lambda kv: (-kv[1]["uses"], kv[0]))[:top]
     out.append("top unmatched shapes (uses, transcripts, shape)")
@@ -203,15 +283,60 @@ def write_transcript(path, commands, junk=False):
         f.write(json.dumps({"type": "assistant", "message": {"content": [other]}}) + "\n")
 
 
+def run_cli(*args):
+    return subprocess.run([sys.executable, "-I", os.path.realpath(__file__)] + list(args),
+                          capture_output=True, text=True)
+
+
 def self_test():
     fams = load_families()
-    names = {f["name"] for f in fams}
+    by_name = {f["name"]: f for f in fams}
     for want in ("style-slop-grep", "mutation-check", "versioned-plugin-path", "curl-smoke-check",
                  "inline-python-replace", "wait-loop", "pgrep", "direct-test-run",
                  "package-version-lookup", "worktree-status-sweep", "graphql-review-threads"):
-        assert want in names, "missing family " + want
-    root = tempfile.mkdtemp(prefix="script-repeats-")
+        assert want in by_name, "missing family " + want
+
+    # every covering script that names a file exists in the repository
+    for fam in fams:
+        cov = fam["covered_by"]
+        if cov == "none" or fam["kind"] != "script":
+            continue
+        path = os.path.join(REPO, cov if "/" in cov else os.path.join("bin", cov))
+        if cov == "hooks/wait-loop.py" and not os.path.exists(path):
+            continue
+        assert os.path.exists(path), "%s: covered_by %s does not exist" % (fam["name"], cov)
+
     em = chr(0x2014)
+
+    # what a command is classified as: code, not prose
+    def hit(cmd):
+        return classify(cmd, fams)
+
+    assert hit("git commit -m \"grep for em dash, pgrep, pytest, until sleep 5\"") == []
+    assert hit("echo \"run pytest and pgrep\"") == []
+    assert hit("cat > notes.md <<'EOF'\npgrep until sleep 5\nEOF") == []
+    assert hit("pip install pytest") == []
+    assert hit("pytest -q tests") == ["direct-test-run"]
+    assert hit("cd app && dotnet test X.sln | tail -5") == ["direct-test-run"]
+    assert hit("brain queue add r p --filter X && dotnet test --list-tests") == ["direct-test-run"]
+    assert hit("brain queue add r p --filter 'ATests|BTests'") == []
+    assert hit("test-phase") == []
+    assert hit("grep -rn '%s' docs" % em) == ["style-slop-grep"]
+    assert hit("python3 - <<'X'\ns=open(p).read()\ns=s.replace(a,b)\nX") == ["inline-python-replace"]
+    assert hit("python3 -c \"s=open(p).read(); print(s.replace('a','b'))\"") == ["inline-python-replace"]
+    assert hit("curl -s \"https://registry.npmjs.org/left-pad\"") == ["curl-smoke-check", "package-version-lookup"]
+
+    # shapes keep no names, secrets or attached flag values
+    assert shape("acmecorp-sync --dry") == "W --dry"
+    assert shape("make acme-deploy") == "make W"
+    assert shape("curl acme-client") == "curl W"
+    assert shape("mysql -uroot -pS3cretPass db") == "W -u -p W"
+    assert shape("git status --short") == "git status --short"
+    assert shape("./bin/style-scan --base main") == "style-scan --base W"
+    leaks = ["acmecorp-sync", "acme-deploy", "acme-client", "S3cretPass", "uroot", "secret-client"]
+
+    # a root with several projects
+    root = tempfile.mkdtemp(prefix="script-repeats-")
     pkg = "curl -s https://registry.npmjs.org/left-pad/latest"
     for proj in ("pa", "pb", "pc"):
         write_transcript(os.path.join(root, proj, "s1.jsonl"), [
@@ -220,6 +345,14 @@ def self_test():
             "pgrep -f vitest",
             "frobnicate --widget 12 /Users/x/secret-client/app",
             "frobnicate --widget 99 /Users/y/other",
+            "acmecorp-sync --dry",
+            "acmecorp-sync --dry",
+            "make acme-deploy",
+            "make acme-deploy",
+            "curl acme-client",
+            "curl acme-client",
+            "mysql -uroot -pS3cretPass db",
+            "mysql -uroot -pS3cretPass db",
         ])
     write_transcript(os.path.join(root, "pa", "s1", "subagents", "agent-1.jsonl"),
                      ["dotnet test Foo.sln | tail -5", "dotnet test Foo.sln | tail -5"])
@@ -233,6 +366,7 @@ def self_test():
         "curl -s https://api.example.com/health",
         "echo hello",
     ], junk=True)
+    write_transcript(os.path.join(root, "top.jsonl"), ["echo top"])
     old = os.path.join(root, "pd", "old.jsonl")
     write_transcript(old, ["pgrep -f old", "pgrep -f old"])
     past = time.time() - 40 * 86400
@@ -240,13 +374,14 @@ def self_test():
 
     res = scan(root, 7, fams)
     fs = res["families"]
-    assert res["files"] == 5, res["files"]
-    assert res["projects"] == 3, res["projects"]
+    assert res["files"] == 6, res["files"]
+    assert res["projects"] == 4, res["projects"]
+    assert res["commands"] == 13 * 3 + 2 + 8 + 1, res["commands"]
     assert fs["pgrep"]["uses"] == 3 and len(fs["pgrep"]["files"]) == 3 and len(fs["pgrep"]["projects"]) == 3
     assert fs["style-slop-grep"]["uses"] == 3
     assert fs["package-version-lookup"]["uses"] == 3
-    # the subagent folder counts toward its project, and the harness test lines do not count
-    assert fs["direct-test-run"]["uses"] == 3 and fs["direct-test-run"]["projects"] == {"pa"}
+    # the subagent folder counts toward its project, and a Read tool line does not count
+    assert fs["direct-test-run"]["uses"] == 4 and fs["direct-test-run"]["projects"] == {"pa"}
     assert fs["wait-loop"]["uses"] == 1
     assert fs["inline-python-replace"]["uses"] == 1
     assert fs["worktree-status-sweep"]["uses"] == 1
@@ -254,27 +389,66 @@ def self_test():
     assert fs["curl-smoke-check"]["uses"] == 4, fs["curl-smoke-check"]["uses"]
     # --days 60 brings the old transcript back; the default cuts it by mtime
     assert scan(root, 60, fams)["families"]["pgrep"]["uses"] == 5
-    # the malformed lines were skipped without stopping the scan
-    assert res["commands"] > 0
+    assert "(root)" in {project_of(root, os.path.join(root, "top.jsonl"))}
 
     text = render(res, fams, 7)
     assert "needs a script (no cover, 3 or more projects): package-version-lookup" in text, text
-    assert "hand-rolled despite a script:" in text and "pgrep (hooks/wait-loop.py)" in text
+    assert "pgrep (hooks/wait-loop.py)" in text
+    assert "method text names it, agents use a path: versioned-plugin-path" in text
+    assert "versioned-plugin-path (" not in text.split("hand-rolled despite a script:")[1].split("\n")[0]
     lines = text.splitlines()
     i = lines.index("top unmatched shapes (uses, transcripts, shape)")
     first = lines[i + 1].split("\t")
-    assert first[0] == "6" and first[1] == "3" and first[2] == "frobnicate --widget N P", lines[i + 1]
-    for secret in ("secret-client", "/Users", "left-pad", "README", "api.example.com"):
+    assert first[0] == "6" and first[1] == "3" and first[2] == "W --dry", lines[i + 1]
+    assert "W --widget N P" in text
+    assert "W -u -p W" in text and "make W" in text and "curl W" in text and "W --dry" in text
+    for secret in leaks + ["/Users", "left-pad", "README", "api.example.com"]:
         assert secret not in text, secret
 
     # the command line, under -I, with a root given
-    p = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "--root", root],
-                       capture_output=True, text=True)
+    p = run_cli("--root", root)
     assert p.returncode == 0 and "family\tuses\ttranscripts\tprojects\tcovered_by" in p.stdout, p.stderr
+    for secret in leaks:
+        assert secret not in p.stdout, secret
     empty = tempfile.mkdtemp(prefix="script-repeats-empty-")
-    p = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "--root", empty],
-                       capture_output=True, text=True)
+    p = run_cli("--root", empty)
     assert p.returncode == 0 and "0 transcripts" in p.stdout, p.stdout
+    p = run_cli("--root", os.path.join(empty, "missing"))
+    assert p.returncode == 2 and p.stderr, (p.returncode, p.stderr)
+    errs = []
+    scan(os.path.join(empty, "missing"), 7, fams, errs)
+    assert errs
+    assert run_cli("--root", empty, "--top", "0").returncode == 2
+    assert run_cli("--root", empty, "--days", "-1").returncode == 2
+
+    # bad input: an exact count, with malformed lines, a missing command and bytes that are not UTF-8
+    bad = tempfile.mkdtemp(prefix="script-repeats-bad-")
+    os.makedirs(os.path.join(bad, "p"))
+    ok = lambda c: json.dumps({"message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": c}}]}})
+    with open(os.path.join(bad, "p", "s.jsonl"), "wb") as f:
+        f.write((ok("echo one") + "\n").encode())
+        f.write(b"{ broken \"Bash\"\n")
+        f.write(b"\xff\xfe \"Bash\" \x80\n")
+        f.write(b"{\"message\": {\"content\": [{\"type\": \"tool_use\", \"name\": \"Bash\", \"input\": {}}]}}\n")
+        f.write(b"{\"message\": {\"content\": [{\"type\": \"tool_use\", \"name\": \"Bash\"}]}}\n")
+        f.write(b"{\"message\": {\"content\": [{\"type\": \"tool_use\", \"name\": \"Bash\", \"input\": {\"command\": 5}}]}}\n")
+        f.write(b"[\"Bash\"]\n")
+        f.write((ok("echo two\xe9") + "\n").encode("utf-8"))
+    assert scan(bad, 7, fams)["commands"] == 2
+
+    # a very long command finishes fast
+    big = tempfile.mkdtemp(prefix="script-repeats-big-")
+    write_transcript(os.path.join(big, "p", "s.jsonl"), [
+        "cat > f <<'EOF'\n" + ("until grep -q x y; do sleep 5; done\n" * 7000) + "EOF",
+        "curl -s " * 30000,
+        "for x in 1; do git status; " * 12000,
+        "until " * 40000,
+        "open(a).read() " * 20000,
+    ])
+    started = time.time()
+    scan(big, 7, fams)
+    took = time.time() - started
+    assert took < 5, "slow scan: %.1fs" % took
     print("self-test passed")
 
 
@@ -288,11 +462,20 @@ def main(argv):
     if args.self_test:
         self_test()
         return 0
+    if args.top < 1:
+        ap.error("--top must be 1 or more")
+    if args.days < 0:
+        ap.error("--days must be 0 or more")
     if not os.path.isdir(args.root):
-        print("script-repeats: no transcripts at %s" % args.root, file=sys.stderr)
+        print("script-repeats: cannot read %s" % args.root, file=sys.stderr)
         return 2
     fams = load_families()
-    print(render(scan(args.root, args.days, fams), fams, args.days, args.top))
+    errors = []
+    res = scan(args.root, args.days, fams, errors)
+    if errors:
+        print("script-repeats: could not read part of %s: %s" % (args.root, errors[0]), file=sys.stderr)
+        return 2
+    print(render(res, fams, args.days, args.top))
     return 0
 
 

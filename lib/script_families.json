@@ -1,34 +1,40 @@
 {
-  "_note": "name, regex (Python re, searched in the whole command), covered_by (a script in bin/ or hooks/, or none), optional exclude regex. Edit here, not in bin/script-repeats.",
+  "_note": "name; regex (Python re); covered_by (a script in bin/ or hooks/, or none); optional: raw (match the command text as written, default is the text with quoted strings and heredoc bodies dropped), code (a regex that must match the code text first), per_segment (match each part split on ; && || |), exclude (a segment that does not count), kind (method: covered by the method text, not a script). Spans are bounded so a long command cannot make a match slow. Edit here, not in bin/script-repeats.",
   "families": [
     {
       "name": "style-slop-grep",
-      "regex": "\\b(grep|rg)\\b[^\\n]*(\\u2014|\\u2013|em.?dash|\\bcomprehensive\\b|\\brobust\\b|\\bseamless|\\bleverag|\\bdelve\\b|\\bstreamlin)",
+      "regex": "\\u2014|\\u2013|em.?dash|\\bcomprehensive\\b|\\brobust\\b|\\bseamless|\\bleverag|\\bdelve\\b|\\bstreamlin",
+      "code": "\\b(grep|rg)\\b",
+      "raw": true,
       "covered_by": "style-scan"
     },
     {
       "name": "mutation-check",
-      "regex": "\\bmutat(e|ion)\\b|\\bsed -i[^\\n]*\\n[^\\n]*(dotnet test|pytest|npm test|go test|vitest)|git (checkout|restore) --? ?\\S+[^\\n]*(;|&&)[^\\n]*(dotnet test|pytest|npm test|go test|vitest)",
+      "regex": "\\bmutat(e|ion)\\b|\\bsed -i[^\\n]{0,150}\\n[^\\n]{0,150}(dotnet test|pytest|npm test|go test|vitest)|git (checkout|restore) --? ?\\S{1,200}[^\\n]{0,150}(;|&&)[^\\n]{0,150}(dotnet test|pytest|npm test|go test|vitest)",
       "covered_by": "holdout.sh"
     },
     {
       "name": "versioned-plugin-path",
       "regex": "lean-agent/lean-agent/\\d+\\.\\d+\\.\\d+/(bin|hooks|lib)/",
-      "covered_by": "bare command on PATH"
+      "raw": true,
+      "kind": "method",
+      "covered_by": "scripts block in skills/method/SKILL.md"
     },
     {
       "name": "curl-smoke-check",
-      "regex": "\\bcurl\\b[^\\n]*(\\s-[a-zA-Z]*[sI]|--head|--silent|-o /dev/null|-w )[^\\n]*https?://",
+      "regex": "\\bcurl(?:\\s+\\S{1,100}){0,8}?\\s+(?:-[a-zA-Z]*[sIw]\\w*|--silent|--head)(?=\\s)(?:\\s+\\S{1,200}){0,8}?\\s+[\"']?https?://",
+      "code": "\\bcurl\\b",
+      "raw": true,
       "covered_by": "check-deployed-sha.sh"
     },
     {
       "name": "inline-python-replace",
-      "regex": "open\\([^\\n]*\\)\\.read\\(\\)[\\s\\S]*\\.replace\\(|\\.read_text\\(\\)[\\s\\S]*\\.replace\\(",
+      "regex": "open\\([^\\n]{0,100}\\)\\.read\\(\\)[\\s\\S]{0,600}\\.replace\\(|\\.read_text\\(\\)[\\s\\S]{0,600}\\.replace\\(",
       "covered_by": "replace"
     },
     {
       "name": "wait-loop",
-      "regex": "\\b(until|while)\\b[\\s\\S]*\\bsleep\\b|\\bsleep\\s+\\d+\\s*(;|&&)\\s*(cat|tail|grep|head)\\b",
+      "regex": "\\b(until|while)\\b[\\s\\S]{0,2000}\\bsleep\\b|\\bsleep\\s+\\d+\\s*(;|&&)\\s*(cat|tail|grep|head)\\b",
       "covered_by": "hooks/wait-loop.py"
     },
     {
@@ -38,23 +44,27 @@
     },
     {
       "name": "direct-test-run",
-      "regex": "\\b(dotnet test|npx vitest|go test|pytest)\\b",
+      "regex": "^\\s*(?:[A-Za-z_]\\w*=\\S*\\s+)*(?:time\\s+)?(?:(?:uv run|poetry run|python3? -m)\\s+)?(?:dotnet test|npx vitest|go test|pytest)\\b",
+      "per_segment": true,
       "exclude": "test-phase|heavy\\.sh|brain queue",
       "covered_by": "test-phase"
     },
     {
       "name": "package-version-lookup",
-      "regex": "hub\\.docker\\.com/v2|api\\.nuget\\.org|azuresearch[^\\s]*nuget|registry\\.npmjs\\.org|\\bnpm (view|info|show)\\b|\\bdotnet (package|nuget) search\\b|\\bdocker manifest inspect\\b",
+      "regex": "hub\\.docker\\.com/v2|api\\.nuget\\.org|azuresearch[^\\s]{0,100}nuget|registry\\.npmjs\\.org|\\bnpm (view|info|show)\\b|\\bdotnet (package|nuget) search\\b|\\bdocker manifest inspect\\b",
+      "code": "\\b(curl|wget|npm|dotnet|docker|python3?|gh)\\b",
+      "raw": true,
       "covered_by": "none"
     },
     {
       "name": "worktree-status-sweep",
-      "regex": "\\bfor\\b[\\s\\S]*\\bgit\\b[^\\n]*\\b(status|worktree list)\\b|git worktree list[\\s\\S]*(xargs|while read)",
+      "regex": "\\bfor\\b[\\s\\S]{0,500}\\bgit\\b[^\\n]{0,200}\\b(status|worktree list)\\b|git worktree list[\\s\\S]{0,300}(xargs|while read)",
       "covered_by": "none"
     },
     {
       "name": "graphql-review-threads",
-      "regex": "gh api graphql[\\s\\S]*reviewThreads",
+      "regex": "gh api graphql[\\s\\S]{0,2000}reviewThreads",
+      "raw": true,
       "covered_by": "pr-blockers.sh"
     }
   ]
