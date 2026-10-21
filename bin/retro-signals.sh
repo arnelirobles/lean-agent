@@ -4,6 +4,10 @@
 #   retro-signals.sh --since 2026-09-24 owner/repo [owner/repo ...]   one TSV row per merged pull request
 #   retro-signals.sh --self-test                                       checks the parsing on a fixture
 #
+# After the rows it prints a script repeats section (bin/script-repeats): the families of commands agents
+# wrote by hand in the last SCRIPT_REPEATS_DAYS days (default 7), with counts only. SCRIPT_REPEATS_ROOT
+# points it at another transcript directory.
+#
 # Per merged pull request: commits pushed after it opened, not counting merges (fix rounds), failed check runs,
 # days from open to merge, and later pull requests or issues in the same repository whose text points
 # back at it as the cause of a fix (an escaped defect, a proxy that undercounts rather than guesses).
@@ -22,10 +26,23 @@ row() { # repo pr opened merged first_review_at commits_after failed_checks
   printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$6" "$7" "$days"
 }
 
+repeats_section() {
+  printf '\n# script repeats\n'
+  python3 -I "$lib/../bin/script-repeats" --days "${SCRIPT_REPEATS_DAYS:-7}" ${SCRIPT_REPEATS_ROOT:+--root "$SCRIPT_REPEATS_ROOT"} \
+    || echo "script-repeats failed"
+}
+
 if [ "${1:-}" = "--self-test" ]; then
   out=$(row BaryoDev/demo 42 2026-09-20T00:00:00Z 2026-09-23T12:00:00Z 2026-09-21T00:00:00Z 2 1)
   want=$(printf 'BaryoDev/demo\t42\t2\t1\t3')
   [ "$out" = "$want" ] || { echo "self-test failed: got '$out', want '$want'"; exit 1; }
+  fixture=$(mktemp -d)
+  mkdir -p "$fixture/proj"
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pgrep -f vitest"}}]}}' > "$fixture/proj/s.jsonl"
+  out=$(SCRIPT_REPEATS_ROOT="$fixture" repeats_section)
+  rm -rf "$fixture"
+  case "$out" in *"# script repeats"*) ;; *) echo "self-test failed: no script repeats section"; exit 1 ;; esac
+  case "$out" in *"pgrep"*"hooks/wait-loop.py"*) ;; *) echo "self-test failed: pgrep family missing: $out"; exit 1 ;; esac
   echo "self-test passed"
   exit 0
 fi
@@ -52,3 +69,4 @@ for repo in "$@"; do
 $prs
 EOF_PRS
 done
+repeats_section

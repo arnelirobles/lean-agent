@@ -1,0 +1,61 @@
+{
+  "_note": "name, regex (Python re, searched in the whole command), covered_by (a script in bin/ or hooks/, or none), optional exclude regex. Edit here, not in bin/script-repeats.",
+  "families": [
+    {
+      "name": "style-slop-grep",
+      "regex": "\\b(grep|rg)\\b[^\\n]*(\\u2014|\\u2013|em.?dash|\\bcomprehensive\\b|\\brobust\\b|\\bseamless|\\bleverag|\\bdelve\\b|\\bstreamlin)",
+      "covered_by": "style-scan"
+    },
+    {
+      "name": "mutation-check",
+      "regex": "\\bmutat(e|ion)\\b|\\bsed -i[^\\n]*\\n[^\\n]*(dotnet test|pytest|npm test|go test|vitest)|git (checkout|restore) --? ?\\S+[^\\n]*(;|&&)[^\\n]*(dotnet test|pytest|npm test|go test|vitest)",
+      "covered_by": "holdout.sh"
+    },
+    {
+      "name": "versioned-plugin-path",
+      "regex": "lean-agent/lean-agent/\\d+\\.\\d+\\.\\d+/(bin|hooks|lib)/",
+      "covered_by": "bare command on PATH"
+    },
+    {
+      "name": "curl-smoke-check",
+      "regex": "\\bcurl\\b[^\\n]*(\\s-[a-zA-Z]*[sI]|--head|--silent|-o /dev/null|-w )[^\\n]*https?://",
+      "covered_by": "check-deployed-sha.sh"
+    },
+    {
+      "name": "inline-python-replace",
+      "regex": "open\\([^\\n]*\\)\\.read\\(\\)[\\s\\S]*\\.replace\\(|\\.read_text\\(\\)[\\s\\S]*\\.replace\\(",
+      "covered_by": "replace"
+    },
+    {
+      "name": "wait-loop",
+      "regex": "\\b(until|while)\\b[\\s\\S]*\\bsleep\\b|\\bsleep\\s+\\d+\\s*(;|&&)\\s*(cat|tail|grep|head)\\b",
+      "covered_by": "hooks/wait-loop.py"
+    },
+    {
+      "name": "pgrep",
+      "regex": "\\bpgrep\\b|\\bps\\s+(aux|-ef|ax)\\s*\\|\\s*grep",
+      "covered_by": "hooks/wait-loop.py"
+    },
+    {
+      "name": "direct-test-run",
+      "regex": "\\b(dotnet test|npx vitest|go test|pytest)\\b",
+      "exclude": "test-phase|heavy\\.sh|brain queue",
+      "covered_by": "test-phase"
+    },
+    {
+      "name": "package-version-lookup",
+      "regex": "hub\\.docker\\.com/v2|api\\.nuget\\.org|azuresearch[^\\s]*nuget|registry\\.npmjs\\.org|\\bnpm (view|info|show)\\b|\\bdotnet (package|nuget) search\\b|\\bdocker manifest inspect\\b",
+      "covered_by": "none"
+    },
+    {
+      "name": "worktree-status-sweep",
+      "regex": "\\bfor\\b[\\s\\S]*\\bgit\\b[^\\n]*\\b(status|worktree list)\\b|git worktree list[\\s\\S]*(xargs|while read)",
+      "covered_by": "none"
+    },
+    {
+      "name": "graphql-review-threads",
+      "regex": "gh api graphql[\\s\\S]*reviewThreads",
+      "covered_by": "pr-blockers.sh"
+    }
+  ]
+}

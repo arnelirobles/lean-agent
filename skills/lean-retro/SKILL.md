@@ -25,6 +25,8 @@ is a gap in what was recorded, not a zero: say so in the retro and do not reason
 row per pull request, run
 `REVIEW_LOG=<path to review-log.tsv> ${CLAUDE_PLUGIN_ROOT}/bin/retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
 
+`retro-signals.sh` ends with a script repeats section from `script-repeats --days 7`: per family of hand-written commands, the uses, transcripts and projects, and the script that covers it. It prints counts and family names only. Run `script-repeats` alone to change the window.
+
 Also gather, from the session or the coordinator's notes:
 - the adversarial review findings of the batch, by category (the review reports, or `review-log.tsv`);
 - every step that needed a person (an approval, a production apply, a permission change);
@@ -42,6 +44,8 @@ Read the previous retro's accepted changes (the method's history, or `retro-log.
 | A finding category in two or more changes | A scripted check, a Risks line (section 0) or a critic question |
 | A check or critic question with no findings for three batches | Drop it for that tier |
 | Reasoning repeated across agents | A script (section 4a), with a test |
+| A family with no covering script, used in 3 or more projects in a week (`script-repeats`) | A ticket for a script that covers it, with the family's count as evidence |
+| A family whose covering script exists but is still hand-rolled (`script-repeats`) | The method does not name the script: add it to the scripts block, or to the agent brief |
 | A step that needed a person in two or more changes | Automate it or script it with confirmations |
 | Fix rounds or cost per change rising | Name the step that grew and a change to it |
 | An escaped defect | A check that would have caught it, proven against that defect |
