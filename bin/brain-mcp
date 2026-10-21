@@ -379,17 +379,17 @@ def digest_and_size_tests(fails, call, db):
     import sqlite3
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     con = sqlite3.connect(db)
-    rows = [("Big%d" % (i % 30), "test-fail", "t%d" % i, "title " + "x" * 80, "open" if i % 4 else "closed", now, now)
+    rows = [("big%d" % (i % 30), "test-fail", "t%d" % i, "title " + "x" * 80, "open" if i % 4 else "closed", now, now)
             for i in range(2000)]
-    rows.append(("Big1", "blocker", "bb", "waiting on the user", "open", now, now))
-    rows.append(("Big1", "agent", "oldagent", "stale one", "open", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"))
+    rows.append(("big1", "blocker", "bb", "waiting on the user", "open", now, now))
+    rows.append(("big1", "agent", "oldagent", "stale one", "open", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"))
     con.executemany("INSERT INTO items (project, kind, ref, title, status, first_seen, last_seen) "
                     "VALUES (?,?,?,?,?,?,?)", rows)
     for i in range(300):
         con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
-                    "VALUES ('Big1', '/x', ?, 'done', ?)", ("t/Done%d.csproj" % i, now))
+                    "VALUES ('big1', '/x', ?, 'done', ?)", ("t/Done%d.csproj" % i, now))
     con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
-                "VALUES ('Big1', '/x', 't/Running.csproj', 'running', ?)", (now,))
+                "VALUES ('big1', '/x', 't/Running.csproj', 'running', ?)", (now,))
     con.commit()
     con.close()
     err, text = call("brain_list")
@@ -454,7 +454,7 @@ def long_title_tests(fails, call, db):
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     con = sqlite3.connect(db)
     con.executemany("INSERT INTO items (project, kind, ref, title, first_seen, last_seen) VALUES (?,?,?,?,?,?)",
-                    [("Long", "test-fail", ("r%d-" % i) + "x" * 190, "t", now, now) for i in range(100)])
+                    [("long", "test-fail", ("r%d-" % i) + "x" * 190, "t", now, now) for i in range(100)])
     con.executemany("INSERT INTO items (project, kind, ref, first_seen, last_seen) VALUES (?,?,?,?,?)",
                     [("Stat%d" % i, "test-fail", "s", now, now) for i in range(400)])
     con.commit()
