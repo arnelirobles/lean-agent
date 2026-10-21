@@ -115,7 +115,7 @@ def import_baryovm(con, path):
 
 
 def cmd_activity(a):
-    con = connect()
+    con = connect(migrate=False)  # no schema bump: an older brain sharing the file keeps working
     ensure_activities(con)
     if a.acmd == "add":
         ts = now()

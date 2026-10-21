@@ -20,7 +20,7 @@ describe("db queries", () => {
   });
 
   it("reads the schema version", () => {
-    expect(db.schemaVersion(d)).toBe(7);
+    expect(db.schemaVersion(d)).toBe(9);
   });
 
   it("lists activity newest first and says which failed", () => {

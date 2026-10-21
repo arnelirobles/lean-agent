@@ -65,7 +65,7 @@ def self_test():
         rc, out, err = hook()
         if rc != 0 or "waiting on the user" not in out or "SessionStart" not in out:
             fails.append(f"open item not in context: {rc} {out!r} {err!r}")
-        subprocess.run([sys.executable, BRAIN, "close", "1"], env=env, capture_output=True)
+        subprocess.run([sys.executable, BRAIN, "close", "1", "--resolution", "fixed"], env=env, capture_output=True)
         if hook() != (0, "", ""):
             fails.append("nothing open must be silent")
         if hook("not json")[0] != 0:

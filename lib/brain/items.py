@@ -2,7 +2,9 @@ import re
 import sys
 import time
 
-from .store import connect, now
+import os
+
+from .store import KIND, RESOLUTION, canon_kind, connect, now
 
 
 def tags_of(con, item_id):
@@ -41,10 +43,30 @@ def session_ok(ident):
     return bool(re.fullmatch(r"[A-Za-z0-9-]{1,100}", ident))
 
 
+def infer_session(con):
+    """The open session started in this folder, as (id, cwd). ("", "") when there is none or more than one."""
+    here = os.path.realpath(os.getcwd())
+    rows = con.execute("SELECT id, cwd FROM sessions WHERE ended_at='' AND cwd=?", (here,)).fetchall()
+    if len(rows) > 1:
+        print(f"brain: {len(rows)} open sessions in {here}, so no session was stored", file=sys.stderr)
+    return (rows[0]["id"], rows[0]["cwd"]) if len(rows) == 1 else ("", "")
+
+
+def kind_or_exit(kind):
+    k = canon_kind(kind)
+    if not k:
+        sys.exit(f"brain: unknown kind {kind!r}; use one of: {', '.join(KIND)} "
+                 "(aliases: todo, task, open-question, finding, running, running-agent)")
+    return k
+
+
 def cmd_add(a):
     if a.session and not session_ok(a.session):
         sys.exit("brain: --session takes letters, digits and dashes only")
+    a.kind = kind_or_exit(a.kind)
     con = connect()
+    if not a.session and a.infer_session:
+        a.session, a.session_cwd = infer_session(con)
     body = body_of(a)
     t = now()
     with con:
@@ -81,7 +103,8 @@ def cmd_list(a):
         args.append(a.tag)
     q += " WHERE 1=1"
     status = "open" if a.open else a.status
-    for col, val in (("status", status), ("project", a.project), ("kind", a.kind), ("cycle", a.cycle)):
+    kind = canon_kind(a.kind) or a.kind
+    for col, val in (("status", status), ("project", a.project), ("kind", kind), ("cycle", a.cycle)):
         if val:
             q += f" AND items.{col}=?"
             args.append(val)
@@ -113,6 +136,8 @@ def cmd_close(a):
         r = get(con, a.id)
         if r["status"] != "open":
             sys.exit(f"brain: #{a.id} is already {r['status']}")
+        if not a.resolution and not a.wontfix:
+            sys.exit(f"brain: close needs --resolution ({', '.join(RESOLUTION)}), or --wontfix")
         body = r["body"] + (("\n\nclosed: " + a.note) if a.note else "")
         t = now()
         con.execute("UPDATE items SET status=?, resolution=?, closed_at=?, body=?, answer_delivered_at=?,"
