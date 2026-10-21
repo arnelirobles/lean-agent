@@ -10,6 +10,10 @@
   brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest]
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
+  brain flaky-clear --project P --test-project T [--runs 5]      closes each open flaky item of T with no new
+            occurrence in that many passing full runs of T (unfiltered, exit 0, tests passed, started after the
+            item was last seen), with resolution flaky-cleared. Runs carry no branch, so the item's branch is
+            not looked at. --runs is at least 1 (test-phase calls it)
   brain queue add <repo-dir> <test-project> [--filter F] [--tier fast|full] [--after ID] [--cycle C]
             [--by NAME] [--project P] [--session ID] [--infer-session] [--platform apple|auto|none] [--again REASON] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
@@ -62,7 +66,7 @@ or nothing open. Queued and running jobs are listed after the blockers and agent
 digest prints under 2 KB: open items by project and kind (project names match without regard to case),
 open blockers and questions one line each, running jobs, and agent items open with no update for 24 hours.
 It covers the current project, or every project with --all. The brain_digest MCP tool runs it.
-Status: open, closed, wontfix. Resolution: fixed, flaky, not-a-bug, duplicate, answered, filed.
+Status: open, closed, wontfix. Resolution: fixed, flaky, flaky-cleared, not-a-bug, duplicate, answered, filed.
 Severity: critical, important, minor, info. Phase: code, test, fix, review.
 Source: test-phase, agent, review, user. Model: haiku, sonnet, opus, or empty.
 add stores the Claude session that filed the item and its folder (--session, --session-cwd, defaulting
@@ -91,6 +95,7 @@ import os
 
 from .store import norm_project, MODEL, PHASE, RESOLUTION, RUNNERS, SEVERITY, SOURCE, STATUS, TIERS
 from .items import cmd_add, cmd_answers, cmd_close, cmd_list, cmd_reopen, cmd_run_add, cmd_session, cmd_show
+from .flaky import cmd_flaky_clear
 from .activity import cmd_activity
 from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
 from .report import cmd_digest, cmd_export, cmd_resume, cmd_stats
@@ -181,6 +186,11 @@ def parser():
     s.add_argument("--exit-code", type=int)
     s.add_argument("--host", default="")
     s.set_defaults(fn=cmd_run_add)
+    s = sub.add_parser("flaky-clear")
+    s.add_argument("--project", required=True)
+    s.add_argument("--test-project", required=True)
+    s.add_argument("--runs", type=int, default=5)
+    s.set_defaults(fn=cmd_flaky_clear)
     s = sub.add_parser("queue")
     qs = s.add_subparsers(dest="qcmd", required=True)
     q = qs.add_parser("add")

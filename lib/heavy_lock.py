@@ -16,6 +16,18 @@ move. After HEAVY_STALL seconds without progress the group gets SIGTERM, then SI
 exits 76. Only the command heavy.sh started is stopped. After the SIGTERM the group always gets a
 SIGKILL too, because a child that ignores SIGTERM would otherwise outlive the lock.
 
+HEAVY_FAIL_STALL (seconds) stops a run that adds only failures. The clock starts at the first failed test
+after the last passed one and resets whenever a test passes; after that many seconds of failures with no pass
+the group is stopped and this exits 78 with "stalled-failing". Passed and failed are counted from the
+"[+N/xM]" counter when the output has one, else from result lines. Both stall messages end with
+"(passed P, failed F, last test: NAME)". The two watchdogs are independent: either, both or neither may be set.
+
+HEAVY_HELD=<lock path>:<pid>:<nonce> says the caller already holds the lane lock for the whole job (bin/test-phase
+does, so a job's alone reruns keep the lane). run then takes no lock, waits for none and reaps no orphan.
+It counts only when the lock path is this lane's, <lock>.held holds the nonce (claim() writes it), the lock is
+held, and pid is one of our parents; otherwise the lane is taken as usual. The command does not inherit it.
+  heavy_lock.py held <lockfile>                           exit 0 if HEAVY_HELD holds for this lane
+
 The watchdog's process group is recorded in <lockfile>.pgid while the command runs and removed when it
 ends. It is written 0600 with O_NOFOLLOW into a lock directory that must be a real directory owned by the
 caller (made 0700); otherwise no record is kept. It holds the group id, the leader's start time and a random
@@ -39,6 +51,10 @@ import time
 DEFAULT_PROGRESS = (r"\[\+\d+/x\d+(?:/\?\d+)?\]"
                     r"|^\s*(?:passed|failed|Passed|Failed)\b.*")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+COUNTER = re.compile(r"\[\+(\d+)/x(\d+)(?:/\?\d+)?\]")
+PASS_LINE = re.compile(r"^(?:passed|  Passed)\s+(\S.*)")
+FAIL_LINE = re.compile(r"^(?:failed|  Failed)\s+(\S.*)")
+START_LINE = re.compile(r"^\s*(?:started|starting|running)\s+\S.*", re.I)
 
 
 def acquire(path, wait):
@@ -53,6 +69,51 @@ def acquire(path, wait):
                 os.close(fd)
                 return None
             time.sleep(0.2)
+
+
+def ancestors():
+    """Pids of this process's parents, nearest first."""
+    pid, out = os.getppid(), []
+    while pid > 1 and len(out) < 32:
+        out.append(pid)
+        try:
+            pid = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                                     timeout=10).stdout.strip() or 0)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            break
+    return out
+
+
+def claim(path):
+    """Write the claim file for a lock this process holds; returns the HEAVY_HELD value that names it."""
+    nonce = secrets.token_hex(16)
+    fd = os.open(path + ".held", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(nonce)
+    return f"{os.path.realpath(path)}:{os.getpid()}:{nonce}"
+
+
+def unclaim(path):
+    try:
+        os.remove(path + ".held")
+    except OSError:
+        pass
+
+
+def held_here(path):
+    """True when HEAVY_HELD (<lock path>:<holder pid>:<nonce>) is a live claim on this lane: the claim file
+    carries the nonce, the lock is held, and the holder is one of our own parents. Anything else, such as a
+    stray value, another lane's claim or a lane that is free, is ignored and the lane is taken as usual."""
+    parts = os.environ.get("HEAVY_HELD", "").rsplit(":", 2)
+    if len(parts) != 3 or not parts[1].isdigit() or os.path.realpath(parts[0]) != os.path.realpath(path):
+        return False
+    try:
+        with open(path + ".held") as fh:
+            if not parts[2] or fh.read().strip() != parts[2]:
+                return False
+    except OSError:
+        return False
+    return int(parts[1]) in ancestors() and probe(path) == 1
 
 
 def probe(path):
@@ -75,9 +136,46 @@ class Watch:
         self.mutex = threading.Lock()
         self.last = time.monotonic()
         self.sig = None
+        self.passed = self.failed = 0  # totals over every assembly
+        self.base_p = self.base_f = self.cur_p = self.cur_f = 0  # finished assemblies, and the one running
+        self.counter = False  # the "[+N/xM]" counter is exact, so once seen it replaces counting result lines
+        self.fail_since = None  # when the first failure after the last pass arrived
+        self.last_test = ""
+
+    def count(self, text):
+        m = COUNTER.search(text)
+        shown = text.strip()[:150]
+        with self.mutex:
+            if m:
+                self.counter = True
+                self.last_test = shown
+                p, f = int(m.group(1)), int(m.group(2))
+                if p < self.cur_p or f < self.cur_f:  # the counter restarted: the next test assembly
+                    self.base_p, self.base_f = self.passed, self.failed
+                    self.cur_p = self.cur_f = 0
+                    self.fail_since = None
+            elif PASS_LINE.match(text) or FAIL_LINE.match(text):
+                self.last_test = shown
+                if self.counter:  # the counter is exact; the result line only names the test
+                    return
+                ok = bool(PASS_LINE.match(text))
+                p, f = self.cur_p + ok, self.cur_f + (not ok)
+            elif START_LINE.match(text):
+                self.last_test = shown
+                return
+            else:
+                return
+            if p > self.cur_p:
+                self.cur_p, self.fail_since = p, None
+            if f > self.cur_f:
+                self.cur_f = f
+                if self.fail_since is None:
+                    self.fail_since = time.monotonic()
+            self.passed, self.failed = self.base_p + self.cur_p, self.base_f + self.cur_f
 
     def line(self, text):
         text = ANSI.sub("", text)
+        self.count(text)
         m = self.pattern.search(text)
         if not m:
             return
@@ -89,6 +187,15 @@ class Watch:
     def idle(self):
         with self.mutex:
             return time.monotonic() - self.last
+
+    def fail_idle(self):
+        """Seconds of failures with no pass since, 0 when the last thing to happen was a pass."""
+        with self.mutex:
+            return 0 if self.fail_since is None else time.monotonic() - self.fail_since
+
+    def facts(self):
+        with self.mutex:
+            return f"passed {self.passed}, failed {self.failed}, last test: {self.last_test or 'none seen'}"
 
 
 def pump(fd, out, watch):
@@ -197,11 +304,17 @@ def reap_orphan(record):
     sys.stderr.flush()
 
 
-def run(argv, stall, pattern, record=None):
+def clean_env():
+    """The command's environment without HEAVY_HELD: the claim is for this lane only, so a heavy.sh the
+    command starts must take its own lock."""
+    return {k: v for k, v in os.environ.items() if k != "HEAVY_HELD"}
+
+
+def run(argv, stall, pattern, record=None, fail_stall=0):
     nonce = secrets.token_hex(16)
     cmd = ["nice", "-n", "19"] + argv
-    if not stall:
-        proc = subprocess.Popen(cmd)
+    if not stall and not fail_stall:
+        proc = subprocess.Popen(cmd, env=clean_env())
 
         def forward(signum, _frame):
             if signum != signal.SIGINT:  # the terminal already sent ^C to the whole group
@@ -214,12 +327,13 @@ def run(argv, stall, pattern, record=None):
             signal.signal(s, forward)
         while True:
             try:
-                return proc.wait()
+                rc = proc.wait()
+                return rc if rc >= 0 else 128 - rc  # by signal: 128 + n, as a shell reports it
             except KeyboardInterrupt:
                 continue
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-                            env=dict(os.environ, HEAVY_LANE_TOKEN=nonce))
+                            env=dict(clean_env(), HEAVY_LANE_TOKEN=nonce))
     if record:
         try:
             write_record(record, proc.pid, nonce)
@@ -243,10 +357,13 @@ def run(argv, stall, pattern, record=None):
         t = threading.Thread(target=pump, args=(stream.fileno(), out, watch), daemon=True)
         t.start()
         threads.append(t)
-    stalled = False
+    stalled = ""
     while proc.poll() is None:
-        if watch.idle() >= stall:
-            stalled = True
+        if stall and watch.idle() >= stall:
+            stalled = "stalled"
+        elif fail_stall and watch.fail_idle() >= fail_stall:
+            stalled = "stalled-failing"
+        if stalled:
             killgroup(signal.SIGTERM)
             try:
                 proc.wait(timeout=5)
@@ -258,10 +375,16 @@ def run(argv, stall, pattern, record=None):
         time.sleep(0.1)
     for t in threads:  # a leftover child can hold the pipe open; do not wait on it for long
         t.join(1)
-    if stalled:
-        sys.stderr.write(f"heavy.sh: stalled: no test progress for {stall} s; likely load, not code\n")
+    if stalled == "stalled":
+        sys.stderr.write(f"heavy.sh: stalled: no test progress for {stall} s; likely load, not code"
+                         f" ({watch.facts()})\n")
         sys.stderr.flush()
         return 76
+    if stalled:
+        sys.stderr.write(f"heavy.sh: stalled-failing: only failures for {fail_stall} s, no test passed"
+                         f" ({watch.facts()})\n")
+        sys.stderr.flush()
+        return 78
     return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
 
 
@@ -376,6 +499,92 @@ def self_test():
             fails.append("write_record followed a symlink")
         except OSError:
             pass
+        # 4. A run that adds only failures is stopped after HEAVY_FAIL_STALL and exits 78 with the counts; a
+        # run that keeps passing tests is not, even though it fails as many.
+        envf = {k: v for k, v in os.environ.items() if k != "HEAVY_STALL"}
+        envf["HEAVY_FAIL_STALL"] = "3"
+        r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "sh", "-c",
+                            'echo "passed A.B.One (1ms)"; while :; do echo "failed A.B.Two (1ms)"; sleep 0.3; done'],
+                           env=envf, capture_output=True, text=True, timeout=60)
+        if r.returncode != 78 or "stalled-failing" not in r.stderr or "(passed 1, failed " not in r.stderr \
+                or "last test: failed A.B.Two" not in r.stderr:
+            fails.append(f"only failures must stop the run with counts, exit 78 ({r.returncode}): {r.stderr!r}")
+        r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "sh", "-c",
+                            'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo "failed F.$i"; echo "passed P.$i"; sleep 0.4; done'],
+                           env=envf, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            fails.append(f"a run that keeps passing tests must not be stopped ({r.returncode}): {r.stderr!r}")
+        r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "sh", "-c",
+                            'for i in 1 2 3 4 5 6 7 8; do echo "[+$i/x$((i * 2))/?0] t"; sleep 0.5; done'],
+                           env=envf, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            fails.append(f"a moving [+N/xM] counter with passes must not be stopped ({r.returncode}): {r.stderr!r}")
+
+        # 5. A run killed by a signal exits 128 + n, with and without the watchdog.
+        for extra in ({}, {"HEAVY_STALL": "60"}):
+            r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "sh", "-c", "kill -TERM $$"],
+                               env={**{k: v for k, v in os.environ.items() if k != "HEAVY_STALL"}, **extra},
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 143:
+                fails.append(f"a command killed by SIGTERM must exit 143 {extra} ({r.returncode}): {r.stderr!r}")
+
+        # 6. HEAVY_HELD=<lock>:<our pid> runs without taking the lock we hold; it is not passed to the command.
+        fd = acquire(lock, 1)
+        held_env = dict(os.environ, HEAVY_HELD=claim(lock))
+        r = subprocess.run([sys.executable, me, "run", lock, "1", marker, "true"], env=held_env,
+                           capture_output=True, text=True, timeout=30)
+        busy = subprocess.run([sys.executable, me, "run", lock, "1", marker, "true"], env=envf,
+                              capture_output=True, text=True, timeout=30)
+        os.close(fd)
+        if r.returncode != 0 or busy.returncode != 75:
+            fails.append(f"HEAVY_HELD must skip the lock and a plain run must still wait ({r.returncode}, {busy.returncode})")
+        fd = acquire(lock, 1)
+        for extra in ({}, {"HEAVY_STALL": "60"}):
+            r = subprocess.run([sys.executable, me, "run", lock, "1", marker, "sh", "-c", 'echo "[${HEAVY_HELD:-none}]"'],
+                               env={**held_env, **extra}, capture_output=True, text=True, timeout=30)
+            if r.stdout.strip() != "[none]":
+                fails.append(f"the command must not inherit HEAVY_HELD {extra}: {r.stdout!r} {r.stderr!r}")
+        os.close(fd)
+        # A claim that is not ours does nothing: not another pid, not another lane, not a free lane.
+        fd = acquire(lock, 1)
+        good = held_env["HEAVY_HELD"]
+        lk, pid, nonce = good.rsplit(":", 2)
+        for bad in (f"{lk}:{int(pid) + 7}:{nonce}", f"{lk}x:{pid}:{nonce}", f"{lk}:{pid}:wrong", f"{lk}:{pid}", "1"):
+            r = subprocess.run([sys.executable, me, "run", lock, "1", marker, "true"],
+                               env=dict(os.environ, HEAVY_HELD=bad), capture_output=True, text=True, timeout=30)
+            if r.returncode != 75:
+                fails.append(f"HEAVY_HELD={bad!r} must not skip the lock ({r.returncode})")
+        os.close(fd)
+        r = subprocess.run([sys.executable, me, "held", lock], env=held_env, timeout=30)
+        if r.returncode != 1:
+            fails.append("a lane that is not held cannot be claimed as held")
+        unclaim(lock)
+        # Another session's watched run holds the lane. A stray HEAVY_HELD=1 must not reap or kill it.
+        pidfile = os.path.join(d, "a.pid")
+        a = subprocess.Popen([sys.executable, me, "run", lock, "5", marker, "sh", "-c", f"echo $$ > {pidfile}; sleep 4"],
+                             env=envf)
+        for _ in range(50):
+            if os.path.exists(pidfile) and open(pidfile).read().strip():
+                break
+            time.sleep(0.1)
+        b = subprocess.run([sys.executable, me, "run", lock, "1", marker, "true"], env=dict(envf, HEAVY_HELD="1"),
+                           capture_output=True, text=True, timeout=30)
+        still = alive(pidfile)
+        arc = a.wait(timeout=30)
+        if b.returncode != 75 or not still or arc != 0:
+            fails.append(f"a stray HEAVY_HELD must leave the holder running (B {b.returncode}, alive {still}, A {arc})")
+        # 7. A second assembly restarts the counter at zero: that is progress, not a failures-only run. A counter
+        # alone still names the last test.
+        r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "sh", "-c",
+                            'echo "[+50/x2/?0] A.T"; for i in 1 2 3 4 5 6; do echo "[+$i/x0/?0] B.T"; sleep 0.5; done'],
+                           env=envf, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            fails.append(f"a counter that restarts for the next assembly must not be stopped ({r.returncode}): {r.stderr!r}")
+        r = subprocess.run([sys.executable, me, "run", lock, "5", marker, "sh", "-c",
+                            'echo "[+50/x2/?0] A.T"; echo "[+3/x1/?0] Some.Test"; sleep 30'],
+                           env=dict(os.environ, HEAVY_STALL="1"), capture_output=True, text=True, timeout=60)
+        if r.returncode != 76 or "(passed 53, failed 3, last test: [+3/x1/?0] Some.Test)" not in r.stderr:
+            fails.append(f"counts must add up across assemblies and the counter must name the last test ({r.returncode}): {r.stderr!r}")
     print("self-test: ok" if not fails else "self-test failed:\n  " + "\n  ".join(fails))
     return 1 if fails else 0
 
@@ -385,24 +594,28 @@ def main(args):
         return self_test()
     if len(args) == 2 and args[0] == "probe":
         return probe(args[1])
+    if len(args) == 2 and args[0] == "held":
+        return 0 if held_here(args[1]) else 1
     if len(args) >= 5 and args[0] == "run":
         path, wait, marker, argv = args[1], args[2], args[3], args[4:]
         try:
             wait = int(wait)
             stall = int(os.environ.get("HEAVY_STALL") or 0)
+            fail_stall = int(os.environ.get("HEAVY_FAIL_STALL") or 0)
             pattern = re.compile(os.environ.get("HEAVY_PROGRESS") or DEFAULT_PROGRESS)
         except (ValueError, re.error) as e:
-            sys.stderr.write(f"heavy.sh: bad HEAVY_WAIT, HEAVY_STALL or HEAVY_PROGRESS: {e}\n")
+            sys.stderr.write(f"heavy.sh: bad HEAVY_WAIT, HEAVY_STALL, HEAVY_FAIL_STALL or HEAVY_PROGRESS: {e}\n")
             return 2
-        fd = acquire(path, wait)
-        if fd is None:
+        held = held_here(path)  # the caller holds the lane for the whole job
+        fd = None if held else acquire(path, wait)
+        if fd is None and not held:
             return 75
         open(marker, "w").close()
         record = path + ".pgid" if private_dir(path) else None
-        if record:
+        if record:  # a valid claim means the lock is ours, so a recorded group is an orphan of an earlier command
             reap_orphan(record)
         try:
-            return run(argv, stall, pattern, record)
+            return run(argv, stall, pattern, record, fail_stall)
         except FileNotFoundError as e:
             sys.stderr.write(f"heavy.sh: {e}\n")
             return 127
@@ -412,7 +625,8 @@ def main(args):
                     os.remove(record)
                 except OSError:
                     pass
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
     sys.stderr.write("usage: heavy_lock.py probe <lock> | run <lock> <wait> <marker> <cmd...>\n")
     return 2
 

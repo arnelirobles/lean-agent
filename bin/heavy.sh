@@ -43,6 +43,15 @@
 # progress line, so a counter that repeats with the same counts does not count. The clock starts when
 # the command starts, so set it above the build time. Only the command heavy.sh started is stopped.
 #
+# HEAVY_FAIL_STALL=<seconds> stops a run that adds only failures: that long after the first failed test with
+# no test passing since, the command is stopped and heavy.sh exits 78 with "stalled-failing". Both stall
+# messages end with "(passed P, failed F, last test: NAME)". It works with or without HEAVY_STALL.
+#
+# HEAVY_HELD=<lock path>:<pid>:<nonce> means the caller (that pid, one of our parents) already holds this lane's lock
+# for a whole job (bin/test-phase takes it once per job, so a job's alone reruns cannot lose the lane to
+# another session). heavy.sh then runs the command without taking or waiting for the lock. A value for another
+# lane, for a lane nobody holds, or for a pid that is not our parent is ignored, and the command never sees it.
+#
 # HEAVY_TIMING_FILE=<path> gets the seconds the command waited for the lane, once it has run.
 #
 # Linux uses util-linux flock. Anywhere else (macOS has no flock and no /proc) the lock is taken with
@@ -64,7 +73,8 @@ HEAVY_HELPER="$(here)/../lib/heavy_lock.py"
 HEAVY_SELF="$(here)/$(basename "${BASH_SOURCE[0]}")"
 
 backend() { # flock on Linux with util-linux, the python helper everywhere else or when watching
-  if [ "${HEAVY_BACKEND:-}" = python ] || [ -n "${HEAVY_STALL:-}" ] \
+  if [ "${HEAVY_BACKEND:-}" = python ] || [ -n "${HEAVY_STALL:-}" ] || [ "${HEAVY_FAIL_STALL:-0}" != 0 ] \
+     || [ "${HELD_LANE:-}" = 1 ] \
      || [ "$(uname -s)" != Linux ] || ! command -v flock >/dev/null 2>&1; then
     echo python
   else
@@ -130,13 +140,17 @@ run_lane() { # $1 lane, rest: command
   check_lane "$lane" || return 2
   wait=${HEAVY_WAIT:-300}
   case "$wait" in ''|*[!0-9]*) echo "HEAVY_WAIT must be a whole number of seconds" >&2; return 2 ;; esac
+  case "${HEAVY_FAIL_STALL:-0}" in ''|*[!0-9]*) echo "HEAVY_FAIL_STALL must be a whole number of seconds" >&2; return 2 ;; esac
   case "${HEAVY_STALL:-0}" in ''|*[!0-9]*) echo "HEAVY_STALL must be a whole number of seconds" >&2; return 2 ;; esac
   dir=${HEAVY_LOCK_DIR:-/tmp/heavy-locks}
   mkdir -p "$dir"
   lock="$dir/$lane.lock"
   : >> "$lock"
+  # HEAVY_HELD counts only when helper agrees: this lane's lock, held, by one of our parents.
+  HELD_LANE=0
+  if [ -n "${HEAVY_HELD:-}" ] && python3 "$HEAVY_HELPER" held "$lock" 2>/dev/null; then HELD_LANE=1; fi
 
-  if ! lock_free "$lock"; then
+  if [ "$HELD_LANE" != 1 ] && ! lock_free "$lock"; then
     holders=$(lock_holders "$lock")
     echo "heavy.sh: lane '$lane' is busy, waiting up to ${wait}s. Held by:" >&2
     printf '%s\n' "${holders:-  (no visible process; another user may hold it)}" >&2
@@ -264,6 +278,22 @@ stall_suite() { # the watchdog, always through the python helper
   [ "$rc" = 2 ] || { echo "self-test failed: bad HEAVY_STALL accepted ($rc)"; fails=$((fails + 1)); }
   out=$( (HEAVY_STALL=60 run_lane s7 true) 2>&1 ); rc=$?
   [ "$rc" = 0 ] || { echo "self-test failed: quick command under the watchdog exited $rc: $out"; fails=$((fails + 1)); }
+  # Only failures: stopped with 78 and the counts, with HEAVY_STALL off. A run that keeps passing is left alone.
+  out=$( (HEAVY_FAIL_STALL=2 run_lane f1 sh -c 'echo "passed T.One"; while :; do echo "failed T.Two"; sleep 0.3; done') 2>&1 ); rc=$?
+  { [ "$rc" = 78 ] && grep -q 'stalled-failing: only failures for 2 s' <<<"$out" && grep -q '(passed 1, failed [0-9]*, last test: failed T.Two' <<<"$out"; } || { echo "self-test failed: failures only were not stopped with counts ($rc): $out"; fails=$((fails + 1)); }
+  out=$( (HEAVY_FAIL_STALL=25 run_lane f2 sh -c 'for i in 1 2 3 4 5 6; do echo "failed F$i"; echo "passed P$i"; sleep 0.5; done') 2>&1 ); rc=$?
+  [ "$rc" = 0 ] || { echo "self-test failed: a run that keeps passing was stopped ($rc): $out"; fails=$((fails + 1)); }
+  out=$( (HEAVY_FAIL_STALL=abc run_lane f3 true) 2>&1 ); rc=$?
+  [ "$rc" = 2 ] || { echo "self-test failed: bad HEAVY_FAIL_STALL accepted ($rc)"; fails=$((fails + 1)); }
+  # A stray HEAVY_HELD=1 on a lane another process holds must wait like any run and must not hurt the holder.
+  (run_lane f4 sh -c 'sleep 6; echo holder done' </dev/null >"$t/f4.out" 2>&1) &
+  sleep 1
+  out=$( (HEAVY_HELD=1 HEAVY_WAIT=1 run_lane f4 sh -c 'echo ran') 2>&1 ); rc=$?
+  [ "$rc" = 75 ] || { echo "self-test failed: HEAVY_HELD=1 on a lane someone else holds must time out ($rc): $out"; fails=$((fails + 1)); }
+  out=$( (HEAVY_HELD="$HEAVY_LOCK_DIR/f4.lock:$$:guess" HEAVY_WAIT=1 run_lane f4 sh -c 'echo ran') 2>&1 ); rc=$?
+  [ "$rc" = 75 ] || { echo "self-test failed: a guessed HEAVY_HELD claim must time out ($rc): $out"; fails=$((fails + 1)); }
+  wait
+  grep -q 'holder done' "$t/f4.out" || { echo "self-test failed: the holder was killed by a HEAVY_HELD run: $(cat "$t/f4.out")"; fails=$((fails + 1)); }
   return "$fails"
 }
 
