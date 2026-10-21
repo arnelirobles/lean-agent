@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 
+from .items import infer_session, session_ok
 from .store import connect, now
 
 
@@ -21,8 +22,9 @@ def project_of(path):
     if r.returncode == 0 and r.stdout.strip():
         common = os.path.abspath(os.path.join(path, r.stdout.strip()))
         name = os.path.basename(common)
-        return os.path.basename(os.path.dirname(common)) if name == ".git" else re.sub(r"\.git$", "", name)
-    return os.path.basename(path.rstrip("/"))
+        name = os.path.basename(os.path.dirname(common)) if name == ".git" else re.sub(r"\.git$", "", name)
+        return name.lower()
+    return os.path.basename(path.rstrip("/")).lower()
 
 
 def cancel_dependents(con, job_id, reason):
@@ -137,15 +139,21 @@ def cmd_queue(a):
                 print(f"brain: the same job is already queued as #{same['id']}; joined it", file=sys.stderr)
                 print(same["id"])
                 return 0
+        session, session_cwd = a.session, a.session_cwd if a.session else ""
+        if not session and a.infer_session:
+            session, session_cwd = infer_session(con)
+        if session and not session_ok(session):
+            sys.exit("brain: --session takes letters, digits and dashes only")
         with con:
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
-                " enqueued_at, status, reason, ended_at, args, platform) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " enqueued_at, status, reason, ended_at, args, platform, session_id, session_cwd)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.cycle, a.project or project_of(repo), repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
                  f"dependency #{a.after} {dep['status']}" if dead else "", now() if dead else None, a.args,
                  detect_platform(repo, a.test_project) if a.platform == "auto" else
-                 ("apple" if a.platform == "apple" else "")))
+                 ("apple" if a.platform == "apple" else ""), session, session_cwd))
         print(cur.lastrowid)
         return 0
     if a.qcmd == "list":

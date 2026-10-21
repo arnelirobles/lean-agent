@@ -1,6 +1,7 @@
 import json
 import os
 import statistics
+import time
 
 from .store import connect, db_path, epoch
 from .items import tags_of
@@ -8,6 +9,9 @@ from .queue import job_line, project_of
 
 
 RESUME_ORDER = ("blocker", "agent", "pending", "question")
+
+
+STALE_AGENT_S = 24 * 3600
 
 
 def default_project():
@@ -56,6 +60,10 @@ def stats(con):
     spans = {}
     for r in con.execute("SELECT kind, first_seen, closed_at FROM items WHERE closed_at IS NOT NULL"):
         spans.setdefault(r["kind"], []).append(epoch(r["closed_at"]) - epoch(r["first_seen"]))
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - STALE_AGENT_S))
+    out["stale_agents"] = [dict(r) for r in con.execute(
+        "SELECT id, project, title, last_seen FROM items WHERE kind='agent' AND status='open' AND last_seen < ?"
+        " ORDER BY last_seen, id", (cutoff,))]
     out["median_close_s"] = {k: statistics.median(v) for k, v in sorted(spans.items())}
     out["suites"] = [dict(r) for r in con.execute(
         "SELECT r.project, r.test_project, COUNT(*) AS runs, ROUND(AVG(r.lane_wait_s), 1) AS mean_lane_wait_s,"
@@ -86,6 +94,10 @@ def cmd_stats(a):
     print(grid(["kind", "status", "count"], [[r["kind"], r["status"], r["n"]] for r in s["by_kind_status"]]))
     print("\nopen by project")
     print(grid(["project", "open"], [[r["project"], r["n"]] for r in s["open_by_project"]]))
+    if s["stale_agents"]:
+        print("\nstale agents (open, no update for 24 hours)")
+        print(grid(["id", "project", "last seen", "title"],
+                   [[r["id"], r["project"], r["last_seen"], r["title"][:60]] for r in s["stale_agents"]]))
     print("\nmedian time to close")
     print(grid(["kind", "hours"], [[k, round(v / 3600, 2)] for k, v in s["median_close_s"].items()]))
     print("\nsuites (fast and full runs)")

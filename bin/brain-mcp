@@ -104,7 +104,8 @@ def t_show(a):
 
 
 def t_add(a):
-    args = ["add", "--project", need_str(a, "project"), "--kind", need_str(a, "kind"), "--ref", need_str(a, "ref")]
+    args = ["add", "--project", need_str(a, "project"), "--kind", need_str(a, "kind"), "--ref", need_str(a, "ref"),
+            "--infer-session"]
     for k in ("title", "severity", "repo", "branch", "cycle"):
         opt(a, args, k)
     body = a.get("body")
@@ -137,7 +138,7 @@ CLASS = re.compile(r"[A-Za-z0-9_.*~`+<>]+")
 
 
 def t_queue_add(a):
-    args = ["queue", "add", need_str(a, "repo_dir"), need_str(a, "test_project"), "--by", "mcp"]
+    args = ["queue", "add", need_str(a, "repo_dir"), need_str(a, "test_project"), "--by", "mcp", "--infer-session"]
     # test-phase splits a filter on | and hands each piece to dotnet, so check each piece, not the whole.
     f = a.get("filter")
     if f not in (None, "") and not (isinstance(f, str) and all(CLASS.fullmatch(p.strip()) for p in f.split("|"))):
@@ -182,11 +183,12 @@ TOOLS = [
         "kind": S("item kind, such as test-fail or question"), "tag": S("a tag"), "cycle": S("cycle name")})),
     ("brain_show", "Show one brain item in full.", t_show, schema({"id": I("item id")}, ["id"])),
     ("brain_add", "Add an item, or bump the count of an open one with the same project, kind and ref.", t_add, schema({
-        "project": S("project name"), "kind": S("test-fail, flaky, minor, question, ticket, security, pending, blocker, agent"),
+        "project": S("project name"), "kind": S("test-fail, flaky, minor, question, ticket, security, pending, blocker, agent, note, failure, "
+                  "risk, ruling, bug, review-finding or isolation; other kinds are refused"),
         "ref": S("short key that identifies the item"), "title": S("one-line title"), "body": S("details"),
         "severity": S("critical, important, minor or info"), "repo": S("repository"), "branch": S("branch"),
         "cycle": S("cycle name")}, ["project", "kind", "ref"])),
-    ("brain_close", "Close an item.", t_close, schema({
+    ("brain_close", "Close an item. Needs a resolution, or wontfix.", t_close, schema({
         "id": I("item id"), "resolution": S("fixed, flaky, not-a-bug, duplicate, answered or filed"),
         "note": S("closing note"), "wontfix": B("close as wontfix")}, ["id"])),
     ("brain_queue_list", "List test queue jobs.", t_queue_list, schema({
@@ -346,6 +348,18 @@ def self_test():
             err, text = call("brain_show", id=1)
             if err or secret not in text or "second line" not in text:
                 fails.append(f"brain_show must return the stdin body: {err} {text!r}")
+            subprocess.run([sys.executable, BRAIN, "session", "start", "mcp-sess-1", "--cwd", os.path.realpath(os.getcwd())],
+                           env=env, capture_output=True)
+            err, text = call("brain_add", project="Demo", kind="todo", ref="sess1", title="from a session")
+            err2, shown = call("brain_show", id=2)
+            if err or err2 or "session: mcp-sess-1" not in shown or "pending demo sess1" not in text:
+                fails.append(f"brain_add must store the session of this folder and the lower case project: {text!r} {shown!r}")
+            err, text = call("brain_add", project="demo", kind="no-such-kind", ref="bad")
+            if not err or "one of:" not in text:
+                fails.append(f"brain_add must refuse an unknown kind with the list: {err} {text!r}")
+            err, text = call("brain_close", id=2)
+            if not err or "resolution" not in text:
+                fails.append(f"brain_close must need a resolution: {err} {text!r}")
             err, text = call("brain_add", project="demo", kind="note", ref="q2", title="-1 offset in the parser")
             if err:
                 fails.append(f"a title may start with a dash: {text!r}")

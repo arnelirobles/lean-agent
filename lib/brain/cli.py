@@ -2,16 +2,16 @@
 
   brain add --project P --kind K --ref R [--repo R] [--branch B] [--title T] [--body B | --body-file F]
             [--severity S] [--phase P] [--source S] [--model M] [--cycle C] [--commit H] [--link L]
-            [--run-id N] [--tag T ...] [--session ID] [--session-cwd DIR]
+            [--run-id N] [--tag T ...] [--session ID] [--session-cwd DIR] [--infer-session]
   brain list [--open] [--status S] [--project P] [--kind K] [--tag T] [--cycle C]
   brain show ID
-  brain close ID [--wontfix] [--resolution R] [--note N] [--commit H] [--tag T ...]
+  brain close ID (--resolution R | --wontfix) [--note N] [--commit H] [--tag T ...]
   brain reopen ID
   brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest]
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain queue add <repo-dir> <test-project> [--filter F] [--tier fast|full] [--after ID] [--cycle C]
-            [--by NAME] [--project P] [--platform apple|auto|none] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
+            [--by NAME] [--project P] [--session ID] [--infer-session] [--platform apple|auto|none] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
             --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
             or -macos; a remote lane never claims an apple job
@@ -40,10 +40,14 @@ The file is ${LEAN_BRAIN_DB:-~/.local/share/lean/brain.db}, one sqlite database 
 (table meta) that is migrated forward on open. Nothing leaves the machine. Output is plain text, one
 line per item. --body-file - reads the body from stdin.
 
-Kinds in use: test-fail, flaky, minor, question, ticket, security, and three for surviving a context
-compaction: pending (the next step), blocker (waiting on the user, or a denied action that must not be
-worked around) and agent (a running subagent: id, task and worktree in the title or body; closed when it
-reports back). Others are allowed. Never store secrets, tokens or passwords.
+Kinds: test-fail, flaky, minor, question, ticket, security, note, failure, risk, ruling, bug,
+review-finding, isolation, and three for surviving a context compaction: pending (the next step),
+blocker (waiting on the user, or a denied action that must not be worked around) and agent (a running
+subagent: id, task and worktree in the title or body; closed when it reports back). Aliases: todo and
+task mean pending, open-question means question, finding means review-finding, running and
+running-agent mean agent. Any other kind is refused. Project names are stored lower case. close needs
+--resolution, or --wontfix. An open agent item not updated for 24 hours shows as stale in stats.
+Never store secrets, tokens or passwords.
 resume prints the open items of one project as a short digest: blockers, agents, queued and running
 jobs, pending, questions, then the rest, newest first, titles only, at most --max lines (default 40). The project defaults to the
 git toplevel's name in the current directory. It prints nothing and exits 0 when there is no database
@@ -82,11 +86,15 @@ from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
 from .report import cmd_export, cmd_resume, cmd_stats
 
 
+def lower(s):
+    return s.strip().lower()
+
+
 def parser():
     p = argparse.ArgumentParser(prog="brain", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("add")
-    s.add_argument("--project", required=True)
+    s.add_argument("--project", required=True, type=lower)
     s.add_argument("--repo", default="")
     s.add_argument("--branch", default="")
     s.add_argument("--kind", required=True)
@@ -107,11 +115,13 @@ def parser():
                    help="the Claude session that filed it (default $LEAN_SESSION_ID)")
     s.add_argument("--session-cwd", default=os.environ.get("LEAN_SESSION_CWD", ""),
                    help="that session's folder (default $LEAN_SESSION_CWD)")
+    s.add_argument("--infer-session", action="store_true",
+                   help="with no session, take the open one started in this folder")
     s.set_defaults(fn=cmd_add)
     s = sub.add_parser("list")
     s.add_argument("--open", action="store_true")
     s.add_argument("--status", choices=STATUS)
-    s.add_argument("--project")
+    s.add_argument("--project", type=lower)
     s.add_argument("--kind")
     s.add_argument("--tag")
     s.add_argument("--cycle")
@@ -141,7 +151,7 @@ def parser():
     s.set_defaults(fn=cmd_reopen)
     s = sub.add_parser("run-add")
     s.add_argument("--cycle", default="")
-    s.add_argument("--project", required=True)
+    s.add_argument("--project", required=True, type=lower)
     s.add_argument("--repo", default="")
     s.add_argument("--test-project", required=True)
     s.add_argument("--runner", default="", choices=RUNNERS)
@@ -168,9 +178,14 @@ def parser():
     q.add_argument("--after", type=int)
     q.add_argument("--cycle", default="")
     q.add_argument("--by", default="")
-    q.add_argument("--project", default="")
+    q.add_argument("--project", default="", type=lower)
     q.add_argument("--args", default="")
     q.add_argument("--platform", choices=("apple", "auto", "none"), default="auto")
+    q.add_argument("--session", default=os.environ.get("LEAN_SESSION_ID", ""),
+                   help="the session that queued it (default $LEAN_SESSION_ID); its items carry it")
+    q.add_argument("--session-cwd", default=os.environ.get("LEAN_SESSION_CWD", ""))
+    q.add_argument("--infer-session", action="store_true",
+                   help="with no session, take the open one started in this folder")
     q = qs.add_parser("list")
     q.add_argument("--cycle")
     q.add_argument("--status", choices=JOB_STATUS)
@@ -220,7 +235,7 @@ def parser():
     q.add_argument("--file", help="default $BARYOVM_HOME/activity.jsonl, or ~/.baryovm/activity.jsonl")
     s.set_defaults(fn=cmd_activity)
     s = sub.add_parser("resume")
-    s.add_argument("--project")
+    s.add_argument("--project", type=lower)
     s.add_argument("--max", type=int, default=40)
     s.set_defaults(fn=cmd_resume)
     s = sub.add_parser("stats")
@@ -228,7 +243,7 @@ def parser():
     s.set_defaults(fn=cmd_stats)
     s = sub.add_parser("export")
     s.add_argument("--format", choices=("md", "json"), default="md")
-    s.add_argument("--project")
+    s.add_argument("--project", type=lower)
     s.add_argument("--status", choices=STATUS)
     s.set_defaults(fn=cmd_export)
     return p
