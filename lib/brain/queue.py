@@ -25,6 +25,11 @@ def project_of(path):
     return os.path.basename(path.rstrip("/"))
 
 
+def git_out(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
 def cancel_dependents(con, job_id, reason):
     for r in con.execute("SELECT id FROM jobs WHERE status='queued' AND after_id=?", (job_id,)).fetchall():
         con.execute("UPDATE jobs SET status='cancelled', reason=?, ended_at=? WHERE id=?", (reason, now(), r["id"]))
@@ -125,27 +130,42 @@ def cmd_queue(a):
         if a.after and not dep:
             sys.exit(f"brain: no job #{a.after} to run after")
         repo = os.path.abspath(a.repo_dir)
+        commit = git_out(repo, "rev-parse", "HEAD") or ""
         # A job behind one that already failed or was cancelled can never run; record that at once.
         dead = dep and dep["status"] in ("failed", "cancelled")
         if not dead:
             # The same run already waiting: join it, so one build serves every agent that asked.
             same = con.execute(
                 "SELECT id FROM jobs WHERE status='queued' AND repo_dir=? AND test_project=? AND filter IS ?"
-                " AND tier=? AND after_id IS ? AND args IS ? ORDER BY id LIMIT 1",
-                (repo, a.test_project, a.filter, a.tier, a.after, a.args)).fetchone()
+                " AND tier=? AND after_id IS ? AND args IS ? AND commit_hash=? ORDER BY id LIMIT 1",
+                (repo, a.test_project, a.filter, a.tier, a.after, a.args, commit)).fetchone()
             if same:
                 print(f"brain: the same job is already queued as #{same['id']}; joined it", file=sys.stderr)
                 print(same["id"])
                 return 0
+            # One full run per commit: the suite runs once, as the final check.
+            if a.tier == "full" and commit and not a.again:
+                project = a.project or project_of(repo)
+                prior = con.execute(
+                    "SELECT id, status FROM jobs WHERE tier='full' AND project=? AND test_project=? AND commit_hash=?"
+                    " AND status IN ('queued','running','done') ORDER BY id LIMIT 1",
+                    (project, a.test_project, commit)).fetchone()
+                if prior:
+                    sys.exit(f"brain: a full run of {project} {a.test_project} at {commit[:8]} already exists as job "
+                             f"#{prior['id']} ({prior['status']}); pass --again \"reason\" to run it again")
+                if git_out(repo, "status", "--porcelain", "--untracked-files=no"):
+                    sys.exit(f"brain: {repo} has uncommitted changes, so a full run would not be the commit {commit[:8]}; "
+                             "commit first, or pass --again \"reason\"")
         with con:
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
-                " enqueued_at, status, reason, ended_at, args, platform) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " enqueued_at, status, reason, ended_at, args, platform, commit_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.cycle, a.project or project_of(repo), repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
-                 f"dependency #{a.after} {dep['status']}" if dead else "", now() if dead else None, a.args,
+                 f"dependency #{a.after} {dep['status']}" if dead else
+                 (f"again: {a.again}" if a.again else ""), now() if dead else None, a.args,
                  detect_platform(repo, a.test_project) if a.platform == "auto" else
-                 ("apple" if a.platform == "apple" else "")))
+                 ("apple" if a.platform == "apple" else ""), commit))
         print(cur.lastrowid)
         return 0
     if a.qcmd == "list":

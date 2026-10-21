@@ -207,6 +207,66 @@ def run(brain_cli):
             fails.append("a different filter is a different job")
         run("queue", "cancel", d1)
         run("queue", "cancel", d3)
+
+        # One full run per commit, identical queued jobs joined by commit, no full run from a dirty tree.
+        g = os.path.join(d, "gitrepo")
+        os.makedirs(g)
+
+        def git(*args):
+            subprocess.run(["git", "-C", g, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True,
+                           capture_output=True)
+        git("init", "-q")
+        with open(os.path.join(g, "f.txt"), "w") as f:
+            f.write("one\n")
+        git("add", "f.txt")
+        git("commit", "-q", "-m", "one")
+        rc, c1, _ = run("queue", "add", g, "T.csproj")
+        rc, out, err = run("queue", "add", g, "T.csproj", "--cycle", "other")
+        if rc == 0 or f"#{c1}" not in err:
+            fails.append(f"a full job for a commit with a full job queued must be refused with its id: {rc} {out!r} {err!r}")
+        run("queue", "finish", c1, "--status", "done")
+        rc, out, err = run("queue", "add", g, "T.csproj")
+        if rc == 0 or f"#{c1}" not in err or "done" not in err:
+            fails.append(f"a full job for a commit with a done full job must be refused with its id: {rc} {out!r} {err!r}")
+        rc, c2, _ = run("queue", "add", g, "T.csproj", "--again", "flaky infra, rerun")
+        if rc != 0 or c2 == c1 or "again: flaky infra, rerun" not in run("queue", "list", "--status", "queued")[1]:
+            fails.append(f"--again must allow a second full job and keep the reason: {rc} {c2!r}")
+        rc, c2b, _ = run("queue", "add", g, "T.csproj", "--again", "once more")
+        if c2b != c2:
+            fails.append(f"--again must still join an identical queued job: {c2} {c2b}")
+        if run("queue", "add", g, "U.csproj")[0] != 0:
+            fails.append("a full job for another test project of the same commit must be allowed")
+        run("queue", "cancel", c2)
+        if run("queue", "add", g, "T.csproj", "--tier", "fast", "--filter", "X")[0] != 0:
+            fails.append("a fast job is never refused for an earlier full job")
+        f1 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
+        f2 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
+        if f1 != f2:
+            fails.append(f"an add identical to a queued job must return its id: {f1} {f2}")
+        git("commit", "-q", "--allow-empty", "-m", "two")
+        f3 = run("queue", "add", g, "V.csproj", "--tier", "fast", "--filter", "X")[1]
+        if f3 == f1:
+            fails.append("the same job at another commit is not identical")
+        if run("queue", "add", g, "T.csproj")[0] != 0:
+            fails.append("a full job for a new commit must be allowed")
+        with open(os.path.join(g, "f.txt"), "w") as f:
+            f.write("edited\n")
+        rc, out, err = run("queue", "add", g, "W.csproj")
+        if rc == 0 or "uncommitted" not in err:
+            fails.append(f"a full job from a tree with tracked changes must be refused: {rc} {out!r} {err!r}")
+        if run("queue", "add", g, "W.csproj", "--tier", "fast", "--filter", "X")[0] != 0:
+            fails.append("a fast job from a dirty tree must be allowed")
+        rc, w1, _ = run("queue", "add", g, "W.csproj", "--again", "testing the edit")
+        if rc != 0:
+            fails.append("--again must allow a full job from a dirty tree")
+        git("checkout", "--", "f.txt")
+        with open(os.path.join(g, "untracked.txt"), "w") as f:
+            f.write("x\n")
+        if run("queue", "add", g, "X.csproj")[0] != 0:
+            fails.append("an untracked file must not make the tree dirty")
+        for line in run("queue", "list", "--status", "queued")[1].splitlines():
+            if " gitrepo " in line:
+                run("queue", "cancel", line.split()[1][1:])
         b1 = run("queue", "add", "/tmp/r", "I.csproj")[1]
         b2 = run("queue", "add", "/tmp/r", "J.csproj")[1]
         b3 = run("queue", "add", "/tmp/r", "J.csproj", "--after", b2)[1]
