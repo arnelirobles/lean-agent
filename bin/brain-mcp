@@ -383,14 +383,14 @@ def digest_and_size_tests(fails, call, db):
     err, text = call("brain_list", project="Big1", kind="blocker")
     if err or "bb" not in text or len(text.splitlines()) != 1:
         fails.append(f"brain_list project and kind filters must still work: {err} {text!r}")
-    err, text = call("brain_list", open=False, project="Big1", limit=1000)
+    err, text = call("brain_list", open=False, project="Big0", limit=1000)
     if err or " closed " not in text:
         fails.append(f"brain_list open=false must include closed items: {err}")
     err, text = call("brain_queue_list")
     if err or "Running.csproj" not in text or "Done" in text or "tests/A.csproj" not in text:
         fails.append(f"brain_queue_list default must be queued and running jobs only: {err} {text[:300]!r}")
     err, text = call("brain_queue_list", status="done")
-    if err or "Done0.csproj" not in text or len(text.splitlines()) != 51 or "more jobs" not in text.splitlines()[-1]:
+    if err or "Done299.csproj" not in text or len(text.splitlines()) != 51 or "more jobs" not in text.splitlines()[-1]:
         fails.append(f"brain_queue_list status done must list done jobs, cut at 50: {err} {len(text.splitlines())}")
     err, text = call("brain_digest", project="big1")
     if err or len(text.encode()) > 2048 or "waiting on the user" not in text or "stale agent" not in text \
