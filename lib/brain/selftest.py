@@ -222,8 +222,11 @@ def run(brain_cli):
         git("commit", "-q", "-m", "one")
         rc, c1, _ = run("queue", "add", g, "T.csproj")
         rc, out, err = run("queue", "add", g, "T.csproj", "--cycle", "other")
+        if rc != 0 or out != c1:
+            fails.append(f"a full job identical to a queued one must return its id: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "add", g, "T.csproj", "--args=-p:A=1")
         if rc == 0 or f"#{c1}" not in err:
-            fails.append(f"a full job for a commit with a full job queued must be refused with its id: {rc} {out!r} {err!r}")
+            fails.append(f"a different full job for a commit with a full job queued must be refused with its id: {rc} {out!r} {err!r}")
         run("queue", "finish", c1, "--status", "done")
         rc, out, err = run("queue", "add", g, "T.csproj")
         if rc == 0 or f"#{c1}" not in err or "done" not in err:
@@ -424,7 +427,7 @@ def run(brain_cli):
         c0.close()
         if hosts != ["dev"]:
             fails.append(f"run-add --host must store the host: {hosts}")
-        if ver != "7":
+        if ver != "8":
             fails.append(f"schema version after open: {ver}")
 
         # A worktree shares its repository's project name.
@@ -434,6 +437,8 @@ def run(brain_cli):
         subprocess.run(["git", "init", "-q", main_repo], check=True)
         subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "x"], check=True)
         subprocess.run(git + ["worktree", "add", "-q", wt, "-b", "side"], check=True, capture_output=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", wt, "commit", "-q", "--allow-empty",
+                        "-m", "y"], check=True)
         jw = run("queue", "add", wt, "W.csproj")[1]
         jm = run("queue", "add", main_repo, "W.csproj")[1]
         ql = run("queue", "list")[1]
@@ -663,7 +668,8 @@ def run(brain_cli):
         subprocess.run(["tar", "-x", "-C", old_root], input=tar, check=True)
         old_brain = os.path.join(old_root, "bin", "brain")
         env["LEAN_BRAIN_DB"] = os.path.join(d, "shared.db")
-        run("add", "--project", "keepme", "--kind", "k", "--ref", "r")
+        subprocess.run([sys.executable, old_brain, "add", "--project", "keepme", "--kind", "k", "--ref", "r"], env=env,
+                       capture_output=True, check=True)
         run("activity", "add", "--source", "agent", "--action", "x")
         con = sq.connect(env["LEAN_BRAIN_DB"])
         ver = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]

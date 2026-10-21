@@ -120,7 +120,7 @@ def migrate_8(con):  # the repo HEAD a job was queued at, so a full run is not r
 MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7, migrate_8]
 
 
-def connect():
+def connect(migrate=True):
     path = db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     con = sqlite3.connect(path, timeout=30, isolation_level=None)
@@ -136,7 +136,7 @@ def connect():
             sys.exit(f"brain: {path} has schema version {version}, newer than this brain knows")
         return version
 
-    if current() < len(MIGRATIONS):
+    if migrate and current() < len(MIGRATIONS):
         # One writer migrates; a second opener waits for the lock, then sees the new version and does nothing.
         # SQLite DDL is transactional, so a migration that fails leaves the old version and no half-built tables.
         con.execute("BEGIN IMMEDIATE")
