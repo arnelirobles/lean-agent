@@ -11,10 +11,16 @@
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain queue add <repo-dir> <test-project> [--filter F] [--tier fast|full] [--after ID] [--cycle C]
-            [--by NAME] [--project P] [--platform apple|auto|none] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
+            [--by NAME] [--project P] [--platform apple|auto|none] [--again REASON] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
             --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
             or -macos; a remote lane never claims an apple job
+            The job records the repo HEAD. A full job for a project, test project and commit that already has a
+            queued, running or done full job (one without a filter) is refused with that job's id, and so is a
+            full job from a tree with uncommitted or untracked files (the refusal names up to 5 paths) or
+            where git status fails; --again REASON allows any of these (one line, 200 characters at most).
+            A folder that is not a git repo, or has no commit yet, gets neither check. An add identical to a queued job prints
+            that job's id instead of adding one.
   brain queue list [--cycle C] [--status S]     --status queued lists in the order the drainer takes them
   brain queue bump ID                      a queued job, and the jobs chained after it, to the front
   brain queue move ID up|down              swap a queued job with the one before or after it; a job never
@@ -171,6 +177,7 @@ def parser():
     q.add_argument("--project", default="")
     q.add_argument("--args", default="")
     q.add_argument("--platform", choices=("apple", "auto", "none"), default="auto")
+    q.add_argument("--again", default="", metavar="REASON")
     q = qs.add_parser("list")
     q.add_argument("--cycle")
     q.add_argument("--status", choices=JOB_STATUS)
