@@ -3,6 +3,7 @@
 #
 #   bash holdout.sh --spec change-description.md
 #   bash holdout.sh --spec change-description.md --dry-run
+#   bash holdout.sh --self-test
 #
 # The spec is a fenced ```holdout block in the change description, binding each new test to the
 # production hunk it depends on. This script holds that hunk out (reverts it), rebuilds, and
@@ -44,6 +45,79 @@ set -uo pipefail
 # test id from the spec, and must run that and nothing else.
 HOLDOUT_BUILD_CMD="${HOLDOUT_BUILD_CMD:-dotnet build --configuration Release --no-restore}"
 HOLDOUT_TEST_CMD="${HOLDOUT_TEST_CMD:-dotnet test --no-build --configuration Release --filter FullyQualifiedName~}"
+
+self_test() {
+  local self t fails=0 rc base
+  self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+  t=$(mktemp -d)
+  trap 'rm -rf "$t"' RETURN
+
+  # A tiny repository: a base commit, then a change that adds the line the fake test looks for.
+  mkdir "$t/repo" "$t/bin"
+  git -C "$t/repo" init -q
+  git -C "$t/repo" config user.email self-test@example.com
+  git -C "$t/repo" config user.name self-test
+  mkdir "$t/repo/src"
+  printf 'one\nold\nthree\n' > "$t/repo/src/a.txt"
+  git -C "$t/repo" add -A
+  git -C "$t/repo" commit -q -m base
+  base=$(git -C "$t/repo" rev-parse HEAD)
+  printf 'one\nfeature on\nthree\n' > "$t/repo/src/a.txt"
+  git -C "$t/repo" commit -q -am change
+
+  # The fake test passes only while the feature line is present.
+  cat > "$t/bin/depends.sh" <<'X'
+#!/bin/sh
+if grep -q 'feature on' src/a.txt; then echo "Total: 1"; echo "Failed: 0"; else echo "Total: 1"; echo "Failed: 1"; fi
+X
+  cat > "$t/bin/always.sh" <<'X'
+#!/bin/sh
+echo "Total: 1"; echo "Failed: 0"
+X
+  printf '```holdout\n- test: SomeTests\n  breaks: src/a.txt "feature on"\n```\n' > "$t/spec.md"
+  printf '```holdout\n- untested: src/a.txt #1\n  why: data only\n```\n' > "$t/untested.md"
+  printf '```holdout\n- test: SomeTests\n  breaks: src/a.txt "no such line"\n```\n' > "$t/bad.md"
+  printf 'no block here\n' > "$t/none.md"
+
+  # run <fake test script> <holdout script> <spec> [args]; sets rc to the exit code.
+  run() {
+    local tc="$1" script="$2" spec="$3"; shift 3
+    ( cd "$t/repo" && HOLDOUT_BASE="$base" HOLDOUT_BUILD_CMD=true HOLDOUT_TEST_CMD="sh $t/bin/$tc" \
+        bash "$script" --spec "$spec" "$@" >"$t/out" 2>&1 )
+    rc=$?
+  }
+  want() {
+    [ "$rc" = "$2" ] || { echo "self-test failed: $1: exit $rc, want $2"; sed 's/^/  /' "$t/out"; fails=$((fails + 1)); }
+  }
+
+  run depends.sh "$self" "$t/spec.md"
+  want "test that depends on its hunk passes" 0
+  run always.sh "$self" "$t/spec.md"
+  want "test that ignores its hunk is caught" 1
+  run depends.sh "$self" "$t/spec.md" --dry-run
+  want "dry run resolves the anchor" 0
+  run depends.sh "$self" "$t/untested.md"
+  want "only untested hunks pass without a build" 0
+  run depends.sh "$self" "$t/bad.md"
+  want "anchor that matches nothing is unresolved" 2
+  run depends.sh "$self" "$t/none.md"
+  want "spec without a block is refused" 2
+
+  # With the revert step removed the held-out tree equals the clean one, so even the test that
+  # depends on its hunk passes there and the run must report it as caught.
+  sed 's/git apply -R --unidiff-zero "\$patch_file"/true/' "$self" > "$t/no-revert.sh"
+  if cmp -s "$self" "$t/no-revert.sh"; then
+    echo "self-test failed: the revert mutation did not apply"; fails=$((fails + 1))
+  else
+    run depends.sh "$t/no-revert.sh" "$t/spec.md"
+    want "run without the revert step fails" 1
+  fi
+
+  [ "$fails" = 0 ] && echo "self-test passed" && return 0
+  return 1
+}
+
+if [ "${1:-}" = "--self-test" ]; then self_test; exit $?; fi
 
 # Resolve the repository from the working directory, not from where this file happens to live. A
 # copy of this script run from outside its checkout used to cd to the wrong place and report
