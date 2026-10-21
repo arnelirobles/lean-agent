@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Make exact text edits to a file. Fails when the old text is not there once.
+
+  replace [--all] FILE < blocks
+  replace --self-test
+
+Blocks come from stdin:
+
+  @@@ old
+  text to find
+  @@@ new
+  text to put in
+  @@@ end
+
+Several blocks per call, applied in order, all or nothing: the file is written
+only when every block applied, through a temp file in the same directory and a
+rename, keeping the file mode. A block that matches 0 times, or more than once
+without --all, exits 1 and names the block number and the count found. Matching
+is literal, with no regex and no escaping. One line is printed per block applied.
+
+A line that is exactly `@@@ end` cannot appear inside a block. The line break
+before @@@ new and @@@ end is not part of the text; to delete a whole line,
+include the line before or after it in old. In a file where every line break is
+CRLF the block text is matched with CRLF endings; a file with mixed endings is
+matched as given. The old text may not be empty. A read-only file, or one with
+more than one hard link (the rename would break the link), is refused.
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def parse(data):
+    blocks = []
+    state = None
+    old = new = None
+    for n, line in enumerate(data.split("\n"), 1):
+        line = line.rstrip("\r")
+        if state is None:
+            if line == "@@@ old":
+                state, old, new = "old", [], []
+            elif line.strip():
+                raise ValueError(f"line {n}: expected '@@@ old', got {line!r}")
+        elif state == "old":
+            if line == "@@@ new":
+                state = "new"
+            else:
+                old.append(line)
+        else:
+            if line == "@@@ end":
+                blocks.append(("\n".join(old), "\n".join(new)))
+                state = None
+            else:
+                new.append(line)
+    if state is not None:
+        raise ValueError("input ended inside a block, missing '@@@ end'")
+    if not blocks:
+        raise ValueError("no blocks on stdin")
+    return blocks
+
+
+def apply(text, blocks, replace_all):
+    crlf = "\r\n" in text and text.count("\r\n") == text.count("\n")
+    out = []
+    for i, (old, new) in enumerate(blocks, 1):
+        if crlf:
+            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+        if not old:
+            raise ValueError(f"block {i}: old text is empty")
+        count = text.count(old)
+        if count == 0 or (count > 1 and not replace_all):
+            raise ValueError(f"block {i}: found {count} matches, need exactly 1 (use --all for several)")
+        text = text.replace(old, new)
+        out.append(f"block {i}: replaced {count}")
+    return text, out
+
+
+def write_atomic(path, text):
+    path = os.path.realpath(path)
+    st = os.stat(path)
+    mode = st.st_mode
+    if not os.access(path, os.W_OK):
+        raise ValueError(f"{path} is not writable")
+    if st.st_nlink > 1:
+        raise ValueError(f"{path} has {st.st_nlink} hard links; the rename would break them")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".replace-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode("utf-8", "surrogateescape"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode & 0o7777)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def run(path, replace_all, stdin_bytes):
+    try:
+        blocks = parse(stdin_bytes.decode("utf-8", "surrogateescape"))
+        with open(path, "rb") as f:
+            text = f.read().decode("utf-8", "surrogateescape")
+        text, lines = apply(text, blocks, replace_all)
+        write_atomic(path, text)
+    except (ValueError, OSError) as e:
+        print(f"replace: {e}", file=sys.stderr)
+        return 1
+    print("\n".join(lines))
+    return 0
+
+
+def self_test():
+    failures = 0
+    me = os.path.realpath(__file__)
+
+    def check(name, cond):
+        nonlocal failures
+        if not cond:
+            failures += 1
+            print(f"FAIL {name}")
+
+    def block(old, new):
+        return f"@@@ old\n{old}\n@@@ new\n{new}\n@@@ end\n"
+
+    with tempfile.TemporaryDirectory() as d:
+        def go(content, blocks, *flags):
+            p = os.path.join(d, "f.txt")
+            with open(p, "wb") as f:
+                f.write(content)
+            os.chmod(p, 0o640)
+            r = subprocess.run([sys.executable, "-I", me, *flags, p], input=blocks.encode(),
+                               capture_output=True)
+            with open(p, "rb") as f:
+                after = f.read()
+            return r, after, os.stat(p).st_mode & 0o777
+
+        r, after, mode = go(b"a\nfoo\nb\n", block("foo", "bar"))
+        check("one match applies", r.returncode == 0 and after == b"a\nbar\nb\n")
+        check("prints a line per block", r.stdout.decode().strip() == "block 1: replaced 1")
+        check("keeps file mode", mode == 0o640)
+
+        src = b"a\nfoo\nb\n"
+        r, after, _ = go(src, block("nope", "x"))
+        check("zero matches exits 1", r.returncode == 1 and after == src)
+        check("zero matches names block and count", b"block 1" in r.stderr and b"found 0" in r.stderr)
+
+        src = b"foo\nfoo\n"
+        r, after, _ = go(src, block("foo", "bar"))
+        check("two matches exits 1", r.returncode == 1 and after == src and b"found 2" in r.stderr)
+        r, after, _ = go(src, block("foo", "bar"), "--all")
+        check("--all replaces every match", r.returncode == 0 and after == b"bar\nbar\n")
+        r, after, _ = go(src, block("zzz", "bar"), "--all")
+        check("--all still fails on zero", r.returncode == 1 and after == src)
+
+        src = b"one\ntwo\n"
+        r, after, _ = go(src, block("one", "1") + block("missing", "x"))
+        check("second block failing leaves first unapplied", r.returncode == 1 and after == src
+              and b"block 2" in r.stderr)
+        r, after, _ = go(src, block("one", "1") + block("two", "2"))
+        check("blocks apply in order", r.returncode == 0 and after == b"1\n2\n")
+        r, after, _ = go(src, block("one", "two") + block("two", "3"))
+        check("later block sees earlier result", r.returncode == 1 and after == src
+              and b"block 2" in r.stderr and b"found 2" in r.stderr)
+
+        r, after, _ = go(b"a\r\nfoo\r\nb\r\n", block("a\nfoo", "x\ny"))
+        check("CRLF kept", r.returncode == 0 and after == b"x\r\ny\r\nb\r\n")
+        r, after, _ = go(b"a\nfoo", block("foo", "bar"))
+        check("no final newline kept", r.returncode == 0 and after == b"a\nbar")
+        r, after, _ = go(b"a\r\nfoo", block("foo", "bar"))
+        check("CRLF with no final newline kept", r.returncode == 0 and after == b"a\r\nbar")
+
+        r, after, _ = go(b"a\nfoo\nlast\r\n", block("foo", "x\ny"))
+        check("mixed endings are not translated", r.returncode == 0 and after == b"a\nx\ny\nlast\r\n")
+        r, after, _ = go(b"a\nfoo\nb\n", block("a\nfoo", "a"))
+        check("whole line deleted with a neighbour line", r.returncode == 0 and after == b"a\nb\n")
+
+        r, after, _ = go(b"x = 1\n", block("x = 1", "y = '$1 \\n \\1 $HOME \\\\'"))
+        check("dollar and backslashes are literal", r.returncode == 0
+              and after == b"y = '$1 \\n \\1 $HOME \\\\'\n")
+
+        r, after, _ = go(b"a\n", "@@@ old\na\n@@@ new\nb\n")
+        check("missing end exits 1", r.returncode == 1 and after == b"a\n")
+        r, after, _ = go(b"a\n", "")
+        check("no blocks exits 1", r.returncode == 1 and after == b"a\n")
+        r, after, _ = go(b"a\n", block("", "b"))
+        check("empty old exits 1", r.returncode == 1 and after == b"a\n")
+        p = os.path.join(d, "f.txt")
+        with open(p, "wb") as f:
+            f.write(b"foo\n")
+        os.chmod(p, 0o444)
+        r = subprocess.run([sys.executable, "-I", me, p], input=block("foo", "bar").encode(),
+                           capture_output=True)
+        with open(p, "rb") as f:
+            after = f.read()
+        check("read-only file refused", os.geteuid() == 0 or (r.returncode == 1 and after == b"foo\n"))
+        os.chmod(p, 0o644)
+        link = os.path.join(d, "link.txt")
+        os.link(p, link)
+        r = subprocess.run([sys.executable, "-I", me, p], input=block("foo", "bar").encode(),
+                           capture_output=True)
+        with open(p, "rb") as f:
+            after = f.read()
+        check("hard-linked file refused", r.returncode == 1 and after == b"foo\n" and b"hard link" in r.stderr)
+        os.unlink(link)
+        check("no temp files left", os.listdir(d) == ["f.txt"])
+
+        r = subprocess.run([sys.executable, "-I", me, os.path.join(d, "absent")],
+                           input=block("a", "b").encode(), capture_output=True)
+        check("missing file exits 1", r.returncode == 1)
+
+    print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
+    return 1 if failures else 0
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
+    replace_all = "--all" in argv
+    rest = [a for a in argv if a != "--all"]
+    if len(rest) != 1 or rest[0].startswith("-"):
+        print("usage: replace [--all] FILE < blocks", file=sys.stderr)
+        return 2
+    return run(rest[0], replace_all, sys.stdin.buffer.read())
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
