@@ -127,23 +127,27 @@ def cmd_queue(a):
         if a.after and not dep:
             sys.exit(f"brain: no job #{a.after} to run after")
         repo = os.path.abspath(a.repo_dir)
-        # A job behind one that already failed or was cancelled can never run; record that at once.
-        dead = dep and dep["status"] in ("failed", "cancelled")
-        if not dead:
-            # The same run already waiting: join it, so one build serves every agent that asked.
-            same = con.execute(
-                "SELECT id FROM jobs WHERE status='queued' AND repo_dir=? AND test_project=? AND filter IS ?"
-                " AND tier=? AND after_id IS ? AND args IS ? ORDER BY id LIMIT 1",
-                (repo, a.test_project, a.filter, a.tier, a.after, a.args)).fetchone()
-            if same:
-                print(f"brain: the same job is already queued as #{same['id']}; joined it", file=sys.stderr)
-                print(same["id"])
-                return 0
         session, session_cwd = a.session, a.session_cwd if a.session else ""
         if not session and a.infer_session:
             session, session_cwd = infer_session(con)
         if session and not session_ok(session):
             sys.exit("brain: --session takes letters, digits and dashes only")
+        # A job behind one that already failed or was cancelled can never run; record that at once.
+        dead = dep and dep["status"] in ("failed", "cancelled")
+        if not dead:
+            # The same run already waiting: join it, so one build serves every agent that asked.
+            same = con.execute(
+                "SELECT id, session_id FROM jobs WHERE status='queued' AND repo_dir=? AND test_project=? AND filter IS ?"
+                " AND tier=? AND after_id IS ? AND args IS ? ORDER BY id LIMIT 1",
+                (repo, a.test_project, a.filter, a.tier, a.after, a.args)).fetchone()
+            if same:
+                if session and not same["session_id"]:
+                    with con:
+                        con.execute("UPDATE jobs SET session_id=?, session_cwd=? WHERE id=?",
+                                    (session, session_cwd, same["id"]))
+                print(f"brain: the same job is already queued as #{same['id']}; joined it", file=sys.stderr)
+                print(same["id"])
+                return 0
         with con:
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"

@@ -38,7 +38,12 @@ KIND_ALIAS = {"todo": "pending", "task": "pending", "open-question": "question",
 
 
 # Kinds seen in old data that no alias covers; anything else unknown becomes note.
-KIND_OLD = {"82-tests-to-run": "pending", "82-fonts-tests": "pending", "open": "pending", "test": "note"}
+KIND_OLD = {"82-tests-to-run": "pending", "82-fonts-tests": "pending", "open": "pending", "test": "note",
+            "defect": "bug"}
+
+
+def norm_project(name):
+    return (name or "").strip().lower()
 
 
 def canon_kind(kind):
@@ -133,8 +138,10 @@ def migrate_7(con):  # which platform a job needs, and which host ran a job or a
 
 
 def migrate_8(con):  # lower case projects, a fixed list of kinds, and the session that queued a job
-    for table in ("items", "runs", "jobs"):
-        con.execute(f"UPDATE {table} SET project=LOWER(project) WHERE project != LOWER(project)")
+    for table in ("items", "runs", "jobs"):  # in Python, because SQLite LOWER() leaves non-ASCII letters alone
+        for r in con.execute(f"SELECT DISTINCT project FROM {table}").fetchall():
+            if norm_project(r["project"]) != r["project"]:
+                con.execute(f"UPDATE {table} SET project=? WHERE project=?", (norm_project(r["project"]), r["project"]))
     for r in con.execute("SELECT DISTINCT kind FROM items").fetchall():
         new = canon_kind(r["kind"]) or KIND_OLD.get(r["kind"].strip().lower(), "note")
         if new != r["kind"]:

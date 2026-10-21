@@ -79,7 +79,7 @@ import argparse
 import socket
 import os
 
-from .store import MODEL, PHASE, RESOLUTION, RUNNERS, SEVERITY, SOURCE, STATUS, TIERS
+from .store import norm_project, MODEL, PHASE, RESOLUTION, RUNNERS, SEVERITY, SOURCE, STATUS, TIERS
 from .items import cmd_add, cmd_answers, cmd_close, cmd_list, cmd_reopen, cmd_run_add, cmd_session, cmd_show
 from .activity import cmd_activity
 from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
@@ -87,7 +87,10 @@ from .report import cmd_export, cmd_resume, cmd_stats
 
 
 def lower(s):
-    return s.strip().lower()
+    name = norm_project(s)
+    if not name:
+        raise argparse.ArgumentTypeError("a project name cannot be empty")
+    return name
 
 
 def parser():
@@ -178,7 +181,7 @@ def parser():
     q.add_argument("--after", type=int)
     q.add_argument("--cycle", default="")
     q.add_argument("--by", default="")
-    q.add_argument("--project", default="", type=lower)
+    q.add_argument("--project", default=None, type=lower)
     q.add_argument("--args", default="")
     q.add_argument("--platform", choices=("apple", "auto", "none"), default="auto")
     q.add_argument("--session", default=os.environ.get("LEAN_SESSION_ID", ""),

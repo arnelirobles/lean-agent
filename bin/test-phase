@@ -817,6 +817,9 @@ def self_test():
     if "--session" not in a or a[a.index("--session") + 1] != "s-1":
         fails.append(f"an item must carry the session that queued the job: {a}")
 
+    if Lane("r", "remote", None, {"MixedCase": {"dir": "/x"}}).repos.get("mixedcase") != {"dir": "/x"}:
+        fails.append("a lane must find a repository config by its project name in any case")
+
     # A remote job's log opens with a one-line header, so the reason is never script text.
     head = "$ ssh dev <script for job 9>\n"
     why = lane_problem(255, head + "ssh: connect refused\n")

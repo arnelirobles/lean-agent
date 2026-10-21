@@ -44,10 +44,12 @@ def session_ok(ident):
 
 
 def infer_session(con):
-    """The newest open session started in this folder, as (id, cwd), or ("", "") when there is none."""
-    r = con.execute("SELECT id, cwd FROM sessions WHERE ended_at='' AND cwd=? ORDER BY started_at DESC, rowid DESC"
-                    " LIMIT 1", (os.path.realpath(os.getcwd()),)).fetchone()
-    return (r["id"], r["cwd"]) if r else ("", "")
+    """The open session started in this folder, as (id, cwd). ("", "") when there is none or more than one."""
+    here = os.path.realpath(os.getcwd())
+    rows = con.execute("SELECT id, cwd FROM sessions WHERE ended_at='' AND cwd=?", (here,)).fetchall()
+    if len(rows) > 1:
+        print(f"brain: {len(rows)} open sessions in {here}, so no session was stored", file=sys.stderr)
+    return (rows[0]["id"], rows[0]["cwd"]) if len(rows) == 1 else ("", "")
 
 
 def kind_or_exit(kind):

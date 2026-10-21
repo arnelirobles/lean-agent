@@ -763,6 +763,7 @@ def run(brain_cli):
         a10 = item("core", "test-fail", "tf1", status="closed")
         a11 = item("Core", "test-fail", "tf2", status="closed", resolution="fixed")
         a12 = item("core", "test-fail", "tf3", status="closed", occ=2)
+        a13 = item("Ärger", "defect", "ae")
         con.execute("INSERT INTO tags VALUES (?, 'a')", (a1,))
         con.execute("INSERT INTO tags VALUES (?, 'b')", (a2,))
         con.execute("INSERT INTO tags VALUES (?, 'a')", (a2,))
@@ -791,6 +792,10 @@ def run(brain_cli):
         got = {i: rows[i]["kind"] for i in want if i in rows}
         if got != want:
             fails.append(f"odd kinds must map to the closest allowed kind: {got}")
+        if rows[a13]["project"] != "ärger" or rows[a13]["kind"] != "bug":
+            fails.append(f"migration must lower case non-ASCII projects and map defect to bug: {dict(rows[a13])}")
+        if f"#{a13} " not in run("list", "--project", "ÄRGER")[1]:
+            fails.append("list --project must match a non-ASCII project in any case")
         if any(r["kind"] not in KIND for r in rows.values()):
             fails.append("every kind must be on the list after migrating")
         if rows[a10]["resolution"] != "" or rows[a10]["status"] != "closed" or rows[a11]["resolution"] != "fixed" \
@@ -832,6 +837,35 @@ def run(brain_cli):
             fails.append("queue next must hand the drainer the job's session")
         if run("queue", "add", "/tmp/r", "D.csproj", "--session", "a b;rm")[0] == 0:
             fails.append("a job session with odd characters must be refused")
+        # A blank project is refused; a non-ASCII one is stored lower case.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "proj.db")
+        rc, _, err = run("add", "--project", " ", "--kind", "note", "--ref", "r")
+        if rc == 0 or "empty" not in err:
+            fails.append(f"an empty project must be refused: {rc} {err!r}")
+        out = run("add", "--project", "ÄRGER", "--kind", "note", "--ref", "r")[1]
+        if " ärger " not in out:
+            fails.append(f"add must lower case a non-ASCII project: {out!r}")
+
+        # Two open sessions in one folder: no guess, and a note says why.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "two.db")
+        run("session", "start", "one-1", "--cwd", here)
+        run("session", "start", "two-1", "--cwd", here)
+        rc, out, err = run("add", "--project", "p", "--kind", "question", "--ref", "q", "--infer-session")
+        n = out.split("#", 1)[1].split()[0]
+        if rc != 0 or "session" in run("show", n)[1] or "2 open sessions" not in err:
+            fails.append(f"two open sessions must store none and say so: {rc} {err!r} {run('show', n)[1]!r}")
+        run("queue", "add", "/tmp/r", "A.csproj", "--infer-session")
+        if connect_rows(env["LEAN_BRAIN_DB"], "SELECT session_id FROM jobs")[0]["session_id"] != "":
+            fails.append("a job queued from a folder with two open sessions must carry none")
+
+        # A job that is joined takes the session of the second caller when it had none, and never replaces one.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "join.db")
+        j1 = run("queue", "add", "/tmp/r", "A.csproj")[1]
+        j2 = run("queue", "add", "/tmp/r", "A.csproj", "--session", "second-1", "--session-cwd", "/w2")[1]
+        run("queue", "add", "/tmp/r", "A.csproj", "--session", "third-1")
+        got = [(r["id"], r["session_id"], r["session_cwd"]) for r in connect_rows(env["LEAN_BRAIN_DB"], "SELECT * FROM jobs")]
+        if j1 != j2 or got != [(int(j1), "second-1", "/w2")]:
+            fails.append(f"a joined job must take the session it lacked and keep it: {j1} {j2} {got}")
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
