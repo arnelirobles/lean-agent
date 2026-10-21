@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Catch wait loops and direct test runs when the command is written.
+
+PreToolUse hook on Bash. It denies:
+  - sleep followed by a command that reads a file or task output (sleep 100; cat x.output)
+  - an until or while loop that contains sleep
+  - pgrep
+and adds a note (never a deny) on dotnet test, npx vitest, go test and pytest run
+outside bin/test-phase and heavy.sh. The note only fires when the brain script is
+present, since it names `brain queue add`. Quoted strings and heredoc bodies are not
+commands, so a sleep inside them passes. A run_in_background command is checked the
+same way. A hook error never fails the session.
+
+  LEAN_WAIT_GUARD=off   turn it off (environment, settings env, or inline)
+  wait-loop.py --self-test
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import hookkit  # noqa: E402
+
+BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "brain")
+KEYWORDS = {"do", "then", "else", "elif", "!", "{", "}", "time"}
+LOOP_OPEN = {"until", "while"}
+READERS = {"cat", "tail", "head", "grep", "egrep", "fgrep", "rg", "less", "more", "wc", "ls", "stat", "test", "[", "[["}
+LANES = {"test-phase", "heavy.sh"}
+
+DENY_SLEEP_READ = (
+    "Do not sleep and then read a file or task output. End the turn and wait for the "
+    "notification, or check a lane with `heavy.sh status <lane>`.")
+DENY_LOOP = (
+    "Do not poll in an until or while loop with sleep. End the turn and wait for the "
+    "notification, or check a lane with `heavy.sh status <lane>`.")
+DENY_PGREP = (
+    "Do not use pgrep to wait on a process. End the turn and wait for the notification, "
+    "or check a lane with `heavy.sh status <lane>`.")
+TURN_OFF = " LEAN_WAIT_GUARD=off turns this check off."
+NOTE_TEST = (
+    "This runs tests outside the lane lock, and its failures never reach brain. Queue it: "
+    "`brain queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
+
+
+def is_off(segs):
+    value = os.environ.get("LEAN_WAIT_GUARD")
+    if value is None:
+        value = next((s.env["LEAN_WAIT_GUARD"] for s in segs if "LEAN_WAIT_GUARD" in s.env), "")
+    return value.lower() == "off"
+
+
+def command_words(seg):
+    words = list(seg.words)
+    while words and words[0] in KEYWORDS:
+        words.pop(0)
+    return hookkit.strip_wrappers(words, {})
+
+
+def name(words):
+    return os.path.basename(words[0]) if words else ""
+
+
+def is_test_run(words):
+    cmd, rest = name(words), words[1:]
+    if cmd == "dotnet":
+        return "test" in rest[:2]
+    if cmd == "go":
+        return rest[:1] == ["test"]
+    if cmd in ("npx", "pnpx", "bunx"):
+        return name(rest) == "vitest"
+    if cmd in ("vitest", "pytest"):
+        return True
+    if cmd.startswith("python") and rest[:2] == ["-m", "pytest"]:
+        return True
+    return False
+
+
+def verdict(command, cwd="."):
+    """Return ("deny", reason), ("note", text) or None."""
+    segs = hookkit.segments(command, cwd)
+    if is_off(segs):
+        return None
+    cmds = [command_words(s) for s in segs]
+    depth = 0
+    for i, words in enumerate(cmds):
+        cmd = name(words)
+        if not cmd:
+            continue
+        if cmd in LOOP_OPEN:
+            depth += 1
+            cmd = name(words[1:])  # the loop condition is a command too
+        if cmd == "done":
+            depth = max(0, depth - 1)
+        elif cmd == "pgrep":
+            return "deny", DENY_PGREP + TURN_OFF
+        elif cmd == "sleep":
+            if depth:
+                return "deny", DENY_LOOP + TURN_OFF
+            if i + 1 < len(cmds) and name(cmds[i + 1]) in READERS:
+                return "deny", DENY_SLEEP_READ + TURN_OFF
+    if os.path.exists(BRAIN) and any(is_test_run(w) for w in cmds) \
+            and not any(name(w) in LANES for w in cmds):
+        return "note", NOTE_TEST
+    return None
+
+
+def main():
+    event = hookkit.read_event()
+    command = hookkit.tool_input(event).get("command") or ""
+    if not any(w in command for w in ("sleep", "pgrep", "test", "vitest")):
+        return 0
+    found = verdict(command, event.get("cwd") or os.getcwd())
+    if not found:
+        return 0
+    kind, text = found
+    if kind == "deny":
+        print(text, file=sys.stderr)
+        return 2
+    hookkit.note("PreToolUse", text)
+    return 0
+
+
+def self_test():
+    failures = 0
+    os.environ.pop("LEAN_WAIT_GUARD", None)
+
+    def check(label, command, want):
+        nonlocal failures
+        found = verdict(command)
+        got = found[0] if found else None
+        if got != want:
+            print(f"FAIL {label}: got {got!r}, want {want!r}")
+            failures += 1
+
+    check("until grep loop", "until grep -q DONE out.txt; do sleep 15; done", "deny")
+    check("while loop with sleep", "while true; do sleep 5; done", "deny")
+    check("sleep then cat output", "sleep 100; cat /tmp/tasks/x.output", "deny")
+    check("sleep then tail", "sleep 30 && tail -20 build.log", "deny")
+    check("pgrep", "pgrep -f dotnet", "deny")
+    check("pgrep in a loop", "while pgrep -f dotnet; do echo w; done", "deny")
+    check("sleep alone", "sleep 2", None)
+    check("sleep then a build", "sleep 2 && make", None)
+    check("sleep in a quoted string", "echo 'until x; do sleep 1; done'", None)
+    check("sleep in a double quoted string", 'git commit -m "no sleep 5; cat x"', None)
+    check("sleep in a heredoc body",
+          "cat > run.sh <<'EOF'\nuntil grep -q x f; do sleep 1; done\nsleep 5; cat f\nEOF", None)
+    check("while read without sleep", "while read line; do echo $line; done < list.txt", None)
+    check("sleep after a loop ends", "while read l; do echo $l; done < f; sleep 1", None)
+    check("comment", "echo hi # until x; do sleep 1; done", None)
+    check("off switch inline", "LEAN_WAIT_GUARD=off sleep 100; cat x.output", None)
+    os.environ["LEAN_WAIT_GUARD"] = "off"
+    check("off switch environment", "pgrep -f dotnet", None)
+    del os.environ["LEAN_WAIT_GUARD"]
+    reason = (verdict("pgrep x") or ("", ""))[1]
+    if "LEAN_WAIT_GUARD=off" not in reason or "heavy.sh status" not in reason:
+        print("FAIL deny reason names the fix and the off switch")
+        failures += 1
+
+    if os.path.exists(BRAIN):
+        check("bare dotnet test notes", "dotnet test X | tail -20", "note")
+        check("npx vitest notes", "npx vitest run", "note")
+        check("go test notes", "cd svc && go test ./...", "note")
+        check("pytest notes", "python3 -m pytest -q", "note")
+        check("test inside test-phase passes", "bin/test-phase run -- dotnet test X", None)
+        check("test inside heavy.sh passes", "heavy.sh run lane dotnet test X", None)
+        check("queued test passes", "brain queue add repo proj --filter 'dotnet test'", None)
+    check("dotnet build is quiet", "dotnet build X", None)
+    print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    hookkit.run(main)
