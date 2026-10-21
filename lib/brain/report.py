@@ -100,21 +100,52 @@ def digest_lines(con, project):
     return lines
 
 
+RECOVER_MAX = 4000
+
+
+def recover_lines(con, project):
+    """What a session needs after a compaction: queued jobs, every open agent and pending item."""
+    where, args = " AND lower(project)=lower(?)", [project]
+    lines = [job_line(j)[:110] for j in con.execute("SELECT * FROM jobs WHERE status='queued'" + where
+                                                    + " ORDER BY priority DESC, id", args)]
+    for r in con.execute("SELECT id, kind, title, ref FROM items WHERE status='open' AND kind IN ('agent', 'pending')"
+                         + where + " ORDER BY kind, id DESC", args):
+        lines.append(f"#{r['id']} {r['kind']} {short(r['title'] or r['ref'], 100)}")
+    return lines
+
+
 def cmd_digest(a):
     if a.all and a.project:
         raise SystemExit("brain: use --project or --all, not both")
+    if a.recover and a.all:
+        raise SystemExit("brain: --recover is for one project")
     if a.quiet and not os.path.exists(db_path()):
         return 0
     project = None if a.all else (a.project or default_project())
-    lines = digest_lines(connect(), project)
-    if not lines:
+    con = connect()
+    lines = digest_lines(con, project)
+    out = f"brain digest {project or 'all projects'}\n" + "\n".join(lines) if lines else ""
+    if len(out.encode()) > DIGEST_MAX:
+        out = out.encode()[:DIGEST_MAX - 20].decode(errors="ignore").rsplit("\n", 1)[0] + "\n... cut, see brain list"
+    if a.recover:
+        extra = recover_lines(con, project)
+        room = RECOVER_MAX - len(out.encode()) - 60
+        kept = []
+        for ln in extra:
+            if len(ln.encode()) + 1 > room:
+                break
+            room -= len(ln.encode()) + 1
+            kept.append(ln)
+        if not out and kept:
+            out = f"brain digest {project}"
+        out += ("\n" if out else "") + "\n".join(kept)
+        if len(kept) < len(extra):
+            out += f"\n... {len(extra) - len(kept)} more: brain list --project {project} --status open"
+    if not out:
         if not a.quiet:
             print(f"brain digest {project or 'all projects'}: nothing open")
         return 0
-    out = f"brain digest {project or 'all projects'}\n" + "\n".join(lines)
-    if len(out.encode()) > DIGEST_MAX:
-        out = out.encode()[:DIGEST_MAX - 20].decode(errors="ignore").rsplit("\n", 1)[0] + "\n... cut, see brain list"
-    print(out)
+    print(out.strip())
     return 0
 
 

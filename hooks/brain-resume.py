@@ -24,13 +24,13 @@ def db_path():
     return os.environ.get("LEAN_BRAIN_DB") or os.path.expanduser("~/.local/share/lean/brain.db")
 
 
-def digest(cwd):
+def digest(cwd, recover=False):
     if (os.environ.get("LEAN_BRAIN_RESUME") or "").lower() == "off" or not os.path.exists(db_path()):
         return ""
     if not os.path.isdir(cwd or ""):
         cwd = os.getcwd()
     try:
-        r = subprocess.run([sys.executable, BRAIN, "digest", "--quiet"], cwd=cwd, capture_output=True, text=True, timeout=5)
+        r = subprocess.run([sys.executable, BRAIN, "digest", "--quiet"] + (["--recover"] if recover else []), cwd=cwd, capture_output=True, text=True, timeout=5)
     except (subprocess.SubprocessError, OSError):  # a locked database makes brain wait past the timeout
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -38,7 +38,7 @@ def digest(cwd):
 
 def main():
     event = hookkit.read_event()
-    text = digest(str(event.get("cwd") or ""))
+    text = digest(str(event.get("cwd") or ""), event.get("source") == "compact")  # only a compaction loses state
     if text:
         hookkit.note("SessionStart", "Brain digest for this project (full list: brain list --project NAME --status open). "
                      "Do not work around a blocker.\n" + text)
@@ -73,6 +73,19 @@ def self_test():
         rc, out, err = hook()
         if "which port" not in out or "not for this folder" in out:
             fails.append(f"the digest covers this project only, whatever the case of its name: {out!r}")
+        subprocess.run([sys.executable, BRAIN, "add", "--project", "MyProj", "--kind", "pending", "--ref", "p",
+                        "--title", "next step is the migration"], env=env, capture_output=True)
+        subprocess.run([sys.executable, BRAIN, "add", "--project", "myproj", "--kind", "agent", "--ref", "a",
+                        "--title", "worker in the mcp worktree"], env=env, capture_output=True)
+        subprocess.run([sys.executable, BRAIN, "add", "--project", "elsewhere", "--kind", "pending", "--ref", "p",
+                        "--title", "pending for another folder"], env=env, capture_output=True)
+        startup = hook('{"cwd": "%s", "source": "startup"}' % proj)[1]
+        compact = hook('{"cwd": "%s", "source": "compact"}' % proj)[1]
+        if "migration" in startup or "worker in the mcp" in startup:
+            fails.append(f"startup must print the digest only: {startup!r}")
+        if "next step is the migration" not in compact or "worker in the mcp worktree" not in compact \
+                or "another folder" in compact or "waiting on the user" not in compact:
+            fails.append(f"compact must add this project's open agent and pending items to the digest: {compact!r}")
         for i in range(300):
             subprocess.run([sys.executable, BRAIN, "add", "--project", "myproj", "--kind", "blocker",
                             "--ref", f"many{i}", "--title", "x" * 90], env=env, capture_output=True)
@@ -82,7 +95,7 @@ def self_test():
         subprocess.run([sys.executable, BRAIN, "close", "1"], env=env, capture_output=True)
         subprocess.run([sys.executable, BRAIN, "close", "2"], env=env, capture_output=True)
         con = sqlite3.connect(env["LEAN_BRAIN_DB"], isolation_level=None)
-        con.execute("UPDATE items SET status='closed' WHERE project IN ('myproj', 'MYPROJ')")
+        con.execute("UPDATE items SET status='closed' WHERE lower(project)='myproj'")
         con.close()
         if hook() != (0, "", ""):
             fails.append("nothing open must be silent")

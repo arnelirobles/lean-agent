@@ -30,7 +30,7 @@
   brain activity import-baryovm [--file PATH]   reads BaryoVM's activity.jsonl from where the last import
             stopped, so a rerun adds nothing; a file that shrank is read from the start
   brain resume [--project P] [--max N]
-  brain digest [--project P | --all] [--quiet]
+  brain digest [--project P | --all] [--quiet] [--recover]
   brain stats [--json]
   brain export [--format md|json] [--project P] [--status S]
   brain session start|end|status ID [--cwd DIR]
@@ -231,6 +231,8 @@ def parser():
     s.add_argument("--project", help="default: the git toplevel's name in the current directory")
     s.add_argument("--all", action="store_true", help="every project")
     s.add_argument("--quiet", action="store_true", help="print nothing when nothing is open")
+    s.add_argument("--recover", action="store_true",
+                   help="after the digest, queued jobs and every open agent and pending item, 4 KB at most")
     s.set_defaults(fn=cmd_digest)
     s = sub.add_parser("stats")
     s.add_argument("--json", action="store_true")
