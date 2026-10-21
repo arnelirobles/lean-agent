@@ -6,8 +6,12 @@ next to this script as a subprocess with an argument list (never a shell), so th
 stay in one place. A nonzero exit becomes a tool result with isError true and the stderr text.
 
 Tools: brain_list, brain_show, brain_add, brain_close, brain_queue_list, brain_queue_add,
-brain_queue_cancel, brain_queue_bump, brain_queue_route, brain_stats. `queue next` and `queue finish` are not exposed:
+brain_queue_cancel, brain_queue_bump, brain_queue_route, brain_stats, brain_digest. `queue next` and `queue finish` are not exposed:
 only the drainer (bin/test-phase) claims and finishes jobs.
+
+brain_list answers small by default: open items, newest first, 50 lines (the limit argument changes that, and
+a status or open=false asks for more). brain_queue_list defaults to queued and running jobs. A cut says how
+many more exist. brain_digest is the short start-of-session read.
 
 A body goes to brain on stdin (--body-file -), never on the command line.
 BRAIN_MCP_ARGV_LOG=FILE appends the argv of every brain call to FILE as one JSON line (used by the
@@ -21,6 +25,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 BRAIN = os.path.join(HERE, "brain")
@@ -90,9 +95,38 @@ def opt(a, args, key, flag=None, kind=str):
     args.append((flag or "--" + key.replace("_", "-")) + "=" + v)
 
 
+DEFAULT_LIMIT = 50
+
+
+def limit_of(a):
+    v = a.get("limit", DEFAULT_LIMIT)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise Bad("limit must be a positive integer")
+    return v
+
+
+def cut(lines, limit, what):
+    if len(lines) <= limit:
+        return "\n".join(lines)
+    return "\n".join(lines[:limit] + [f"... {len(lines) - limit} more {what}; narrow the filters or pass a bigger limit"])
+
+
+def after_list(a, text):
+    # brain lists oldest first; an agent wants the newest.
+    return cut(list(reversed(text.splitlines())), limit_of(a), "items")
+
+
+def after_queue_list(a, text):
+    lines = text.splitlines()
+    if not a.get("status"):
+        lines = [ln for ln in lines if ln.split()[2:3] in (["queued"], ["running"])]
+    return cut(list(reversed(lines)), limit_of(a), "jobs") or "no queued or running jobs"
+
+
 def t_list(a):
+    limit_of(a)
     args = ["list"]
-    if a.get("open") is True:
+    if a.get("open") is True or (a.get("open") is not False and not a.get("status")):
         args.append("--open")
     for k in ("status", "project", "kind", "tag", "cycle"):
         opt(a, args, k)
@@ -127,6 +161,7 @@ def t_close(a):
 
 
 def t_queue_list(a):
+    limit_of(a)
     args = ["queue", "list"]
     opt(a, args, "status")
     opt(a, args, "cycle")
@@ -172,13 +207,23 @@ def t_queue_route(a):
     return ["queue", "route", need_int(a, "id"), "--to=" + to], None
 
 
+def t_digest(a):
+    args = ["digest"]
+    if a.get("all") is True:
+        args.append("--all")
+    opt(a, args, "project")
+    return args, None
+
+
 def t_stats(a):
     return ["stats", "--json"], None
 
 
 TOOLS = [
-    ("brain_list", "List brain items. Filters are optional.", t_list, schema({
-        "open": B("only open items"), "status": S("open, closed or wontfix"), "project": S("project name"),
+    ("brain_list", "List brain items, one line each: open items, newest first, 50 at most unless limit says "
+     "otherwise. Filters are optional.", t_list, schema({
+        "limit": I("most lines to return, default 50"),
+        "open": B("only open items (the default); false lists every status"), "status": S("open, closed or wontfix"), "project": S("project name"),
         "kind": S("item kind, such as test-fail or question"), "tag": S("a tag"), "cycle": S("cycle name")})),
     ("brain_show", "Show one brain item in full.", t_show, schema({"id": I("item id")}, ["id"])),
     ("brain_add", "Add an item, or bump the count of an open one with the same project, kind and ref.", t_add, schema({
@@ -189,7 +234,9 @@ TOOLS = [
     ("brain_close", "Close an item.", t_close, schema({
         "id": I("item id"), "resolution": S("fixed, flaky, not-a-bug, duplicate, answered or filed"),
         "note": S("closing note"), "wontfix": B("close as wontfix")}, ["id"])),
-    ("brain_queue_list", "List test queue jobs.", t_queue_list, schema({
+    ("brain_queue_list", "List test queue jobs: queued and running unless status says otherwise, newest first, "
+     "50 at most.", t_queue_list, schema({
+        "limit": I("most lines to return, default 50"),
         "status": S("queued, running, done, failed or cancelled"), "cycle": S("cycle name")})),
     ("brain_queue_add", "Queue a test job. Returns the job id at once; do not wait for it.", t_queue_add, schema({
         "repo_dir": S("repository folder"), "test_project": S("test project path"), "filter": S("test filter"),
@@ -202,9 +249,14 @@ TOOLS = [
     ("brain_queue_route", "Choose which lanes may run a queued job: remote (only a remote host such as the VM), "
      "local (only this machine) or any.", t_queue_route,
      schema({"id": I("job id"), "to": S("remote, local or any")}, ["id", "to"])),
+    ("brain_digest", "Short read for the start of a session, under 2 KB: open counts by project and kind, open "
+     "blockers and questions, running jobs, stale agents. The current project unless project or all is given.",
+     t_digest, schema({"project": S("project name, matched without regard to case"),
+                       "all": B("every project")})),
     ("brain_stats", "Run counts, flaky rate and durations as JSON.", t_stats, schema({})),
 ]
 BY_NAME = {n: f for n, _, f, _ in TOOLS}
+AFTER = {"brain_list": after_list, "brain_queue_list": after_queue_list}
 
 
 def run_brain(args, stdin):
@@ -237,6 +289,8 @@ def call_tool(name, a):
         return result(f"could not run brain: {e}", True)
     if rc != 0:
         return result((err.strip() or out.strip() or f"brain exited {rc}"), True)
+    if name in AFTER:
+        out = AFTER[name](a, out)
     return result(out.strip() or "ok")
 
 
@@ -293,11 +347,66 @@ def serve():
             sys.stdout.flush()
 
 
+def digest_and_size_tests(fails, call, db):
+    import sqlite3
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    con = sqlite3.connect(db)
+    rows = [("Big%d" % (i % 30), "test-fail", "t%d" % i, "title " + "x" * 80, "open" if i % 4 else "closed", now, now)
+            for i in range(2000)]
+    rows.append(("Big1", "blocker", "bb", "waiting on the user", "open", now, now))
+    rows.append(("Big1", "agent", "oldagent", "stale one", "open", "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"))
+    con.executemany("INSERT INTO items (project, kind, ref, title, status, first_seen, last_seen) "
+                    "VALUES (?,?,?,?,?,?,?)", rows)
+    for i in range(300):
+        con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                    "VALUES ('Big1', '/x', ?, 'done', ?)", ("t/Done%d.csproj" % i, now))
+    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                "VALUES ('Big1', '/x', 't/Running.csproj', 'running', ?)", (now,))
+    con.commit()
+    con.close()
+    err, text = call("brain_list")
+    lines = text.splitlines()
+    if err or len(text.encode()) > 8000 or len(lines) != 51 or " closed " in text:
+        fails.append(f"brain_list default must be open items, 50 lines and under 8 KB: {err} {len(text.encode())} "
+                     f"bytes {len(lines)} lines")
+    if "more items" not in lines[-1] or not lines[-1].startswith("... "):
+        fails.append(f"a cut brain_list must say how many more: {lines[-1:]!r}")
+    err, text = call("brain_list", limit=5)
+    if err or len(text.splitlines()) != 6:
+        fails.append(f"brain_list limit 5: {err} {text!r}")
+    err, text = call("brain_list", limit=0)
+    if not err:
+        fails.append("a limit under 1 must be refused")
+    err, text = call("brain_list", status="closed", limit=1000)
+    if err or " open " in text or len(text.splitlines()) != 500:
+        fails.append(f"brain_list status closed must list closed items past the default: {err} {len(text.splitlines())}")
+    err, text = call("brain_list", project="Big1", kind="blocker")
+    if err or "bb" not in text or len(text.splitlines()) != 1:
+        fails.append(f"brain_list project and kind filters must still work: {err} {text!r}")
+    err, text = call("brain_list", open=False, project="Big1", limit=1000)
+    if err or " closed " not in text:
+        fails.append(f"brain_list open=false must include closed items: {err}")
+    err, text = call("brain_queue_list")
+    if err or "Running.csproj" not in text or "Done" in text or "tests/A.csproj" not in text:
+        fails.append(f"brain_queue_list default must be queued and running jobs only: {err} {text[:300]!r}")
+    err, text = call("brain_queue_list", status="done")
+    if err or "Done0.csproj" not in text or len(text.splitlines()) != 51 or "more jobs" not in text.splitlines()[-1]:
+        fails.append(f"brain_queue_list status done must list done jobs, cut at 50: {err} {len(text.splitlines())}")
+    err, text = call("brain_digest", project="big1")
+    if err or len(text.encode()) > 2048 or "waiting on the user" not in text or "stale agent" not in text \
+            or "Running.csproj" not in text or "Done" in text:
+        fails.append(f"brain_digest for one project: {err} {len(text.encode())} bytes {text!r}")
+    err, text = call("brain_digest", all=True)
+    if err or len(text.encode()) > 2048 or "big0" not in text:
+        fails.append(f"brain_digest all on 2000 items must stay under 2 KB: {err} {len(text.encode())} bytes")
+
+
 def self_test():
     fails = []
     me = os.path.realpath(__file__)
     secret = "hunter2"
     with tempfile.TemporaryDirectory() as d:
+        d_root = d
         argv_log = os.path.join(d, "argv.log")
         env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "brain.db"), BRAIN_MCP_ARGV_LOG=argv_log)
         env.pop("LEAN_SESSION_ID", None)
@@ -333,7 +442,7 @@ def self_test():
                 fails.append("ping must return {}")
             names = {t["name"] for t in rpc("tools/list").get("result", {}).get("tools", [])}
             want = {"brain_list", "brain_show", "brain_add", "brain_close", "brain_queue_list", "brain_queue_add",
-                    "brain_queue_cancel", "brain_queue_bump", "brain_queue_route", "brain_stats"}
+                    "brain_queue_cancel", "brain_queue_bump", "brain_queue_route", "brain_stats", "brain_digest"}
             if names != want:
                 fails.append(f"tools/list: missing {sorted(want - names)} extra {sorted(names - want)}")
             err, text = call("brain_add", project="demo", kind="question", ref="q1", title="a title",
@@ -387,6 +496,7 @@ def self_test():
             err, text = call("brain_queue_list")
             if err or "tests/A.csproj" not in text:
                 fails.append(f"brain_queue_list must show the job: {err} {text!r}")
+            digest_and_size_tests(fails, call, os.path.join(d_root, "brain.db"))
             err, text = call("brain_stats")
             if err or not text.lstrip().startswith(("{", "[")):
                 fails.append(f"brain_stats must return json: {err} {text!r}")

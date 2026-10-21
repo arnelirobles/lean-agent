@@ -1,6 +1,7 @@
 import json
 import os
 import statistics
+import time
 
 from .store import connect, db_path, epoch
 from .items import tags_of
@@ -44,6 +45,76 @@ def cmd_resume(a):
         print(text)
     if len(shown) < total:
         print(f"... {total - len(shown)} more: brain list --project {project} --status open")
+    return 0
+
+
+DIGEST_MAX = 2000
+DIGEST_LIST = 8  # lines per section
+STALE_AGENT_S = 24 * 3600
+
+
+def short(text, n=90):
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n - 3] + "..."
+
+
+def digest_lines(con, project):
+    """The digest as lines. project None means all of them; it matches without regard to case."""
+    where, args = "", []
+    if project:
+        where, args = " AND lower(project)=lower(?)", [project]
+    lines = []
+    counts = {}
+    for r in con.execute("SELECT lower(project) AS p, kind, COUNT(*) AS n FROM items WHERE status='open'" + where
+                         + " GROUP BY lower(project), kind ORDER BY p, n DESC, kind", args):
+        counts.setdefault(r["p"], []).append(f"{r['kind']} {r['n']}")
+    shown = list(counts.items())[:12]
+    for p, kinds in shown:
+        lines.append(f"{p}: " + ", ".join(kinds[:8]) + (f", +{len(kinds) - 8} kinds" if len(kinds) > 8 else ""))
+    if len(counts) > len(shown):
+        lines.append(f"+{len(counts) - len(shown)} more projects")
+    for kind in ("blocker", "question"):
+        rows = con.execute("SELECT id, project, title, ref FROM items WHERE status='open' AND kind=?" + where
+                           + " ORDER BY id DESC", [kind] + args).fetchall()
+        for r in rows[:DIGEST_LIST]:
+            lines.append(f"#{r['id']} {kind}{'' if project else ' ' + r['project']} {short(r['title'] or r['ref'])}")
+        if len(rows) > DIGEST_LIST:
+            lines.append(f"+{len(rows) - DIGEST_LIST} more {kind}s: brain list --open --kind {kind}")
+    jobs = con.execute("SELECT * FROM jobs WHERE status='running'" + where + " ORDER BY id", args).fetchall()
+    for j in jobs[:DIGEST_LIST]:
+        lines.append(short(job_line(j), 110))
+    if len(jobs) > DIGEST_LIST:
+        lines.append(f"+{len(jobs) - DIGEST_LIST} more running jobs")
+    queued = con.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'" + where, args).fetchone()[0]
+    if queued:
+        lines.append(f"{queued} queued jobs")
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - STALE_AGENT_S))
+    rows = con.execute("SELECT id, project, title, ref, last_seen FROM items WHERE status='open' AND kind='agent'"
+                       " AND last_seen < ?" + where + " ORDER BY last_seen", [cutoff] + args).fetchall()
+    for r in rows[:DIGEST_LIST]:
+        hours = (time.time() - epoch(r["last_seen"])) // 3600
+        lines.append(f"#{r['id']} stale agent {int(hours)}h{'' if project else ' ' + r['project']} "
+                     f"{short(r['title'] or r['ref'])}")
+    if len(rows) > DIGEST_LIST:
+        lines.append(f"+{len(rows) - DIGEST_LIST} more stale agents: brain list --open --kind agent")
+    return lines
+
+
+def cmd_digest(a):
+    if a.all and a.project:
+        raise SystemExit("brain: use --project or --all, not both")
+    if a.quiet and not os.path.exists(db_path()):
+        return 0
+    project = None if a.all else (a.project or default_project())
+    lines = digest_lines(connect(), project)
+    if not lines:
+        if not a.quiet:
+            print(f"brain digest {project or 'all projects'}: nothing open")
+        return 0
+    out = f"brain digest {project or 'all projects'}\n" + "\n".join(lines)
+    if len(out.encode()) > DIGEST_MAX:
+        out = out.encode()[:DIGEST_MAX - 20].decode(errors="ignore").rsplit("\n", 1)[0] + "\n... cut, see brain list"
+    print(out)
     return 0
 
 

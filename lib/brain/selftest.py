@@ -9,6 +9,64 @@ from .store import MIGRATIONS, connect, migrate_1
 from .queue import detect_platform, project_of
 
 
+def digest_tests(fails, me, d):
+    import sqlite3
+    db = os.path.join(d, "digest.db")
+    env = dict(os.environ, LEAN_BRAIN_DB=db)
+    env.pop("LEAN_SESSION_ID", None)
+    env.pop("LEAN_SESSION_CWD", None)
+    repo = os.path.join(d, "demo")
+    os.mkdir(repo)
+    subprocess.run(["git", "init", "-q", repo], check=True)
+
+    def brain(*args, cwd=None):
+        r = subprocess.run([sys.executable, me, *args], env=env, capture_output=True, text=True, cwd=cwd)
+        return r.returncode, r.stdout
+
+    rc, out = brain("digest", "--all")
+    if rc != 0 or "nothing open" not in out:
+        fails.append(f"digest on an empty brain: {rc} {out!r}")
+    if brain("digest", "--quiet", cwd=repo) != (0, ""):
+        fails.append("digest --quiet must print nothing when nothing is open")
+    old = "2020-01-01T00:00:00Z"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    con = sqlite3.connect(db)
+    rows = [("DEMO", "blocker", "b1", "waiting on a key", "open", now),
+            ("Demo", "question", "q1", "which port", "open", now),
+            ("demo", "agent", "old", "stale agent here", "open", old),
+            ("demo", "agent", "new", "fresh agent here", "open", now),
+            ("demo", "agent", "closed", "closed old agent", "closed", old),
+            ("other", "blocker", "ob", "other project blocker", "open", now)]
+    rows += [("Bulk%d" % (i % 40), "test-fail", "t%d" % i, "title " + "x" * 80, "open", now) for i in range(2000)]
+    con.executemany("INSERT INTO items (project, kind, ref, title, status, first_seen, last_seen) "
+                    "VALUES (?,?,?,?,?,?,?)", [r + (r[5],) for r in rows])
+    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                "VALUES ('Demo', '/x', 't/A.csproj', 'running', ?)", (now,))
+    con.execute("INSERT INTO jobs (project, repo_dir, test_project, status, enqueued_at) "
+                "VALUES ('demo', '/x', 't/B.csproj', 'done', ?)", (now,))
+    con.commit()
+    con.close()
+    rc, out = brain("digest", cwd=repo)
+    if rc != 0 or "waiting on a key" not in out or "which port" not in out:
+        fails.append(f"digest must list blockers and questions, whatever the case of the project: {rc} {out!r}")
+    if "other project blocker" in out or "bulk" in out:
+        fails.append(f"digest of the current project must not show other projects: {out!r}")
+    if "stale agent here" not in out or "fresh agent here" in out or "closed old agent" in out:
+        fails.append(f"digest must show only open agents older than 24 hours as stale: {out!r}")
+    if "t/A.csproj" not in out or "t/B.csproj" in out:
+        fails.append(f"digest must show running jobs only: {out!r}")
+    if "demo:" not in out or "blocker 1" not in out:
+        fails.append(f"digest must count by project and kind, with the project in one case: {out!r}")
+    rc, out = brain("digest", "--project", "DEMO")
+    if "waiting on a key" not in out:
+        fails.append(f"--project must match without regard to case: {out!r}")
+    rc, out = brain("digest", "--all")
+    if len(out.encode()) > 2048 or "other project blocker" not in out or "bulk0" not in out:
+        fails.append(f"digest --all on 2000 items: {len(out.encode())} bytes, {out[:300]!r}")
+    if brain("digest", "--all", "--project", "x")[0] == 0:
+        fails.append("digest must refuse --all with --project")
+
+
 def run(brain_cli):
     fails = []
     me = brain_cli
@@ -676,6 +734,7 @@ def run(brain_cli):
         names = [ln.split()[4] for ln in run("activity", "list")[1].splitlines()]
         if names != ["new", "mid", "old"]:
             fails.append(f"list is newest first by ts: {names}")
+        digest_tests(fails, me, d)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
