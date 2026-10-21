@@ -40,6 +40,7 @@
   brain activity import-baryovm [--file PATH]   reads BaryoVM's activity.jsonl from where the last import
             stopped, so a rerun adds nothing; a file that shrank is read from the start
   brain resume [--project P] [--max N]
+  brain digest [--project P | --all] [--quiet] [--recover]
   brain stats [--json]
   brain export [--format md|json] [--project P] [--status S]
   brain session start|end|status ID [--cwd DIR]
@@ -62,6 +63,9 @@ resume prints the open items of one project as a short digest: blockers, agents,
 jobs, pending, questions, then the rest, newest first, titles only, at most --max lines (default 40). The project defaults to the
 git toplevel's name in the current directory. It prints nothing and exits 0 when there is no database
 or nothing open. Queued and running jobs are listed after the blockers and agents. The SessionStart hook runs it on startup and after a compaction.
+digest prints under 2 KB: open items by project and kind (project names match without regard to case),
+open blockers and questions one line each, running jobs, and agent items open with no update for 24 hours.
+It covers the current project, or every project with --all. The brain_digest MCP tool runs it.
 Status: open, closed, wontfix. Resolution: fixed, flaky, flaky-cleared, not-a-bug, duplicate, answered, filed.
 Severity: critical, important, minor, info. Phase: code, test, fix, review.
 Source: test-phase, agent, review, user. Model: haiku, sonnet, opus, or empty.
@@ -94,7 +98,7 @@ from .items import cmd_add, cmd_answers, cmd_close, cmd_list, cmd_reopen, cmd_ru
 from .flaky import cmd_flaky_clear
 from .activity import cmd_activity
 from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
-from .report import cmd_export, cmd_resume, cmd_stats
+from .report import cmd_digest, cmd_export, cmd_resume, cmd_stats
 
 
 def lower(s):
@@ -258,6 +262,13 @@ def parser():
     s.add_argument("--project", type=lower)
     s.add_argument("--max", type=int, default=40)
     s.set_defaults(fn=cmd_resume)
+    s = sub.add_parser("digest")
+    s.add_argument("--project", help="default: the git toplevel's name in the current directory")
+    s.add_argument("--all", action="store_true", help="every project")
+    s.add_argument("--quiet", action="store_true", help="print nothing when nothing is open")
+    s.add_argument("--recover", action="store_true",
+                   help="after the digest, queued jobs and every open agent and pending item, 4 KB at most")
+    s.set_defaults(fn=cmd_digest)
     s = sub.add_parser("stats")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_stats)
