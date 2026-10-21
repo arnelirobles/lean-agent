@@ -95,7 +95,7 @@ def run(brain_cli):
         if ids != ["1", "2", "3"]:
             fails.append(f"run ids: {ids}")
         run("add", "--project", "core", "--kind", "flaky", "--ref", "Other.Flaky", "--run-id", "2", "--cycle", "c1")
-        rc, out, _ = run("show", "6")
+        rc, out, _ = run("show", "5")
         if "run id: 2" not in out:
             fails.append(f"item not linked to its run: {out!r}")
         rc, out, _ = run("stats", "--json")
