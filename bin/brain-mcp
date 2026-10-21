@@ -403,8 +403,10 @@ def digest_and_size_tests(fails, call, db):
     if not err:
         fails.append("a limit under 1 must be refused")
     err, text = call("brain_list", status="closed", limit=1000)
-    if err or " open " in text or len(text.splitlines()) != 500:
-        fails.append(f"brain_list status closed must list closed items past the default: {err} {len(text.splitlines())}")
+    ls = text.splitlines()
+    if err or " open " in text or len(ls) <= 51 or len(text.encode()) > 8200 or "... 3" not in ls[-1]:
+        fails.append(f"brain_list status closed must list closed items past the default line limit, up to 8 KB: "
+                     f"{err} {len(ls)} lines {len(text.encode())} bytes")
     err, text = call("brain_list", project="Big1", kind="blocker")
     if err or "bb" not in text or len(text.splitlines()) != 1:
         fails.append(f"brain_list project and kind filters must still work: {err} {text!r}")
