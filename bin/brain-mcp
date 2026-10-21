@@ -189,7 +189,7 @@ TOOLS = [
         "severity": S("critical, important, minor or info"), "repo": S("repository"), "branch": S("branch"),
         "cycle": S("cycle name")}, ["project", "kind", "ref"])),
     ("brain_close", "Close an item. Needs a resolution, or wontfix.", t_close, schema({
-        "id": I("item id"), "resolution": S("fixed, flaky, not-a-bug, duplicate, answered or filed"),
+        "id": I("item id"), "resolution": S("fixed, flaky, flaky-cleared, not-a-bug, duplicate, answered or filed"),
         "note": S("closing note"), "wontfix": B("close as wontfix")}, ["id"])),
     ("brain_queue_list", "List test queue jobs.", t_queue_list, schema({
         "status": S("queued, running, done, failed or cancelled"), "cycle": S("cycle name")})),

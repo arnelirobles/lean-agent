@@ -778,6 +778,50 @@ def run(brain_cli):
         names = [ln.split()[4] for ln in run("activity", "list")[1].splitlines()]
         if names != ["new", "mid", "old"]:
             fails.append(f"list is newest first by ts: {names}")
+
+        # flaky-clear closes a flaky item after 5 passing full runs of its test project since it was last seen.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "flaky.db")
+
+        def frun(project, test, started, rc, tier="full", passed=3, failed=0):
+            return run("run-add", "--project", project, "--test-project", test, "--tier", tier, "--started", str(started),
+                       "--exit-code", str(rc), "--passed", str(passed), "--failed", str(failed))[1]
+
+        r1 = frun("core", "A.csproj", 1000, 1, failed=1)
+        r2 = frun("core", "B.csproj", 1000, 1, failed=1)
+        run("add", "--project", "core", "--kind", "flaky", "--ref", "A.One", "--run-id", r1)
+        run("add", "--project", "core", "--kind", "flaky", "--ref", "B.One", "--run-id", r2)
+        run("add", "--project", "core", "--kind", "test-fail", "--ref", "A.Real", "--run-id", r1)
+        for i in range(5):  # all before the item was last seen: they cannot clear it
+            frun("core", "A.csproj", 1001 + i, 0)
+        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        if rc != 0 or out:
+            fails.append(f"passing runs older than the last sighting must not clear a flaky item: {rc} {out!r}")
+        future = 4102444800  # year 2100, after any sighting made now
+        for i in range(4):
+            frun("core", "A.csproj", future + i, 0)
+        frun("core", "A.csproj", future + 9, 1, failed=1)  # a failing run does not count
+        frun("core", "A.csproj", future + 10, 0, tier="rerun")  # nor does a rerun
+        frun("core", "B.csproj", future + 11, 0)  # nor a run of another test project
+        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        if out:
+            fails.append(f"4 passing runs must not clear it: {out!r}")
+        frun("core", "A.csproj", future + 12, 0)
+        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "A.csproj")
+        if "closed: #1 closed flaky" not in out:
+            fails.append(f"5 passing runs must close the flaky item: {rc} {out!r}")
+        rc, out, _ = run("show", "1")
+        if "resolution: flaky-cleared" not in out or "5 passing runs" not in out:
+            fails.append(f"the item must carry resolution flaky-cleared: {out!r}")
+        rc, out, _ = run("list", "--open")
+        if "B.One" not in out or "A.Real" not in out or "A.One" in out:
+            fails.append(f"only the cleared flaky item may close, not another project's or a test-fail: {out!r}")
+        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "B.csproj", "--runs", "0")
+        rc2, out2, _ = run("list", "--open")
+        if rc == 0 or "B.One" not in out2:
+            fails.append(f"--runs 0 must be refused and close nothing: {rc} {out!r} {out2!r}")
+        rc, out, _ = run("close", "2", "--resolution", "flaky-cleared")
+        if rc != 0:
+            fails.append(f"close must accept the flaky-cleared resolution: {rc} {out!r}")
         # Project names are stored lower case, so BarakoCMS and barakocms are one project.
         env["LEAN_BRAIN_DB"] = os.path.join(d, "case.db")
         run("add", "--project", "BarakoCMS", "--kind", "pending", "--ref", "x")
