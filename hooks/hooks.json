@@ -1,5 +1,5 @@
 {
-  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text and commit-author checks that block, and notes on house style, stale test runs, unverified claims, containers for docs-only diffs and lessons.",
+  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author and wait-loop checks that block, and notes on house style, stale test runs, unverified claims, containers for docs-only diffs and lessons.",
   "hooks": {
     "SessionStart": [
       {
