@@ -12,8 +12,8 @@ The method improves only through this routine, and only with a person's approval
 Run, for the batch's window and every repository it touched:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/bin/lean-stats collect --since <YYYY-MM-DD> owner/repo ...
-${CLAUDE_PLUGIN_ROOT}/bin/lean-stats report --since <YYYY-MM-DD>
+lean-stats collect --since <YYYY-MM-DD> owner/repo ...
+lean-stats report --since <YYYY-MM-DD>
 ```
 
 The collection step can run as a `lean:retro` agent on the fast model (`LEAN_MODEL_FAST`, default `haiku`), which runs the commands and returns the rows. The reasoning in sections 2 to 4 stays with the session.
@@ -23,7 +23,7 @@ prints cost per change by model and by role, the escalation rate, findings by wh
 critic misses, fix rounds and hook fires, each with the count behind it. A line that says `no data`
 is a gap in what was recorded, not a zero: say so in the retro and do not reason from it. For the raw
 row per pull request, run
-`REVIEW_LOG=<path to review-log.tsv> ${CLAUDE_PLUGIN_ROOT}/bin/retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
+`REVIEW_LOG=<path to review-log.tsv> retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
 
 `retro-signals.sh` ends with a script repeats section from `script-repeats --days 7`: per family of hand-written commands, the uses, transcripts and projects, and the script that covers it. It prints counts and family names only. Run `script-repeats` alone to change the window.
 

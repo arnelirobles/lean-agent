@@ -29,15 +29,34 @@ Label every agent you start, so `lean-stats` can count it by role. The Agent des
 - A rule in the agent instructions that can be stated about types, namespaces or references becomes an architecture test, and the instructions name the test.
 - A script that works on any repository goes to the method as a pull request; one tied to a repository goes to its `scripts/`. Always a pull request, merged by a person.
 - Every change the diff gates gets the `adversarial-review` skill; findings go back to the agent that wrote the change.
-- At most four changes in flight. Heavy commands under a shared lock (`${CLAUDE_PLUGIN_ROOT}/bin/heavy.sh`), every wait loop has a deadline, every agent writes under its own scratchpad subdirectory.
+- At most four changes in flight. Heavy commands under a shared lock (`heavy.sh`), every wait loop has a deadline, every agent writes under its own scratchpad subdirectory.
 - Subagents run commands in the foreground; they are never told when background work finishes and stall. Size every gate piece to finish under the 600 second tool timeout, including any time spent waiting for a lock.
 - A worktree-isolated agent runs git as plain single commands from the worktree root: no `cd x &&`, no pipes. The harness refuses what it cannot verify.
 - Parallel changes never append to one shared file such as a changelog: one fragment file per change.
 - Verify content and identity, not status codes or ratios: a page baked empty still answers 200, a small pixel ratio can hide wrong dates, and the deployed commit sha proves a deploy where a version string does not.
+- Before opening a pull request, run `style-scan` on the branch and on the body file, and `holdout.sh` for the mutation check. Do not write your own dash grep or revert loop.
 - A task is not done until the pull request URL exists.
 
+## Scripts on PATH
+The plugin's `bin/` is on PATH, so call these by name, not by a path. Use them instead of writing your own. If a command is not found (older Claude Code, a plain shell), the scripts are in the `bin` directory of the plugin, under the path in `CLAUDE_PLUGIN_ROOT`.
+- `style-scan`: checks the lines you add (and untracked files, so a body file counts) for dashes, arrows, slop and attribution. Run it before every commit, and on a body file before `gh ... --body-file`.
+- `holdout.sh --spec <file>`: holds a change's production hunk out and requires its named test to fail. Use it for the mutation check, not a hand revert.
+- `replace`: exact text edit that fails unless the old text is there exactly once.
+- `wait-loop` hook (`hooks/wait-loop.py`): denies `sleep` and `pgrep` wait loops. Enqueue and end the turn instead.
+- `pr-blockers.sh <pr>`: every reason a pull request cannot merge, in one read-only call.
+- `why-red.sh <log>`: names environmental causes (no Docker, a busy port, a full disk) in a failed log before you debug code.
+- `assert-ran.sh <report>`: fails when a test report shows zero tests ran.
+- `check-deployed-sha.sh <url> <sha>`: proves a deploy by the commit sha it reports, not a 200.
+- `brain` and `test-phase`: the issue list and the test queue (below).
+- `heavy.sh <lane> <command>`: runs a heavy command under the shared lane lock; `heavy.sh status <lane>` says whether it is free.
+- `sync-default.sh`: merges the default branch and runs a locked restore. Refuses a dirty tree.
+- `needs-review.sh`: prints the review rules a diff fires.
+- `agent-hygiene.sh`: reports what parallel agents left behind.
+- `check-conflict-markers.sh`, `check-top-level-md.sh`, `check-workflow-keys.py`, `check-runtime.sh`: cheap repository checks, run them in the preflight.
+- `retro-signals.sh`, `lean-stats`, `workflow-cost.py`: the retro's facts and what a run cost.
+
 ## Tests and brain
-- Code first, build only. Run the tests once, as one phase: add each test project with `${CLAUDE_PLUGIN_ROOT}/bin/brain queue add <repo-dir> <test project> [--after ID]`, then the orchestrator starts one `${CLAUDE_PLUGIN_ROOT}/bin/test-phase` as a background task. Queue one job per worktree: put every class you need in one `--filter 'ATests|BTests'` rather than one job per class, run `brain queue list` first, and when an earlier job of yours for the same worktree is still queued, cancel it and add the merged one. Adding a job that is already queued returns its id, so wait on that. Failures land in `${CLAUDE_PLUGIN_ROOT}/bin/brain`. The fix round reads `brain list --open`, closes entries with a resolution and the fix commit, and the phase runs again.
+- Code first, build only. Run the tests once, as one phase: add each test project with `brain queue add <repo-dir> <test project> [--after ID]`, then the orchestrator starts one `test-phase` as a background task. Queue one job per worktree: put every class you need in one `--filter 'ATests|BTests'` rather than one job per class, run `brain queue list` first, and when an earlier job of yours for the same worktree is still queued, cancel it and add the merged one. Adding a job that is already queued returns its id, so wait on that. Failures land in `brain`. The fix round reads `brain list --open`, closes entries with a resolution and the fix commit, and the phase runs again.
 - Test only what is needed while working. A fix or review round queues only the classes the change touches and the classes that failed. The full suite runs once, as the final check before pushing: the queue refuses a second full job for the same project, test project and commit, and a full job from a tree with uncommitted changes, unless you pass `--again "reason"`. Its failures are rerun one class at a time. When several branches need that final run, merge them into one candidate and run it once. A red run, the test proving it fails before the fix, stays on its own branch.
 - Never write a `sleep` or `pgrep` wait loop. Enqueue the job, end the turn, and the orchestrator's one drainer runs it. The orchestrator gets one notice when the drainer exits, then reads `brain list --cycle C` or `brain stats`. `brain resume` shows queued and running jobs after a compaction, and the startup hook prints `brain digest` for the project.
 - Ask whether a lane is free with `heavy.sh status <lane>`. Never write a `pgrep` loop for it: it matches its own command line and never ends. Set `HEAVY_STALL` on test commands so a stalled run stops as load, not as a code failure.
@@ -48,8 +67,8 @@ Label every agent you start, so `lean-stats` can count it by role. The Agent des
 - Never store secrets, tokens or passwords in brain.
 
 ## After a batch
-- Run the `lean-retro` skill: facts from `${CLAUDE_PLUGIN_ROOT}/bin/lean-stats`, fixed triggers, check whether the last method change helped, propose changes with evidence. Nothing changes without the owner's approval.
+- Run the `lean-retro` skill: facts from `lean-stats`, fixed triggers, check whether the last method change helped, propose changes with evidence. Nothing changes without the owner's approval.
 - Log every review with `${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh`.
 - No agent attribution and no slop in commits, pull requests, issues or releases. The plugin hook blocks both; rewrite the text, do not turn the hook off.
-- Sweep with `${CLAUDE_PLUGIN_ROOT}/bin/agent-hygiene.sh` for what parallel agents left behind.
+- Sweep with `agent-hygiene.sh` for what parallel agents left behind.
 - After each milestone, a lean pass over what shipped: agent-written code and comments over-explain, so cut commentary that restates the code and verbose code a newer language feature says more plainly. No behaviour change, and its own pull request.

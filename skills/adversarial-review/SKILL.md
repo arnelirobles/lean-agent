@@ -105,6 +105,8 @@ comparison, rate limits); stability (timeouts, bounded lists, cache staleness un
 shutdown); data integrity (ordering of side effects against failures, replay and duplicates);
 missing behaviour (the handler, default, rollback or check that should be in the diff and is not);
 tests that pass for the wrong reason (a disabled retry, an empty collection, a mock asserting on itself).
+To check that a test fails without the code it names, run `holdout.sh --spec <description file>`
+rather than reverting a line by hand.
 
 The hunter writes candidates as `category | severity | file:line | input | path | wrong result |
 proposed fix`, and states what it did not check.
@@ -147,9 +149,12 @@ If nothing survives, say so, and list what was checked. A clean review is a resu
 - **No finding is left as a follow-up by default.** Fix it in the change or drop it. File an issue
   only for something that needs a different repository or a decision nobody in the change can make.
 
+Before a review body goes out with `gh ... --body-file`, put the file in the checkout and run
+`style-scan`. It reads added lines and untracked files, so it catches dashes and slop in the body. Delete the file right after the scan so it is never committed.
+
 ## 7. Record
 
-Append one line per review with `log-review.sh`, so each batch can compare what this caught against
+Append one line per review with `${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh`, so each batch can compare what this caught against
 CI and any review bot:
 
 ```bash
