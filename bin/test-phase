@@ -209,7 +209,7 @@ class Hold:
     reruns are not queued behind another session's run."""
 
     def __init__(self, lane):
-        self.lane, self.fd, self.path, self.claim = lane, None, None, ""
+        self.lane, self.fd, self.path, self.claim, self.error = lane, None, None, "", ""
         self.ok = bool(hl) and bool(re.fullmatch(r"[A-Za-z0-9._-]+", lane))
 
     def take(self, wait):
@@ -225,9 +225,10 @@ class Hold:
             return None
         try:
             self.claim = hl.claim(self.path)
-        except OSError:  # no claim file: heavy.sh takes the lock itself, which waits for us
-            self.release()
-            return None
+        except OSError as e:  # no claim file (a symlink or a stranger's file there): give the lane back and let
+            self.release()    # heavy.sh take it command by command, as without a hold
+            self.ok, self.error = False, str(e)
+            return 0.0
         return time.monotonic() - t0
 
     def release(self):
@@ -262,7 +263,11 @@ def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0):
                 + f"heavy.sh: timed out after {env['HEAVY_WAIT']}s waiting for lane '{lane}'. Nothing ran.\n"
             open(log, "w").write(text)
             return 75, text, started, int(time.time()), float(env["HEAVY_WAIT"])
-        env["HEAVY_HELD"] = held.claim
+        if held.claim:
+            env["HEAVY_HELD"] = held.claim
+        else:
+            sys.stderr.write(f"test-phase: no lane hold for '{lane}' (claim failed: {held.error}); "
+                             "locking command by command\n")
     with open(log, "w") as fh:
         # The header is always one line, so what follows it is the command's own output.
         fh.write(header if header is not None else "$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")

@@ -612,7 +612,7 @@ def main(args):
             return 75
         open(marker, "w").close()
         record = path + ".pgid" if private_dir(path) else None
-        if record and not held:  # a held lane's record belongs to its holder, never to an orphan
+        if record:  # a valid claim means the lock is ours, so a recorded group is an orphan of an earlier command
             reap_orphan(record)
         try:
             return run(argv, stall, pattern, record, fail_stall)
