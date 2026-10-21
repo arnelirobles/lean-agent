@@ -53,10 +53,14 @@ def is_off(segs):
 
 
 def command_words(seg):
-    words = list(seg.words)
+    return hookkit.strip_wrappers(after_keywords(seg.words), {})
+
+
+def after_keywords(words):
+    words = list(words)
     while words and words[0] in KEYWORDS:
         words.pop(0)
-    return hookkit.strip_wrappers(words, {})
+    return words
 
 
 def name(words):
@@ -125,7 +129,8 @@ def verdict(command, cwd="."):
             inner = verdict(script, cwd)
             if inner and inner[0] == "deny":
                 return inner
-    if any(name(w) == "pgrep" for w in cmds):
+    if any(name(w) == "pgrep" or (name(w) in LOOP_OPEN | {"if"} and name(after_keywords(w[1:])) == "pgrep")
+           for w in cmds):
         return "deny", DENY_PGREP + TURN_OFF
     if loop_poll(cmds):
         return "deny", DENY_LOOP + TURN_OFF
@@ -204,6 +209,7 @@ def self_test():
     check("sleep then tail", "sleep 30 && tail -20 build.log", "deny")
     check("pgrep", "pgrep -f dotnet", "deny")
     check("pgrep in a loop", "while pgrep -f dotnet; do echo w; done", "deny")
+    check("negated pgrep in a loop", "until ! pgrep -f dotnet; do echo w; done", "deny")
     check("bash -c loop", "bash -c 'until grep -q x f; do sleep 15; done'", "deny")
     check("sh -c pgrep", 'sh -c "pgrep -f foo"', "deny")
     check("timeout bash -c loop", "timeout 60 bash -c 'until grep -q x f; do sleep 1; done'", "deny")
