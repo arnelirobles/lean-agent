@@ -18,8 +18,12 @@ rename, keeping the file mode. A block that matches 0 times, or more than once
 without --all, exits 1 and names the block number and the count found. Matching
 is literal, with no regex and no escaping. One line is printed per block applied.
 
-A line that is exactly `@@@ end` cannot appear inside a block. In a CRLF file
-the block text is matched with CRLF endings. The old text may not be empty.
+A line that is exactly `@@@ end` cannot appear inside a block. The line break
+before @@@ new and @@@ end is not part of the text; to delete a whole line,
+include the line before or after it in old. In a file where every line break is
+CRLF the block text is matched with CRLF endings; a file with mixed endings is
+matched as given. The old text may not be empty. A read-only file, or one with
+more than one hard link (the rename would break the link), is refused.
 """
 import os
 import subprocess
@@ -57,7 +61,7 @@ def parse(data):
 
 
 def apply(text, blocks, replace_all):
-    crlf = "\r\n" in text
+    crlf = "\r\n" in text and text.count("\r\n") == text.count("\n")
     out = []
     for i, (old, new) in enumerate(blocks, 1):
         if crlf:
@@ -74,11 +78,18 @@ def apply(text, blocks, replace_all):
 
 def write_atomic(path, text):
     path = os.path.realpath(path)
-    mode = os.stat(path).st_mode
+    st = os.stat(path)
+    mode = st.st_mode
+    if not os.access(path, os.W_OK):
+        raise ValueError(f"{path} is not writable")
+    if st.st_nlink > 1:
+        raise ValueError(f"{path} has {st.st_nlink} hard links; the rename would break them")
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".replace-")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(text.encode("utf-8", "surrogateescape"))
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, mode & 0o7777)
         os.replace(tmp, path)
     except BaseException:
@@ -161,6 +172,11 @@ def self_test():
         r, after, _ = go(b"a\r\nfoo", block("foo", "bar"))
         check("CRLF with no final newline kept", r.returncode == 0 and after == b"a\r\nbar")
 
+        r, after, _ = go(b"a\nfoo\nlast\r\n", block("foo", "x\ny"))
+        check("mixed endings are not translated", r.returncode == 0 and after == b"a\nx\ny\nlast\r\n")
+        r, after, _ = go(b"a\nfoo\nb\n", block("a\nfoo", "a"))
+        check("whole line deleted with a neighbour line", r.returncode == 0 and after == b"a\nb\n")
+
         r, after, _ = go(b"x = 1\n", block("x = 1", "y = '$1 \\n \\1 $HOME \\\\'"))
         check("dollar and backslashes are literal", r.returncode == 0
               and after == b"y = '$1 \\n \\1 $HOME \\\\'\n")
@@ -171,6 +187,24 @@ def self_test():
         check("no blocks exits 1", r.returncode == 1 and after == b"a\n")
         r, after, _ = go(b"a\n", block("", "b"))
         check("empty old exits 1", r.returncode == 1 and after == b"a\n")
+        p = os.path.join(d, "f.txt")
+        with open(p, "wb") as f:
+            f.write(b"foo\n")
+        os.chmod(p, 0o444)
+        r = subprocess.run([sys.executable, "-I", me, p], input=block("foo", "bar").encode(),
+                           capture_output=True)
+        with open(p, "rb") as f:
+            after = f.read()
+        check("read-only file refused", os.geteuid() == 0 or (r.returncode == 1 and after == b"foo\n"))
+        os.chmod(p, 0o644)
+        link = os.path.join(d, "link.txt")
+        os.link(p, link)
+        r = subprocess.run([sys.executable, "-I", me, p], input=block("foo", "bar").encode(),
+                           capture_output=True)
+        with open(p, "rb") as f:
+            after = f.read()
+        check("hard-linked file refused", r.returncode == 1 and after == b"foo\n" and b"hard link" in r.stderr)
+        os.unlink(link)
         check("no temp files left", os.listdir(d) == ["f.txt"])
 
         r = subprocess.run([sys.executable, "-I", me, os.path.join(d, "absent")],
