@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import initSqlJs, { Database } from "sql.js";
 
-// Copied from bin/brain (migrate_2 to migrate_5, and the meta table; LATER has migrate_6 to migrate_8). schema.test.ts keeps it honest.
+// Copied from bin/brain (migrate_2 to migrate_5, and the meta table; LATER has migrate_6 to migrate_9). schema.test.ts keeps it honest.
 export const SCHEMA = [
   `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE runs (
@@ -46,6 +46,8 @@ export const LATER = [
   `ALTER TABLE jobs ADD COLUMN host TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE runs ADD COLUMN host TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE jobs ADD COLUMN commit_hash TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''`,
 ];
 
 export const ACTIVITY = [
@@ -66,11 +68,11 @@ export async function sqlJs() {
   return initSqlJs({ wasmBinary: wasm as unknown as ArrayBuffer });
 }
 
-/** schema 8 by default, with the activities table a `brain activity` command makes; 5 is from before platform and host and has no activities. */
-export async function emptyDb(version: 5 | 8 = 8): Promise<Database> {
+/** schema 9 by default, with the activities table a `brain activity` command makes; 5 is from before platform and host and has no activities. */
+export async function emptyDb(version: 5 | 9 = 9): Promise<Database> {
   const SQL = await sqlJs();
   const db = new SQL.Database();
-  for (const s of version === 8 ? [...SCHEMA, ...LATER, ...ACTIVITY] : SCHEMA) db.run(s);
+  for (const s of version === 9 ? [...SCHEMA, ...LATER, ...ACTIVITY] : SCHEMA) db.run(s);
   db.run(`INSERT INTO meta VALUES ('schema_version','${version}')`);
   return db;
 }

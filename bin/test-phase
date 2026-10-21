@@ -177,7 +177,8 @@ class Lane:
     """One place jobs run: the local machine, or one SSH host."""
 
     def __init__(self, name, where, remote=None, repos=None):
-        self.name, self.where, self.remote, self.repos = name, where, remote, repos or {}
+        self.name, self.where, self.remote = name, where, remote
+        self.repos = {k.lower(): v for k, v in (repos or {}).items()}
 
 
 LOCAL = Lane("local", "local")
@@ -253,6 +254,8 @@ def add_item(row, kind, ref, severity, body, run_id, ctx):
     args = ["add", "--project", row["project"], "--repo", ctx["repo"], "--kind", kind, "--ref", ref,
             "--title", ref, "--body-file", "-", "--severity", severity, "--phase", "test", "--source", "test-phase",
             "--cycle", ctx["cycle"]]
+    if row.get("session"):
+        args += ["--session", row["session"], "--session-cwd", row.get("session_cwd", "")]
     if ctx["branch"]:
         args += ["--branch", ctx["branch"]]
     if run_id:
@@ -351,10 +354,11 @@ def run_job(job, a, run_dir, runner, lane=LOCAL):
 def _run_job(job, a, run_dir, runner, lane):
     repo, project = job["repo_dir"], job["test_project"]
     remote = lane.remote
-    cfg = lane.repos.get(job["project"]) if remote else None
+    cfg = lane.repos.get(job["project"].lower()) if remote else None
     row = {"job": job["id"], "project": job["project"], "test": project, "tier": job["tier"],
            "result": "", "failing": 0, "real": 0, "flaky": 0, "notes": [], "run_id": None, "rc": 1,
-           "host": remote.name if remote else ""}
+           "host": remote.name if remote else "", "session": job.get("session_id", ""),
+           "session_cwd": job.get("session_cwd", "")}
     if not os.path.isdir(repo):
         row["result"] = "error"
         row["notes"].append("no such directory")
@@ -821,6 +825,19 @@ def self_test():
     if "hunter2" in " ".join(seen.get("args", [])) or "hunter2" in (seen.get("stdin") or "") \
             or "-" not in seen.get("args", []) or "--body" in seen.get("args", []):
         fails.append(f"item body must be masked and sent by stdin, not argv: {seen}")
+
+    globals()["brain"] = lambda args, stdin=None: seen.update(args=args, stdin=stdin)
+    try:
+        add_item({"project": "p", "session": "s-1", "session_cwd": "/w"}, "flaky", "T.b", "minor", "x", None,
+                 {"repo": "r", "cycle": "c", "branch": ""})
+    finally:
+        globals()["brain"] = real_brain
+    a = seen.get("args", [])
+    if "--session" not in a or a[a.index("--session") + 1] != "s-1":
+        fails.append(f"an item must carry the session that queued the job: {a}")
+
+    if Lane("r", "remote", None, {"MixedCase": {"dir": "/x"}}).repos.get("mixedcase") != {"dir": "/x"}:
+        fails.append("a lane must find a repository config by its project name in any case")
 
     # A remote job's log opens with a one-line header, so the reason is never script text.
     head = "$ ssh dev <script for job 9>\n"

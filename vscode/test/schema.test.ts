@@ -58,6 +58,6 @@ describe("fixture schema matches lib/brain", () => {
   it("is at the schema version the fixture says", () => {
     const text = brainSource();
     const n = /MIGRATIONS = \[(.*)\]/.exec(text)![1].split(",").length;
-    expect(n).toBe(8);
+    expect(n).toBe(9);
   });
 });

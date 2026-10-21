@@ -5,8 +5,18 @@ import sys
 import tempfile
 import time
 
-from .store import MIGRATIONS, connect, migrate_1
+from .store import KIND, MIGRATIONS, connect, migrate_1
 from .queue import detect_platform, project_of
+
+
+def connect_rows(path, query):
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute(query).fetchall()
+    finally:
+        con.close()
 
 
 def run(brain_cli):
@@ -71,8 +81,9 @@ def run(brain_cli):
             fails.append("close of a missing id")
         if run("add", "--project", "p", "--kind", "note", "--ref", "r", "--severity", "huge")[0] == 0:
             fails.append("unknown severity accepted")
-        if run("add", "--project", "p", "--kind", "anything-goes", "--ref", "r")[0] != 0:
-            fails.append("a kind outside the documented ones must be allowed")
+        rc, _, err = run("add", "--project", "p", "--kind", "anything-goes", "--ref", "r")
+        if rc == 0 or "test-fail" not in err or "review-finding" not in err:
+            fails.append(f"an unknown kind must be refused with the list: {rc} {err!r}")
 
         # Runs and their link to items, and stats over them.
         ids = []
@@ -84,7 +95,7 @@ def run(brain_cli):
         if ids != ["1", "2", "3"]:
             fails.append(f"run ids: {ids}")
         run("add", "--project", "core", "--kind", "flaky", "--ref", "Other.Flaky", "--run-id", "2", "--cycle", "c1")
-        rc, out, _ = run("show", "6")
+        rc, out, _ = run("show", "5")
         if "run id: 2" not in out:
             fails.append(f"item not linked to its run: {out!r}")
         rc, out, _ = run("stats", "--json")
@@ -464,7 +475,7 @@ def run(brain_cli):
         c0.close()
         if hosts != ["dev"]:
             fails.append(f"run-add --host must store the host: {hosts}")
-        if ver != "8":
+        if ver != str(len(MIGRATIONS)):
             fails.append(f"schema version after open: {ver}")
 
         # A worktree shares its repository's project name.
@@ -696,30 +707,18 @@ def run(brain_cli):
                 or run("activity", "list", "--project", "nope")[1]:
             fails.append("--source and --project filter")
 
-        # No schema bump: a database the activity commands touched still opens with the previous brain.
-        # bin/brain needs lib/brain next to it, so take both.
-        old_root = os.path.join(d, "brain-main")
-        os.makedirs(old_root)
-        tar = subprocess.run(["git", "archive", "origin/main", "bin/brain", "lib/brain"], capture_output=True,
-                             cwd=os.path.dirname(os.path.dirname(me)), check=True).stdout
-        subprocess.run(["tar", "-x", "-C", old_root], input=tar, check=True)
-        old_brain = os.path.join(old_root, "bin", "brain")
+        # No schema bump: the activity commands leave the schema version where the other commands put it.
         env["LEAN_BRAIN_DB"] = os.path.join(d, "shared.db")
-        subprocess.run([sys.executable, old_brain, "add", "--project", "keepme", "--kind", "k", "--ref", "r"], env=env,
-                       capture_output=True, check=True)
+        run("add", "--project", "keepme", "--kind", "note", "--ref", "r")
+        con = sq.connect(env["LEAN_BRAIN_DB"])
+        before = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        con.close()
         run("activity", "add", "--source", "agent", "--action", "x")
         con = sq.connect(env["LEAN_BRAIN_DB"])
         ver = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         con.close()
-        if ver != "7":
-            fails.append(f"activity commands must not bump the schema version: {ver}")
-        for args in (["list"], ["queue", "list"], ["queue", "next", "--peek"], ["stats"]):
-            r = subprocess.run([sys.executable, old_brain, *args], env=env, capture_output=True, text=True)
-            if r.returncode != 0:
-                fails.append(f"previous brain {args} after activity use: {r.returncode} {r.stderr!r}")
-        r = subprocess.run([sys.executable, old_brain, "list"], env=env, capture_output=True, text=True)
-        if "keepme" not in r.stdout:
-            fails.append(f"previous brain lost the item: {r.stdout!r}")
+        if ver != before or ver != str(len(MIGRATIONS)):
+            fails.append(f"activity commands must not bump the schema version: {before} then {ver}")
 
         # Rotated file that regrows past the stored offset is read from the start.
         env["LEAN_BRAIN_DB"] = os.path.join(d, "rot.db")
@@ -779,6 +778,196 @@ def run(brain_cli):
         names = [ln.split()[4] for ln in run("activity", "list")[1].splitlines()]
         if names != ["new", "mid", "old"]:
             fails.append(f"list is newest first by ts: {names}")
+        # Project names are stored lower case, so BarakoCMS and barakocms are one project.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "case.db")
+        run("add", "--project", "BarakoCMS", "--kind", "pending", "--ref", "x")
+        rc, out, _ = run("add", "--project", "barakocms", "--kind", "pending", "--ref", "x")
+        if "seen again: #1" not in out or "occ=2" not in out or " barakocms " not in out:
+            fails.append(f"a project name must be stored lower case: {out!r}")
+        if "#1 " not in run("list", "--project", "BARAKOCMS")[1] or "#1 " not in run("resume", "--project", "BarakoCMS")[1]:
+            fails.append("list and resume must match a project in any case")
+        if sorted(r["project"] for r in connect_rows(env["LEAN_BRAIN_DB"], "SELECT project FROM items")) != ["barakocms"]:
+            fails.append("the stored project must be lower case")
+
+        # Kinds are a fixed list with aliases, and an unknown kind is refused.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "kinds.db")
+        for alias, want in (("todo", "pending"), ("task", "pending"), ("pending", "pending"),
+                            ("open-question", "question"), ("finding", "review-finding"), ("running", "agent"),
+                            ("running-agent", "agent"), ("isolation", "isolation"), ("Risk", "risk")):
+            rc, out, err = run("add", "--project", "k", "--kind", alias, "--ref", "ref-" + alias)
+            if rc != 0 or f" {want} k ref-{alias}" not in out:
+                fails.append(f"kind {alias} must be stored as {want}: {rc} {out!r} {err!r}")
+        if "#1 " not in run("list", "--kind", "todo")[1]:
+            fails.append("list --kind must accept an alias")
+        run("add", "--project", "k", "--kind", "todo", "--ref", "same")
+        if "seen again" not in run("add", "--project", "k", "--kind", "task", "--ref", "same")[1]:
+            fails.append("two aliases of one kind are the same item")
+        for bad in ("82-tests-to-run", "open", "test", ""):
+            rc, _, err = run("add", "--project", "k", "--kind", bad, "--ref", "r")
+            if rc == 0 or "one of:" not in err:
+                fails.append(f"kind {bad!r} must be refused with the list: {rc} {err!r}")
+
+        # close needs a resolution; --wontfix is the other way to say why.
+        rc, _, err = run("close", "1")
+        if rc == 0 or "--resolution" not in err or "open" not in run("show", "1")[1].splitlines()[0]:
+            fails.append(f"close with no resolution must be refused and leave the item open: {rc} {err!r}")
+        if run("close", "1", "--resolution", "fixed")[0] != 0:
+            fails.append("close with a resolution")
+        if run("close", "2", "--wontfix")[0] != 0:
+            fails.append("close --wontfix must keep working")
+        if " wontfix " not in run("show", "2")[1].splitlines()[0]:
+            fails.append("close --wontfix must set the status wontfix")
+
+        # An agent item with no update for 24 hours is stale in stats.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "stale.db")
+        run("add", "--project", "s", "--kind", "agent", "--ref", "old-agent", "--title", "old one")
+        run("add", "--project", "s", "--kind", "agent", "--ref", "new-agent", "--title", "new one")
+        run("add", "--project", "s", "--kind", "pending", "--ref", "old-pending")
+        con = sq.connect(env["LEAN_BRAIN_DB"])
+        con.execute("UPDATE items SET last_seen='2020-01-01T00:00:00Z' WHERE ref IN ('old-agent', 'old-pending')")
+        con.commit()
+        con.close()
+        st = json.loads(run("stats", "--json")[1])
+        if [x["title"] for x in st["stale_agents"]] != ["old one"]:
+            fails.append(f"only the old open agent is stale: {st.get('stale_agents')}")
+        out = run("stats")[1]
+        if "stale agents" not in out or "old one" not in out or "new one" in out.split("stale agents")[1].split("median")[0]:
+            fails.append(f"stats must list the stale agent: {out!r}")
+        run("close", "1", "--resolution", "answered")
+        if json.loads(run("stats", "--json")[1])["stale_agents"]:
+            fails.append("a closed agent is not stale")
+
+        # Migration 8 on a copy of a database with the current mix.
+        mixed = os.path.join(d, "mixed.db")
+        con = sq.connect(mixed)
+        con.row_factory = sq.Row
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        for m in MIGRATIONS[:7]:
+            m(con)
+        con.execute("INSERT INTO meta VALUES ('schema_version', '7')")
+        t0, t1 = "2026-10-18T00:00:00Z", "2026-10-20T00:00:00Z"
+
+        def item(project, kind, ref, status="open", resolution="", occ=1, first=t0, last=t0, session=""):
+            cur = con.execute("INSERT INTO items (project, kind, ref, title, status, resolution, occurrences,"
+                              " first_seen, last_seen, session_id, closed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                              (project, kind, ref, ref, status, resolution, occ, first, last, session,
+                               t1 if status != "open" else None))
+            return cur.lastrowid
+        a1 = item("barakoCMS", "todo", "x", occ=2, first=t0, last=t0)
+        a2 = item("barakocms", "pending", "x", occ=3, first="2026-10-19T00:00:00Z", last=t1, session="s-1")
+        a3 = item("medXpress", "82-tests-to-run", "t1")
+        a4 = item("medxpress", "open", "t2")
+        a5 = item("BaryoClub", "test", "t3")
+        a6 = item("baryoclub", "weird-kind", "t4")
+        a7 = item("core", "running-agent", "ag")
+        a8 = item("core", "open-question", "q")
+        a9 = item("core", "finding", "f")
+        a10 = item("core", "test-fail", "tf1", status="closed")
+        a11 = item("Core", "test-fail", "tf2", status="closed", resolution="fixed")
+        a12 = item("core", "test-fail", "tf3", status="closed", occ=2)
+        a13 = item("Ärger", "defect", "ae")
+        con.execute("INSERT INTO tags VALUES (?, 'a')", (a1,))
+        con.execute("INSERT INTO tags VALUES (?, 'b')", (a2,))
+        con.execute("INSERT INTO tags VALUES (?, 'a')", (a2,))
+        run_id = con.execute("INSERT INTO runs (project, test_project) VALUES ('Core', 'T')").lastrowid
+        con.execute("INSERT INTO jobs (project, repo_dir, test_project, enqueued_at) VALUES ('Core', '/r', 'T', ?)", (t0,))
+        con.commit()
+        con.close()
+        env["LEAN_BRAIN_DB"] = mixed
+        rc, out, err = run("list")
+        if rc != 0:
+            fails.append(f"a database with the old mix must open: {err!r}")
+        rows = {r["id"]: r for r in connect_rows(mixed, "SELECT * FROM items")}
+        if any(r["project"] != r["project"].lower() for r in rows.values()):
+            fails.append("migration must lower case every project")
+        if a2 in rows or a1 not in rows:
+            fails.append("the two open copies of one item must merge into the oldest row")
+        else:
+            m = rows[a1]
+            if m["occurrences"] != 5 or m["first_seen"] != t0 or m["last_seen"] != t1 or m["kind"] != "pending" \
+                    or m["session_id"] != "s-1":
+                fails.append(f"merged item must add the counts and span the dates: {dict(m)}")
+            tags = [t["tag"] for t in connect_rows(mixed, "SELECT tag FROM tags WHERE item_id=%d ORDER BY tag" % a1)]
+            if tags != ["a", "b"] or connect_rows(mixed, "SELECT * FROM tags WHERE item_id=%d" % a2):
+                fails.append(f"merge must move the tags: {tags}")
+        want = {a3: "pending", a4: "pending", a5: "note", a6: "note", a7: "agent", a8: "question", a9: "review-finding"}
+        got = {i: rows[i]["kind"] for i in want if i in rows}
+        if got != want:
+            fails.append(f"odd kinds must map to the closest allowed kind: {got}")
+        if rows[a13]["project"] != "ärger" or rows[a13]["kind"] != "bug":
+            fails.append(f"migration must lower case non-ASCII projects and map defect to bug: {dict(rows[a13])}")
+        if f"#{a13} " not in run("list", "--project", "ÄRGER")[1]:
+            fails.append("list --project must match a non-ASCII project in any case")
+        if any(r["kind"] not in KIND for r in rows.values()):
+            fails.append("every kind must be on the list after migrating")
+        if rows[a10]["resolution"] != "" or rows[a10]["status"] != "closed" or rows[a11]["resolution"] != "fixed" \
+                or rows[a12]["occurrences"] != 2:
+            fails.append("closed items, with or without a resolution, must come through unchanged")
+        if connect_rows(mixed, "SELECT project FROM runs")[0]["project"] != "core" \
+                or connect_rows(mixed, "SELECT project FROM jobs")[0]["project"] != "core":
+            fails.append("migration must lower case runs and jobs")
+        if connect_rows(mixed, "SELECT value FROM meta WHERE key='schema_version'")[0]["value"] != str(len(MIGRATIONS)):
+            fails.append("migration must record the new version")
+        if run("close", str(a1), "--resolution", "fixed")[0] != 0 or run("add", "--project", "Core", "--kind",
+                                                                        "todo", "--ref", "after")[0] != 0:
+            fails.append("a migrated database must take close and add")
+
+        # Items carry the session of the one that filed them, also when it is found from the folder (MCP) or
+        # from the job that test-phase ran.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "infer.db")
+        here = os.path.realpath(os.getcwd())
+        run("session", "start", "old-1", "--cwd", here)
+        run("session", "start", "new-1", "--cwd", here)
+        run("session", "start", "far-1", "--cwd", "/somewhere/else")
+        run("session", "end", "old-1")
+        run("add", "--project", "p", "--kind", "note", "--ref", "plain")
+        run("add", "--project", "p", "--kind", "note", "--ref", "inferred", "--infer-session")
+        if "session" in run("show", "1")[1] or "session: new-1" not in run("show", "2")[1] \
+                or f"session cwd: {here}" not in run("show", "2")[1]:
+            fails.append(f"--infer-session takes the open session of this folder: {run('show', '2')[1]!r}")
+        run("add", "--project", "p", "--kind", "note", "--ref", "given", "--infer-session", "--session", "mine-1")
+        if "session: mine-1" not in run("show", "3")[1]:
+            fails.append("an explicit session wins over the inferred one")
+        run("queue", "add", "/tmp/r", "A.csproj", "--session", "job-1", "--session-cwd", "/w")
+        run("queue", "add", "/tmp/r", "B.csproj", "--infer-session")
+        run("queue", "add", "/tmp/r", "C.csproj")
+        sess = [(j["test_project"], j["session_id"], j["session_cwd"])
+                for j in connect_rows(env["LEAN_BRAIN_DB"], "SELECT * FROM jobs ORDER BY id")]
+        if sess != [("A.csproj", "job-1", "/w"), ("B.csproj", "new-1", here), ("C.csproj", "", "")]:
+            fails.append(f"a queued job must record the session that queued it: {sess}")
+        if json.loads(run("queue", "next")[1])["session_id"] != "job-1":
+            fails.append("queue next must hand the drainer the job's session")
+        if run("queue", "add", "/tmp/r", "D.csproj", "--session", "a b;rm")[0] == 0:
+            fails.append("a job session with odd characters must be refused")
+        # A blank project is refused; a non-ASCII one is stored lower case.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "proj.db")
+        rc, _, err = run("add", "--project", " ", "--kind", "note", "--ref", "r")
+        if rc == 0 or "empty" not in err:
+            fails.append(f"an empty project must be refused: {rc} {err!r}")
+        out = run("add", "--project", "ÄRGER", "--kind", "note", "--ref", "r")[1]
+        if " ärger " not in out:
+            fails.append(f"add must lower case a non-ASCII project: {out!r}")
+
+        # Two open sessions in one folder: no guess, and a note says why.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "two.db")
+        run("session", "start", "one-1", "--cwd", here)
+        run("session", "start", "two-1", "--cwd", here)
+        rc, out, err = run("add", "--project", "p", "--kind", "question", "--ref", "q", "--infer-session")
+        n = out.split("#", 1)[1].split()[0]
+        if rc != 0 or "session" in run("show", n)[1] or "2 open sessions" not in err:
+            fails.append(f"two open sessions must store none and say so: {rc} {err!r} {run('show', n)[1]!r}")
+        run("queue", "add", "/tmp/r", "A.csproj", "--infer-session")
+        if connect_rows(env["LEAN_BRAIN_DB"], "SELECT session_id FROM jobs")[0]["session_id"] != "":
+            fails.append("a job queued from a folder with two open sessions must carry none")
+
+        # A job that is joined takes the session of the second caller when it had none, and never replaces one.
+        env["LEAN_BRAIN_DB"] = os.path.join(d, "join.db")
+        j1 = run("queue", "add", "/tmp/r", "A.csproj")[1]
+        j2 = run("queue", "add", "/tmp/r", "A.csproj", "--session", "second-1", "--session-cwd", "/w2")[1]
+        run("queue", "add", "/tmp/r", "A.csproj", "--session", "third-1")
+        got = [(r["id"], r["session_id"], r["session_cwd"]) for r in connect_rows(env["LEAN_BRAIN_DB"], "SELECT * FROM jobs")]
+        if j1 != j2 or got != [(int(j1), "second-1", "/w2")]:
+            fails.append(f"a joined job must take the session it lacked and keep it: {j1} {j2} {got}")
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 
+from .items import infer_session, session_ok
 from .store import connect, now
 
 
@@ -21,8 +22,9 @@ def project_of(path):
     if r.returncode == 0 and r.stdout.strip():
         common = os.path.abspath(os.path.join(path, r.stdout.strip()))
         name = os.path.basename(common)
-        return os.path.basename(os.path.dirname(common)) if name == ".git" else re.sub(r"\.git$", "", name)
-    return os.path.basename(path.rstrip("/"))
+        name = os.path.basename(os.path.dirname(common)) if name == ".git" else re.sub(r"\.git$", "", name)
+        return name.lower()
+    return os.path.basename(path.rstrip("/")).lower()
 
 
 def git_out(repo, *args):
@@ -136,6 +138,11 @@ def cmd_queue(a):
         platform = detect_platform(repo, a.test_project) if a.platform == "auto" else ("apple" if a.platform == "apple" else "")
         st = subprocess.run(["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True) \
             if a.tier == "full" and commit and not again else None
+        session, session_cwd = a.session, a.session_cwd if a.session else ""
+        if not session and a.infer_session:
+            session, session_cwd = infer_session(con)
+        if session and not session_ok(session):
+            sys.exit("brain: --session takes letters, digits and dashes only")
         # The checks and the insert are one transaction, so parallel adds of one job make one job.
         con.isolation_level = None
         con.execute("BEGIN IMMEDIATE")
@@ -148,10 +155,13 @@ def cmd_queue(a):
             if not dead:
                 # The same run already waiting: join it, so one build serves every agent that asked.
                 same = con.execute(
-                    "SELECT id FROM jobs WHERE status='queued' AND repo_dir=? AND test_project=? AND filter IS ?"
+                    "SELECT id, session_id FROM jobs WHERE status='queued' AND repo_dir=? AND test_project=? AND filter IS ?"
                     " AND tier=? AND after_id IS ? AND args IS ? AND commit_hash=? ORDER BY id LIMIT 1",
                     (repo, a.test_project, a.filter, a.tier, a.after, a.args, commit)).fetchone()
                 if same:
+                    if session and not same["session_id"]:
+                        con.execute("UPDATE jobs SET session_id=?, session_cwd=? WHERE id=?",
+                                    (session, session_cwd, same["id"]))
                     con.execute("COMMIT")
                     print(f"brain: the same job is already queued as #{same['id']}; joined it", file=sys.stderr)
                     print(same["id"])
@@ -175,12 +185,13 @@ def cmd_queue(a):
                                  f"would not be the commit {commit[:8]}; commit first, or pass --again \"reason\"")
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
-                " enqueued_at, status, reason, ended_at, args, platform, commit_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " enqueued_at, status, reason, ended_at, args, platform, commit_hash, session_id, session_cwd)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.cycle, project, repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
                  f"dependency #{a.after} {dep['status']}" if dead else
                  (f"again: {again}" if again else ""), now() if dead else None, a.args,
-                 platform, commit))
+                 platform, commit, session, session_cwd))
             con.execute("COMMIT")
         except BaseException:
             if con.in_transaction:
