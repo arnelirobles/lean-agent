@@ -1,3 +1,5 @@
+import sys
+
 from .items import line
 from .store import connect, epoch, now
 
@@ -5,10 +7,13 @@ from .store import connect, epoch, now
 def cmd_flaky_clear(a):
     """Close each open flaky item of a test project that has had no new occurrence in --runs passing full runs.
 
-    A passing run is a full run of the project that exited 0 and passed tests, started after the item was last seen."""
+    A passing run is an unfiltered full run of the test project that exited 0 and passed tests, started after the
+    item was last seen. Runs carry no branch, so this does not look at the item's branch."""
+    if a.runs < 1:
+        sys.exit("brain: --runs must be at least 1")
     con = connect()
     with con:
-        rows = con.execute("SELECT items.* FROM items JOIN runs ON runs.id = items.run_id"
+        rows = con.execute("SELECT items.id, items.last_seen FROM items JOIN runs ON runs.id = items.run_id"
                            " WHERE items.status='open' AND items.kind='flaky' AND items.project=?"
                            " AND runs.test_project=? ORDER BY items.id", (a.project, a.test_project)).fetchall()
         for r in rows:
@@ -17,7 +22,9 @@ def cmd_flaky_clear(a):
                             (a.project, a.test_project, epoch(r["last_seen"]))).fetchone()[0]
             if n < a.runs:
                 continue
-            con.execute("UPDATE items SET status='closed', resolution='flaky-cleared', closed_at=?, body=? WHERE id=?",
-                        (now(), r["body"] + f"\n\nclosed: no new occurrence in {n} passing runs", r["id"]))
-            print("closed: " + line(con, con.execute("SELECT * FROM items WHERE id=?", (r["id"],)).fetchone()))
+            cur = con.execute("UPDATE items SET status='closed', resolution='flaky-cleared', closed_at=?,"
+                              " body=body || ? WHERE id=? AND status='open'",
+                              (now(), f"\n\nclosed: no new occurrence in {n} passing runs", r["id"]))
+            if cur.rowcount:
+                print("closed: " + line(con, con.execute("SELECT * FROM items WHERE id=?", (r["id"],)).fetchone()))
     return 0

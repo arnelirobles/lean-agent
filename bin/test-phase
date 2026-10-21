@@ -209,7 +209,7 @@ class Hold:
     reruns are not queued behind another session's run."""
 
     def __init__(self, lane):
-        self.lane, self.fd = lane, None
+        self.lane, self.fd, self.path, self.claim = lane, None, None, ""
         self.ok = bool(hl) and bool(re.fullmatch(r"[A-Za-z0-9._-]+", lane))
 
     def take(self, wait):
@@ -219,13 +219,22 @@ class Hold:
         d = os.environ.get("HEAVY_LOCK_DIR") or "/tmp/heavy-locks"
         os.makedirs(d, exist_ok=True)
         t0 = time.monotonic()
-        self.fd = hl.acquire(os.path.join(d, self.lane + ".lock"), wait)
-        return None if self.fd is None else time.monotonic() - t0
+        self.path = os.path.join(d, self.lane + ".lock")
+        self.fd = hl.acquire(self.path, wait)
+        if self.fd is None:
+            return None
+        try:
+            self.claim = hl.claim(self.path)
+        except OSError:  # no claim file: heavy.sh takes the lock itself, which waits for us
+            self.release()
+            return None
+        return time.monotonic() - t0
 
     def release(self):
         if self.fd is not None:
+            hl.unclaim(self.path)
             os.close(self.fd)
-            self.fd = None
+            self.fd, self.claim = None, ""
 
 
 def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0):
@@ -253,7 +262,7 @@ def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0):
                 + f"heavy.sh: timed out after {env['HEAVY_WAIT']}s waiting for lane '{lane}'. Nothing ran.\n"
             open(log, "w").write(text)
             return 75, text, started, int(time.time()), float(env["HEAVY_WAIT"])
-        env["HEAVY_HELD"] = "1"
+        env["HEAVY_HELD"] = held.claim
     with open(log, "w") as fh:
         # The header is always one line, so what follows it is the command's own output.
         fh.write(header if header is not None else "$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
@@ -389,12 +398,17 @@ def stall_facts(text):
 def earlier_items(row, ctx):
     """Item ids by test name: this branch's open flaky items, and its open order-dependent test-fails."""
     where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
-    out = {"flaky": {}, "order": {}}
+    mine = "tp:" + os.path.basename(row["test"])  # a name can repeat in another test project: that is no history
+    out = {"flaky": {}, "order": {}, "shared": set()}
     for kind, key, extra in (("flaky", "flaky", []), ("test-fail", "order", ["--tag", "order-dependent"])):
         text = brain(["list", "--open", "--kind", kind, "--project", row["project"]] + extra) or ""
-        for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important) occ=\d+ last=", text, re.M):
-            if m.group(2) == where:
+        for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important) occ=\d+ last=\S+(?: tags=(\S+))?$",
+                             text, re.M):
+            tags = (m.group(4) or "").split(",")
+            if m.group(2) == where and mine in tags:
                 out[key][m.group(3)] = int(m.group(1))
+                if any(t.startswith("tp:") and t != mine for t in tags):
+                    out["shared"].add(int(m.group(1)))  # another test project saw this name too
     return out
 
 
@@ -409,23 +423,26 @@ def file_results(row, labelled, a, run_id, ctx, stem):
                  f"{len(flaky)} tests failed in one run and every one passed alone, more than {a.isolation_over}. "
                  f"That is a leak between tests, not {len(flaky)} flaky tests. Log: {stem}.log\n" + "\n".join(flaky),
                  run_id, ctx)
-    earlier = earlier_items(row, ctx) if flaky and not isolated and row["tier"] == "full" else {"flaky": {}, "order": {}}
+    earlier = earlier_items(row, ctx) if flaky and not isolated and row["tier"] == "full" and not row["filtered"] else {"flaky": {}, "order": {}, "shared": set()}
+    tp = "tp:" + os.path.basename(project)
     for name, label, body in labelled:
         if label != "flaky":
             row["real"] += 1
-            add_item(row, "test-fail", name, "important", body, run_id, ctx)
+            add_item(row, "test-fail", name, "important", body, run_id, ctx, tags=[tp])
         elif isolated:
             row["flaky"] += 1
         elif mask(name) in earlier["flaky"] or mask(name) in earlier["order"]:
             row["real"] += 1  # failed in a full run and passed alone, again: it depends on what ran before it
             add_item(row, "test-fail", name, "important", "order-dependent; " + body, run_id, ctx,
-                     tags=["order-dependent"])
-            if mask(name) in earlier["flaky"]:
-                brain(["close", str(earlier["flaky"][mask(name)]), "--resolution", "duplicate", "--note",
-                       "failed in a full run and passed alone again; filed as an order-dependent test-fail"])
+                     tags=["order-dependent", tp])
+            old = earlier["flaky"].get(mask(name))
+            if old and old not in earlier["shared"]:  # a flaky item another test project shares stays open
+                if brain(["close", str(old), "--resolution", "duplicate", "--note",
+                          "failed in a full run and passed alone again; filed as an order-dependent test-fail"]) is None:
+                    row["notes"].append(f"flaky #{old} could not be closed")
         else:
             row["flaky"] += 1
-            add_item(row, "flaky", name, "minor", body, run_id, ctx)
+            add_item(row, "flaky", name, "minor", body, run_id, ctx, tags=[tp])
 
 
 def matched_none(rc, text):
@@ -477,7 +494,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     remote = lane.remote
     cfg = lane.repos.get(job["project"]) if remote else None
     row = {"job": job["id"], "project": job["project"], "test": project, "tier": job["tier"],
-           "result": "", "failing": 0, "real": 0, "flaky": 0, "notes": [], "run_id": None, "rc": 1,
+           "filtered": bool(job["filter"]), "result": "", "failing": 0, "real": 0, "flaky": 0, "notes": [], "run_id": None, "rc": 1,
            "host": remote.name if remote else ""}
     if not os.path.isdir(repo):
         row["result"] = "error"
@@ -536,7 +553,8 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         else:
             before = load1()
             rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall, hold=hold, fail_stall=a.fail_stall)
-        return rc, text, record_run(row, ctx, name, mode, rc, text, started, ended, wait, before, project, lane)
+        return rc, text, record_run(row, ctx, "fast" if name == "full" and cls_filter else name, mode, rc, text, started,
+                                    ended, wait, before, project, lane)
 
     try:
         rc, text, run_id = tier(job["tier"], job["filter"] or None, stem + ".log")
@@ -548,6 +566,9 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     if signal_of(rc):  # killed from outside: what it printed before that says nothing about the tests
         row["result"] = "killed"
         row["notes"].append(f"killed by signal {signal_of(rc)}, nothing filed")
+        p_, f_, _ = runner.counts(text)
+        row["kill"] = (f"killed by signal {signal_of(rc)} in the {job['tier']} run; what it printed first: "
+                       f"{p_} passed, {f_} failed. Log: {stem}.log", ctx)
         return row
     for name, detail in runner.failures(text):
         failing.setdefault(name, detail)
@@ -579,7 +600,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     for name in failing:
         by_class.setdefault(runner.class_of(name), []).append(name)
     row["failing"] = len(failing)
-    if rc == 0 and job["tier"] == "full" and not failing:
+    if rc == 0 and job["tier"] == "full" and not job["filter"] and not failing:
         cleared = (brain(["flaky-clear", "--project", row["project"], "--test-project", os.path.basename(project)])
                    or "").splitlines()
         if cleared:
@@ -598,12 +619,15 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         if signal_of(rrc):
             row["result"] = "killed"
             row["notes"].append(f"killed by signal {signal_of(rrc)} in a rerun, nothing filed")
+            p_, f_, _ = runner.counts(rtext)
+            row["kill"] = (f"killed by signal {signal_of(rrc)} in the rerun of {cls}; what it printed first: "
+                           f"{p_} passed, {f_} failed. Log: {log}", ctx)
             return row
         again = {n for n, _ in runner.failures(rtext)}
         rpassed = runner.counts(rtext)[0]
         for name in names:
             # A rerun that named no failure is not proof: a crash or build error names none either.
-            if rrc in (75, 76):
+            if rrc in (75, 76, 78):
                 label = "unverified"
             elif rrc == 0 or (rpassed > 0 and name not in again):
                 label = "flaky"
@@ -778,6 +802,10 @@ def drain(a, run_dir, runner, lanes=None):
                         finished()
                         continue
                     row["notes"].append("killed again, not retried")
+                    if row.get("kill"):  # the job fails, so brain must say why
+                        add_item(row, "note", f"killed twice: {row['test']}", "important",
+                                 row["kill"][0] + "\nThe job was run again once and was killed again.",
+                                 row["run_id"], row["kill"][1])
                 with lock:
                     rows.append(row)
                 reason = "; ".join(row["notes"])
@@ -1011,6 +1039,7 @@ def self_test():
         with open(shim, "w") as fh:
             fh.write('''#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
+echo "${HEAVY_HELD:-none}" >> "$FAKE_DIR/held-env"
 : > "$FAKE_DIR/first-call"
 [ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
 for k in kill-once kill-always; do
@@ -1028,6 +1057,7 @@ case "$*" in
     cls=${cls%% *}
     : > "$FAKE_DIR/rerun-$cls"
     f=$FAKE_DIR/class-$cls
+    if [ -f "$f.failstall" ]; then while :; do echo "failed $cls.T"; sleep 0.3; done; fi
     if [ -f "$f.kill" ]; then rm -f "${f:?}.kill"; kill -TERM $$; fi
     if [ -f "$f" ]; then cat "$f"; [ -f "$f.rc" ] && exit "$(cat "$f.rc")"; exit 0; fi
     echo "passed $cls.Any (1ms)"; exit 0 ;;
@@ -1309,6 +1339,8 @@ echo "Passed!  - Failed: 0"; exit 0
         put("full-Hd.csproj", "  Failed Hd.C1.T [1 ms]\n  Failed Hd.C2.T [1 ms]\n"
             "Failed!  - Failed: 2, Passed: 1, Skipped: 0, Total: 3\n", 1)
         free, stop = [], threading.Event()
+        if os.path.exists(os.path.join(d, "held-env")):
+            os.remove(os.path.join(d, "held-env"))
 
         def competitor():
             end = time.monotonic() + 120  # never outlives the test, whatever happens to the drain
@@ -1329,6 +1361,9 @@ echo "Passed!  - Failed: 0"; exit 0
             thread.join(10)
         if len([c for c in calls if "FullyQualifiedName~Hd.C" in c]) != 2 or free:
             fails.append(f"the lane must stay held from a job's full run to its last rerun ({len(free)} free polls): {calls}")
+        seen_env = open(os.path.join(d, "held-env")).read().split()
+        if not seen_env or set(seen_env) != {"none"}:
+            fails.append(f"the test command must not inherit HEAVY_HELD: {seen_env}")
 
         # A command ended by a signal is killed: nothing is filed from it, and the job runs again once.
         put("full-K.csproj", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
@@ -1346,8 +1381,9 @@ echo "Passed!  - Failed: 0"; exit 0
         rc, out, calls = drain()
         os.remove(os.path.join(d, "kill-always"))
         if len([c for c in calls if "K2.csproj" in c]) != 2 or f"job #{jk2} failed" not in qlist("--cycle", "qk2") \
-                or rc != 1 or "K.Tests.A" in brain_list():
-            fails.append(f"a second kill must fail the job, not loop ({rc}): {calls} {qlist('--cycle', 'qk2')}")
+                or rc != 1 or "K.Tests.A" in brain_list() \
+                or "killed twice: tests/T/K2.csproj" not in brain_list("--kind", "note", "--open"):
+            fails.append(f"a second kill must fail the job with one note, not loop ({rc}): {calls} {qlist('--cycle', 'qk2')}")
         put("full-Kr.csproj", "  Failed Kr.C1.T [1 ms]\nFailed!  - Failed: 1, Passed: 1, Skipped: 0, Total: 2\n", 1)
         open(os.path.join(d, "class-Kr.C1.kill"), "w").close()
         qadd(repo_v, "tests/T/Kr.csproj", "--cycle", "qkr")
@@ -1356,6 +1392,15 @@ echo "Passed!  - Failed: 0"; exit 0
         if len([c for c in calls if "Kr.csproj" in c and "FullyQualifiedName" not in c]) != 2 \
                 or len(kr) != 1 or "occ=1" not in kr[0]:
             fails.append(f"a rerun killed on the way must file nothing from that attempt: {calls} {kr}")
+
+        # A rerun stopped for failing only is not proof that the test passes alone: it is unverified, not flaky.
+        put("full-Fs.csproj", "  Failed Fs.C1.T [1 ms]\nFailed!  - Failed: 1, Passed: 1, Skipped: 0, Total: 2\n", 1)
+        open(os.path.join(d, "class-Fs.C1.failstall"), "w").close()
+        qadd(repo_v, "tests/T/Fs.csproj", "--cycle", "qfs")
+        rc, out, calls = drain("--fail-stall", "2")
+        os.remove(os.path.join(d, "class-Fs.C1.failstall"))
+        if "Fs.C1.T" in brain_list("--kind", "flaky") or "test-fail vrepo Fs.C1.T" not in brain_list("--kind", "test-fail") or rc != 1:
+            fails.append(f"a rerun stopped as stalled-failing must be unverified, not flaky ({rc}): {brain_list()!r} {out}")
 
         # Many tests that fail together and pass alone are one isolation item, not flaky items.
         put("full-Iso.csproj", "".join(f"  Failed Iso.C{i}.T [1 ms]\n" for i in range(1, 12))
@@ -1405,6 +1450,14 @@ echo "Passed!  - Failed: 0"; exit 0
         if "flaky vrepo@other Od.C1.T" not in brain_list("--open"):
             fails.append(f"a different branch starts as flaky again: {brain_list()!r}")
 
+        # The same test name in another test project is not history for this one.
+        put("full-Od2.csproj", "  Failed Od.C1.T [1 ms]\nFailed!  - Failed: 1, Passed: 1, Skipped: 0, Total: 2\n", 1)
+        qadd(repo_v, "tests/T/Od2.csproj", "--cycle", "qo5")
+        rc, out, calls = drain("--branch", "feat")
+        odd = [l for l in brain_list("--kind", "test-fail", "--open").splitlines() if "Od.C1.T" in l and "@feat" in l]
+        if "flaky vrepo@feat Od.C1.T" not in brain_list("--open") or len(odd) != 1 or "occ=2" not in odd[0]:
+            fails.append(f"a name shared with another test project must start as flaky there ({rc}): {brain_list()!r}")
+
         # A flaky item with no new occurrence in 5 passing full runs closes as flaky-cleared.
         put("full-Fc.csproj", "  Failed Fc.C1.T [1 ms]\nFailed!  - Failed: 1, Passed: 1, Skipped: 0, Total: 2\n", 1)
         qadd(repo_v, "tests/T/Fc.csproj", "--cycle", "qf0")
@@ -1413,8 +1466,13 @@ echo "Passed!  - Failed: 0"; exit 0
         for i in range(1, 5):
             qadd(repo_v, "tests/T/Fc.csproj", "--cycle", f"qf{i}")
             drain()
+        put("class-Fc", "Passed!  - Failed: 0, Passed: 3, Skipped: 0, Total: 3\n", 0)
+        for i in range(2):  # a filtered run is not a full run, even when the job asks for the full tier
+            qadd(repo_v, "tests/T/Fc.csproj", "--tier", "full", "--filter", "Fc", "--cycle", f"qff{i}")
+            drain()
+        os.remove(os.path.join(d, "class-Fc"))
         if "flaky vrepo Fc.C1.T" not in brain_list("--open"):
-            fails.append(f"4 passing runs must not clear it: {brain_list()!r}")
+            fails.append(f"4 passing runs must not clear it, filtered ones do not count: {brain_list()!r}")
         qadd(repo_v, "tests/T/Fc.csproj", "--cycle", "qf5")
         drain()
         closed = [l for l in brain_list("--kind", "flaky", "--status", "closed").splitlines() if "Fc.C1.T" in l]

@@ -713,6 +713,13 @@ def run(brain_cli):
         rc, out, _ = run("list", "--open")
         if "B.One" not in out or "A.Real" not in out or "A.One" in out:
             fails.append(f"only the cleared flaky item may close, not another project's or a test-fail: {out!r}")
+        rc, out, _ = run("flaky-clear", "--project", "core", "--test-project", "B.csproj", "--runs", "0")
+        rc2, out2, _ = run("list", "--open")
+        if rc == 0 or "B.One" not in out2:
+            fails.append(f"--runs 0 must be refused and close nothing: {rc} {out!r} {out2!r}")
+        rc, out, _ = run("close", "2", "--resolution", "flaky-cleared")
+        if rc != 0:
+            fails.append(f"close must accept the flaky-cleared resolution: {rc} {out!r}")
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

@@ -11,7 +11,9 @@
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain flaky-clear --project P --test-project T [--runs 5]      closes each open flaky item of T with no new
-            occurrence in that many passing full runs of T, with resolution flaky-cleared (test-phase calls it)
+            occurrence in that many passing full runs of T (unfiltered, exit 0, tests passed, started after the
+            item was last seen), with resolution flaky-cleared. Runs carry no branch, so the item's branch is
+            not looked at. --runs is at least 1 (test-phase calls it)
   brain queue add <repo-dir> <test-project> [--filter F] [--tier fast|full] [--after ID] [--cycle C]
             [--by NAME] [--project P] [--platform apple|auto|none] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
@@ -50,7 +52,7 @@ resume prints the open items of one project as a short digest: blockers, agents,
 jobs, pending, questions, then the rest, newest first, titles only, at most --max lines (default 40). The project defaults to the
 git toplevel's name in the current directory. It prints nothing and exits 0 when there is no database
 or nothing open. Queued and running jobs are listed after the blockers and agents. The SessionStart hook runs it on startup and after a compaction.
-Status: open, closed, wontfix. Resolution: fixed, flaky, not-a-bug, duplicate, answered, filed.
+Status: open, closed, wontfix. Resolution: fixed, flaky, flaky-cleared, not-a-bug, duplicate, answered, filed.
 Severity: critical, important, minor, info. Phase: code, test, fix, review.
 Source: test-phase, agent, review, user. Model: haiku, sonnet, opus, or empty.
 add stores the Claude session that filed the item and its folder (--session, --session-cwd, defaulting

@@ -8,7 +8,7 @@ import time
 STATUS = ("open", "closed", "wontfix")
 
 
-RESOLUTION = ("fixed", "flaky", "not-a-bug", "duplicate", "answered", "filed")
+RESOLUTION = ("fixed", "flaky", "flaky-cleared", "not-a-bug", "duplicate", "answered", "filed")
 
 
 SEVERITY = ("critical", "important", "minor", "info")

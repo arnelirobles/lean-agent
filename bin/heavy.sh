@@ -47,9 +47,10 @@
 # no test passing since, the command is stopped and heavy.sh exits 78 with "stalled-failing". Both stall
 # messages end with "(passed P, failed F, last test: NAME)". It works with or without HEAVY_STALL.
 #
-# HEAVY_HELD=1 means the caller already holds this lane's lock for a whole job (bin/test-phase takes it once
-# per job, so a job's alone reruns cannot lose the lane to another session). heavy.sh then runs the command
-# without taking or waiting for the lock.
+# HEAVY_HELD=<lock path>:<pid>:<nonce> means the caller (that pid, one of our parents) already holds this lane's lock
+# for a whole job (bin/test-phase takes it once per job, so a job's alone reruns cannot lose the lane to
+# another session). heavy.sh then runs the command without taking or waiting for the lock. A value for another
+# lane, for a lane nobody holds, or for a pid that is not our parent is ignored, and the command never sees it.
 #
 # HEAVY_TIMING_FILE=<path> gets the seconds the command waited for the lane, once it has run.
 #
@@ -73,7 +74,7 @@ HEAVY_SELF="$(here)/$(basename "${BASH_SOURCE[0]}")"
 
 backend() { # flock on Linux with util-linux, the python helper everywhere else or when watching
   if [ "${HEAVY_BACKEND:-}" = python ] || [ -n "${HEAVY_STALL:-}" ] || [ "${HEAVY_FAIL_STALL:-0}" != 0 ] \
-     || [ "${HEAVY_HELD:-}" = 1 ] \
+     || [ "${HELD_LANE:-}" = 1 ] \
      || [ "$(uname -s)" != Linux ] || ! command -v flock >/dev/null 2>&1; then
     echo python
   else
@@ -145,8 +146,11 @@ run_lane() { # $1 lane, rest: command
   mkdir -p "$dir"
   lock="$dir/$lane.lock"
   : >> "$lock"
+  # HEAVY_HELD counts only when helper agrees: this lane's lock, held, by one of our parents.
+  HELD_LANE=0
+  if [ -n "${HEAVY_HELD:-}" ] && python3 "$HEAVY_HELPER" held "$lock" 2>/dev/null; then HELD_LANE=1; fi
 
-  if [ "${HEAVY_HELD:-}" != 1 ] && ! lock_free "$lock"; then
+  if [ "$HELD_LANE" != 1 ] && ! lock_free "$lock"; then
     holders=$(lock_holders "$lock")
     echo "heavy.sh: lane '$lane' is busy, waiting up to ${wait}s. Held by:" >&2
     printf '%s\n' "${holders:-  (no visible process; another user may hold it)}" >&2
@@ -281,14 +285,15 @@ stall_suite() { # the watchdog, always through the python helper
   [ "$rc" = 0 ] || { echo "self-test failed: a run that keeps passing was stopped ($rc): $out"; fails=$((fails + 1)); }
   out=$( (HEAVY_FAIL_STALL=abc run_lane f3 true) 2>&1 ); rc=$?
   [ "$rc" = 2 ] || { echo "self-test failed: bad HEAVY_FAIL_STALL accepted ($rc)"; fails=$((fails + 1)); }
-  # HEAVY_HELD=1 runs while another process holds the lane, because the caller says it holds it already.
-  (run_lane f4 sleep 6 </dev/null >/dev/null 2>&1) &
+  # A stray HEAVY_HELD=1 on a lane another process holds must wait like any run and must not hurt the holder.
+  (run_lane f4 sh -c 'sleep 6; echo holder done' </dev/null >"$t/f4.out" 2>&1) &
   sleep 1
   out=$( (HEAVY_HELD=1 HEAVY_WAIT=1 run_lane f4 sh -c 'echo ran') 2>&1 ); rc=$?
-  { [ "$rc" = 0 ] && [ "$out" = ran ]; } || { echo "self-test failed: HEAVY_HELD still waited for the lane ($rc): $out"; fails=$((fails + 1)); }
-  out=$( (HEAVY_WAIT=1 run_lane f4 sh -c 'echo ran') 2>&1 ); rc=$?
-  [ "$rc" = 75 ] || { echo "self-test failed: without HEAVY_HELD the busy lane must time out ($rc): $out"; fails=$((fails + 1)); }
+  [ "$rc" = 75 ] || { echo "self-test failed: HEAVY_HELD=1 on a lane someone else holds must time out ($rc): $out"; fails=$((fails + 1)); }
+  out=$( (HEAVY_HELD="$HEAVY_LOCK_DIR/f4.lock:$$:guess" HEAVY_WAIT=1 run_lane f4 sh -c 'echo ran') 2>&1 ); rc=$?
+  [ "$rc" = 75 ] || { echo "self-test failed: a guessed HEAVY_HELD claim must time out ($rc): $out"; fails=$((fails + 1)); }
   wait
+  grep -q 'holder done' "$t/f4.out" || { echo "self-test failed: the holder was killed by a HEAVY_HELD run: $(cat "$t/f4.out")"; fails=$((fails + 1)); }
   return "$fails"
 }
 
