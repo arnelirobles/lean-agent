@@ -200,7 +200,8 @@ class Dotnet:
 VITEST_FAIL = re.compile(r"^\s*[\u00d7\u2717\u2718x]\s+(?:\|[^|]*\|\s*)?(\S.*?)\s*$")
 VITEST_FAIL_BLOCK = re.compile(r"^\s*FAIL\s+(?:\|[^|]*\|\s*)?(\S.*?)\s*$")
 VITEST_TIME = re.compile(r"\s+\d+(?:\.\d+)?\s*m?s$")
-VITEST_FILE = re.compile(r"[\w./@+()\[\]-]+\.[cm]?[jt]sx?(?: > | \[ |$)")
+VITEST_RETRY = re.compile(r"\s+\((?:retry|repeat) x\d+\)$")
+VITEST_FILE = re.compile(r"(?:(?! > | \[ ).)+?\.[cm]?[jt]sx?(?: > | \[ |$)")
 VITEST_SCRIPT = """cd "$1" || exit 2
 shift
 # Without a packageManager field corepack takes the newest pnpm, which can refuse a lockfile an older one wrote.
@@ -241,14 +242,16 @@ class Vitest:
             for rx, into in ((VITEST_FAIL, first), (VITEST_FAIL_BLOCK, blocks)):
                 m = rx.match(l)
                 if m:
-                    name = VITEST_TIME.sub("", m.group(1))
+                    name = m.group(1)
+                    if into is first:  # only the one-line result carries a duration and a retry count
+                        name = VITEST_TIME.sub("", VITEST_RETRY.sub("", name))
                     if VITEST_FILE.match(name):
                         end = i + 1
                         while end < min(i + 12, len(lines)) and not VITEST_FAIL.match(lines[end]) \
                                 and not VITEST_FAIL_BLOCK.match(lines[end]):
                             end += 1
                         into.setdefault(name, "\n".join(lines[i:end]))
-        return [(n, blocks.get(n, first[n])) for n in list(first) + [b for b in blocks if b not in first]]
+        return [(n, blocks.get(n) or first.get(n, "")) for n in list(first) + [b for b in blocks if b not in first]]
 
     @staticmethod
     def counts(text):
