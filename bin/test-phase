@@ -77,8 +77,8 @@ failures were all flaky finishes done, so the jobs after it still run.
 
 Runner support is a class with mode, command, failures, counts and class_of; another runner is another
 class in RUNNERS. Dotnet runs a test project. Vitest runs a job whose test path ends in package.json (for
-example web/package.json): in that folder it installs with the lockfile (pnpm install --frozen-lockfile),
-then runs `vitest run --reporter=verbose`, the fast filter pieces as file filters. A failed test file is
+example web/package.json): in that folder it installs with the lockfile (pnpm install --frozen-lockfile,
+the lockfile found in that folder or a parent; npm and yarn projects are refused), then runs `vitest run --reporter=verbose`, the fast filter pieces as file filters. A failed test file is
 the class, so the rerun is per file. The runner is chosen per job from the test path (runner_for).
 TEST_PHASE_DOTNET_ARGS does not reach a Vitest job; `args=` on the job does. A remote lane runs it in the
 node_image container; see docs/remote-lane.md.

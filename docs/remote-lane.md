@@ -71,6 +71,14 @@ A job whose test path is a `package.json` (for example `brain queue add ~/app we
 
 On a host it runs in `node_image`. The container sits on the job's bridge network, so it has outbound network for the install. pnpm's store and corepack's download are kept in `<workdir>/.node-cache`, which `cache_max_gb` also caps. The host needs no Node.
 
+The lockfile is looked up from the package folder to the repo root, so a pnpm workspace with one root `pnpm-lock.yaml` installs frozen. A project with `package-lock.json` or `yarn.lock` and no `pnpm-lock.yaml` is refused with a `run-failed` item, because only pnpm is run. `LEAN_PNPM_VERSION` (default 10, used when pnpm is not installed and `package.json` has no `packageManager`) is passed to the container.
+
+Three things to know:
+
+- A drainer from before the Vitest runner does not know `package.json` jobs. It runs one as `dotnet test` and fails it with a `run-failed` item. Replace every copy of `test-phase` before queueing one.
+- A tracked `.npmrc` is copied to the host like any tracked file, token included. Add `.npmrc` to `exclude` if it holds one (and send the token through `env_file`).
+- A cold first run downloads pnpm and installs with little output. If it trips `--stall` (default 600 seconds), raise `--stall` for that run.
+
 ## Which jobs go where
 
 A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
