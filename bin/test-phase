@@ -270,6 +270,13 @@ class Vitest:
 RUNNERS = [Dotnet, Vitest]
 
 
+def tp_name(path):
+    """How a test project is named in runs and tags: its file name, and for a package.json its folder too."""
+    base = os.path.basename(path)
+    return os.path.join(os.path.basename(os.path.dirname(path)), base) if base == "package.json" \
+        and os.path.dirname(path) else base
+
+
 def runner_for(test_project):
     """Vitest for a package.json, Dotnet for everything else."""
     return Vitest if os.path.basename(test_project) == "package.json" else Dotnet
@@ -428,7 +435,7 @@ def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start,
     passed, failed, skipped = ctx["runner"].counts(text)
     load_end = lr.remote_load(lane.remote) if lane.remote else load1()
     out = brain(["run-add", "--cycle", ctx["cycle"], "--project", row["project"], "--repo", ctx["repo"],
-                 "--test-project", os.path.basename(project), "--runner", mode, "--tier", tier,
+                 "--test-project", tp_name(project), "--runner", mode, "--tier", tier,
                  "--started", str(started), "--ended", str(ended), "--passed", str(passed),
                  "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc in (76, 78) else "0",
                  "--exit-code", str(rc)]
@@ -490,7 +497,7 @@ def stall_facts(text):
 def earlier_items(row, ctx):
     """Item ids by test name: this branch's open flaky items, and its open order-dependent test-fails."""
     where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
-    mine = "tp:" + os.path.basename(row["test"])  # a name can repeat in another test project: that is no history
+    mine = "tp:" + tp_name(row["test"])  # a name can repeat in another test project: that is no history
     out = {"flaky": {}, "order": {}, "shared": set()}
     for kind, key, extra in (("flaky", "flaky", []), ("test-fail", "order", ["--tag", "order-dependent"])):
         text = brain(["list", "--open", "--kind", kind, "--project", row["project"]] + extra) or ""
@@ -516,7 +523,7 @@ def file_results(row, labelled, a, run_id, ctx, stem):
                  f"That is a leak between tests, not {len(flaky)} flaky tests. Log: {stem}.log\n" + "\n".join(flaky),
                  run_id, ctx)
     earlier = earlier_items(row, ctx) if flaky and not isolated and row["tier"] == "full" and not row["filtered"] else {"flaky": {}, "order": {}, "shared": set()}
-    tp = "tp:" + os.path.basename(project)
+    tp = "tp:" + tp_name(project)
     for name, label, body in labelled:
         if label != "flaky":
             row["real"] += 1
@@ -541,7 +548,7 @@ def matched_none(rc, text):
     """A filtered run that ran no test: MTP exit 8, VSTest's no-match line, vitest's no-files line, or a summary of zero tests."""
     if rc == 8:
         return True
-    if rc == 1 and "No test files found" in ANSI.sub("", text):  # vitest
+    if "No test files found" in ANSI.sub("", text):  # vitest, which exits 0 under passWithNoTests
         return True
     if rc != 0:
         return False
@@ -599,7 +606,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     row["runner"] = f"{runner.name}/{mode}"
     ctx = {"repo": repo, "cycle": job["cycle"], "runner": runner,
            "branch": a.branch if a.branch is not None else current_branch(repo)}
-    stem = os.path.join(run_dir, f"job{job['id']:03d}-{safe(os.path.basename(project))}-{job['tier']}")
+    stem = os.path.join(run_dir, f"job{job['id']:03d}-{safe(tp_name(project))}-{job['tier']}")
     failing = {}  # test name to its detail
 
     try:
@@ -698,7 +705,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         by_class.setdefault(runner.class_of(name), []).append(name)
     row["failing"] = len(failing)
     if rc == 0 and job["tier"] == "full" and not job["filter"] and not failing:
-        cleared = (brain(["flaky-clear", "--project", row["project"], "--test-project", os.path.basename(project)])
+        cleared = (brain(["flaky-clear", "--project", row["project"], "--test-project", tp_name(project)])
                    or "").splitlines()
         if cleared:
             row["notes"].append(f"{len(cleared)} flaky closed after 5 passing runs")
@@ -713,6 +720,8 @@ def _run_job(job, a, run_dir, runner, lane, hold):
             except LaneProblem as e:
                 lost = row["lane_rest"] = str(e)
                 row["notes"].append(f"rerun not run: {lost}")
+            except ValueError as e:  # a file name vitest would read as an option
+                row["notes"].append(f"rerun of {cls} not run: {e}")
         if signal_of(rrc):
             row["result"] = "killed"
             row["notes"].append(f"killed by signal {signal_of(rrc)} in a rerun, nothing filed")
