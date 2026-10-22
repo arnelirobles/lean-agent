@@ -1,0 +1,14 @@
+
+ RUN  v4.1.12 /work/-x
+
+ × -a.test.ts > t 3ms
+   → expected 1 to be 2 // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  -a.test.ts > t
+AssertionError: expected 1 to be 2 // Object.is equality
+ ❯ -a.test.ts:2:20
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)

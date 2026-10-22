@@ -89,6 +89,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1068,6 +1069,53 @@ def vitest_checks(fails, fixture):
     nx = " \u00d7 src/app/[handle]/(app)/members/page.test.tsx > live > a test 64ms\n"
     if [n for n, _ in V.failures(nx)] != ["src/app/[handle]/(app)/members/page.test.tsx > live > a test"]:
         fails.append("a vitest failure under a Next.js [segment] or (group) folder must be found")
+    def named(label, text, want):
+        try:
+            got = [n for n, _ in V.failures(text)]
+        except Exception as e:
+            got = f"{type(e).__name__}: {e}"
+        if got != want:
+            fails.append(f"vitest failures, {label}: want {want}, got {got}")
+
+    named("a suite that fails in beforeAll and a file that fails to load", fixture("vitest-load-failed.log"),
+          ["src/a.test.ts > B", "src/b.test.ts [ src/b.test.ts ]"])
+    named("a retried test is one name", fixture("vitest-retry.log"), ["src/d.test.ts > retry"])
+    named("a title ending in a duration, a space or a $ in the path", fixture("vitest-odd-names.log"),
+          ["src/sp ace.test.ts > sp", "src/users.$id.test.ts > dollar", "src/a.test.ts > waits 5ms"])
+    named("a colored failure line", "\x1b[31m \u00d7 src/a.test.ts > t 1ms\x1b[39m\n", ["src/a.test.ts > t"])
+    twice = " \u00d7 src/a.test.ts > t 1ms\n   \u2192 first\n \u00d7 src/a.test.ts > t 2ms\n   \u2192 second\n"
+    got = V.failures(twice)
+    if len(got) != 1 or "first" not in got[0][1] or "second" in got[0][1]:
+        fails.append(f"a name seen twice keeps its first detail: {got}")
+    longblock = " \u00d7 src/a.test.ts > t 1ms\n" + "".join(f"line {i}\n" for i in range(30))
+    got = V.failures(longblock)
+    if len(got) != 1 or len(got[0][1].splitlines()) != 12:
+        fails.append(f"a failure carries 12 lines at most: {[len(d.splitlines()) for _, d in got]}")
+    if V.counts("     Tests  1 failed (1)\n     Tests  2 passed | 1 todo | 1 skipped (4)\n") != (2, 0, 2):
+        fails.append("the last vitest Tests line counts, and todo counts as skipped")
+    if hl:
+        w = hl.Watch(re.compile("x"))
+        w.count(" \u2713 src/a.test.ts > t 1ms")
+        w.count(" \u00d7 src/a.test.ts > u 1ms")
+        if (w.passed, w.failed) != (1, 1):
+            fails.append(f"heavy_lock must count vitest result marks for --fail-stall: {w.passed} {w.failed}")
+    if matched_none(0, "No test files found, exiting with code 0\n") is not True \
+            or matched_none(1, "No test files found, exiting with code 1\n") is not True:
+        fails.append("vitest's no-files line is a filter that matched nothing, at any exit code")
+    tp = globals().get("tp_name")
+    if not tp or tp("web/package.json") == tp("mobile/package.json") or tp("tests/T/T.csproj") != "T.csproj":
+        fails.append("two package.json test projects must not share one name")
+    sent = []
+    real_brain = globals()["brain"]
+    globals()["brain"] = lambda args, stdin=None: sent.append(args) or ""
+    try:
+        record_run({"project": "p"}, {"cycle": "c", "repo": "r", "runner": V}, "full", "vitest", 0, "", 1, 2, None,
+                   None, "web/package.json")
+    finally:
+        globals()["brain"] = real_brain
+    mine = sent[0][sent[0].index("--test-project") + 1] if sent and "--test-project" in sent[0] else ""
+    if mine == "package.json" or "web" not in mine:
+        fails.append(f"a run row names its package.json by folder: {mine!r}")
     if V.failures(fixture("vitest-passed.log")):
         fails.append("a passing vitest run has no failures")
     if [V.class_of(n) for n in names] != ["src/cart/cart.test.tsx"] * 2 \
@@ -1110,6 +1158,20 @@ def vitest_checks(fails, fixture):
         fails.append("a dotnet job keeps the dotnet image")
     if subprocess.run(["sh", "-n", "-c", sc]).returncode != 0:
         fails.append("the vitest remote script is not valid shell")
+    r.cache_max_gb = 5
+    if ".node-cache" not in lr.sweep_script(r, []):
+        fails.append("the host sweep must also empty an over-size .node-cache")
+    was = os.environ.get("LEAN_PNPM_VERSION")
+    os.environ["LEAN_PNPM_VERSION"] = "9"
+    try:
+        sc = lr.run_script(r, None, 5, V.command("vitest", "web/package.json"), kind="vitest")
+        dn = lr.run_script(r, None, 5, ["dotnet", "test"])
+    finally:
+        os.environ.pop("LEAN_PNPM_VERSION")
+        if was is not None:
+            os.environ["LEAN_PNPM_VERSION"] = was
+    if "-e LEAN_PNPM_VERSION=9" not in sc or "LEAN_PNPM_VERSION" in dn:
+        fails.append("LEAN_PNPM_VERSION must reach a vitest container and no other")
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, "web", "node_modules", "x"))
         for f in ("web/package.json", "web/node_modules/x/i.js", "web/a.test.ts"):
@@ -1759,7 +1821,12 @@ echo "Passed!  - Failed: 0"; exit 0
 echo "pnpm $* in $(basename "$PWD")" >> "$FAKE_LOG"
 case "$*" in
   *"src/cart/cart.test.tsx"*) echo "     Tests  2 passed (2)"; exit 0 ;;
-  *"exec vitest"*) cat "$FAKE_DIR/vitest-full"; exit 1 ;;
+  *none?.test.ts*) echo "No test files found, exiting with code $(cat "$FAKE_DIR/nofiles.rc")"; exit "$(cat "$FAKE_DIR/nofiles.rc")" ;;
+  *"exec vitest"*)
+    if [ -f "$FAKE_DIR/vitest-stream" ]; then
+      for i in 1 2 3 4 5 6 7 8 9 10; do echo " \u2713 src/a.test.ts > t$i 1ms"; sleep 0.5; done; exit 0
+    fi
+    cat "$FAKE_DIR/vitest-full"; exit 1 ;;
 esac
 exit 0
 ''')
@@ -1774,6 +1841,46 @@ exit 0
             fails.append(f"summary row for a vitest job: {out}")
         if "flaky nrepo src/cart/cart.test.tsx > Cart > adds an item" not in brain_list("--kind", "flaky"):
             fails.append(f"a failed vitest test that passes alone is flaky in brain: {brain_list('--kind', 'flaky')!r}")
+
+        # Vitest edge cases. The lockfile may sit above the package; an npm project is refused; a path may start with -;
+        # a failed rerun filter may too; a filter that matches nothing is not a pass; the result marks keep a run alive.
+        wrepo, nprepo, drepo = (os.path.join(d, x) for x in ("wrepo", "nprepo", "drepo"))
+        for rp, lock, pkg in ((wrepo, "pnpm-lock.yaml", "web"), (nprepo, "package-lock.json", "app"),
+                              (drepo, "", "-x")):
+            os.makedirs(os.path.join(rp, pkg))
+            open(os.path.join(rp, pkg, "package.json"), "w").write("{}\n")
+            if lock:
+                open(os.path.join(rp, lock), "w").write("{}\n")
+        open(os.path.join(drepo, "-x", "pnpm-lock.yaml"), "w").write("{}\n")
+        rc, out, calls = run(f"{wrepo} web/package.json src/cart/cart.test.tsx\n")
+        if calls[:1] != ["pnpm install --frozen-lockfile in web"]:
+            fails.append(f"a lockfile above the package must make the install frozen: {calls}")
+        rc, out, calls = run(f"{nprepo} app/package.json\n")
+        runlogs = "".join(open(os.path.join(r_, f), errors="replace").read()
+                          for r_, _, fs in os.walk(os.path.join(d, "runs")) for f in fs if f.endswith(".log"))
+        if calls or rc == 0 or "package-lock.json" not in runlogs or "run-failed" not in brain_list("--kind", "test-fail"):
+            fails.append(f"an npm project must be refused before pnpm runs, with a run-failed item ({rc}): {calls} {out}")
+        put("vitest-full", fixture("vitest-dash.log"))
+        subprocess.run([sys.executable, BRAIN, "queue", "add", "--", drepo, "-x/package.json"], env=env, capture_output=True)
+        rc, out, calls = drain()
+        if calls != ["pnpm install --frozen-lockfile in -x", "pnpm exec vitest run --reporter=verbose in -x"] \
+                or "-a.test.ts" not in out:
+            fails.append(f"a package folder or test file starting with - must not crash the lane ({rc}): {calls} {out}")
+        for code in ("0", "1"):
+            put("nofiles.rc", code)
+            rc, out, calls = run(f"{repo_n} web/package.json src/none{code}.test.ts\n")
+            if "filter matched no test" not in out:
+                fails.append(f"a vitest filter that finds no file must not pass (vitest exit {code}): {out}")
+        env["TEST_PHASE_DOTNET_ARGS"] = "--dotnet-only-arg"
+        rc, out, calls = run(f"{repo_n} web/package.json src/cart/cart.test.tsx\n")
+        env.pop("TEST_PHASE_DOTNET_ARGS")
+        if any("--dotnet-only-arg" in c for c in calls) or not calls:
+            fails.append(f"TEST_PHASE_DOTNET_ARGS must not reach a vitest job: {calls}")
+        put("vitest-stream", "")
+        rc, out, calls = run(f"{repo_n} web/package.json\n", "--stall", "2")
+        os.remove(os.path.join(d, "vitest-stream"))
+        if rc != 0 or "stalled" in out:
+            fails.append(f"vitest result marks are progress, a streaming run is not stalled ({rc}): {out}")
 
         # Remote lanes: a fake ssh, rsync and docker act on local folders (tests/fixtures/test-phase/remote).
         # The apple job keeps the local lane busy for about three seconds, so a plain job goes to the remote lane.
@@ -1804,7 +1911,7 @@ exit 0
 
         def reset():
             for f in os.listdir(d):
-                if f.startswith(("where", "files-", "peers", "envmode", "docker.log", "ssh.log", "rsync", "inflight-")):
+                if f.startswith(("where", "files-", "peers", "envmode", "docker.log", "ssh.log", "rsync", "inflight-", "nfiles")):
                     os.remove(os.path.join(d, f))
 
         def rdrain(*extra, e=None):
@@ -1864,6 +1971,20 @@ exit 0
             fails.append(f"apple job local, plain job remote: {runs_of('Apple.csproj')} {runs_of('Plain.csproj')} {out}")
         if any("Apple.csproj" in l and not l.startswith("rrepo ") for l in rlog("where.log").splitlines()):
             fails.append(f"a remote lane ran an apple job: {rlog('where.log')!r}")
+
+        # A vitest job on a host: the copy leaves node_modules behind and the container gets LEAN_PNPM_VERSION.
+        for f in ("web/package.json", "web/pnpm-lock.yaml", "web/node_modules/x/i.js"):
+            os.makedirs(os.path.dirname(os.path.join(rrepo, f)), exist_ok=True)
+            open(os.path.join(rrepo, f), "w").write("{}\n")
+        vj = qadd(rrepo, "web/package.json", "--cycle", "r2v")
+        subprocess.run([sys.executable, BRAIN, "queue", "route", vj, "--to", "remote"], env=env, capture_output=True)
+        rc, out, _ = rdrain(e=dict(renv, LEAN_PNPM_VERSION="9"))
+        shutil.rmtree(os.path.join(rrepo, "web"))
+        if "./web/package.json" not in rlog("nfiles.log") or "node_modules" in rlog("nfiles.log") \
+                or "node_modules" in rlog("rsync.log"):
+            fails.append(f"a vitest copy to the host must leave node_modules behind ({rc}): {rlog('nfiles.log')!r} {out}")
+        if "-e LEAN_PNPM_VERSION=9" not in rlog("docker.log"):
+            fails.append(f"a vitest container must get LEAN_PNPM_VERSION: {rlog('docker.log')!r}")
 
         # An idle lane keeps polling while another lane works: the local lane finds nothing, then an apple job
         # arrives while the remote lane is still on its job, and the drain still ends.

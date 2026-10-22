@@ -1,0 +1,25 @@
+
+ RUN  v4.1.12 /private/tmp/lav-vt
+
+ × src/d.test.ts > retry 11ms (retry x2)
+   → expected 1 to be 5 // Object.is equality
+   → expected 2 to be 5 // Object.is equality
+   → expected 3 to be 5 // Object.is equality
+ ✓ src/d.test.ts > retry ok 1ms (retry x1)
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/d.test.ts > retry
+AssertionError: expected 1 to be 5 // Object.is equality
+ ❯ src/d.test.ts:3:50
+
+ FAIL  src/d.test.ts > retry
+AssertionError: expected 2 to be 5 // Object.is equality
+ ❯ src/d.test.ts:3:50
+
+ FAIL  src/d.test.ts > retry
+AssertionError: expected 3 to be 5 // Object.is equality
+ ❯ src/d.test.ts:3:50
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)

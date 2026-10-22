@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake pnpm for the remote lane self-test: records the job folder's files and passes.
+echo "pnpm $*" >> "$FAKE_DIR/pnpm.log"
+(cd .. && find . -type f | sort) >> "$FAKE_DIR/nfiles.log"
+case "$*" in
+  *"exec vitest"*) echo "     Tests  1 passed (1)" ;;
+esac
+exit 0
