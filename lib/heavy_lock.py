@@ -52,8 +52,8 @@ DEFAULT_PROGRESS = (r"\[\+\d+/x\d+(?:/\?\d+)?\]"
                     r"|^\s*(?:passed|failed|Passed|Failed)\b.*")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 COUNTER = re.compile(r"\[\+(\d+)/x(\d+)(?:/\?\d+)?\]")
-PASS_LINE = re.compile(r"^(?:passed|  Passed)\s+(\S.*)")
-FAIL_LINE = re.compile(r"^(?:failed|  Failed)\s+(\S.*)")
+PASS_LINE = re.compile(r"^(?:passed|  Passed|\s*\u2713)\s+(\S.*)")  # the last is vitest's mark
+FAIL_LINE = re.compile(r"^(?:failed|  Failed|\s*[\u00d7\u2717\u2718])\s+(\S.*)")
 START_LINE = re.compile(r"^\s*(?:started|starting|running)\s+\S.*", re.I)
 
 

@@ -332,8 +332,10 @@ def run_script(r, cfg, job_id, cmd, kind="dotnet"):
     # Main, and a host that parses its own command line can exit before the test server starts.
     unset = "" if node else "unset ASPNETCORE_HTTP_PORTS ASPNETCORE_HTTPS_PORTS; "
     inner = f'echo "{MARKER}"; {unset}exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
+    pnpm = os.environ.get("LEAN_PNPM_VERSION")
     tools = ("-e HOME=/tmp -e CI=true -e COREPACK_HOME=/cache/corepack -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 "
-             f"-e npm_config_store_dir=/cache/store -v {nuget}:/cache") if node else \
+             + (f"-e LEAN_PNPM_VERSION={shlex.quote(pnpm)} " if pnpm else "")
+             + f"-e npm_config_store_dir=/cache/store -v {nuget}:/cache") if node else \
         f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget"
     out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
                f"{tools} -v {jd}:/work -w /work{env}{denv} "
