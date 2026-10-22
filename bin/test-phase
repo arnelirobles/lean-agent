@@ -75,8 +75,13 @@ TEST_PHASE_RUNNER=mtp or vstest overrides detection. The wait for a busy lane is
 defaulting to 3600 seconds. Exit 0 when nothing real failed and no job was cancelled during the drain, 1 otherwise. A job whose
 failures were all flaky finishes done, so the jobs after it still run.
 
-Runner support is a class with mode, command, failures, counts and class_of. Dotnet is the one that
-exists; another runner is another class in RUNNERS.
+Runner support is a class with mode, command, failures, counts and class_of; another runner is another
+class in RUNNERS. Dotnet runs a test project. Vitest runs a job whose test path ends in package.json (for
+example web/package.json): in that folder it installs with the lockfile (pnpm install --frozen-lockfile),
+then runs `vitest run --reporter=verbose`, the fast filter pieces as file filters. A failed test file is
+the class, so the rerun is per file. The runner is chosen per job from the test path (runner_for).
+TEST_PHASE_DOTNET_ARGS does not reach a Vitest job; `args=` on the job does. A remote lane runs it in the
+node_image container; see docs/remote-lane.md.
 """
 import argparse
 import fcntl
@@ -191,7 +196,76 @@ class Dotnet:
         return base.rsplit(".", 1)[0] if "." in base else base
 
 
-RUNNERS = [Dotnet]
+VITEST_FAIL = re.compile(r"^\s*[\u00d7\u2717\u2718x]\s+(?:\|[^|]*\|\s*)?(\S.*?)\s*$")
+VITEST_FAIL_BLOCK = re.compile(r"^\s*FAIL\s+(?:\|[^|]*\|\s*)?(\S.*?)\s*$")
+VITEST_TIME = re.compile(r"\s+\d+(?:\.\d+)?\s*m?s$")
+VITEST_FILE = re.compile(r"[\w./@+-]+\.[cm]?[jt]sx?(?: > | \[ |$)")
+VITEST_SCRIPT = """cd "$1" || exit 2
+shift
+if command -v pnpm >/dev/null 2>&1; then P=pnpm; else P="corepack pnpm"; fi
+if [ -f pnpm-lock.yaml ]; then $P install --frozen-lockfile || exit $?; else $P install || exit $?; fi
+exec $P exec vitest run --reporter=verbose "$@"
+"""
+
+
+class Vitest:
+    name = "vitest"
+    # heavy.sh counts "passed"/"failed" lines as progress; vitest's verbose lines start with a mark instead.
+    progress = r"^\s*[\u2713\u00d7\u2717\u2718\u2193]\s.*|^Progress: .*|^Packages: .*"
+
+    @staticmethod
+    def mode(repo):
+        return "vitest"
+
+    @staticmethod
+    def command(mode, project, cls_filter=None, fast=False, extra=()):
+        """A shell that goes to the project folder, installs with the lockfile and runs vitest. Each filter
+        piece (split on |) is a file filter; with none, everything runs."""
+        files = [c.strip() for c in (cls_filter or "").split("|")]
+        files = [c for c in files if c]
+        if any(c.startswith("-") for c in files):  # a piece read as a vitest option instead of a file
+            raise ValueError("a filter piece starts with -")
+        return ["sh", "-c", VITEST_SCRIPT, "vitest", os.path.dirname(project) or "."] + list(extra) + files
+
+    @staticmethod
+    def failures(text):
+        """[(test name, the lines that follow it)] in order, each name once. A name is file > suite > test.
+        The FAIL block after the run has the stack, so its lines win over the one-line reason."""
+        lines = [ANSI.sub("", l).rstrip() for l in text.splitlines()]
+        first, blocks = {}, {}
+        for i, l in enumerate(lines):
+            for rx, into in ((VITEST_FAIL, first), (VITEST_FAIL_BLOCK, blocks)):
+                m = rx.match(l)
+                if m:
+                    name = VITEST_TIME.sub("", m.group(1))
+                    if VITEST_FILE.match(name):
+                        end = i + 1
+                        while end < min(i + 12, len(lines)) and not VITEST_FAIL.match(lines[end]) \
+                                and not VITEST_FAIL_BLOCK.match(lines[end]):
+                            end += 1
+                        into.setdefault(name, "\n".join(lines[i:end]))
+        return [(n, blocks.get(n, first[n])) for n in list(first) + [b for b in blocks if b not in first]]
+
+    @staticmethod
+    def counts(text):
+        """(passed, failed, skipped) from the "Tests  N failed | M passed | K skipped (T)" line, else zeros."""
+        found = re.findall(r"^\s*Tests\s+(\d.*)$", ANSI.sub("", text), re.M)
+        if not found:
+            return 0, 0, 0
+        n = {k: int(v) for v, k in re.findall(r"(\d+) (failed|passed|skipped|todo)", found[-1])}
+        return n.get("passed", 0), n.get("failed", 0), n.get("skipped", 0) + n.get("todo", 0)
+
+    @staticmethod
+    def class_of(test):
+        return re.split(r" > | \[ ", test, maxsplit=1)[0]
+
+
+RUNNERS = [Dotnet, Vitest]
+
+
+def runner_for(test_project):
+    """Vitest for a package.json, Dotnet for everything else."""
+    return Vitest if os.path.basename(test_project) == "package.json" else Dotnet
 
 
 class Lane:
@@ -239,7 +313,7 @@ class Hold:
             self.fd, self.claim = None, ""
 
 
-def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0):
+def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0, progress=None):
     """Run cmd in the lane. Returns (exit code, output, started, ended, seconds spent waiting for the lane)."""
     env = dict(os.environ)
     env.setdefault("HEAVY_WAIT", "3600")
@@ -252,6 +326,8 @@ def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0):
     else:
         env.pop("HEAVY_FAIL_STALL", None)
     env.pop("HEAVY_HELD", None)
+    if progress:
+        env["HEAVY_PROGRESS"] = progress
     timing = log + ".wait"
     env["HEAVY_TIMING_FILE"] = timing
     started = int(time.time())
@@ -455,8 +531,10 @@ def file_results(row, labelled, a, run_id, ctx, stem):
 
 
 def matched_none(rc, text):
-    """A filtered run that ran no test: MTP exit 8, VSTest's no-match line, or a summary of zero tests."""
+    """A filtered run that ran no test: MTP exit 8, VSTest's no-match line, vitest's no-files line, or a summary of zero tests."""
     if rc == 8:
+        return True
+    if rc == 1 and "No test files found" in ANSI.sub("", text):  # vitest
         return True
     if rc != 0:
         return False
@@ -518,7 +596,8 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     failing = {}  # test name to its detail
 
     try:
-        extra = shlex.split(os.environ.get("TEST_PHASE_DOTNET_ARGS", "")) + shlex.split(job.get("args") or "")
+        extra = (shlex.split(os.environ.get("TEST_PHASE_DOTNET_ARGS", "")) if runner is Dotnet else []) \
+            + shlex.split(job.get("args") or "")
     except ValueError as e:
         row["result"] = "error"
         row["notes"].append(f"bad extra arguments: {e}")
@@ -535,7 +614,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     def prepare():  # the copy and the env file go once per job, however many commands follow
         if synced:
             return
-        files = lr.file_list(repo, remote.extra_paths, remote.exclude)
+        files = lr.file_list(repo, remote.extra_paths, remote.exclude, skip_node_modules=runner is Vitest)
         data = b"".join(f.encode("utf-8", "surrogateescape") + b"\0" for f in files)
         try:
             p = subprocess.run(lr.sync_argv(remote, repo, job["id"]), input=data, capture_output=True)
@@ -553,16 +632,17 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         if remote:
             prepare()
             before = lr.remote_load(remote)
-            ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd))
+            ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd, kind=runner.name))
             rc, text, started, ended, wait = heavy(f"remote-{remote.name}", ssh, repo, log, a.stall,
                                                    header=f"$ ssh {remote.name} <script for job {job['id']}>\n",
-                                                   hold=hold, fail_stall=a.fail_stall)
+                                                   hold=hold, fail_stall=a.fail_stall, progress=getattr(runner, "progress", None))
             problem = lane_problem(rc, text)
             if problem:
                 raise LaneProblem(problem)
         else:
             before = load1()
-            rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall, hold=hold, fail_stall=a.fail_stall)
+            rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall, hold=hold, fail_stall=a.fail_stall,
+                                                   progress=getattr(runner, "progress", None))
         return rc, text, record_run(row, ctx, "fast" if name == "full" and cls_filter else name, mode, rc, text, started,
                                     ended, wait, before, project, lane)
 
@@ -721,7 +801,7 @@ def error_row(job_id, why):
             "flaky": 0, "notes": [why], "run_id": None, "rc": 1, "host": ""}
 
 
-def drain(a, run_dir, runner, lanes=None):
+def drain(a, run_dir, lanes=None):
     """(rows, how many jobs were cancelled while draining). One thread per lane."""
     lanes = lanes or [LOCAL]
     before = cancelled_ids()
@@ -811,7 +891,7 @@ def drain(a, run_dir, runner, lanes=None):
                 job = json.loads(out)
                 say(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})"
                     + (f" on {lane.remote.name}" if lane.remote else ""))
-                row = run_job(job, a, run_dir, runner, lane)
+                row = run_job(job, a, run_dir, runner_for(job["test_project"]), lane)
                 problem = row.get("lane_problem")
                 if problem:
                     if requeue_job(job["id"], problem, say):
@@ -933,7 +1013,7 @@ def main(argv):
             print(f"test-phase: logs in {run_dir}", flush=True)
             if len(lanes) > 1:
                 print("test-phase: lanes " + ", ".join(l.name for l in lanes), flush=True)
-        got, dropped = drain(a, run_dir, RUNNERS[0], lanes)
+        got, dropped = drain(a, run_dir, lanes)
         rows += got
         cancelled += dropped
         fcntl.flock(lock, fcntl.LOCK_UN)

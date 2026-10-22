@@ -14,6 +14,7 @@ remote off. One section per host and, optionally, one per repository:
   min_free_gb = 15
   cache_max_gb = 10           ; the NuGet cache folder is emptied when it passes this, 0 keeps it
   image = mcr.microsoft.com/dotnet/sdk:10.0
+  node_image = node:22-bookworm-slim   ; for package.json (Vitest) jobs
   extra_paths = local-packages
   exclude = .env*, *.key, *.pem, *license-key*, secrets*
 
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 
 DEFAULT_EXCLUDE = [".env*", "*.key", "*.pem", "*license-key*", "secrets*"]
 DEFAULT_IMAGE = "mcr.microsoft.com/dotnet/sdk:10.0"
+DEFAULT_NODE_IMAGE = "node:22-bookworm-slim"
 MARKER = "lean-remote: started"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
@@ -56,6 +58,7 @@ class Remote:
     memory: str = "8g"
     min_free_gb: int = 15
     image: str = DEFAULT_IMAGE
+    node_image: str = DEFAULT_NODE_IMAGE
     extra_paths: list = field(default_factory=list)
     exclude: list = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
     cache_max_gb: int = 10
@@ -127,9 +130,10 @@ def load(path=None, env=os.environ):
                 except ValueError:
                     bad(key, "want a whole number of GB")
                 setattr(r, key, val)
-            r.image = sec.get("image", r.image).strip()
-            if not IMAGE.fullmatch(r.image):
-                bad("image", f"not an image name: {r.image!r}")
+            for key in ("image", "node_image"):
+                setattr(r, key, sec.get(key, getattr(r, key)).strip())
+                if not IMAGE.fullmatch(getattr(r, key)):
+                    bad(key, f"not an image name: {getattr(r, key)!r}")
             r.extra_paths = split_list(sec.get("extra_paths", ""))
             for p in r.extra_paths:
                 if os.path.isabs(p) or ".." in p.split("/"):
@@ -160,8 +164,8 @@ def load(path=None, env=os.environ):
 
 
 IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@-]*")
-REMOTE_KEYS = {"host", "workdir", "cpus", "memory", "min_free_gb", "cache_max_gb", "image", "extra_paths",
-               "exclude"}
+REMOTE_KEYS = {"host", "workdir", "cpus", "memory", "min_free_gb", "cache_max_gb", "image", "node_image",
+               "extra_paths", "exclude"}
 REPO_KEYS = {"sidecars", "env_file", "ready", "docker"}
 DIND_IMAGE = "docker:27-dind"
 DIND_VOLUME = "lean-dind"  # image cache kept between jobs; one lane per host, so one daemon uses it at a time
@@ -224,8 +228,9 @@ def excluded(rel, patterns):
     return any(fnmatch.fnmatchcase(rel, pat) or any(fnmatch.fnmatchcase(x, pat) for x in parts) for pat in patterns)
 
 
-def file_list(repo, extra_paths, exclude):
-    """Relative paths to copy: tracked and untracked files git does not ignore, plus each extra path."""
+def file_list(repo, extra_paths, exclude, skip_node_modules=False):
+    """Relative paths to copy: tracked and untracked files git does not ignore, plus each extra path.
+    skip_node_modules drops any node_modules folder: its binaries are for the local machine, not the host."""
     p = subprocess.run(["git", "-C", repo, "ls-files", "-z", "-co", "--exclude-standard"], capture_output=True)
     if p.returncode != 0:
         raise LaneProblem("git ls-files failed in " + repo)
@@ -239,6 +244,8 @@ def file_list(repo, extra_paths, exclude):
         elif os.path.lexists(top):
             found.add(os.path.normpath(extra))
     # .lean.env is where send_env writes; a repo file of that name must not be copied over it.
+    if skip_node_modules:
+        exclude = list(exclude) + ["node_modules"]
     return sorted(f for f in found if os.path.lexists(os.path.join(repo, f)) and not excluded(f, exclude)
                   and f != ENV_NAME)
 
@@ -280,10 +287,13 @@ def send_env(r, job_id, env_file, run=subprocess.run):
         raise LaneProblem(f"{r.name}: env file not sent (exit {p.returncode})")
 
 
-def run_script(r, cfg, job_id, cmd):
-    """One shell script for ssh: network, sidecars, then the capped test container. Its exit code is the test's."""
+def run_script(r, cfg, job_id, cmd, kind="dotnet"):
+    """One shell script for ssh: network, sidecars, then the capped test container. Its exit code is the test's.
+    kind vitest runs in node_image with a pnpm store volume (corepack and the store live in <workdir>/.node-cache);
+    the container is on the job's bridge network, so it has outbound network for the install."""
     jd = sh_path(job_dir(r, job_id))
-    nuget = sh_path(r.workdir.rstrip("/") + "/.nuget")
+    node = kind == "vitest"
+    nuget = sh_path(r.workdir.rstrip("/") + ("/.node-cache" if node else "/.nuget"))
     label, net = f"lean.job={job_id}", f"lean-{job_id}"
     caps = f"--cpus {shlex.quote(r.cpus)} --memory {shlex.quote(r.memory)}"
     env = f" --env-file {jd}/.lean.env" if cfg and cfg.env_file else ""
@@ -320,10 +330,14 @@ def run_script(r, cfg, job_id, cmd):
                 " -e TESTCONTAINERS_RYUK_DISABLED=true")
     # The sdk image sets ASPNETCORE_HTTP_PORTS. WebApplicationFactory then passes --HTTP_PORTS to the app's
     # Main, and a host that parses its own command line can exit before the test server starts.
-    inner = f'echo "{MARKER}"; unset ASPNETCORE_HTTP_PORTS ASPNETCORE_HTTPS_PORTS; exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
+    unset = "" if node else "unset ASPNETCORE_HTTP_PORTS ASPNETCORE_HTTPS_PORTS; "
+    inner = f'echo "{MARKER}"; {unset}exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
+    tools = ("-e HOME=/tmp -e CI=true -e COREPACK_HOME=/cache/corepack -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 "
+             f"-e npm_config_store_dir=/cache/store -v {nuget}:/cache") if node else \
+        f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget"
     out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
-               f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget -v {jd}:/work -w /work{env}{denv} "
-               f"{shlex.quote(r.image)} sh -c {shlex.quote(inner)}")
+               f"{tools} -v {jd}:/work -w /work{env}{denv} "
+               f"{shlex.quote(r.node_image if node else r.image)} sh -c {shlex.quote(inner)}")
     out.append("rc=$?")
     out += remove_labelled(f"label={label}")
     out.append('exit "$rc"')
@@ -366,6 +380,10 @@ def sweep_script(r, running_ids):
         out += [f"if [ -d {wd}/.nuget ] && [ -z \"$(docker ps -q --filter label=lean.job 2>/dev/null)\" ]; then",
                 f'  kb=$(du -sk {wd}/.nuget 2>/dev/null | cut -f1)',
                 f'  [ "${{kb:-0}}" -gt {r.cache_max_gb * 1048576} ] && rm -rf {wd}/.nuget',
+                "fi",
+                f"if [ -d {wd}/.node-cache ] && [ -z \"$(docker ps -q --filter label=lean.job 2>/dev/null)\" ]; then",
+                f'  kb=$(du -sk {wd}/.node-cache 2>/dev/null | cut -f1)',
+                f'  [ "${{kb:-0}}" -gt {r.cache_max_gb * 1048576} ] && rm -rf {wd}/.node-cache',
                 "fi"]
     return "\n".join(out) + "\nexit 0\n"
 
@@ -395,7 +413,8 @@ docker = yes
         r = remotes[0] if remotes else None
         if not r or (r.name, r.host, r.workdir, r.cpus, r.memory, r.min_free_gb) != ("dev", "devbox", "~/lean-runs", "2", "8g", 15):
             fails.append(f"remote parse: {remotes}")
-        elif r.exclude != DEFAULT_EXCLUDE or r.extra_paths != ["local-packages", "tools"] or r.image != DEFAULT_IMAGE:
+        elif r.exclude != DEFAULT_EXCLUDE or r.extra_paths != ["local-packages", "tools"] or r.image != DEFAULT_IMAGE \
+                or r.node_image != DEFAULT_NODE_IMAGE:
             fails.append(f"remote defaults or lists: {r}")
         c = repos.get("app")
         if not c or list(c.sidecars.items()) != [("db", "postgres:16"), ("cache", "redis:7")] \

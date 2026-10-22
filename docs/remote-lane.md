@@ -21,6 +21,7 @@ memory = 8g
 min_free_gb = 15
 cache_max_gb = 10
 image = mcr.microsoft.com/dotnet/sdk:10.0
+node_image = node:22-bookworm-slim
 extra_paths = local-packages
 exclude = .env*, *.key, *.pem, *license-key*, secrets*
 
@@ -40,7 +41,8 @@ Remote section keys:
 | `memory` | `--memory` for every container of a job. | `8g` |
 | `min_free_gb` | The lane does not claim a job when the workdir has less free space. | `15` |
 | `cache_max_gb` | The shared NuGet cache (`<workdir>/.nuget`) is emptied when it is bigger and no job runs. `0` keeps it. | `10` |
-| `image` | The test container image. | `mcr.microsoft.com/dotnet/sdk:10.0` |
+| `image` | The test container image for .NET jobs. | `mcr.microsoft.com/dotnet/sdk:10.0` |
+| `node_image` | The test container image for `package.json` (Vitest) jobs. | `node:22-bookworm-slim` |
 | `extra_paths` | Git-ignored paths to copy anyway, for example a local package folder. | none |
 | `exclude` | Patterns never copied. A pattern matches a file name, a path, or any folder in the path. | the list above |
 
@@ -61,7 +63,13 @@ The test command runs with `ASPNETCORE_HTTP_PORTS` and `ASPNETCORE_HTTPS_PORTS` 
 
 ## What is copied and what is not
 
-The copy is the files `git ls-files` lists (tracked and untracked, not ignored) plus `extra_paths`, minus anything matching `exclude`. Files deleted in the working tree are skipped. Nothing else leaves this machine. Secrets go only through `env_file`.
+The copy is the files `git ls-files` lists (tracked and untracked, not ignored) plus `extra_paths`, minus anything matching `exclude`. A Vitest job also leaves out every `node_modules` folder, because the local binaries are for this machine, not the host. Files deleted in the working tree are skipped. Nothing else leaves this machine. Secrets go only through `env_file`.
+
+## Vitest jobs
+
+A job whose test path is a `package.json` (for example `brain queue add ~/app web/package.json`) runs Vitest, not `dotnet test`. In that folder it installs with the lockfile (`pnpm install --frozen-lockfile`, through corepack when pnpm is not installed), then runs `vitest run --reporter=verbose`. The fast filter pieces are file filters, and a failed test file is rerun alone.
+
+On a host it runs in `node_image`. The container sits on the job's bridge network, so it has outbound network for the install. pnpm's store and corepack's download are kept in `<workdir>/.node-cache`, which `cache_max_gb` also caps. The host needs no Node.
 
 ## Which jobs go where
 
