@@ -202,13 +202,26 @@ VITEST_FAIL_BLOCK = re.compile(r"^\s*FAIL\s+(?:\|[^|]*\|\s*)?(\S.*?)\s*$")
 VITEST_TIME = re.compile(r"\s+\d+(?:\.\d+)?\s*m?s$")
 VITEST_RETRY = re.compile(r"\s+\((?:retry|repeat) x\d+\)$")
 VITEST_FILE = re.compile(r"(?:(?! > | \[ ).)+?\.[cm]?[jt]sx?(?: > | \[ |$)")
-VITEST_SCRIPT = """cd "$1" || exit 2
+VITEST_SCRIPT = """R=$PWD
+cd -- "$1" || exit 2
 shift
+# The lockfile may sit in a parent folder (a pnpm workspace); only pnpm is run.
+L=; N=; d=$PWD
+while :; do
+  [ -f "$d/pnpm-lock.yaml" ] && L=$d && break
+  for f in package-lock.json yarn.lock; do [ -f "$d/$f" ] && N=$f; done
+  [ "$d" = "$R" ] || [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+if [ -z "$L" ] && [ -n "$N" ]; then
+  echo "run-failed: found $N and no pnpm-lock.yaml; test-phase runs package.json jobs with pnpm only" >&2
+  exit 2
+fi
 # Without a packageManager field corepack takes the newest pnpm, which can refuse a lockfile an older one wrote.
 if command -v pnpm >/dev/null 2>&1; then P=pnpm
 elif grep -q '"packageManager"' package.json; then P="corepack pnpm"
 else P="corepack pnpm@${LEAN_PNPM_VERSION:-10}"; fi
-if [ -f pnpm-lock.yaml ]; then $P install --frozen-lockfile || exit $?; else $P install || exit $?; fi
+if [ -n "$L" ]; then $P install --frozen-lockfile || exit $?; else $P install || exit $?; fi
 exec $P exec vitest run --reporter=verbose "$@"
 """
 
