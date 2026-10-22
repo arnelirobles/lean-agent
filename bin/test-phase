@@ -1065,6 +1065,9 @@ def vitest_checks(fails, fixture):
         fails.append(f"vitest failures must be each failed test once, as file > suite > name: {names}")
     elif "AssertionError: expected 1 to be 2" not in fl[0][1] or "expected 0 to be 1" in fl[0][1]:
         fails.append(f"a vitest failure must carry the lines after it: {fl[0][1]!r}")
+    nx = " \u00d7 src/app/[handle]/(app)/members/page.test.tsx > live > a test 64ms\n"
+    if [n for n, _ in V.failures(nx)] != ["src/app/[handle]/(app)/members/page.test.tsx > live > a test"]:
+        fails.append("a vitest failure under a Next.js [segment] or (group) folder must be found")
     if V.failures(fixture("vitest-passed.log")):
         fails.append("a passing vitest run has no failures")
     if [V.class_of(n) for n in names] != ["src/cart/cart.test.tsx"] * 2 \
