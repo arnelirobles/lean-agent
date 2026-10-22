@@ -464,6 +464,29 @@ def file_results(row, labelled, a, run_id, ctx, stem):
             add_item(row, "flaky", name, "minor", body, run_id, ctx, tags=[tp])
 
 
+BUILD_FLAG_VALUE = {"-c", "--configuration", "-f", "--framework", "-r", "--runtime", "-v", "--verbosity", "--arch",
+                    "--os"}
+BUILD_FLAG = {"--no-restore"}
+BUILD_PREFIX = ("-p:", "--property:", "-property:")
+
+
+def build_args(extra):
+    """The arguments `dotnet build` accepts out of the extra ones, or None when any is for the test run only
+    (--settings, --logger, -e, --results-directory, ...): that job cannot share a build and takes a fresh folder."""
+    out, i = [], 0
+    while i < len(extra):
+        a = extra[i]
+        if a in BUILD_FLAG or a.startswith(BUILD_PREFIX):
+            out.append(a)
+        elif a in BUILD_FLAG_VALUE and i + 1 < len(extra):
+            out += [a, extra[i + 1]]
+            i += 1
+        else:
+            return None
+        i += 1
+    return out
+
+
 def matched_none(rc, text):
     """A filtered run that ran no test: MTP exit 8, VSTest's no-match line, or a summary of zero tests."""
     if rc == 8:
@@ -558,7 +581,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
             return
         files = lr.file_list(repo, remote.extra_paths, remote.exclude)
         dest = None
-        if remote.reuse_build:
+        if remote.reuse_build and build_args(extra) is not None:
             # One build folder per repository, commit, tree state, image and build arguments. A match skips the
             # copy and the build; a miss copies and builds, and the host lock keeps a second job off the folder
             # until the build is done.
@@ -591,10 +614,11 @@ def _run_job(job, a, run_dir, runner, lane, hold):
             prepare()
         build = mark = None
         if kept.get("dest"):  # the folder holds a build, or this command makes it
-            build = ["dotnet", "build", project] + extra if kept.get("mark") else None
+            build = ["dotnet", "build", project] + build_args(extra) if kept.get("mark") else None
             mark = kept.pop("mark", None)
+        # A probe follows a run that built, so it never builds again.
         cmd = runner.command(mode, project, cls_filter, name == "fast",
-                             extra + ["--no-build"] if kept.get("dest") else extra, probe)
+                             extra + ["--no-build"] if kept.get("dest") or probe else extra, probe)
         if remote:
             before = lr.remote_load(remote)
             ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd, kept.get("dest"), build, mark))
@@ -658,9 +682,9 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         for n in names:
             try:
                 prc, _, _ = tier(job["tier"], n, f"{stem}-probe-{safe(n)}.log", probe=True)
-            except LaneProblem as e:
-                row["result"], row["lane_problem"] = "requeued", str(e)
-                return row
+            except LaneProblem as e:  # the run is recorded already: say what was not checked, do not requeue
+                row["notes"].append(f"class check skipped, lane problem: {e}")
+                break
             if prc == 8:
                 row["result"] = "fail"
                 row["notes"].append(f"class {n} matched no test")
@@ -1043,6 +1067,12 @@ def self_test():
     got = Dotnet.command("vstest", "T.csproj", "ATests|BTests", fast=True)
     if got[-2:] != ["--filter", "FullyQualifiedName~ATests|FullyQualifiedName~BTests"]:
         fails.append(f"vstest must prefix every class: {got}")
+    if build_args(["-p:A=1", "-c", "Release", "--no-restore"]) != ["-p:A=1", "-c", "Release", "--no-restore"]:
+        fails.append("build_args must pass build-safe arguments through")
+    for bad in (["--settings", "x.runsettings"], ["--blame-hang"], ["--results-directory", "r"], ["-e", "A=1"],
+                ["--logger", "trx"], ["-p:A=1", "--logger", "trx"], ["-c"]):
+        if build_args(bad) is not None:
+            fails.append(f"build_args must refuse a test-only argument: {bad}")
     fix = os.path.join(HERE, "..", "tests", "fixtures", "test-phase")
 
     def fixture(name):
@@ -1839,15 +1869,15 @@ echo "Passed!  - Failed: 0"; exit 0
         git("add", "-A")
         git("commit", "-q", "-m", "one")
         open(ini2, "w").write(f"[remote dev]\nhost = devbox\nworkdir = {hostwork2}\ncpus = 2\nmemory = 8g\n"
-                              f"min_free_gb = 0\nbuild_keep = 2\n")
+                              f"min_free_gb = 0\nbuild_keep = 2\n\n[repo urepo]\nenv_file = {d}/rrepo.env\n")
         uenv = dict(renv, TEST_PHASE_REMOTES_FILE=ini2)
 
-        def reuse_drain(cycle, *classes):
+        def reuse_drain(cycle, *classes, e=None):
             for c in classes:
                 job = qadd(urepo, "tests/T/Reuse.csproj", "--tier", "fast", "--filter", c, "--cycle", cycle)
                 subprocess.run([sys.executable, BRAIN, "queue", "route", job, "--to", "remote"], env=env,
                                capture_output=True)
-            rc, out, _ = rdrain(e=uenv)
+            rc, out, _ = rdrain(e=dict(uenv, **(e or {})))
             where = rlog("where.log").splitlines()
             builds = [l for l in where if l.split()[0].startswith("build-urepo") and l.split()[1] == "build"]
             tests = [l for l in where if l.split()[0].startswith("build-urepo") and l.split()[1] == "test"]
@@ -1859,7 +1889,7 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"two jobs on one commit must build and copy once, then test with --no-build "
                          f"({rc}): builds={builds} copies={copies} {tests} {out}")
         rc, out, builds, tests, copies = reuse_drain("u2", "ClassC")
-        if rc != 0 or builds != 0 or copies != 0 or len(tests) != 1:
+        if rc != 0 or builds != 0 or copies != 0 or len(tests) != 1 or "--no-build" not in tests[0]:
             fails.append(f"a later job on the same commit must reuse the build ({rc}): builds={builds} copies={copies} {tests}")
         open(os.path.join(urepo, "Code.cs"), "w").write("class A { int x; }\n")
         git("commit", "-q", "-am", "two")
@@ -1871,7 +1901,7 @@ echo "Passed!  - Failed: 0"; exit 0
         if rc != 0 or builds != 1 or copies != 1:
             fails.append(f"a dirty change on the same commit must build again ({rc}): builds={builds} copies={copies} {out}")
         rc, out, builds, tests, copies = reuse_drain("u5", "ClassA")
-        if rc != 0 or builds != 0 or copies != 0 or not all("--no-build" in t for t in tests):
+        if rc != 0 or builds != 0 or copies != 0 or len(tests) != 1 or not all("--no-build" in t for t in tests):
             fails.append(f"the same dirty tree again must reuse its build ({rc}): builds={builds} copies={copies} {tests}")
         open(os.path.join(urepo, "Code.cs"), "w").write("class A { int z; }\n")
         rc, out, builds, tests, copies = reuse_drain("u6", "ClassA")
@@ -1880,6 +1910,20 @@ echo "Passed!  - Failed: 0"; exit 0
             fails.append(f"build_keep = 2 must prune older folders and leave no lock: {os.listdir(hostwork2)} builds={builds}")
         if any(f.startswith("job-") for f in os.listdir(hostwork2)):
             fails.append(f"a reused build must not leave a job folder: {os.listdir(hostwork2)}")
+        if any(os.path.exists(os.path.join(hostwork2, f, ".lean.env")) for f in os.listdir(hostwork2)) \
+                or any(f.startswith("env-") for f in os.listdir(hostwork2)):
+            fails.append(f"the env file must not outlive the job in a kept build folder: {os.listdir(hostwork2)}")
+        # An argument for the test run only (--logger) cannot go to dotnet build: that job takes a fresh folder.
+        # A build-safe one (-c) goes to the build as well.
+        before = set(os.listdir(hostwork2))
+        rc, out, builds, tests, copies = reuse_drain("u6a", "ClassA", e={"TEST_PHASE_DOTNET_ARGS": "--logger trx"})
+        where = rlog("where.log")
+        if rc != 0 or builds != 0 or " build " in where or not re.search(r"^job-\d+ test .*--logger trx", where, re.M) \
+                or set(os.listdir(hostwork2)) != before:
+            fails.append(f"a test-only argument must run in a fresh job folder with no build ({rc}): {where!r} {out}")
+        rc, out, builds, tests, copies = reuse_drain("u6b", "ClassA", e={"TEST_PHASE_DOTNET_ARGS": "-c Release"})
+        if rc != 0 or builds != 1 or not re.search(r"^build-urepo\S* build \S+ -c Release$", rlog("where.log"), re.M):
+            fails.append(f"a build-safe argument goes to dotnet build ({rc}): builds={builds} {rlog('where.log')!r}")
         # A failed build is not recorded: the next job builds again instead of testing a missing build.
         open(os.path.join(d, "dotnet-build-fail"), "w").close()
         open(os.path.join(urepo, "Code.cs"), "w").write("class A { int w; }\n")

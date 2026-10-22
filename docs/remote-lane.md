@@ -73,6 +73,10 @@ The first job on a key copies the files and runs `dotnet build` for its test pro
 
 A lock directory next to the folder (`<folder>.lock`) is held from the claim until the build ends. A second job on the same key waits for it (up to 30 minutes, then the job goes back to queued), so it never reads a half-built folder. A lock older than two hours is treated as left by a dead job. When a job is cleaned up, it releases a lock it still holds and deletes a folder with no finished build.
 
+A job whose extra arguments include one only `dotnet test` takes (`--settings`, `--logger`, `-e`, `--results-directory`, ...) cannot share a build and uses a fresh `job-<id>` folder. Build-safe ones (`-c`, `-f`, `-r`, `-v`, `--arch`, `--os`, `-p:`, `--no-restore`) go to the build too. The env file is written to `<workdir>/env-<id>`, outside the kept folders, and removed with the job.
+
+Limits: reuse assumes one drainer per host and workdir, because the prune and the lock are not safe across two drainers sharing them. A miss holds the lock through its test run, so a second job on that key waits for the tests too. Submodule contents are not in the key, so a dirty submodule under an unchanged pointer reuses the build. A workdir cannot contain whitespace. The sweep removes locks over two hours old, env files of no running job, and unlocked build folders unused for 7 days.
+
 Each claim prunes: the newest `build_keep` folders of the repository stay (newest by last use), the rest go, except any with a lock. Build folders are not swept by the `job-*` rule below. `env_file` is sent again on every job. The local lane is unchanged.
 
 ## Which jobs go where

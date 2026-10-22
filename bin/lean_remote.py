@@ -119,6 +119,8 @@ def load(path=None, env=os.environ):
             r.workdir = sec.get("workdir", r.workdir).strip()
             if not r.workdir or r.workdir in ("/", "~", "~/"):
                 bad("workdir", "a folder of its own is required")
+            if re.search(r"\s", r.workdir):
+                bad("workdir", "must not contain whitespace")
             r.cpus = sec.get("cpus", r.cpus).strip()
             if not re.fullmatch(r"\d+(\.\d+)?", r.cpus) or float(r.cpus) <= 0:
                 bad("cpus", f"want a positive number, got {r.cpus!r}")
@@ -254,6 +256,7 @@ def file_list(repo, extra_paths, exclude):
 
 
 ENV_NAME = ".lean.env"
+BUILD_MAX_DAYS = 7  # a kept build folder unused this long goes in the next sweep
 
 
 def job_dir(r, job_id):
@@ -308,7 +311,7 @@ def claim_script(r, job_id, prefix, name, project):
     mark = d + "/" + project_mark(project)
     out = [f"wd={wd}; d={d}; mark={mark}", 'mkdir -p "$wd"', "n=0",
            'until mkdir "$d.lock" 2>/dev/null; do',
-           '  [ -n "$(find "$d.lock" -maxdepth 0 -mmin +120 2>/dev/null)" ] && { rm -rf "$d.lock"; continue; }',
+           '  [ -n "$(find "$d.lock" -maxdepth 0 -mmin +120 2>/dev/null)" ] && { m="$d.lock.stale.$$"; mv "$d.lock" "$m" 2>/dev/null && rm -rf "$m"; continue; }',
            '  n=$((n + 1)); [ "$n" -ge 1800 ] && { echo "lean-claim: busy"; exit 0; }; sleep 1',
            "done",
            f'echo {int(job_id)} > "$d.lock/job"',
@@ -317,11 +320,11 @@ def claim_script(r, job_id, prefix, name, project):
            '  [ -n "$(ls -A "$d"/.lean-built.* 2>/dev/null)" ] || rm -rf "$d"',
            '  mkdir -p "$d"; got=miss',
            "fi",
-           f'i=0; for old in $(ls -dt "$wd"/{shlex.quote(prefix)}* 2>/dev/null); do',
+           f'ls -dt "$wd"/{shlex.quote(prefix)}* 2>/dev/null | {{ i=0; while IFS= read -r old; do',
            '  case "$old" in *.lock) continue ;; esac',
            '  i=$((i + 1)); [ "$i" -le ' + str(int(r.build_keep)) + ' ] && continue',
            '  [ -e "$old.lock" ] || rm -rf "$old"',
-           "done",
+           "done; }",
            'echo "lean-claim: $got"', "exit 0"]
     return "\n".join(out) + "\n"
 
@@ -340,9 +343,17 @@ def ssh_cmd_opts():
     return ["ssh"] + SSH_OPTS
 
 
+def env_path(r, job_id, dest=None):
+    """Where the job's env file sits on the host: in its own folder, or beside the workdir's kept build folders
+    (never inside one, so it does not outlive the job)."""
+    return f"{r.workdir.rstrip('/')}/env-{int(job_id)}" if dest else f"{job_dir(r, job_id)}/{ENV_NAME}"
+
+
 def send_env(r, job_id, env_file, run=subprocess.run, dest=None):
-    """Put the env file in the job folder, mode 600, by ssh stdin. Never on a command line."""
-    jd = sh_path(dest or job_dir(r, job_id))
+    """Put the env file on the host, mode 600, by ssh stdin. Never on a command line."""
+    target = env_path(r, job_id, dest)
+    jd = sh_path(os.path.dirname(target))
+    leaf = os.path.basename(target)
     try:
         with open(env_file, "rb") as fh:
             data = fh.read()
@@ -350,7 +361,7 @@ def send_env(r, job_id, env_file, run=subprocess.run, dest=None):
         raise LaneProblem(f"cannot read env_file {env_file}: {e.strerror}")
     try:
         p = run(ssh_argv(r, # A fresh temp file renamed into place, so a symlink already at that name is replaced, never followed.
-            f"umask 077; mkdir -p {jd} && t=$(mktemp {jd}/.lean.env.XXXXXX) && cat > \"$t\" && mv -f \"$t\" {jd}/.lean.env"),
+            f"umask 077; mkdir -p {jd} && t=$(mktemp {jd}/.lean.env.XXXXXX) && cat > \"$t\" && mv -f \"$t\" {jd}/{leaf}"),
                 input=data, capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         raise LaneProblem(f"{r.name}: env file not sent ({type(e).__name__})")
@@ -366,7 +377,7 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None):
     nuget = sh_path(r.workdir.rstrip("/") + "/.nuget")
     label, net = f"lean.job={job_id}", f"lean-{job_id}"
     caps = f"--cpus {shlex.quote(r.cpus)} --memory {shlex.quote(r.memory)}"
-    env = f" --env-file {jd}/.lean.env" if cfg and cfg.env_file else ""
+    env = f" --env-file {sh_path(env_path(r, job_id, dest))}" if cfg and cfg.env_file else ""
     fail = lambda why: f'{{ echo "lean-remote: {why}"; exit 125; }}'
     # A job runs several commands (its tier, then class reruns); each starts from a clean network and sidecars.
     out = remove_labelled(f"label={label}") + [f"install -d {nuget}",
@@ -408,7 +419,7 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None):
                f"{shlex.quote(r.image)} sh -c {shlex.quote(inner)}")
     out.append("rc=$?")
     if build:
-        out.append(f'rm -rf {jd}.lock')
+        out.append(f'[ "$(cat {jd}.lock/job 2>/dev/null)" = "{int(job_id)}" ] && rm -rf {jd}.lock')
     out += remove_labelled(f"label={label}")
     out.append('exit "$rc"')
     return "\n".join(out) + "\n"
@@ -426,6 +437,7 @@ def cleanup_script(r, job_id):
     out = remove_labelled(f"label=lean.job={job_id}")
     out.append(f"rm -rf {sh_path(job_dir(r, job_id))}")
     wd = sh_path(r.workdir.rstrip("/"))
+    out.append(f"rm -f {wd}/env-{int(job_id)}")
     out += [f'for l in {wd}/build-*.lock; do',
             f'  [ "$(cat "$l/job" 2>/dev/null)" = "{int(job_id)}" ] || continue',
             '  [ -n "$(ls -A "${l%.lock}"/.lean-built.* 2>/dev/null)" ] || rm -rf "${l%.lock}"',
@@ -434,7 +446,8 @@ def cleanup_script(r, job_id):
 
 
 def sweep_script(r, running_ids):
-    """Remove what belongs to no running job: labelled objects, job folders, and folders over a day old.
+    """Remove what belongs to no running job: labelled objects, job folders, and folders over a day old, plus
+    env files of no running job, locks over two hours old and unlocked build folders unused for BUILD_MAX_DAYS.
     The package cache is emptied when it passes cache_max_gb and no job is using it. Never fails."""
     keep = " " + " ".join(str(int(i)) for i in running_ids) + " "
     wd = sh_path(r.workdir.rstrip("/"))
@@ -451,6 +464,19 @@ def sweep_script(r, running_ids):
            '  [ -d "$d" ] || continue',
            '  n=${d##*/job-}',
            '  case "$keep" in *" $n "*) [ -n "$(find "$d" -maxdepth 0 -mtime +1 2>/dev/null)" ] && rm -rf "$d" ;; *) rm -rf "$d" ;; esac',
+           "done",
+           f'for l in {wd}/build-*.lock; do',
+           '  [ -d "$l" ] && [ -n "$(find "$l" -maxdepth 0 -mmin +120 2>/dev/null)" ] && rm -rf "$l"',
+           "done",
+           f'for d in {wd}/build-*; do',
+           '  case "$d" in *.lock) continue ;; esac',
+           '  [ -d "$d" ] && [ ! -e "$d.lock" ] || continue',
+           f'  [ -n "$(find "$d" -maxdepth 0 -mtime +{BUILD_MAX_DAYS} 2>/dev/null)" ] && rm -rf "$d"',
+           "done",
+           f'for e in {wd}/env-*; do',
+           '  [ -f "$e" ] || continue',
+           '  n=${e##*/env-}',
+           '  case "$keep" in *" $n "*) ;; *) rm -f "$e" ;; esac',
            "done"]
     if r.cache_max_gb > 0:
         out += [f"if [ -d {wd}/.nuget ] && [ -z \"$(docker ps -q --filter label=lean.job 2>/dev/null)\" ]; then",
@@ -664,6 +690,36 @@ docker = yes
             left = sorted(f for f in os.listdir(work) if f.startswith(pre))
             if len(left) != 2 or name not in left:
                 fails.append(f"build_keep = 2 must keep the claimed folder and one more: {left}")
+            # A workdir with a space must not make the prune delete a sibling: only the oldest folder goes.
+            sp = os.path.join(t, "my work")
+            rs = Remote(name="dev", host="devbox", workdir=sp, build_keep=1)
+            for i, nm in enumerate(("a", "b")):
+                os.makedirs(os.path.join(sp, pre + nm))
+                os.utime(os.path.join(sp, pre + nm), (2000 + i, 2000 + i))
+            os.makedirs(os.path.join(t, "my"))
+            os.makedirs(os.path.join(t, "work-build-keep"))
+            os.makedirs(os.path.join(sp, "unrelated"))
+            subprocess.run(["sh", "-c", claim_script(rs, 3, pre, name, "T.csproj")], capture_output=True)
+            if sorted(os.listdir(sp)) != sorted(["unrelated", name, name + ".lock"]) or not os.path.isdir(os.path.join(t, "my")) \
+                    or not os.path.isdir(os.path.join(t, "work-build-keep")):
+                fails.append(f"pruning in a workdir with a space must delete only old build folders: {os.listdir(sp)}")
+            open(ini2, "w").write("[remote dev]\nhost = devbox\nworkdir = /tmp/a b\n")
+            try:
+                load(ini2, {})
+                fails.append("a workdir with whitespace must be refused")
+            except ValueError:
+                pass
+            rl = run_script(rw, None, 4, ["dotnet", "test"], folder, ["dotnet", "build"], ".lean-built.x")
+            if '= "4" ] && rm -rf' not in rl:
+                fails.append(f"a run script must release the lock only when it is this job's: {rl!r}")
+            env_t = env_path(rw, 4, folder)
+            if not env_t.startswith(work + "/env-4") or env_path(rw, 4) != f"{work}/job-4/.lean.env":
+                fails.append(f"env file goes beside the kept folders, not in them: {env_t}")
+            sw = sweep_script(rw, [3])
+            if "build-*" not in sw or "env-*" not in sw or "-mmin +120" not in sw:
+                fails.append(f"sweep_script must age out build folders, env files and locks: {sw!r}")
+            if subprocess.run(["sh", "-n", "-c", sw]).returncode != 0:
+                fails.append("sweep_script is not valid shell")
             if subprocess.run(["sh", "-n", "-c", run_script(rw, None, 4, ["dotnet", "test"], folder, ["dotnet", "build"],
                                                           ".lean-built.x")]).returncode != 0:
                 fails.append("a run_script with a build is not valid shell")
