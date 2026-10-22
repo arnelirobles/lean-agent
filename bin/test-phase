@@ -199,7 +199,7 @@ class Dotnet:
 VITEST_FAIL = re.compile(r"^\s*[\u00d7\u2717\u2718x]\s+(?:\|[^|]*\|\s*)?(\S.*?)\s*$")
 VITEST_FAIL_BLOCK = re.compile(r"^\s*FAIL\s+(?:\|[^|]*\|\s*)?(\S.*?)\s*$")
 VITEST_TIME = re.compile(r"\s+\d+(?:\.\d+)?\s*m?s$")
-VITEST_FILE = re.compile(r"[\w./@+-]+\.[cm]?[jt]sx?(?: > | \[ |$)")
+VITEST_FILE = re.compile(r"[\w./@+()\[\]-]+\.[cm]?[jt]sx?(?: > | \[ |$)")
 VITEST_SCRIPT = """cd "$1" || exit 2
 shift
 # Without a packageManager field corepack takes the newest pnpm, which can refuse a lockfile an older one wrote.
