@@ -202,7 +202,10 @@ VITEST_TIME = re.compile(r"\s+\d+(?:\.\d+)?\s*m?s$")
 VITEST_FILE = re.compile(r"[\w./@+-]+\.[cm]?[jt]sx?(?: > | \[ |$)")
 VITEST_SCRIPT = """cd "$1" || exit 2
 shift
-if command -v pnpm >/dev/null 2>&1; then P=pnpm; else P="corepack pnpm"; fi
+# Without a packageManager field corepack takes the newest pnpm, which can refuse a lockfile an older one wrote.
+if command -v pnpm >/dev/null 2>&1; then P=pnpm
+elif grep -q '"packageManager"' package.json; then P="corepack pnpm"
+else P="corepack pnpm@${LEAN_PNPM_VERSION:-10}"; fi
 if [ -f pnpm-lock.yaml ]; then $P install --frozen-lockfile || exit $?; else $P install || exit $?; fi
 exec $P exec vitest run --reporter=verbose "$@"
 """
