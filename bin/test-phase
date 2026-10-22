@@ -962,6 +962,78 @@ def say_waiting_remote():
               + " ".join(f"#{i}" for i in ids) + "); `brain queue route ID --to any` lets this machine take one")
 
 
+def vitest_checks(fails, fixture):
+    """Vitest: counts, failures with the test file as class, runner by path, the node image on a remote.
+    Looked up by name, so a build without the runner reports failed checks instead of crashing."""
+    V = globals().get("Vitest")
+    if V is None:
+        fails.append("no Vitest runner class")
+        return
+    got = V.counts(fixture("vitest-failed.log"))
+    if got != (3, 2, 1):
+        fails.append(f"vitest summary must give (passed, failed, skipped) = (3, 2, 1): {got}")
+    if V.counts("\x1b[2m     Tests \x1b[22m \x1b[1m\x1b[32m5 passed\x1b[39m\x1b[22m\x1b[90m (5)\x1b[39m\n") != (5, 0, 0):
+        fails.append("a colored vitest summary must parse")
+    if V.counts(fixture("vitest-passed.log")) != (2, 0, 0) or V.counts("no summary\n") != (0, 0, 0):
+        fails.append("a passing vitest run counts its tests; no summary gives zeros")
+    fl = V.failures(fixture("vitest-failed.log"))
+    names = [n for n, _ in fl]
+    if names != ["src/cart/cart.test.tsx > Cart > adds an item", "src/cart/cart.test.tsx > Cart > removes an item"]:
+        fails.append(f"vitest failures must be each failed test once, as file > suite > name: {names}")
+    elif "AssertionError: expected 1 to be 2" not in fl[0][1] or "expected 0 to be 1" in fl[0][1]:
+        fails.append(f"a vitest failure must carry the lines after it: {fl[0][1]!r}")
+    if V.failures(fixture("vitest-passed.log")):
+        fails.append("a passing vitest run has no failures")
+    if [V.class_of(n) for n in names] != ["src/cart/cart.test.tsx"] * 2 \
+            or V.class_of("src/a.test.ts [ src/a.test.ts ]") != "src/a.test.ts":
+        fails.append("the class of a vitest test is its file, so the rerun is per file")
+    if V.mode("/tmp") != "vitest":
+        fails.append("the vitest mode is vitest")
+    cmd = V.command("vitest", "web/package.json", "src/a.test.ts|src/b.test.ts", fast=True)
+    if cmd[:2] != ["sh", "-c"] or "web" not in cmd or cmd[-2:] != ["src/a.test.ts", "src/b.test.ts"] \
+            or "--frozen-lockfile" not in cmd[2] or "vitest run --reporter=verbose" not in cmd[2]:
+        fails.append(f"vitest command: install with the lockfile, run verbose, one file filter per piece: {cmd}")
+    cmd = V.command("vitest", "package.json")
+    if cmd[3:] != ["vitest", "."] or "src/" in " ".join(cmd[3:]):
+        fails.append(f"a vitest run with no filter runs everything, in the project folder: {cmd}")
+    try:
+        V.command("vitest", "web/package.json", "a| --help")
+        fails.append("a vitest filter piece starting with - must be refused")
+    except ValueError:
+        pass
+    pick = globals().get("runner_for")
+    if not pick or pick("web/package.json") is not V or pick("package.json") is not V \
+            or pick("tests/T/T.csproj") is not Dotnet or pick("tests/T") is not Dotnet:
+        fails.append("a test path ending in package.json uses Vitest, everything else Dotnet")
+    r = lr.Remote(name="dev", host="devbox") if lr else None
+    if r is None or getattr(r, "node_image", "") != "node:22-bookworm-slim":
+        fails.append("the remote default node image is node:22-bookworm-slim")
+        return
+    r.node_image = "node:20-slim"
+    try:
+        sc = lr.run_script(r, None, 5, V.command("vitest", "web/package.json"), kind="vitest")
+        dn = lr.run_script(r, None, 5, ["dotnet", "test"])
+    except TypeError as e:
+        fails.append(f"run_script must take the runner kind: {e}")
+        return
+    if "node:20-slim sh -c" not in sc or "mcr.microsoft.com/dotnet/sdk" in sc or "/nuget" in sc:
+        fails.append("a vitest job runs in the node image and uses no NuGet cache")
+    if "node_modules" in sc or "-e CI=true" not in sc or "store_dir" not in sc:
+        fails.append("a vitest job gets a pnpm store volume and CI=true")
+    if "mcr.microsoft.com/dotnet/sdk:10.0 sh -c" not in dn or "node:" in dn:
+        fails.append("a dotnet job keeps the dotnet image")
+    if subprocess.run(["sh", "-n", "-c", sc]).returncode != 0:
+        fails.append("the vitest remote script is not valid shell")
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "web", "node_modules", "x"))
+        for f in ("web/package.json", "web/node_modules/x/i.js", "web/a.test.ts"):
+            open(os.path.join(d, f), "w").write("x")
+        subprocess.run(["git", "init", "-q", d], check=True)
+        got = lr.file_list(d, [], [], skip_node_modules=True)
+        if got != ["web/a.test.ts", "web/package.json"]:
+            fails.append(f"a vitest copy must leave node_modules behind: {got}")
+
+
 def self_test():
     fails = []
     # A fast filter of several classes joined by | runs each of them, on both runners.
@@ -992,6 +1064,8 @@ def self_test():
             fails.append(f"detailed VSTest summary {name}: {Dotnet.counts(fixture(name))}, want {want}")
     if Dotnet.counts("Failed!  - Failed:     2, Passed:     1, Skipped:     0, Total:     3\n") != (1, 2, 0):
         fails.append("the one-line summary must still parse")
+
+    vitest_checks(fails, fixture)
 
     # Secrets in test output are masked, and the body travels by stdin.
     probe = ("Server=db;Password=hunter2;User=x\nPwd=\"p w\" Authorization: Bearer abc.DEF-123/x=\n"
@@ -1587,6 +1661,33 @@ echo "Passed!  - Failed: 0"; exit 0
         r = subprocess.run([sys.executable, os.path.realpath(__file__), pf], env=env, capture_output=True, text=True)
         if r.returncode == 0:
             fails.append("an empty plan exited 0")
+
+        # A package.json job runs Vitest through the same queue: install with the lockfile, run verbose, and
+        # rerun a failed file alone. A fake pnpm stands in; the dotnet shim must not be called.
+        repo_n = os.path.join(d, "nrepo")
+        os.makedirs(os.path.join(repo_n, "web"))
+        for f in ("web/package.json", "web/pnpm-lock.yaml"):
+            open(os.path.join(repo_n, f), "w").write("{}\n")
+        with open(os.path.join(bin_dir, "pnpm"), "w") as fh:
+            fh.write('''#!/bin/sh
+echo "pnpm $* in $(basename "$PWD")" >> "$FAKE_LOG"
+case "$*" in
+  *"src/cart/cart.test.tsx"*) echo "     Tests  2 passed (2)"; exit 0 ;;
+  *"exec vitest"*) cat "$FAKE_DIR/vitest-full"; exit 1 ;;
+esac
+exit 0
+''')
+        os.chmod(os.path.join(bin_dir, "pnpm"), 0o755)
+        put("vitest-full", fixture("vitest-failed.log"))
+        rc, out, calls = run(f"{repo_n} web/package.json\n")
+        want = ["pnpm install --frozen-lockfile in web", "pnpm exec vitest run --reporter=verbose in web"]
+        if calls[:2] != want or "pnpm exec vitest run --reporter=verbose src/cart/cart.test.tsx in web" not in calls \
+                or len(calls) != 4 or any(c.startswith("test ") for c in calls):
+            fails.append(f"a package.json job must install, run vitest, then rerun each failed file once: {calls}")
+        if not re.search(r"nrepo:package\.json\s+vitest/vitest\s+full\s+fail\s+2\s+0\s+2", out):
+            fails.append(f"summary row for a vitest job: {out}")
+        if "flaky nrepo src/cart/cart.test.tsx > Cart > adds an item" not in brain_list("--kind", "flaky"):
+            fails.append(f"a failed vitest test that passes alone is flaky in brain: {brain_list('--kind', 'flaky')!r}")
 
         # Remote lanes: a fake ssh, rsync and docker act on local folders (tests/fixtures/test-phase/remote).
         # The apple job keeps the local lane busy for about three seconds, so a plain job goes to the remote lane.
