@@ -3,6 +3,10 @@
 echo "$(basename "$PWD") $*" >> "$FAKE_DIR/where.log"
 find . -type f | sort >> "$FAKE_DIR/files-$(basename "$PWD").log"
 [ -f .lean.env ] && ls -l .lean.env >> "$FAKE_DIR/envmode.log"
+case "$1" in
+  build) if [ -f "$FAKE_DIR/dotnet-build-fail" ]; then echo "error CS1002: ; expected"; exit 1; fi
+    echo "Build succeeded."; exit 0 ;;
+esac
 case "$*" in
   *Apple.csproj*) for i in 1 2 3 4 5 6; do echo "passed Busy$i"; sleep 0.5; done; exit 0 ;;
   *Stall.csproj*) echo "[+1/x0/?0] t"; sleep 60; exit 0 ;;

@@ -133,24 +133,34 @@ class Dotnet:
                 return "vstest"
             d = os.path.dirname(d)
 
-    @classmethod
-    def command(cls, mode, project, cls_filter=None, fast=False, extra=()):
-        # A filter may name several classes joined by |, with or without the FullyQualifiedName~ prefix.
+    @staticmethod
+    def classes(cls_filter):
+        """The class names in a filter: several may be joined by |, with or without FullyQualifiedName~."""
         cls = [c.strip().removeprefix("FullyQualifiedName~") for c in (cls_filter or "").split("|")]
-        cls = [c for c in cls if c]
-        if any(c.startswith("-") for c in cls):  # a piece read as a dotnet option instead of a class
+        return [c for c in cls if c]
+
+    @classmethod
+    def command(cls, mode, project, cls_filter=None, fast=False, extra=(), probe=False):
+        # probe lists instead of running: MTP exits 8 when the filter matches no test, whatever else it names.
+        names = cls.classes(cls_filter)
+        if any(c.startswith("-") for c in names):  # a piece read as a dotnet option instead of a class
             raise ValueError("a filter piece starts with -")
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
             cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
             # --filter-class matches the full class name. The fast tier takes a fragment, and so does a
             # name with no namespace in any tier, hence the wildcards. A rerun passes full names.
-            for c in cls:
+            # xunit v3 ORs repeated --filter-class, so one run covers every class (checked on 4.0.0:
+            # A, B and C of 2, 1 and 3 tests ran 3 for A+B and 6 for all). It also hides a class that
+            # matches nothing while another matches, which the probe run per class catches.
+            if probe:
+                cmd.append("--list-tests")
+            for c in names:
                 cmd += ["--filter-class", f"*{c}*" if fast or "." not in c else c]
             return cmd + ["--output", "Detailed"]
         cmd = ["dotnet", "test", project] + list(extra) + ["--logger", "console;verbosity=normal"]
-        if cls:
-            cmd += ["--filter", "|".join("FullyQualifiedName~" + c for c in cls)]
+        if names:
+            cmd += ["--filter", "|".join("FullyQualifiedName~" + c for c in names)]
         return cmd
 
     @staticmethod
@@ -531,29 +541,63 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         return row
 
     synced = []
+    kept = {}  # a reused build folder: its path, and the mark and project while its build still has to run
+
+    def host(script, timeout):
+        try:
+            p = subprocess.run(lr.ssh_argv(remote, "sh", "-c", script), capture_output=True, text=True,
+                               timeout=timeout, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise LaneProblem(f"{remote.name}: ssh failed ({type(e).__name__})")
+        if p.returncode != 0:
+            raise LaneProblem(f"{remote.name}: ssh failed (exit {p.returncode}) {mask(p.stderr.strip()[-120:])}".strip())
+        return p.stdout
 
     def prepare():  # the copy and the env file go once per job, however many commands follow
         if synced:
             return
         files = lr.file_list(repo, remote.extra_paths, remote.exclude)
-        data = b"".join(f.encode("utf-8", "surrogateescape") + b"\0" for f in files)
-        try:
-            p = subprocess.run(lr.sync_argv(remote, repo, job["id"]), input=data, capture_output=True)
-        except OSError as e:
-            raise LaneProblem(f"{remote.name}: rsync did not start ({e.strerror})")
-        if p.returncode != 0:
-            tail = p.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
-            raise LaneProblem(f"{remote.name}: copy failed (rsync exit {p.returncode}) {mask(tail[0])[:120]}".strip())
+        dest = None
+        if remote.reuse_build:
+            # One build folder per repository, commit, tree state, image and build arguments. A match skips the
+            # copy and the build; a miss copies and builds, and the host lock keeps a second job off the folder
+            # until the build is done.
+            prefix, name = lr.build_name(remote, repo, files, extra)
+            dest = lr.build_dir(remote, name)
+            got = re.findall(r"^lean-claim: (\w+)$", host(lr.claim_script(remote, job["id"], prefix, name, project), 1900),
+                             re.M)
+            if got[-1:] == ["busy"]:
+                raise LaneProblem(f"{remote.name}: another job held the build folder for 30 minutes")
+            if got[-1:] == ["miss"]:
+                kept.update(mark=lr.project_mark(project))
+            elif got[-1:] != ["hit"]:
+                raise LaneProblem(f"{remote.name}: the build folder check gave no answer")
+            kept["dest"] = dest
+        if not kept.get("dest") or kept.get("mark"):
+            data = b"".join(f.encode("utf-8", "surrogateescape") + b"\0" for f in files)
+            try:
+                p = subprocess.run(lr.sync_argv(remote, repo, job["id"], dest), input=data, capture_output=True)
+            except OSError as e:
+                raise LaneProblem(f"{remote.name}: rsync did not start ({e.strerror})")
+            if p.returncode != 0:
+                tail = p.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+                raise LaneProblem(f"{remote.name}: copy failed (rsync exit {p.returncode}) {mask(tail[0])[:120]}".strip())
         if cfg and cfg.env_file:
-            lr.send_env(remote, job["id"], cfg.env_file)
+            lr.send_env(remote, job["id"], cfg.env_file, dest=dest)
         synced.append(1)
 
-    def tier(name, cls_filter, log):
-        cmd = runner.command(mode, project, cls_filter, name == "fast", extra)
+    def tier(name, cls_filter, log, probe=False):
         if remote:
             prepare()
+        build = mark = None
+        if kept.get("dest"):  # the folder holds a build, or this command makes it
+            build = ["dotnet", "build", project] + extra if kept.get("mark") else None
+            mark = kept.pop("mark", None)
+        cmd = runner.command(mode, project, cls_filter, name == "fast",
+                             extra + ["--no-build"] if kept.get("dest") else extra, probe)
+        if remote:
             before = lr.remote_load(remote)
-            ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd))
+            ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd, kept.get("dest"), build, mark))
             rc, text, started, ended, wait = heavy(f"remote-{remote.name}", ssh, repo, log, a.stall,
                                                    header=f"$ ssh {remote.name} <script for job {job['id']}>\n",
                                                    hold=hold, fail_stall=a.fail_stall)
@@ -563,6 +607,8 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         else:
             before = load1()
             rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall, hold=hold, fail_stall=a.fail_stall)
+        if probe:
+            return rc, text, None
         return rc, text, record_run(row, ctx, "fast" if name == "full" and cls_filter else name, mode, rc, text, started,
                                     ended, wait, before, project, lane)
 
@@ -606,6 +652,21 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         add_item(row, "test-fail", f"run-failed: {project}", "important",
                  f"exit {rc} with no failing test named. Log: {stem}.log\n{tail}", run_id, ctx)
         row["notes"].append(f"exit {rc}, no test named (build error?)")
+    names = runner.classes(job["filter"]) if mode == "mtp" else []
+    if len(names) > 1 and rc in (0, 2):
+        # The run above ORs the classes, so one that matches nothing hides behind the others. List each alone.
+        for n in names:
+            try:
+                prc, _, _ = tier(job["tier"], n, f"{stem}-probe-{safe(n)}.log", probe=True)
+            except LaneProblem as e:
+                row["result"], row["lane_problem"] = "requeued", str(e)
+                return row
+            if prc == 8:
+                row["result"] = "fail"
+                row["notes"].append(f"class {n} matched no test")
+                add_item(row, "test-fail", f"filter-matched-no-test: {n}", "important",
+                         f"class {n} in filter {job['filter']!r} matched no test, though the others ran. "
+                         f"Log: {stem}.log", run_id, ctx)
     by_class = {}
     for name in failing:
         by_class.setdefault(runner.class_of(name), []).append(name)
@@ -1093,6 +1154,13 @@ case "$*" in
   *Canceller.csproj*) python3 "$FAKE_BRAIN" queue cancel "$FAKE_CANCEL" >/dev/null ;;
 esac
 case "$*" in
+  *"--list-tests"*)
+    all="$*"; cls=${all##*--filter-class }; cls=$(echo "${cls%% *}" | tr -d "*")
+    : > "$FAKE_DIR/probe-$cls"
+    [ -f "$FAKE_DIR/nomatch-$cls" ] && exit 8
+    exit 0 ;;
+esac
+case "$*" in
   *"--filter-class "*|*"FullyQualifiedName~"*)
     all="$*"; cls=${all##*--filter-class }; [ "$cls" = "$all" ] && cls=${all##*FullyQualifiedName~}
     cls=${cls%% *}
@@ -1225,6 +1293,23 @@ echo "Passed!  - Failed: 0"; exit 0
            "test --project tests/T/T.csproj -- --filter-class Acme.MtpTests --output Detailed" not in calls:
             fails.append(f"mtp fast tier needs wildcards, reruns the exact class: {calls}")
 
+        # xunit v3 ORs repeated --filter-class, so one run covers every named class. It also hides a class that
+        # matches nothing while another matches, so each class is listed alone and exit 8 fails the job naming it.
+        put("full", "Test run summary: Passed!\n  total: 5\n", 0)
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj Acme.ATests|Acme.BTests\n")
+        if rc != 0 or calls[0] != "test --project tests/T/T.csproj -- --filter-class *Acme.ATests* --filter-class *Acme.BTests* --output Detailed":
+            fails.append(f"two classes must run in one command ({rc}): {calls} {out}")
+        if not all(os.path.exists(os.path.join(d, f"probe-Acme.{c}Tests")) for c in "AB"):
+            fails.append(f"every named class must be probed alone: {os.listdir(d)}")
+        put("nomatch-Acme.BTests", "")
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj Acme.ATests|Acme.BTests\n")
+        if rc != 1 or "class Acme.BTests matched no test" not in out or "filter-matched-no-test: Acme.BTests" not in brain_list():
+            fails.append(f"a class that matches nothing must fail the job and name it ({rc}): {out} {brain_list()!r}")
+        os.remove(os.path.join(d, "nomatch-Acme.BTests"))
+        rc, out, calls = run(f"{repo_m} tests/T/T.csproj Acme.ATests\n")
+        if any("--list-tests" in c for c in calls):
+            fails.append(f"one class needs no probe: {calls}")
+
         # A filter that matches no test is a failure, not a pass: VSTest exits 0 with no summary, MTP exits 8.
         put("full", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
         put("class-Empty", "No test matches the given testcase filter `FullyQualifiedName~Empty` in T.dll\n", 0)
@@ -1247,7 +1332,7 @@ echo "Passed!  - Failed: 0"; exit 0
             os.makedirs(os.path.join(g, "tests", "T"))
             with open(os.path.join(g, "f.txt"), "w") as fh:
                 fh.write("x\n")
-            for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]):
+            for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "x"]):
                 subprocess.run(["git", "-C", g] + cmd, check=True, capture_output=True)
             if dirty:
                 with open(os.path.join(g, "f.txt"), "w") as fh:
@@ -1608,7 +1693,7 @@ echo "Passed!  - Failed: 0"; exit 0
         subprocess.run(["git", "init", "-q", rrepo], check=True)
         open(os.path.join(d, "rrepo.env"), "w").write("POSTGRES_PASSWORD=hunter2\n")
         open(ini, "w").write(f"[remote dev]\nhost = devbox\nworkdir = {hostwork}\ncpus = 2\nmemory = 8g\n"
-                             f"min_free_gb = 0\nextra_paths = local-packages\n\n[repo rrepo]\n"
+                             f"min_free_gb = 0\nextra_paths = local-packages\nreuse_build = no\n\n[repo rrepo]\n"
                              f"sidecars = db=postgres:16\nenv_file = {d}/rrepo.env\nready = pg_isready\n")
         renv = dict(env, PATH=rfix + os.pathsep + os.environ["PATH"], TEST_PHASE_REMOTES_FILE=ini,
                     FAKE_SSH_LOG=os.path.join(d, "ssh.log"), FAKE_DOCKER_DIR=dockdir, TEST_PHASE_REST="600",
@@ -1740,6 +1825,71 @@ echo "Passed!  - Failed: 0"; exit 0
         rc, out, _ = rdrain(e=dict(renv, TEST_PHASE_REMOTES="off"))
         if rc != 0 or rlog("ssh.log") or runs_of("Off.csproj") != [("full", "")] or "lanes" in out:
             fails.append(f"remotes off must not touch ssh ({rc}): {rlog('ssh.log')!r} {out}")
+
+        # A kept build: two jobs on one commit build once, a new commit or a changed file builds again, and only
+        # the newest build_keep folders stay. reuse_build = no above is the off switch, and the tests before this
+        # ran on per-job folders.
+        urepo, hostwork2, ini2 = (os.path.join(d, x) for x in ("urepo", "hostwork2", "remotes2.ini"))
+        os.makedirs(os.path.join(urepo, "tests", "T"))
+        open(os.path.join(urepo, "tests", "T", "Reuse.csproj"), "w").write(net)
+        open(os.path.join(urepo, "Code.cs"), "w").write("class A {}\n")
+        git = lambda *g: subprocess.run(["git", "-C", urepo, "-c", "user.name=t", "-c", "user.email=t@example.com", *g],
+                                        check=True, capture_output=True)
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "one")
+        open(ini2, "w").write(f"[remote dev]\nhost = devbox\nworkdir = {hostwork2}\ncpus = 2\nmemory = 8g\n"
+                              f"min_free_gb = 0\nbuild_keep = 2\n")
+        uenv = dict(renv, TEST_PHASE_REMOTES_FILE=ini2)
+
+        def reuse_drain(cycle, *classes):
+            for c in classes:
+                job = qadd(urepo, "tests/T/Reuse.csproj", "--tier", "fast", "--filter", c, "--cycle", cycle)
+                subprocess.run([sys.executable, BRAIN, "queue", "route", job, "--to", "remote"], env=env,
+                               capture_output=True)
+            rc, out, _ = rdrain(e=uenv)
+            where = rlog("where.log").splitlines()
+            builds = [l for l in where if l.split()[0].startswith("build-urepo") and l.split()[1] == "build"]
+            tests = [l for l in where if l.split()[0].startswith("build-urepo") and l.split()[1] == "test"]
+            copies = [l for l in rlog("rsync.log").splitlines() if l.startswith("files:")]
+            return rc, out, len(builds), tests, len(copies)
+
+        rc, out, builds, tests, copies = reuse_drain("u1", "ClassA", "ClassB")
+        if rc != 0 or builds != 1 or copies != 1 or len(tests) != 2 or not all("--no-build" in t for t in tests):
+            fails.append(f"two jobs on one commit must build and copy once, then test with --no-build "
+                         f"({rc}): builds={builds} copies={copies} {tests} {out}")
+        rc, out, builds, tests, copies = reuse_drain("u2", "ClassC")
+        if rc != 0 or builds != 0 or copies != 0 or len(tests) != 1:
+            fails.append(f"a later job on the same commit must reuse the build ({rc}): builds={builds} copies={copies} {tests}")
+        open(os.path.join(urepo, "Code.cs"), "w").write("class A { int x; }\n")
+        git("commit", "-q", "-am", "two")
+        rc, out, builds, tests, copies = reuse_drain("u3", "ClassA", "ClassB")
+        if rc != 0 or builds != 1 or copies != 1 or len(tests) != 2:
+            fails.append(f"a new commit must build again ({rc}): builds={builds} copies={copies} {tests} {out}")
+        open(os.path.join(urepo, "Code.cs"), "w").write("class A { int y; }\n")
+        rc, out, builds, tests, copies = reuse_drain("u4", "ClassA")
+        if rc != 0 or builds != 1 or copies != 1:
+            fails.append(f"a dirty change on the same commit must build again ({rc}): builds={builds} copies={copies} {out}")
+        rc, out, builds, tests, copies = reuse_drain("u5", "ClassA")
+        if rc != 0 or builds != 0 or copies != 0 or not all("--no-build" in t for t in tests):
+            fails.append(f"the same dirty tree again must reuse its build ({rc}): builds={builds} copies={copies} {tests}")
+        open(os.path.join(urepo, "Code.cs"), "w").write("class A { int z; }\n")
+        rc, out, builds, tests, copies = reuse_drain("u6", "ClassA")
+        kept_dirs = sorted(f for f in os.listdir(hostwork2) if f.startswith("build-urepo") and not f.endswith(".lock"))
+        if builds != 1 or len(kept_dirs) != 2 or any(f.endswith(".lock") for f in os.listdir(hostwork2)):
+            fails.append(f"build_keep = 2 must prune older folders and leave no lock: {os.listdir(hostwork2)} builds={builds}")
+        if any(f.startswith("job-") for f in os.listdir(hostwork2)):
+            fails.append(f"a reused build must not leave a job folder: {os.listdir(hostwork2)}")
+        # A failed build is not recorded: the next job builds again instead of testing a missing build.
+        open(os.path.join(d, "dotnet-build-fail"), "w").close()
+        open(os.path.join(urepo, "Code.cs"), "w").write("class A { int w; }\n")
+        rc, out, builds, tests, copies = reuse_drain("u7", "ClassA")
+        os.remove(os.path.join(d, "dotnet-build-fail"))
+        rc2, out2, builds2, tests2, _ = reuse_drain("u8", "ClassA")
+        if rc == 0 or builds != 1 or builds2 != 1 or any(f.startswith("build-urepo") and f.endswith(".lock")
+                                                           for f in os.listdir(hostwork2)):
+            fails.append(f"a failed build must not be recorded and must release its lock: {rc} {builds} {builds2} "
+                         f"{os.listdir(hostwork2)} {out}")
 
         # A job left running on a host by a dead drainer: the host's folder and containers go first.
         stale = qadd(rrepo, "tests/T/Stale.csproj", "--cycle", "r7")

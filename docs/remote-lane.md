@@ -40,6 +40,8 @@ Remote section keys:
 | `memory` | `--memory` for every container of a job. | `8g` |
 | `min_free_gb` | The lane does not claim a job when the workdir has less free space. | `15` |
 | `cache_max_gb` | The shared NuGet cache (`<workdir>/.nuget`) is emptied when it is bigger and no job runs. `0` keeps it. | `10` |
+| `reuse_build` | `yes` keeps one build folder per key and reuses it (see Build reuse). `no` copies and builds in a fresh folder for every job. | `yes` |
+| `build_keep` | Build folders kept per repository. | `3` |
 | `image` | The test container image. | `mcr.microsoft.com/dotnet/sdk:10.0` |
 | `extra_paths` | Git-ignored paths to copy anyway, for example a local package folder. | none |
 | `exclude` | Patterns never copied. A pattern matches a file name, a path, or any folder in the path. | the list above |
@@ -62,6 +64,16 @@ The test command runs with `ASPNETCORE_HTTP_PORTS` and `ASPNETCORE_HTTPS_PORTS` 
 ## What is copied and what is not
 
 The copy is the files `git ls-files` lists (tracked and untracked, not ignored) plus `extra_paths`, minus anything matching `exclude`. Files deleted in the working tree are skipped. Nothing else leaves this machine. Secrets go only through `env_file`.
+
+## Build reuse
+
+A remote job used to copy the repository into `job-<id>` and build it, which took minutes where the tests took seconds. With `reuse_build = yes` the host keeps `build-<repo>-<path hash>-<key>` folders instead. The key is a hash of the commit, the copied file list with each file's contents, the image and the build arguments, so a new commit, a dirty tree with a different edit, or other `args=` never match an earlier build.
+
+The first job on a key copies the files and runs `dotnet build` for its test project in the container, then writes a mark file in the folder, and every `dotnet test` of the job runs with `--no-build`. A later job on the same key copies nothing, builds nothing and runs `dotnet test --no-build`. A second test project of the same key builds once itself. A failed build writes no mark, so the next job builds again.
+
+A lock directory next to the folder (`<folder>.lock`) is held from the claim until the build ends. A second job on the same key waits for it (up to 30 minutes, then the job goes back to queued), so it never reads a half-built folder. A lock older than two hours is treated as left by a dead job. When a job is cleaned up, it releases a lock it still holds and deletes a folder with no finished build.
+
+Each claim prunes: the newest `build_keep` folders of the repository stay (newest by last use), the rest go, except any with a lock. Build folders are not swept by the `job-*` rule below. `env_file` is sent again on every job. The local lane is unchanged.
 
 ## Which jobs go where
 

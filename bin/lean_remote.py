@@ -13,6 +13,8 @@ remote off. One section per host and, optionally, one per repository:
   memory = 8g
   min_free_gb = 15
   cache_max_gb = 10           ; the NuGet cache folder is emptied when it passes this, 0 keeps it
+  reuse_build = yes           ; later jobs on the same commit and tree skip the copy and the build, no turns it off
+  build_keep = 3              ; build folders kept per repository
   image = mcr.microsoft.com/dotnet/sdk:10.0
   extra_paths = local-packages
   exclude = .env*, *.key, *.pem, *license-key*, secrets*
@@ -28,12 +30,14 @@ the local machine. The docs are in docs/remote-lane.md.
 """
 import configparser
 import fnmatch
+import hashlib
 import os
 import re
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 DEFAULT_EXCLUDE = [".env*", "*.key", "*.pem", "*license-key*", "secrets*"]
@@ -59,6 +63,8 @@ class Remote:
     extra_paths: list = field(default_factory=list)
     exclude: list = field(default_factory=lambda: list(DEFAULT_EXCLUDE))
     cache_max_gb: int = 10
+    reuse_build: bool = True
+    build_keep: int = 3
 
 
 @dataclass
@@ -119,14 +125,18 @@ def load(path=None, env=os.environ):
             r.memory = sec.get("memory", r.memory).strip()
             if not re.fullmatch(r"\d+[bkmgBKMG]?", r.memory):
                 bad("memory", f"want a size like 8g, got {r.memory!r}")
-            for key in ("min_free_gb", "cache_max_gb"):
+            for key in ("min_free_gb", "cache_max_gb", "build_keep"):
                 try:
                     val = int(sec.get(key, str(getattr(r, key))).strip())
-                    if val < 0:
+                    if val < (1 if key == "build_keep" else 0):
                         raise ValueError
                 except ValueError:
-                    bad(key, "want a whole number of GB")
+                    bad(key, "want at least 1" if key == "build_keep" else "want a whole number of GB")
                 setattr(r, key, val)
+            reuse = sec.get("reuse_build", "yes").strip().lower()
+            if reuse not in ("yes", "no"):
+                bad("reuse_build", f"want yes or no, got {reuse!r}")
+            r.reuse_build = reuse == "yes"
             r.image = sec.get("image", r.image).strip()
             if not IMAGE.fullmatch(r.image):
                 bad("image", f"not an image name: {r.image!r}")
@@ -161,7 +171,7 @@ def load(path=None, env=os.environ):
 
 IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@-]*")
 REMOTE_KEYS = {"host", "workdir", "cpus", "memory", "min_free_gb", "cache_max_gb", "image", "extra_paths",
-               "exclude"}
+               "exclude", "reuse_build", "build_keep"}
 REPO_KEYS = {"sidecars", "env_file", "ready", "docker"}
 DIND_IMAGE = "docker:27-dind"
 DIND_VOLUME = "lean-dind"  # image cache kept between jobs; one lane per host, so one daemon uses it at a time
@@ -250,21 +260,89 @@ def job_dir(r, job_id):
     return f"{r.workdir.rstrip('/')}/job-{job_id}"
 
 
-def sync_argv(r, repo, job_id):
-    """rsync argv; the caller writes the NUL-joined file_list on its stdin."""
-    jd = sh_path(job_dir(r, job_id))
+def tree_hash(repo, files):
+    """Hash of the copied file list and what is in each file, so a dirty tree never matches another build."""
+    h = hashlib.sha256()
+    for f in files:
+        path = os.path.join(repo, f)
+        h.update(f.encode("utf-8", "surrogateescape") + b"\0")
+        try:
+            if os.path.islink(path):
+                h.update(b"L" + os.readlink(path).encode("utf-8", "surrogateescape"))
+            else:
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+        except OSError:
+            h.update(b"?")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def build_name(r, repo, files, extra=()):
+    """(prefix, folder name) for a build folder. The name holds the repository (path), the commit, the hash of
+    the copied tree, the image and the extra build arguments: any of them changing is another build."""
+    repo = os.path.realpath(repo)
+    head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    key = hashlib.sha256("\0".join([head or "none", tree_hash(repo, files), r.image, *extra]).encode()).hexdigest()[:16]
+    slug = re.sub(r"[^A-Za-z0-9_-]", "_", os.path.basename(repo))[:30]
+    prefix = f"build-{slug}-{hashlib.sha256(repo.encode()).hexdigest()[:8]}-"
+    return prefix, prefix + key
+
+
+def build_dir(r, name):
+    return f"{r.workdir.rstrip('/')}/{name}"
+
+
+def project_mark(project):
+    return ".lean-built." + hashlib.sha256(project.encode()).hexdigest()[:12]
+
+
+def claim_script(r, job_id, prefix, name, project):
+    """Decide on the host, under a lock, whether the build folder holds a finished build of this project.
+    Prints "lean-claim: hit" (lock released, nothing to copy or build), "miss" (lock held until the build's
+    run script or the job's cleanup releases it) or "busy" (another job kept the lock for half an hour).
+    Also prunes: the newest build_keep folders of the repository stay, and so does any folder with a lock."""
+    wd = sh_path(r.workdir.rstrip("/"))
+    d = sh_path(build_dir(r, name))
+    mark = d + "/" + project_mark(project)
+    out = [f"wd={wd}; d={d}; mark={mark}", 'mkdir -p "$wd"', "n=0",
+           'until mkdir "$d.lock" 2>/dev/null; do',
+           '  [ -n "$(find "$d.lock" -maxdepth 0 -mmin +120 2>/dev/null)" ] && { rm -rf "$d.lock"; continue; }',
+           '  n=$((n + 1)); [ "$n" -ge 1800 ] && { echo "lean-claim: busy"; exit 0; }; sleep 1',
+           "done",
+           f'echo {int(job_id)} > "$d.lock/job"',
+           'if [ -f "$mark" ]; then touch "$d" "$mark"; rm -rf "$d.lock"; got=hit',
+           'else',
+           '  [ -n "$(ls -A "$d"/.lean-built.* 2>/dev/null)" ] || rm -rf "$d"',
+           '  mkdir -p "$d"; got=miss',
+           "fi",
+           f'i=0; for old in $(ls -dt "$wd"/{shlex.quote(prefix)}* 2>/dev/null); do',
+           '  case "$old" in *.lock) continue ;; esac',
+           '  i=$((i + 1)); [ "$i" -le ' + str(int(r.build_keep)) + ' ] && continue',
+           '  [ -e "$old.lock" ] || rm -rf "$old"',
+           "done",
+           'echo "lean-claim: $got"', "exit 0"]
+    return "\n".join(out) + "\n"
+
+
+def sync_argv(r, repo, job_id, dest=None):
+    """rsync argv; the caller writes the NUL-joined file_list on its stdin. dest is a path on the host,
+    the job's own folder when left out."""
+    dest = dest or job_dir(r, job_id)
+    jd = sh_path(dest)
     # --safe-links skips a symlink that points outside the repo, so nothing outside the job folder is reached.
     return ["rsync", "-a", "--safe-links", "--timeout=600", "--files-from=-", "--from0", "-e", " ".join(ssh_cmd_opts()),
-            f"--rsync-path=mkdir -p {jd} && rsync", repo.rstrip("/") + "/", f"{r.host}:{job_dir(r, job_id)}/"]
+            f"--rsync-path=mkdir -p {jd} && rsync", repo.rstrip("/") + "/", f"{r.host}:{dest}/"]
 
 
 def ssh_cmd_opts():
     return ["ssh"] + SSH_OPTS
 
 
-def send_env(r, job_id, env_file, run=subprocess.run):
+def send_env(r, job_id, env_file, run=subprocess.run, dest=None):
     """Put the env file in the job folder, mode 600, by ssh stdin. Never on a command line."""
-    jd = sh_path(job_dir(r, job_id))
+    jd = sh_path(dest or job_dir(r, job_id))
     try:
         with open(env_file, "rb") as fh:
             data = fh.read()
@@ -280,9 +358,11 @@ def send_env(r, job_id, env_file, run=subprocess.run):
         raise LaneProblem(f"{r.name}: env file not sent (exit {p.returncode})")
 
 
-def run_script(r, cfg, job_id, cmd):
-    """One shell script for ssh: network, sidecars, then the capped test container. Its exit code is the test's."""
-    jd = sh_path(job_dir(r, job_id))
+def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None):
+    """One shell script for ssh: network, sidecars, then the capped test container. Its exit code is the test's.
+    dest is a kept build folder. build is the build command to run first in it, and the folder's lock is
+    released after it, with mark written only when the build succeeded."""
+    jd = sh_path(dest or job_dir(r, job_id))
     nuget = sh_path(r.workdir.rstrip("/") + "/.nuget")
     label, net = f"lean.job={job_id}", f"lean-{job_id}"
     caps = f"--cpus {shlex.quote(r.cpus)} --memory {shlex.quote(r.memory)}"
@@ -320,11 +400,15 @@ def run_script(r, cfg, job_id, cmd):
                 " -e TESTCONTAINERS_RYUK_DISABLED=true")
     # The sdk image sets ASPNETCORE_HTTP_PORTS. WebApplicationFactory then passes --HTTP_PORTS to the app's
     # Main, and a host that parses its own command line can exit before the test server starts.
-    inner = f'echo "{MARKER}"; unset ASPNETCORE_HTTP_PORTS ASPNETCORE_HTTPS_PORTS; exec nice -n 19 ' + " ".join(shlex.quote(c) for c in cmd)
+    quote = lambda argv: " ".join(shlex.quote(c) for c in argv)
+    first = f"nice -n 19 {quote(build)} || exit $?; touch {shlex.quote(mark)}; " if build else ""
+    inner = f'echo "{MARKER}"; unset ASPNETCORE_HTTP_PORTS ASPNETCORE_HTTPS_PORTS; {first}exec nice -n 19 ' + quote(cmd)
     out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
                f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget -v {jd}:/work -w /work{env}{denv} "
                f"{shlex.quote(r.image)} sh -c {shlex.quote(inner)}")
     out.append("rc=$?")
+    if build:
+        out.append(f'rm -rf {jd}.lock')
     out += remove_labelled(f"label={label}")
     out.append('exit "$rc"')
     return "\n".join(out) + "\n"
@@ -337,9 +421,15 @@ def remove_labelled(selector):
 
 
 def cleanup_script(r, job_id):
-    """Remove the job's containers, network and folder. Never fails."""
+    """Remove the job's containers, network and folder, and release any build lock the job still holds. A build
+    folder whose build never finished goes with it. Never fails."""
     out = remove_labelled(f"label=lean.job={job_id}")
     out.append(f"rm -rf {sh_path(job_dir(r, job_id))}")
+    wd = sh_path(r.workdir.rstrip("/"))
+    out += [f'for l in {wd}/build-*.lock; do',
+            f'  [ "$(cat "$l/job" 2>/dev/null)" = "{int(job_id)}" ] || continue',
+            '  [ -n "$(ls -A "${l%.lock}"/.lean-built.* 2>/dev/null)" ] || rm -rf "${l%.lock}"',
+            '  rm -rf "$l"', "done"]
     return "\n".join(out) + "\nexit 0\n"
 
 
@@ -522,6 +612,61 @@ docker = yes
         for script in (sc, cs, ss, bare, dk):
             if subprocess.run(["sh", "-n", "-c", script]).returncode != 0:
                 fails.append("a generated script is not valid shell")
+
+        # Build reuse: the key moves with the commit and with any change to a file, config parses, and a second
+        # claim on one folder waits for the first to finish instead of reading a half-built folder.
+        if not (r.reuse_build and r.build_keep == 3):
+            fails.append(f"reuse_build defaults to yes and build_keep to 3: {r}")
+        with tempfile.TemporaryDirectory() as t:
+            ini2 = os.path.join(t, "r.ini")
+            open(ini2, "w").write("[remote dev]\nhost = devbox\nreuse_build = no\nbuild_keep = 5\n")
+            r2 = load(ini2, {})[0][0]
+            if r2.reuse_build or r2.build_keep != 5:
+                fails.append(f"reuse_build = no and build_keep = 5 must parse: {r2}")
+            for bad in ("reuse_build = maybe", "build_keep = 0"):
+                open(ini2, "w").write(f"[remote dev]\nhost = devbox\n{bad}\n")
+                try:
+                    load(ini2, {})
+                    fails.append(f"{bad!r} must be refused")
+                except ValueError:
+                    pass
+            work = os.path.join(t, "w")
+            gr = os.path.join(t, "repo")
+            os.makedirs(gr)
+            open(os.path.join(gr, "a.cs"), "w").write("one")
+            subprocess.run(["git", "-C", gr, "init", "-q"], check=True)
+            files = ["a.cs"]
+            h1 = tree_hash(gr, files)
+            open(os.path.join(gr, "a.cs"), "w").write("two")
+            if tree_hash(gr, files) == h1:
+                fails.append("tree_hash must change when a file's content changes")
+            rw = Remote(name="dev", host="devbox", workdir=work)
+            pre, name = build_name(rw, gr, files)
+            if build_name(rw, gr, files)[1] != name or build_name(rw, gr, files, ["-p:X=1"])[1] == name:
+                fails.append("build_name must be stable and move with the build arguments")
+            claim = claim_script(rw, 1, pre, name, "T.csproj")
+            first = subprocess.run(["sh", "-c", claim], capture_output=True, text=True).stdout
+            second = subprocess.Popen(["sh", "-c", claim_script(rw, 2, pre, name, "T.csproj")], stdout=subprocess.PIPE,
+                                      text=True)
+            time.sleep(1.5)
+            waited = second.poll() is None
+            folder = os.path.join(work, name)
+            open(os.path.join(folder, project_mark("T.csproj")), "w").close()
+            subprocess.run(["rm", "-rf", folder + ".lock"])
+            got = second.communicate(timeout=30)[0]
+            if "lean-claim: miss" not in first or not waited or "lean-claim: hit" not in got:
+                fails.append(f"a second claim must wait for the first build, then see it: {first!r} {waited} {got!r}")
+            for i, other in enumerate(("x", "y", "z")):
+                os.makedirs(os.path.join(work, pre + other))
+                os.utime(os.path.join(work, pre + other), (1000 + i, 1000 + i))
+            rw.build_keep = 2
+            subprocess.run(["sh", "-c", claim_script(rw, 3, pre, name, "T.csproj")], capture_output=True)
+            left = sorted(f for f in os.listdir(work) if f.startswith(pre))
+            if len(left) != 2 or name not in left:
+                fails.append(f"build_keep = 2 must keep the claimed folder and one more: {left}")
+            if subprocess.run(["sh", "-n", "-c", run_script(rw, None, 4, ["dotnet", "test"], folder, ["dotnet", "build"],
+                                                          ".lean-built.x")]).returncode != 0:
+                fails.append("a run_script with a build is not valid shell")
         sa = sync_argv(r, repo, 7)
         if sa[0] != "rsync" or "--files-from=-" not in sa or sa[-1] != "devbox:~/lean-runs/job-7/" \
                 or "StrictHostKeyChecking=yes" not in sa[sa.index("-e") + 1]:
