@@ -1,0 +1,26 @@
+
+ RUN  v4.1.12 /private/tmp/lav-vt
+
+ ✓ src/a.test.ts > A > ok 2ms
+ ↓ src/a.test.ts > B > x
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Suites 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/a.test.ts > B
+Error: boom
+ ❯ src/a.test.ts:3:47
+      3| describe('B', () => { beforeAll(() => { throw new Error('boom') }); it…
+       |                                               ^
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/b.test.ts [ src/b.test.ts ]
+Error: Cannot find module './missing' imported from /private/tmp/lav-vt/src/b.test.ts
+ ❯ src/b.test.ts:2:1
+      2| import './missing'
+       | ^
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+ Test Files  2 failed (2)
+      Tests  1 passed | 1 skipped (2)

@@ -9,8 +9,11 @@ export interface Progress { passed: number; failed: number; skipped: number; las
 /** A running job's progress as the dashboard shows it, sent to the webview every few seconds. */
 export interface LiveJob extends Progress { id: number; elapsed: number | null; quietFor: number | null }
 
-// "passed Name (3ms)" from Microsoft.Testing.Platform, "  Passed Name [1 ms]" from vstest.
-const TEST_LINE = /^\s*(passed|failed|skipped|Passed|Failed|Skipped) ([^\s(\[]+)/;
+// "passed Name (3ms)" from Microsoft.Testing.Platform, "  Passed Name [1 ms]" from vstest, " \u2713 file > Name 2ms" from vitest.
+const TEST_LINE = /^\s*(passed|failed|skipped|Passed|Failed|Skipped|[\u2713\u00d7\u2717\u2718\u2193]) ([^\s(\[]+)/;
+const MARKS: Record<string, "passed" | "failed" | "skipped"> = {
+  "\u2713": "passed", "\u00d7": "failed", "\u2717": "failed", "\u2718": "failed", "\u2193": "skipped",
+};
 
 export function logProgress(text: string): Progress {
   const p: Progress = { passed: 0, failed: 0, skipped: 0, lastTest: "", tail: [] };
@@ -18,7 +21,7 @@ export function logProgress(text: string): Progress {
   for (const line of lines) {
     const m = TEST_LINE.exec(line);
     if (!m) continue;
-    const kind = m[1].toLowerCase() as "passed" | "failed" | "skipped";
+    const kind = MARKS[m[1]] ?? (m[1].toLowerCase() as "passed" | "failed" | "skipped");
     p[kind]++;
     p.lastTest = m[2];
   }

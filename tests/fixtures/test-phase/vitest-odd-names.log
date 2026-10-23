@@ -1,0 +1,26 @@
+
+ RUN  v4.1.12 /private/tmp/lav-vt
+
+ × src/sp ace.test.ts > sp 11ms
+   → expected 1 to be 2 // Object.is equality
+ × src/users.$id.test.ts > dollar 11ms
+   → expected 1 to be 2 // Object.is equality
+ × src/a.test.ts > waits 5ms 1ms
+   → expected 1 to be 2 // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/sp ace.test.ts > sp
+AssertionError: expected 1 to be 2 // Object.is equality
+ ❯ src/sp ace.test.ts:2:20
+
+ FAIL  src/users.$id.test.ts > dollar
+AssertionError: expected 1 to be 2 // Object.is equality
+ ❯ src/users.$id.test.ts:2:20
+
+ FAIL  src/a.test.ts > waits 5ms
+AssertionError: expected 1 to be 2 // Object.is equality
+ ❯ src/a.test.ts:4:20
+
+ Test Files  3 failed (3)
+      Tests  3 failed (3)

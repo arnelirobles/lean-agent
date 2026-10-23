@@ -1,0 +1,8 @@
+ RUN  v4.1.10 /work/web
+
+ ✓ src/lib/price.test.ts > price > rounds up 2ms
+ ✓ src/lib/price.test.ts > price > keeps cents 1ms
+
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+   Duration  0.80s

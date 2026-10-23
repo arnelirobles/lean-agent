@@ -1,0 +1,24 @@
+ RUN  v4.1.10 /work/web
+
+ ✓ src/lib/price.test.ts > price > rounds up 2ms
+ ✓ src/lib/price.test.ts > price > keeps cents 1ms
+ × src/cart/cart.test.tsx > Cart > adds an item 14ms
+   → expected 1 to be 2
+ × src/cart/cart.test.tsx > Cart > removes an item 3ms
+   → expected 0 to be 1
+ ↓ src/cart/cart.test.tsx > Cart > later
+ ✓ scripts/build.test.mjs > build > runs 5ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/cart/cart.test.tsx > Cart > adds an item
+AssertionError: expected 1 to be 2
+ ❯ src/cart/cart.test.tsx:12:20
+
+ FAIL  src/cart/cart.test.tsx > Cart > removes an item
+AssertionError: expected 0 to be 1
+ ❯ src/cart/cart.test.tsx:19:20
+
+ Test Files  1 failed | 2 passed (3)
+      Tests  2 failed | 3 passed | 1 skipped (6)
+   Duration  1.52s
