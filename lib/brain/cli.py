@@ -7,7 +7,7 @@
   brain show ID
   brain close ID (--resolution R | --wontfix) [--note N] [--commit H] [--tag T ...]
   brain reopen ID
-  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest]
+  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest|vitest]
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain flaky-clear --project P --test-project T [--runs 5]      closes each open flaky item of T with no new
@@ -17,6 +17,7 @@
   brain queue add <repo-dir> <test-project> [--filter F] [--tier fast|full] [--after ID] [--cycle C]
             [--by NAME] [--project P] [--session ID] [--infer-session] [--platform apple|auto|none] [--again REASON] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
+            A test project path ending in package.json is a Vitest job (test-phase runs it in that folder).
             --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
             or -macos; a remote lane never claims an apple job
             The job records the repo HEAD. A full job for a project, test project and commit that already has a
