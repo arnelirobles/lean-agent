@@ -41,6 +41,8 @@ Remote section keys:
 | `memory` | `--memory` for every container of a job. | `8g` |
 | `min_free_gb` | The lane does not claim a job when the workdir has less free space. | `15` |
 | `cache_max_gb` | The shared NuGet cache (`<workdir>/.nuget`) is emptied when it is bigger and no job runs. `0` keeps it. | `10` |
+| `reuse_build` | `yes` keeps one build folder per key and reuses it (see Build reuse). `no` copies and builds in a fresh folder for every job. | `yes` |
+| `build_keep` | Build folders kept per repository. | `3` |
 | `image` | The test container image for .NET jobs. | `mcr.microsoft.com/dotnet/sdk:10.0` |
 | `node_image` | The test container image for `package.json` (Vitest) jobs. | `node:22-bookworm-slim` |
 | `extra_paths` | Git-ignored paths to copy anyway, for example a local package folder. | none |
@@ -78,6 +80,20 @@ Three things to know:
 - A drainer from before the Vitest runner does not know `package.json` jobs. It runs one as `dotnet test` and fails it with a `run-failed` item. Replace every copy of `test-phase` before queueing one.
 - A tracked `.npmrc` is copied to the host like any tracked file, token included. Add `.npmrc` to `exclude` if it holds one (and send the token through `env_file`).
 - A cold first run downloads pnpm and installs with little output. If it trips `--stall` (default 600 seconds), raise `--stall` for that run.
+
+## Build reuse
+
+A remote job used to copy the repository into `job-<id>` and build it, which took minutes where the tests took seconds. With `reuse_build = yes` the host keeps `build-<repo>-<path hash>-<key>` folders instead. The key is a hash of the commit, the copied file list with each file's contents, the image and the build arguments, so a new commit, a dirty tree with a different edit, or other `args=` never match an earlier build.
+
+The first job on a key copies the files and runs `dotnet build` for its test project in the container, then writes a mark file in the folder, and every `dotnet test` of the job runs with `--no-build`. A later job on the same key copies nothing, builds nothing and runs `dotnet test --no-build`. A second test project of the same key builds once itself. A failed build writes no mark, so the next job builds again.
+
+A lock directory next to the folder (`<folder>.lock`) is held from the claim until the build ends. A second job on the same key waits for it (up to 30 minutes, then the job goes back to queued), so it never reads a half-built folder. A lock older than two hours is treated as left by a dead job. When a job is cleaned up, it releases a lock it still holds and deletes a folder with no finished build.
+
+A job whose extra arguments include one only `dotnet test` takes (`--settings`, `--logger`, `-e`, `--results-directory`, ...) cannot share a build and uses a fresh `job-<id>` folder. Build-safe ones (`-c`, `-f`, `-r`, `-v`, `--arch`, `--os`, `-p:`, `--no-restore`) go to the build too. The env file is written to `<workdir>/env-<id>`, outside the kept folders, and removed with the job.
+
+Limits: reuse assumes one drainer per host and workdir, because the prune and the lock are not safe across two drainers sharing them. A miss holds the lock through its test run, so a second job on that key waits for the tests too. Submodule contents are not in the key, so a dirty submodule under an unchanged pointer reuses the build. A workdir cannot contain whitespace. The sweep removes locks over two hours old, env files of no running job, and unlocked build folders unused for 7 days.
+
+Each claim prunes: the newest `build_keep` folders of the repository stay (newest by last use), the rest go, except any with a lock. Build folders are not swept by the `job-*` rule below. `env_file` is sent again on every job. The local lane is unchanged.
 
 ## Which jobs go where
 
