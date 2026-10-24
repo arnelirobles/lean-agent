@@ -43,6 +43,7 @@ The plugin's `bin/` is on PATH, so call these by name, not by a path. Use them i
 - `holdout.sh --spec <file>`: holds a change's production hunk out and requires its named test to fail. Use it for the mutation check, not a hand revert.
 - `replace`: exact text edit that fails unless the old text is there exactly once.
 - `wait-loop` hook (`hooks/wait-loop.py`): denies `sleep` and `pgrep` wait loops. Enqueue and end the turn instead.
+- `bounded [--minutes N] -- cmd`: runs a command in its own process group and stops the whole group after `LEAN_BG_MINUTES` (default 60), when the task is stopped, or when its shell dies. The `bg-bound` hook (`hooks/bg-bound.py`) denies a background command that does not run under it, `test-phase` or `heavy.sh`, and prints the wrapped form to run instead.
 - `pr-blockers.sh <pr>`: every reason a pull request cannot merge, in one read-only call.
 - `why-red.sh <log>`: names environmental causes (no Docker, a busy port, a full disk) in a failed log before you debug code.
 - `assert-ran.sh <report>`: fails when a test report shows zero tests ran.
