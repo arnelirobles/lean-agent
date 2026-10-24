@@ -7,6 +7,7 @@ import time
 
 from .store import KIND, MIGRATIONS, connect, migrate_1
 from .queue import detect_platform, project_of
+from . import records
 
 
 DIGEST_MAX = 2048
@@ -1098,6 +1099,61 @@ def run(brain_cli):
         got = [(r["id"], r["session_id"], r["session_cwd"]) for r in connect_rows(env["LEAN_BRAIN_DB"], "SELECT * FROM jobs")]
         if j1 != j2 or got != [(int(j1), "second-1", "/w2")]:
             fails.append(f"a joined job must take the session it lacked and keep it: {j1} {j2} {got}")
+
+        # Schema 10: created items, notices and the branch of a job.
+        env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "v10.db")
+        con = connect()
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "10":
+            fails.append("a fresh database must reach schema version 10")
+        u = "https://github.com/o/r/pull/1"
+        c1 = records.add_created(con, "pr", "github", "o/r", "feat/x", u, 1, "t", "s-1", "/w")
+        c2 = records.add_created(con, "pr", "github", "o/r", "feat/x", u, 1, "t", "s-1", "/w")
+        if c1 != c2 or con.execute("SELECT COUNT(*) FROM created").fetchone()[0] != 1:
+            fails.append(f"add_created twice with one url must keep one row: {c1} {c2}")
+        records.set_state(con, u, "merged")
+        row = con.execute("SELECT state, state_checked_at FROM created WHERE url=?", (u,)).fetchone()
+        if row["state"] != "merged" or not row["state_checked_at"]:
+            fails.append("set_state must store the state and when it was checked")
+        n1 = records.add_notice(con, "h", "text", "s-1", "/w")
+        n2 = records.add_notice(con, "h", "text", "s-1", "/w")
+        records.add_notice(con, "h", "other", "s-1", "/w")
+        if n1 != n2 or con.execute("SELECT COUNT(*) FROM notices").fetchone()[0] != 2:
+            fails.append("the same notice inside 10 minutes must be added once")
+        con.execute("UPDATE notices SET created_at='2020-01-01T00:00:00Z'")
+        con.commit()
+        if records.add_notice(con, "h", "text", "s-1", "/w") in (n1, n2):
+            fails.append("the same notice after 10 minutes must be added again")
+        if records.dismiss_notice(con, 999) or not records.dismiss_notice(con, n1) \
+                or not con.execute("SELECT dismissed_at FROM notices WHERE id=?", (n1,)).fetchone()[0]:
+            fails.append("dismiss_notice must return False for a missing id and stamp an existing one")
+        con.close()
+        subprocess.run(["git", "-C", g, "checkout", "-q", "-b", "feat/x"], check=True, capture_output=True)
+        jb = run("queue", "add", g, "B.csproj", "--tier", "fast", "--filter", "U")[1]
+        if connect_rows(env["LEAN_BRAIN_DB"], f"SELECT branch FROM jobs WHERE id={jb}")[0]["branch"] != "feat/x":
+            fails.append("queue add must store the branch of the repo")
+        jn = run("queue", "add", os.path.join(d, "nogit"), "B.csproj", "--tier", "fast", "--filter", "U")[1]
+        if connect_rows(env["LEAN_BRAIN_DB"], f"SELECT branch FROM jobs WHERE id={jn}")[0]["branch"] != "":
+            fails.append("queue add outside git must store an empty branch")
+        v9 = os.path.join(d, "v9.db")
+        con = sq.connect(v9)
+        con.row_factory = sq.Row
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        for m in MIGRATIONS[:9]:
+            m(con)
+        con.execute("INSERT INTO meta VALUES ('schema_version', '9')")
+        con.execute("INSERT INTO items (project, kind, ref, title, status, occurrences, first_seen, last_seen)"
+                    " VALUES ('p','note','r','r','open',1,'2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
+        con.execute("INSERT INTO jobs (cycle, project, repo_dir, test_project, tier, enqueued_by, enqueued_at, status)"
+                    " VALUES ('c','p','/r','T','full','me','2026-10-18T00:00:00Z','done')")
+        con.commit()
+        con.close()
+        env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = v9
+        con = connect()
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "10" \
+                or con.execute("SELECT COUNT(*) FROM items").fetchone()[0] != 1 \
+                or con.execute("SELECT branch FROM jobs").fetchone()[0] != "":
+            fails.append("a version 9 database must migrate to 10 and keep its rows")
+        con.close()
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

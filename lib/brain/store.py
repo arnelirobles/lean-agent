@@ -172,8 +172,36 @@ def migrate_9(con):  # lower case projects, a fixed list of kinds, and the sessi
     con.execute("ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''")
 
 
+def migrate_10(con):  # created items, notices from hooks, and the branch a job ran on
+    con.execute("""CREATE TABLE created (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('pr','issue','release','workitem')),
+        forge TEXT NOT NULL CHECK (forge IN ('github','azure')),
+        repo TEXT NOT NULL DEFAULT '',
+        branch TEXT NOT NULL DEFAULT '',
+        url TEXT NOT NULL UNIQUE,
+        number INTEGER,
+        title TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        cwd TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT '',
+        state_checked_at TEXT NOT NULL DEFAULT ''
+    )""")
+    con.execute("""CREATE TABLE notices (
+        id INTEGER PRIMARY KEY,
+        hook TEXT NOT NULL,
+        text TEXT NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        cwd TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        dismissed_at TEXT NOT NULL DEFAULT ''
+    )""")
+    con.execute("ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''")
 
-MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7, migrate_8, migrate_9]
+
+MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7, migrate_8, migrate_9,
+              migrate_10]
 
 
 def connect(migrate=True):
