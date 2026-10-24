@@ -165,6 +165,16 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 | 15 | [What a reader should observe](https://github.com/arnelirobles/lean-agent/wiki/What-to-Observe) | The six results to look for, and the two goals that poison themselves. |
 | 16 | [The method improves itself](https://github.com/arnelirobles/lean-agent/wiki/Self-Improving-Retro) | A scheduled retro that turns the numbers into changes to the method. |
 
+## Data
+
+lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`) and stats (`~/.lean/lean.db`). The `commit-author` hook reads the git author email to check it and stores nothing.
+
+It sends data to other services only through tools you already run, and only where you point them:
+
+- GitHub, through your `gh` login: the adversarial review posts review threads, `lean-stats` and `pr-blockers` read pull requests and checks. The hooks only read the command an agent is about to run; they call nothing.
+- Your own SSH hosts, when `~/.config/lean/remotes.ini` names any: `test-phase` copies the repository there with rsync and runs the tests in Docker. Without that file, no code is copied off the machine.
+- A URL you pass to `check-deployed-sha.sh`, which it fetches with curl.
+
 ## Requirements
 
 - Claude Code with plugin support.
