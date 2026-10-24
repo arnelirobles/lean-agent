@@ -43,7 +43,8 @@ def repo_of(path, run=subprocess.run):
     return _repo_of(path, run)
 
 
-def known_repos(con, roots, run=subprocess.run) -> list:
+def candidate_paths(con, roots) -> list:
+    """Folders the brain has seen, plus the folders inside each root. Reads the database, runs no git."""
     paths = []
     for sql in ("SELECT repo_dir FROM jobs", "SELECT session_cwd FROM items", "SELECT cwd FROM sessions"):
         try:
@@ -55,15 +56,21 @@ def known_repos(con, roots, run=subprocess.run) -> list:
             paths += [os.path.join(root, n) for n in sorted(os.listdir(root))]
         except OSError:
             pass
+    return [p for p in dict.fromkeys(paths) if isinstance(p, str)]
+
+
+def repos_from(paths, run=subprocess.run) -> list:
     seen, out = set(), []
-    for p in dict.fromkeys(paths):
-        if not isinstance(p, str):
-            continue
+    for p in paths:
         repo = _repo_of(p, run)
         if repo and repo[1] not in seen:
             seen.add(repo[1])
             out.append(repo[0])
     return out
+
+
+def known_repos(con, roots, run=subprocess.run) -> list:
+    return repos_from(candidate_paths(con, roots), run)
 
 
 def _count(out):

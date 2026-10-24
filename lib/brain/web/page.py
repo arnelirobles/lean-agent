@@ -183,6 +183,7 @@ def _self_test() -> int:
     sys.path.insert(0, os.path.join(HERE, "..", ".."))
     import forges
     import sections
+    import worktrees
     from brain import store
 
     con = store.connect(timeout=2)
@@ -288,7 +289,25 @@ def _self_test() -> int:
     d2 = sections.collect(con, sc, [], which=nowhere, run=slow)
     check("second load has states", {c["pr_state"] for c in d2["created"]}, {"merged"})
     check("one worker at a time", live[1], 1)
+
+    # a slow worktree scan: the load returns at once, the second load has the rows
+    real_repos, real_list = worktrees.repos_from, worktrees.list_worktrees
+    worktrees.repos_from = lambda paths, run=None: (time.sleep(0.5), ["/r"])[1]
+    worktrees.list_worktrees = lambda repo, run=None: [{"path": "/r/w", "branch": "b", "unpushed": 0, "dirty": False,
+                                                        "missing": False}]
+    try:
+        wc = forges.Cache()
+        t0 = time.monotonic()
+        w1 = sections.collect(con, wc, [], which=nowhere, run=slow)
+        check("slow worktree load is quick", time.monotonic() - t0 < 0.4, True)
+        check("worktrees scanning", (w1["worktrees"], w1["errors"].get("worktrees")), ([], "scanning"))
+        wc.wait(30)
+        w2 = sections.collect(con, wc, [], which=nowhere, run=slow)
+        check("worktrees after scan", ([w["path"] for w in w2["worktrees"]], "worktrees" in w2["errors"]), (["/r/w"], False))
+    finally:
+        worktrees.repos_from, worktrees.list_worktrees = real_repos, real_list
     con.close()
+
 
     # a locked database: rollback journal so the exclusive lock blocks readers
     lock = sqlite3.connect(os.environ["LEAN_BRAIN_DB"], isolation_level=None)

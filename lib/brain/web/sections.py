@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
@@ -22,6 +23,8 @@ import worktrees  # noqa: E402
 
 NEEDS_KINDS = ("question", "blocker", "pending", "risk")
 _RECOMMEND = re.compile(r"recommend(?:ed|ation)?\s*:", re.I)
+WORKTREE_TTL = 90
+_REPOS = {}  # folder to (expiry, repo_of), kept across page loads so git runs once per folder per TTL
 _SECTIONS = ("needs_you", "flaky", "queue", "created", "tickets", "worktrees", "tested", "notices", "usage", "decided")
 
 
@@ -160,12 +163,12 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
         con.execute("PRAGMA busy_timeout=2000")
     except Exception:
         pass
-    paths = {}
 
     def repo_of(path):
-        if path not in paths:
-            paths[path] = worktrees.repo_of(path) if path else None
-        return paths[path]
+        hit = _REPOS.get(path)
+        if not hit or hit[0] <= time.monotonic():
+            hit = _REPOS[path] = (time.monotonic() + WORKTREE_TTL, worktrees.repo_of(path) if path else None)
+        return hit[1]
 
     guard("needs_you", lambda: _needs_you(con))
     guard("flaky", lambda: _flaky(con))
@@ -198,19 +201,28 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
     guard("tickets", tickets, db=False)
 
     def trees():
-        rows = []
-        for repo in worktrees.known_repos(None if state["locked"] else con, roots):
-            for w in worktrees.list_worktrees(repo):
-                w["repo"] = repo
-                rows.append(w)
+        paths = worktrees.candidate_paths(None if state["locked"] else con, roots)
+
+        def scan():
+            rows = []
+            for repo in worktrees.repos_from(paths):
+                mine = worktrees.repo_of(repo)
+                for w in worktrees.list_worktrees(repo):
+                    w["repo"], w["common"] = repo, mine[1] if mine else ""
+                    rows.append(w)
+            return rows
+        got = cache.peek("worktrees", scan, ttl=WORKTREE_TTL)
+        if got is None:
+            data["errors"]["worktrees"] = "scanning"
+            return []
+        rows = [dict(w) for w in got or []]
         keys = set()
         for c in data["created"]:
             mine = repo_of(c["cwd"])
             if c["pr_state"] == "merged" and c["branch"] and mine:
                 keys.add((mine[1], c["branch"]))
         for w in rows:
-            mine = repo_of(w["repo"])
-            w["merged"] = bool(mine and w["branch"] and (mine[1], w["branch"]) in keys)
+            w["merged"] = bool(w["common"] and w["branch"] and (w["common"], w["branch"]) in keys)
         return rows
     guard("worktrees", trees, db=False)
     guard("usage", usage_rows, db=False)

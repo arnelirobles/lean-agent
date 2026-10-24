@@ -161,9 +161,9 @@ class Cache:
         self._pending = set()
         self._worker = None
 
-    def _compute(self, fn):
+    def _compute(self, fn, ttl=None):
         try:
-            return fn(), self.ttl_s
+            return fn(), ttl or self.ttl_s
         except Exception:
             return "", 60
 
@@ -176,12 +176,12 @@ class Cache:
         self._data[key] = (now + ttl, value)
         return value
 
-    def peek(self, key, fn):
+    def peek(self, key, fn, ttl=None):
         with self._cond:
             hit = self._data.get(key)
             if (not hit or hit[0] <= self._clock()) and key not in self._pending:
                 self._pending.add(key)
-                self._queue.append((key, fn))
+                self._queue.append((key, fn, ttl))
                 if self._worker is None or not self._worker.is_alive():
                     self._worker = threading.Thread(target=self._work, daemon=True)
                     self._worker.start()
@@ -195,8 +195,8 @@ class Cache:
                     self._worker = None
                     self._cond.notify_all()
                     return
-                key, fn = self._queue.pop(0)
-            value, ttl = self._compute(fn)
+                key, fn, ttl = self._queue.pop(0)
+            value, ttl = self._compute(fn, ttl)
             with self._cond:
                 self._data[key] = (self._clock() + ttl, value)
                 self._pending.discard(key)
@@ -344,6 +344,11 @@ def _self_test() -> int:
     check("peek stale served", p.peek("a", lambda: "vb"), "va")
     p.wait()
     check("peek refreshed", p.peek("a", lambda: "vc"), "vb")
+    t[0] = 0
+    p.peek("short", lambda: "s1", ttl=60)
+    p.wait()
+    t[0] = 61
+    check("peek own ttl", (p.peek("short", lambda: "s2", ttl=60), p.wait(), p.peek("short", lambda: "s3", ttl=60)), ("s1", True, "s2"))
     check("peek failure is empty", (p.peek("z", bad), p.wait(), p.peek("z", bad)), (None, True, ""))
 
     print("self-test: ok" if not fails else f"self-test: {len(fails)} failed")
