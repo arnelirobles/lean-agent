@@ -132,11 +132,11 @@ brain's code lives in `lib/brain/`, and `bin/brain` only starts it. Reads of mer
 
 The page is meant for a single-user machine. Another local user who takes port 8770 before you could serve a fake page, and the server does not guard against that.
 
-Three modes, set with the plugin's `serve_mode` setting or `brain serve --install MODE`:
+Three modes, set with the plugin's `serve_mode` setting:
 
 - `manual` (default): you run `brain serve` yourself.
-- `session`: the SessionStart hook starts the server when a session opens. It stops after 30 minutes with no open session.
-- `always`: `brain serve --install always` starts it at login. It writes a launchd agent on macOS, a systemd user unit on Linux, or a Startup folder `.cmd` on Windows. No admin rights. `brain serve --uninstall` removes it.
+- `session`: the SessionStart hook starts the server when a session opens. It stops after 30 minutes with no open session. A session that started more than 12 hours ago and never closed does not count as open.
+- `always`: the server starts at login. Run `brain serve --install always` once to write the login entry: a launchd agent on macOS, a systemd user unit on Linux, or a Startup folder `.cmd` on Windows. No admin rights. Until that entry exists, the SessionStart hook starts the server when a session opens and leaves it running. `brain serve --uninstall` removes the entry.
 
 `worktree_roots` is a comma-separated list of folders the page searches for git worktrees, besides the repositories brain already knows. `brain serve --roots A,B` does the same for one run.
 
