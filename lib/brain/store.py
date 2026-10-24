@@ -172,8 +172,10 @@ def migrate_9(con):  # lower case projects, a fixed list of kinds, and the sessi
     con.execute("ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''")
 
 
-def migrate_10(con):  # created items, notices from hooks, and the branch a job ran on
-    con.execute("""CREATE TABLE created (
+def ensure_extras(con):
+    """Created items, hook notices and the branch of a job. Idempotent and outside the numbered migrations, so the
+    schema version stays 9 and an older brain still opens the file."""
+    con.execute("""CREATE TABLE IF NOT EXISTS created (
         id INTEGER PRIMARY KEY,
         kind TEXT NOT NULL CHECK (kind IN ('pr','issue','release','workitem')),
         forge TEXT NOT NULL CHECK (forge IN ('github','azure')),
@@ -188,7 +190,7 @@ def migrate_10(con):  # created items, notices from hooks, and the branch a job 
         state TEXT NOT NULL DEFAULT '',
         state_checked_at TEXT NOT NULL DEFAULT ''
     )""")
-    con.execute("""CREATE TABLE notices (
+    con.execute("""CREATE TABLE IF NOT EXISTS notices (
         id INTEGER PRIMARY KEY,
         hook TEXT NOT NULL,
         text TEXT NOT NULL,
@@ -197,11 +199,11 @@ def migrate_10(con):  # created items, notices from hooks, and the branch a job 
         created_at TEXT NOT NULL,
         dismissed_at TEXT NOT NULL DEFAULT ''
     )""")
-    con.execute("ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''")
+    if not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
+        con.execute("ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''")
 
 
-MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7, migrate_8, migrate_9,
-              migrate_10]
+MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7, migrate_8, migrate_9]
 
 
 def connect(migrate=True):
@@ -232,6 +234,16 @@ def connect(migrate=True):
         except BaseException:
             con.execute("ROLLBACK")
             raise
+    if migrate:
+        have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE name IN ('created','notices')")}
+        if have != {"created", "notices"} or not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                ensure_extras(con)
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
     con.isolation_level = ""  # the rest of brain relies on `with con:` opening and committing a transaction
     return con
 

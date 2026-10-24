@@ -1100,11 +1100,15 @@ def run(brain_cli):
         if j1 != j2 or got != [(int(j1), "second-1", "/w2")]:
             fails.append(f"a joined job must take the session it lacked and keep it: {j1} {j2} {got}")
 
-        # Schema 10: created items, notices and the branch of a job.
+        # Created items, notices and the branch of a job, added without a schema bump.
         env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "v10.db")
         con = connect()
-        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "10":
-            fails.append("a fresh database must reach schema version 10")
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "9" \
+                or not {"created", "notices"} <= {r[0] for r in con.execute("SELECT name FROM sqlite_master")} \
+                or not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
+            fails.append("a fresh database must stay at schema version 9 and have the created and notices tables and jobs.branch")
+        con.close()
+        con = connect()  # a second connect is a no-op
         u = "https://github.com/o/r/pull/1"
         c1 = records.add_created(con, "pr", "github", "o/r", "feat/x", u, 1, "t", "s-1", "/w")
         c2 = records.add_created(con, "pr", "github", "o/r", "feat/x", u, 1, "t", "s-1", "/w")
@@ -1149,10 +1153,11 @@ def run(brain_cli):
         con.close()
         env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = v9
         con = connect()
-        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "10" \
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "9" \
+                or con.execute("SELECT COUNT(*) FROM created").fetchone()[0] != 0 \
                 or con.execute("SELECT COUNT(*) FROM items").fetchone()[0] != 1 \
                 or con.execute("SELECT branch FROM jobs").fetchone()[0] != "":
-            fails.append("a version 9 database must migrate to 10 and keep its rows")
+            fails.append("a version 9 database must gain the new tables and column, stay at 9 and keep its rows")
         con.close()
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
