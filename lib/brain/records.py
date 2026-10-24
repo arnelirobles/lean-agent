@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from .store import now
+from .store import connect, now
 
 
 NOTICE_WINDOW = timedelta(minutes=10)
@@ -34,3 +34,19 @@ def dismiss_notice(con, notice_id):
     with con:
         cur = con.execute("UPDATE notices SET dismissed_at=? WHERE id=?", (now(), notice_id))
         return cur.rowcount > 0
+
+
+def created_line(r):
+    where = r["repo"] + (f"#{r['number']}" if r["number"] is not None else "")
+    state = f" [{r['state']}]" if r["state"] else ""
+    title = f" {r['title']}" if r["title"] else ""
+    return f"{r['created_at']} {r['kind']} {where}{state}{title} {r['url']}"
+
+
+def cmd_created(a):
+    con = connect()
+    sql = "SELECT * FROM created" + (" WHERE state IN ('', 'open')" if a.open else "") \
+        + " ORDER BY created_at DESC, id DESC LIMIT ?"
+    for r in con.execute(sql, (a.limit,)):
+        print(created_line(r))
+    return 0
