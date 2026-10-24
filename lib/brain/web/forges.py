@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 TIMEOUT = 10
 
@@ -73,7 +74,11 @@ def pr_state(forge, repo, number, run=subprocess.run) -> str:
         state = str(data.get("state", "")).lower() if isinstance(data, dict) else ""
         return state if state in ("open", "merged", "closed") else ""
     if forge == "azure":
-        out = _run(run, ["az", "repos", "pr", "show", "--id", n, "-o", "json"])
+        parts = repo.split("/")
+        if len(parts) != 3:
+            return "unknown"  # no org in the stored repo, and the default org may be someone else's
+        org = "https://dev.azure.com/" + urllib.parse.quote(parts[0])
+        out = _run(run, ["az", "repos", "pr", "show", "--id", n, "--organization", org, "-o", "json"])
         data = _json(out) if out is not None else None
         status = str(data.get("status", "")).lower() if isinstance(data, dict) else ""
         return {"active": "open", "completed": "merged", "abandoned": "closed"}.get(status, "")
@@ -268,10 +273,20 @@ def _self_test() -> int:
     for bad in ("", "-p", "a//b", "a/b/c/d", "p;x"):
         check("azure bad repo " + repr(bad), pr_state("azure", bad, 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"active"}')})), "")
     check("azure org/project/repo ok", pr_state("azure", "acme/My Proj/repo", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"active"}')})), "open")
+    az_seen = []
+
+    def az_spy(argv, **kw):
+        az_seen.append(argv)
+        return _R('{"status":"completed"}')
+    pr_state("azure", "acme/My Proj/repo", 9, run=az_spy)
+    check("az pr passes the org", az_seen[0][az_seen[0].index("--organization") + 1], "https://dev.azure.com/acme")
+    az_seen.clear()
+    check("az pr without org is unknown", pr_state("azure", "p/r", 9, run=az_spy), "unknown")
+    check("az pr without org runs nothing", az_seen, [])
     check("pr unknown forge", pr_state("gitlab", "o/r", 5, run=fake({})), "")
-    check("az pr completed", pr_state("azure", "p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"completed"}')})), "merged")
-    check("az pr active", pr_state("azure", "p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"active"}')})), "open")
-    check("az pr abandoned", pr_state("azure", "p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"abandoned"}')})), "closed")
+    check("az pr completed", pr_state("azure", "a/p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"completed"}')})), "merged")
+    check("az pr active", pr_state("azure", "a/p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"active"}')})), "open")
+    check("az pr abandoned", pr_state("azure", "a/p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"abandoned"}')})), "closed")
     r = fake({("gh", "pr", "view"): _R('{"state":"OPEN"}')})
     pr_state("github", "o/r", 5, run=r)
     check("pr argv", r.calls[0][0], ["gh", "pr", "view", "5", "-R", "o/r", "--json", "state"])
