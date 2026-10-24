@@ -3,7 +3,7 @@
 A section that fails puts one line in errors[section] and returns an empty list, so one failure never hides
 the rest. Only the forges and worktrees functions run commands; this module runs none itself.
 
-Tested through lib/brain/web/page.py.
+  python3 lib/brain/web/sections.py --self-test   (runs the page tests)
 """
 import importlib.machinery
 import importlib.util
@@ -60,14 +60,20 @@ def _queue(con):
     return live + ended
 
 
-def _created(con, cache):
+def _created(con, cache, run=None):
     rows = _rows(con, "SELECT id, kind, forge, repo, branch, url, number, title, session_id, cwd, created_at, state "
                       "FROM created ORDER BY id DESC LIMIT 100")
     for r in rows:
         r["pr_state"] = ""
-        if r["kind"] == "pr" and r["number"] is not None:
-            r["pr_state"] = cache.get(("pr", r["forge"], r["repo"], r["number"]),
-                                      lambda r=r: forges.pr_state(r["forge"], r["repo"], r["number"])) or r["state"]
+        if r["kind"] != "pr" or r["number"] is None:
+            continue
+        if r["state"] in ("merged", "closed"):
+            r["pr_state"] = r["state"]
+            continue
+        kw = {"run": run} if run else {}
+        got = cache.peek(("pr", r["forge"], r["repo"], r["number"]),
+                         lambda r=r: forges.pr_state(r["forge"], r["repo"], r["number"], **kw))
+        r["pr_state"] = "checking" if got is None else (got or r["state"])
     return rows
 
 
@@ -164,24 +170,31 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
     guard("needs_you", lambda: _needs_you(con))
     guard("flaky", lambda: _flaky(con))
     guard("queue", lambda: _queue(con))
-    guard("created", lambda: _created(con, cache))
-    guard("tested", lambda: _tested(con, data["created"], repo_of))
+    guard("created", lambda: _created(con, cache, run))
+    def tested():
+        if "created" in data["errors"]:
+            raise RuntimeError(data["errors"]["created"])
+        return _tested(con, data["created"], repo_of)
+    guard("tested", tested)
     guard("decided", lambda: _decided(con))
     guard("notices", lambda: _notices(con))
 
     def tickets():
-        kw = {}
-        if which:
-            kw["which"] = which
-        if run:
-            kw["run"] = run
-        status = {cli: forges.available(cli, **kw) for cli in ("gh", "az")}
-        note = _cli_notes(status)
+        def fetch():
+            kw = {"which": which} if which else {}
+            status = {cli: forges.available(cli, **kw) for cli in ("gh", "az")}
+            rows = []
+            if "ok" in status.values():
+                rows = forges.pending_tickets(**({"run": run} if run else {}))
+            return rows, _cli_notes(status)
+        got = cache.peek("tickets", fetch)
+        if got is None:
+            data["errors"]["tickets"] = "checking"
+            return []
+        rows, note = got if got else ([], "")
         if note:
             data["errors"]["tickets"] = note
-        if "ok" not in status.values():
-            return []
-        return cache.get("tickets", lambda: forges.pending_tickets(**({"run": run} if run else {}))) or []
+        return rows
     guard("tickets", tickets, db=False)
 
     def trees():
@@ -202,3 +215,10 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
     guard("worktrees", trees, db=False)
     guard("usage", usage_rows, db=False)
     return data
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        import page
+        sys.exit(page._self_test())
+    print(__doc__)

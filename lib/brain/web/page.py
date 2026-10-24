@@ -73,6 +73,8 @@ def _needs(data, key):
         rows.append([e(it["id"]), e(it.get("kind")), e(it.get("project")),
                      f'{e(it.get("title") or it.get("ref"))}{body}', "".join(actions)])
     out = _table(["#", "Kind", "Project", "Item", ""], rows)
+    if (data.get("errors") or {}).get("flaky"):
+        out += f'<p class="note">flaky: {e(data["errors"]["flaky"])}</p>'
     for f in data.get("flaky", []):
         out += f'<details><summary>{e(f["n"])} flaky items in {e(f["project"])}</summary>' \
                f'<p class="muted">List them with brain list --kind flaky.</p></details>'
@@ -208,8 +210,23 @@ def _self_test() -> int:
     con.commit()
 
     nowhere = lambda n: None
-    data = sections.collect(con, forges.Cache(), [], which=nowhere)
+
+    class R:
+        stdout, returncode = "", 1
+    calls = []
+    live = [0, 0]
+
+    def failing(argv, **kw):
+        calls.append(argv)
+        return R()
+    cache = forges.Cache()
+    first = sections.collect(con, cache, [], which=nowhere, run=failing)
+    check("first load shows checking", [c["pr_state"] for c in first["created"]], ["checking", "merged"])
+    check("tickets checking", first["errors"].get("tickets"), "checking")
+    cache.wait()
+    data = sections.collect(con, cache, [], which=nowhere, run=failing)
     check("pr state falls back to row", [c["pr_state"] for c in data["created"]], ["open", "merged"])
+    check("merged row never calls run", any(a[:3] == ["gh", "pr", "view"] and a[3] == "1" for a in calls), False)
     check("flaky grouped", sorted(f["n"] for f in data["flaky"]), [203, 204])
     check("needs_you kinds", sorted(i["ref"] for i in data["needs_you"]), ["b1", "q1", "q2"])
     q1 = [i for i in data["needs_you"] if i["ref"] == "q1"][0]
@@ -239,6 +256,35 @@ def _self_test() -> int:
           "dirty": None, "missing": False, "repo": "/r"}], "errors": {}}, "k", 1), True)
     check("missing worktree", "folder is missing" in render({"worktrees": [{"path": "/p", "branch": "b", "unpushed": 0,
           "dirty": False, "missing": True, "repo": "/r"}], "errors": {}}, "k", 1), True)
+    con.close()
+
+    # slow forge: 50 open PRs, 2 s per call, load returns at once, one worker
+    con = sqlite3.connect(os.environ["LEAN_BRAIN_DB"], timeout=2)
+    con.row_factory = sqlite3.Row
+    con.execute("DELETE FROM created")
+    for n in range(50):
+        con.execute("INSERT INTO created (kind, forge, repo, url, number, created_at, state) "
+                    "VALUES ('pr','github','o/r',?,?,?,'open')", (f"https://x/{n}", n + 1, ts))
+    con.commit()
+
+    def slow(argv, **kw):
+        live[0] += 1
+        live[1] = max(live[1], live[0])
+        time.sleep(0.05)
+        live[0] -= 1
+        r = R()
+        r.returncode, r.stdout = 0, '{"state":"MERGED"}'
+        return r
+    sc = forges.Cache()
+    t0 = time.monotonic()
+    d1 = sections.collect(con, sc, [], which=nowhere, run=slow)
+    check("slow forge load is quick", time.monotonic() - t0 < 1, True)
+    check("all checking", {c["pr_state"] for c in d1["created"]}, {"checking"})
+    check("checking rendered", "checking" in render(d1, "k", 1), True)
+    sc.wait(30)
+    d2 = sections.collect(con, sc, [], which=nowhere, run=slow)
+    check("second load has states", {c["pr_state"] for c in d2["created"]}, {"merged"})
+    check("one worker at a time", live[1], 1)
     con.close()
 
     # a locked database: rollback journal so the exclusive lock blocks readers

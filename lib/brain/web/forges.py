@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 TIMEOUT = 10
@@ -141,24 +142,71 @@ def pending_tickets(run=subprocess.run) -> list:
 
 
 class Cache:
-    """Keeps a value for ttl_s seconds. A failing fn is remembered as '' for 60 s."""
+    """Keeps a value for ttl_s seconds. A failing fn is remembered as '' for 60 s.
+
+    get() computes in the caller. peek() never does: it returns what it has (fresh or stale, None if nothing)
+    and queues a refresh for one background worker, one call at a time, deduped by key."""
 
     def __init__(self, ttl_s=300, clock=time.monotonic):
         self.ttl_s = ttl_s
         self._clock = clock
         self._data = {}
+        self._cond = threading.Condition()
+        self._queue = []
+        self._pending = set()
+        self._worker = None
+
+    def _compute(self, fn):
+        try:
+            return fn(), self.ttl_s
+        except Exception:
+            return "", 60
 
     def get(self, key, fn):
         hit = self._data.get(key)
         now = self._clock()
         if hit and hit[0] > now:
             return hit[1]
-        try:
-            value, ttl = fn(), self.ttl_s
-        except Exception:
-            value, ttl = "", 60
+        value, ttl = self._compute(fn)
         self._data[key] = (now + ttl, value)
         return value
+
+    def peek(self, key, fn):
+        with self._cond:
+            hit = self._data.get(key)
+            if (not hit or hit[0] <= self._clock()) and key not in self._pending:
+                self._pending.add(key)
+                self._queue.append((key, fn))
+                if self._worker is None or not self._worker.is_alive():
+                    self._worker = threading.Thread(target=self._work, daemon=True)
+                    self._worker.start()
+                self._cond.notify_all()
+            return hit[1] if hit else None
+
+    def _work(self):
+        while True:
+            with self._cond:
+                if not self._queue:
+                    self._worker = None
+                    self._cond.notify_all()
+                    return
+                key, fn = self._queue.pop(0)
+            value, ttl = self._compute(fn)
+            with self._cond:
+                self._data[key] = (self._clock() + ttl, value)
+                self._pending.discard(key)
+                self._cond.notify_all()
+
+    def wait(self, timeout=5.0) -> bool:
+        """Block until the background queue is drained. For tests."""
+        end = time.monotonic() + timeout
+        with self._cond:
+            while self._pending:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
 
 
 class _R:
@@ -271,6 +319,17 @@ def _self_test() -> int:
     check("failure cached 60s", (c.get("f", bad), n.count("bad")), ("", 1))
     t[0] = 301 + 61
     check("failure retried", (c.get("f", lambda: "ok"),), ("ok",))
+
+    p = Cache(ttl_s=300, clock=lambda: t[0])
+    t[0] = 0
+    check("peek empty is None", p.peek("a", lambda: "va"), None)
+    check("peek drains", p.wait(), True)
+    check("peek fresh", p.peek("a", lambda: "other"), "va")
+    t[0] = 400
+    check("peek stale served", p.peek("a", lambda: "vb"), "va")
+    p.wait()
+    check("peek refreshed", p.peek("a", lambda: "vc"), "vb")
+    check("peek failure is empty", (p.peek("z", bad), p.wait(), p.peek("z", bad)), (None, True, ""))
 
     print("self-test: ok" if not fails else f"self-test: {len(fails)} failed")
     return 1 if fails else 0
