@@ -172,7 +172,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Content-Security-Policy", _CSP)
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
@@ -376,7 +376,9 @@ def _self_test() -> int:
     check("page has key", f'value="{key}"' in b, True)
     check("csp", h.get("content-security-policy"), _CSP)
     check("xfo", h.get("x-frame-options"), "DENY")
-    check("referrer", h.get("referrer-policy"), "no-referrer")
+    # no-referrer makes browsers send "Origin: null" on form POSTs, which origin_ok rejects
+    check("referrer", h.get("referrer-policy"), "same-origin")
+    check("null origin 403", post("/session", {"id": ids["q1"], "key": key}, origin="null")[0], 403)
     check("no-store", h.get("cache-control"), "no-store")
     check("no cors on get", "access-control-allow-origin" in h, False)
 

@@ -95,6 +95,6 @@ The team brain spec says the developer's dashboard is the VS Code dashboard; onc
 ## Left to the builder
 
 - Port number.
-- Page layout and refresh (plain HTML; polling or server-sent events).
+- Page layout and refresh (plain HTML; a Refresh link, no automatic reload, since a reload would wipe a typed answer).
 - Cache times for `gh`/`az` calls.
 - The exact brain schema for created items and notices.

@@ -5,6 +5,7 @@
 import html
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -146,8 +147,9 @@ def _decided(data):
 def render(data: dict, key: str, port: int) -> str:
     err = data.get("errors") or {}
     parts = [
-        '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="30">',
-        f"<title>lean brain</title><style>{CSS}</style></head><body><h1>lean brain</h1>",
+        '<!doctype html><html><head><meta charset="utf-8">',
+        f"<title>lean brain</title><style>{CSS}</style></head><body><h1>lean brain</h1>"
+        f'<p>updated {time.strftime("%H:%M")} <a href="/">Refresh</a></p>',
         _section("Needs you", err, "needs_you", _needs(data, key), "Nothing is waiting on you."),
         _section("Test queue", err, "queue", _queue(data), "The queue is empty."),
         _section("Created by agents", err, "created", _created(data), "Nothing created yet."),
@@ -245,7 +247,8 @@ def _self_test() -> int:
     check("no row per flaky", "flaky 100" in page, False)
     check("merged untested shown", "merged untested" in page, True)
     check("gh note shown", "gh is not installed" in page, True)
-    check("refresh", '<meta http-equiv="refresh" content="30">' in page, True)
+    check("no auto refresh", "http-equiv" in page, False)
+    check("refresh link", ('<a href="/">Refresh</a>' in page, "updated " in page), (True, True))
     check("key in forms", page.count('name="key" value="KEY123"') >= 5, True)
     check("approve form", 'name="approve" value="1"' in page, True)
     check("approve only with marker", page.count('name="approve"'), 1)

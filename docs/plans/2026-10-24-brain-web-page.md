@@ -152,7 +152,7 @@ Matches `gh pr create`, `gh issue create`, `gh release create`, `az repos pr cre
   - `created`: last 100 `created` rows with cached `pr_state`.
   - `tested`: per `created` PR, the newest run whose job has the same `repo_dir` repo and `branch`, with `passed`/`failed`; a merged PR with no passing run gets `flag: 'merged untested'`.
   - `decided`: closed items with resolution `answered` and open or closed `ruling` items, last 50.
-- Produces in `page.py`: `render(data: dict, key: str, port: int) -> str`. Every value goes through `html.escape`. The key is embedded in each form as a hidden field. The page refreshes itself every 30 s with `<meta http-equiv="refresh">`.
+- Produces in `page.py`: `render(data: dict, key: str, port: int) -> str`. Every value goes through `html.escape`. The key is embedded in each form as a hidden field. The page does not refresh itself (a reload would wipe a typed answer); it shows "updated HH:MM" and a Refresh link.
 
 - [ ] **Step 1: Write failing self-test cases**: an item titled `<script>alert(1)</script>` renders as escaped text; with 407 flaky items the page has one flaky line per project, not 407 rows; a merged PR with no run shows `merged untested`; a DB locked with `BEGIN EXCLUSIVE` from another connection makes `collect` return within 3 s with `errors` filled and the page still renders; `gh` missing shows "gh is not installed" in the tickets section and the other sections render.
 - [ ] **Step 2: Run** `python3 lib/brain/web/page.py --self-test`. Expected: FAIL.
