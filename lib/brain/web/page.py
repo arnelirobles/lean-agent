@@ -241,6 +241,7 @@ def _self_test() -> int:
     check("tested pr passes", flags[2], ("", True, 1))
     check("gh missing note", "gh is not installed" in data["errors"].get("tickets", ""), True)
     check("usage error not crash", "usage" in data["errors"], True)
+    check("usage error is no data, not a missing script", "no data yet" in data["errors"].get("usage", ""), True)
     page = render(data, "KEY123", 8770)
     check("script escaped", "<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page, True)
     check("notice escaped", "&lt;b&gt;note&lt;/b&gt;" in page, True)

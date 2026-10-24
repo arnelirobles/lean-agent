@@ -113,7 +113,7 @@ def _notices(con):
 
 
 def usage_rows():
-    root = os.path.dirname(os.path.dirname(HERE))
+    root = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
     path = os.path.join(root, "bin", "lean-stats")
     loader = importlib.machinery.SourceFileLoader("lean_stats_cli", path)
     spec = importlib.util.spec_from_loader("lean_stats_cli", loader)
