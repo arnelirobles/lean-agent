@@ -41,7 +41,7 @@ The user picks at setup, and can change it later:
 
 The choice is a plugin `userConfig` option, so Claude Code asks for it at install.
 
-The page is at `http://leanagent.localhost:<port>`. Chrome, Edge and Firefox send any `*.localhost` name to this machine with no setup (Safari is unverified, so the builder checks it); `http://127.0.0.1:<port>` works too and is printed when the server starts. The plugin never edits `/etc/hosts` or runs `sudo`: a hook cannot prompt for a password, and a plugin that changes system files would likely be held at the directory's review. A user who wants a bare `leanagent.local` adds the hosts line themselves; the README shows it.
+The page is at `http://leanagent.localhost:<port>`. Chrome, Edge and Firefox send any `*.localhost` name to this machine with no setup (Safari is unverified, so the builder checks it); `http://127.0.0.1:<port>` works too and is printed when the server starts. The plugin never edits `/etc/hosts` or runs `sudo`: a hook cannot prompt for a password, and a plugin that changes system files would likely be held at the directory's review.
 
 ## Approving a decision
 
@@ -56,7 +56,7 @@ No other command runs from the page. There is no free text field that reaches a 
 ## Security
 
 - Listen on 127.0.0.1 only, never 0.0.0.0.
-- Reject any request whose `Host` header is not `leanagent.local[:port]` or `127.0.0.1[:port]` (blocks DNS rebinding).
+- Reject any request whose `Host` header is not `leanagent.localhost`, `localhost`, `127.0.0.1` or `[::1]` (each with or without `:port`) (blocks DNS rebinding).
 - Every request that changes something (starting a session, answering, dismissing) is a POST carrying a random key made at server start and embedded in the page, and the server checks `Origin`. No CORS headers, so another site cannot read the page or its key. The key is not stored on disk; after a restart an open tab gets "reload the page".
 - The action takes an item id only. The server reads the item from brain and builds the prompt itself; nothing from the request reaches a command line.
 - Brain text comes from agents and test output, so it is HTML-escaped on render and stripped of control characters before it goes into a prompt.

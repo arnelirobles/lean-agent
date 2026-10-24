@@ -15,7 +15,7 @@
 - Python standard library only. No npm or framework in the page; the HTML is rendered server side.
 - Store no credentials. `gh`, `az` (and `twg` later) are called as subprocesses with an argument list; a missing or logged-out CLI makes that section say so, never fail the page.
 - Listen on 127.0.0.1 only. Default port 8770, `LEAN_SERVE_PORT` overrides. The page URL is `http://leanagent.localhost:<port>`; `http://127.0.0.1:<port>` is printed at start.
-- Accept only `Host` values `leanagent.localhost`, `leanagent.local`, `127.0.0.1`, `localhost`, each with or without `:<port>`. Anything else gets 421.
+- Accept only `Host` values `leanagent.localhost`, `localhost`, `127.0.0.1`, `[::1]`, each with or without `:<port>`. Anything else gets 421.
 - Every state change is a POST with the per-start key and an `Origin` whose host passes the same check. No CORS headers.
 - Nothing from a request reaches a command line except an integer item id; prompts are built server side and passed as one argv element.
 - Schema changes are additive (one new migration, `migrate_10`): the VS Code extension reads `brain.db` directly and must keep working.
@@ -203,7 +203,7 @@ Matches `gh pr create`, `gh issue create`, `gh release create`, `az repos pr cre
 **Files:**
 - Modify: `vscode/src/extension.ts` (on activation, once per version, an information message: "The lean brain panel is deprecated and will be retired. Open the brain page instead." with a button that opens `http://leanagent.localhost:8770`; a command `leanBrain.openPage` does the same)
 - Modify: `vscode/package.json` (register the command), `vscode/README.md` (deprecation line at the top)
-- Modify: `README.md` (a "Brain page" section: `brain serve`, the three modes, the URL, the optional hosts line `127.0.0.1 leanagent.local` the user adds themselves, the Windows and Linux behaviour of the session button), and the Data section (the page calls `gh` and `az` with the user's login)
+- Modify: `README.md` (a "Brain page" section: `brain serve`, the three modes, the URL, the single-user-machine note, the Windows and Linux behaviour of the session button), and the Data section (the page calls `gh` and `az` with the user's login)
 - Modify: `docs/specs/2026-10-20-team-brain-design.md` line 187: the developer's page is the brain page, not the VS Code dashboard
 - Modify: `.claude-plugin/plugin.json` version `1.15.0`
 
