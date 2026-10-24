@@ -13,6 +13,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,10 +25,11 @@ import page  # noqa: E402
 import sections  # noqa: E402
 import session  # noqa: E402
 
-HOSTS = ("leanagent.localhost", "leanagent.local", "localhost", "127.0.0.1")
+HOSTS = ("leanagent.localhost", "localhost", "127.0.0.1", "[::1]")
 MAX_BODY = 16 * 1024
 MAX_ANSWER = 4000
 SESSION_KINDS = ("question", "blocker", "pending", "risk")
+_LENGTH = re.compile(r"[0-9]{1,6}")
 _ID = re.compile(r"[1-9][0-9]{0,9}")
 _CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
 
@@ -83,6 +85,18 @@ class App:
         self.cache = forges.Cache()
         self.flash = Flash()
         self.start_session = session.start_session
+        self.recent = {}
+        self.recent_lock = threading.Lock()
+
+    def first_start(self, item_id, window=10):
+        """False when a session on this item was started less than `window` seconds ago."""
+        t = time.monotonic()
+        with self.recent_lock:
+            self.recent = {k: v for k, v in self.recent.items() if t - v < window}
+            if item_id in self.recent:
+                return False
+            self.recent[item_id] = t
+            return True
 
 
 def _connect():
@@ -95,6 +109,8 @@ def _result_session(app, con, item_id):
                       (item_id, *SESSION_KINDS)).fetchone()
     if not row:
         return f"#{item_id} is not an open item that a session can start on"
+    if not app.first_start(item_id):
+        return f"Already opening a session on #{item_id}"
     out = app.start_session(dict(row))
     note = out.get("note") or ""
     if out.get("opened"):
@@ -132,6 +148,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "lean-brain"
     sys_version = ""
     protocol_version = "HTTP/1.0"
+    timeout = 10
 
     def log_message(self, *a):
         pass
@@ -146,15 +163,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def end_headers(self):
         self.send_header("Content-Security-Policy", _CSP)
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        super().end_headers()
+
+    def _other(self):
+        if self._host_gate():
+            self._send(405, "method not allowed\n", extra={"Allow": "GET, POST"})
+
+    do_HEAD = do_OPTIONS = do_PUT = do_DELETE = do_PATCH = _other
 
     def _host_gate(self) -> bool:
         if host_ok(self.headers.get("Host"), self.app.port):
@@ -179,7 +204,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 con.close()
         except Exception as ex:
             data = {"errors": {"needs_you": f"could not read: {type(ex).__name__}"}}
-        html = page.render(data, self.app.key, self.app.port)
+        try:
+            html = page.render(data, self.app.key, self.app.port)
+        except Exception as ex:
+            return self._send(500, f"could not render the page: {page.e(type(ex).__name__)}\n")
         if flash:
             html = html.replace("<h1>lean brain</h1>", "<h1>lean brain</h1>" + _banner(flash), 1)
         self._send(200, html, "text/html; charset=utf-8")
@@ -195,12 +223,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/x-www-form-urlencoded":
             return self._send(415, "unsupported media type\n")
-        try:
-            length = int(self.headers.get("Content-Length") or "")
-        except ValueError:
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
             return self._send(411, "length required\n")
-        if length < 0:
+        if not _LENGTH.fullmatch(raw_length.strip()):
             return self._send(400, "bad request\n")
+        length = int(raw_length)
         if length > MAX_BODY:
             return self._send(413, "too large\n")
         raw = self.rfile.read(length).decode("utf-8", "replace")
@@ -289,9 +317,9 @@ def _self_test() -> int:
     srv.app.start_session = lambda item: launched.append(item["id"]) or {"opened": False, "command": "claude 'x'", "note": ""}
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     check("bound to loopback", srv.server_address[0], "127.0.0.1")
-    check("host_ok", [host_ok(h, 8770) for h in ("leanagent.localhost:8770", "LOCALHOST:8770", "127.0.0.1:8770", "leanagent.local:8770",
+    check("host_ok", [host_ok(h, 8770) for h in ("leanagent.localhost:8770", "LOCALHOST:8770", "127.0.0.1:8770", "[::1]:8770", "leanagent.local:8770",
                                                   "localhost", "evil.example:8770", "127.0.0.1:1", "")],
-          [True, True, True, True, False, False, False, False])
+          [True, True, True, True, False, False, False, False, False])
     check("origin_ok", [origin_ok(o, 8770) for o in ("http://localhost:8770", "https://localhost:8770", "http://evil.example:8770", "", None)],
           [True, False, False, False, False])
 
@@ -356,6 +384,16 @@ def _self_test() -> int:
     check("negative id 400", post("/answer", {"id": "-1", "key": key, "answer": "x"})[0], 400)
     check("too large 413", req("POST", "/answer", "a" * 10, headers={"Content-Length": str(MAX_BODY + 1)})[0], 413)
     check("json 415", req("POST", "/answer", "{}", headers={"Content-Type": "application/json"})[0], 415)
+    check("bad length 400", req("POST", "/answer", "abcde", headers={"Content-Length": "+5"})[0], 400)
+    check("missing length 411", req("POST", "/answer", None)[0], 411)
+    check("OPTIONS evil host 421", req("OPTIONS", "/", host="evil.example")[0], 421)
+    check("PUT evil host 421", req("PUT", "/", host="evil.example")[0], 421)
+    s, h, b = req("OPTIONS", "/")
+    check("OPTIONS 405 with csp", (s, h.get("content-security-policy")), (405, _CSP))
+    s, h, b = req("GET", "/nope")
+    check("404 with csp", (s, h.get("content-security-policy"), h.get("x-frame-options")), (404, _CSP, "DENY"))
+    check("leanagent.local host 421", req("GET", "/healthz", host=f"leanagent.local:{port}")[0], 421)
+    check("leanagent.local origin 403", post("/session", good, origin=f"http://leanagent.local:{port}")[0], 403)
     check("nothing launched yet", launched, [])
 
     def followed(resp):
@@ -372,6 +410,8 @@ def _self_test() -> int:
     p = followed(post("/session", good))
     check("session launched", launched, [ids["q1"]])
     check("session result shown", "Did not open a terminal" in p, True)
+    p = followed(post("/session", good))
+    check("double session ignored", (launched, "Already opening" in p), ([ids["q1"]], True))
     followed(post("/session", {"id": ids["r1"], "key": key}))
     check("ruling not launched", launched, [ids["q1"]])
     p = followed(post("/session", {"id": ids["b1"], "key": key}))
