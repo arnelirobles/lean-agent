@@ -39,6 +39,10 @@ def _repo_of(path, run):
     return top, common
 
 
+def repo_of(path, run=subprocess.run):
+    return _repo_of(path, run)
+
+
 def known_repos(con, roots, run=subprocess.run) -> list:
     paths = []
     for sql in ("SELECT repo_dir FROM jobs", "SELECT session_cwd FROM items", "SELECT cwd FROM sessions"):
