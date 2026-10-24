@@ -206,10 +206,10 @@ def ensure_extras(con):
 MIGRATIONS = [migrate_1, migrate_2, migrate_3, migrate_4, migrate_5, migrate_6, migrate_7, migrate_8, migrate_9]
 
 
-def connect(migrate=True):
+def connect(migrate=True, timeout=30):
     path = db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    con = sqlite3.connect(path, timeout=30, isolation_level=None)
+    con = sqlite3.connect(path, timeout=timeout, isolation_level=None)
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
