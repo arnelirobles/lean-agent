@@ -30,6 +30,17 @@ inotify_report() {
     echo "  inotify $what: $used of $limit in use ($((used * 100 / limit))%)"
 }
 
+# Seconds since a process started. macOS ps has no etimes, so this parses etime ([[dd-]hh:]mm:ss).
+age_seconds() {
+    local e d=0 h=0 m=0 sec
+    e=$(ps -o etime= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$e" ] || return 1
+    case "$e" in *-*) d=${e%%-*}; e=${e#*-} ;; esac
+    IFS=: read -r a b c <<<"$e"
+    if [ -n "$c" ]; then h=$a; m=$b; sec=$c; else m=$a; sec=$b; fi
+    echo $(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$sec ))
+}
+
 # Prints each agent worktree directory inside the repository that git would not ignore.
 worktree_ignore_report() {
     local repo=$1 top d rel
@@ -57,6 +68,7 @@ if [ "${1:-}" = "--self-test" ]; then
     printf '.claude/worktrees/\n' > "$t/r/.gitignore"
     out=$(worktree_ignore_report "$t/r")
     [ "$out" = "  .worktrees" ] || { echo "self-test failed: ignored dir still listed: '$out'"; fails=$((fails + 1)); }
+    a=$(age_seconds $$) && [ "$a" -ge 0 ] 2>/dev/null || { echo "self-test failed: age_seconds gave '$a'"; fails=$((fails + 1)); }
     [ "$fails" = 0 ] && echo "self-test passed" && exit 0
     exit 1
 fi
@@ -88,7 +100,7 @@ fi
 orphans=""
 for p in $(pgrep -f 'next start|next dev|npm run dev|vite|serve ' 2>/dev/null || true); do
     ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
-    age=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')
+    age=$(age_seconds "$p")
     [ -z "$ppid" ] || [ -z "$age" ] && continue
     if [ "$ppid" = "1" ] && [ "$age" -gt 3600 ]; then
         orphans="$orphans  pid $p, $((age/3600))h, $(ps -o args= -p "$p" | cut -c1-70)
@@ -100,6 +112,27 @@ if [ -n "$orphans" ]; then
     printf '%s' "$orphans"
     echo "  Check nothing proxies to their ports before stopping them, and note they usually"
     echo "  listen on every interface rather than loopback."
+fi
+
+# 2b. Orphaned shells and scripts. A background task that was stopped can leave its command behind:
+# bash defers SIGTERM until a builtin returns, so a stopped preflight kept one CPU busy for two
+# hours, reparented to init, with nothing in any task list. bin/bounded prevents it; this finds it.
+busy=""
+while read -r p ppid cpu args; do
+    [ "$ppid" = "1" ] || continue
+    case "$args" in bash\ *|zsh\ *|sh\ *|/bin/bash\ *|/bin/zsh\ *|/bin/sh\ *|python3\ *|*/python3\ *|node\ *|dotnet\ *) ;; *) continue ;; esac
+    age=$(age_seconds "$p") || continue
+    [ "$age" -gt 1800 ] || continue
+    # launchd agents also have init as their parent on macOS; an idle one is not the problem.
+    [ "${cpu%.*}" -ge 50 ] 2>/dev/null || continue
+    busy="$busy  pid $p, $((age/60))m, ${cpu}% cpu, $(printf '%s' "$args" | cut -c1-70)
+"
+done < <(ps -Ao pid=,ppid=,%cpu=,args= -U "$(id -u)" 2>/dev/null)
+if [ -n "$busy" ]; then
+    note "Shells and scripts with no parent (parent is init) busy on a CPU for over 30 minutes:"
+    printf '%s' "$busy"
+    echo "  Each one outlived the task that started it. If it is not a server you meant to keep,"
+    echo "  stop it with kill, then kill -9 if it ignores that."
 fi
 
 # 3. Scratchpad collisions. Two agents independently invent the same three filenames.
