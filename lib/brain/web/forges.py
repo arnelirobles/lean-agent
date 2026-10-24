@@ -8,6 +8,7 @@ results, never an exception.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,10 +46,25 @@ def available(cli: str, which=shutil.which, run=subprocess.run) -> str:
     return "ok" if _run(run, _AUTH[cli]) is not None else "logged out"
 
 
+_GH_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_AZ_PART = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_. -]*$")
+
+
+def _valid_repo(forge, repo) -> bool:
+    if not isinstance(repo, str) or repo.startswith("-"):
+        return False
+    if forge == "github":
+        return _GH_REPO.match(repo) is not None
+    parts = repo.split("/")
+    return 1 <= len(parts) <= 3 and all(_AZ_PART.match(p) for p in parts)
+
+
 def pr_state(forge, repo, number, run=subprocess.run) -> str:
     try:
         n = str(int(number))
     except (TypeError, ValueError):
+        return ""
+    if forge not in ("github", "azure") or not _valid_repo(forge, repo):
         return ""
     if forge == "github":
         out = _run(run, ["gh", "pr", "view", n, "-R", str(repo), "--json", "state"])
@@ -199,6 +215,11 @@ def _self_test() -> int:
     check("pr failed", pr_state("github", "o/r", 5, run=fake({})), "")
     check("pr odd state", pr_state("github", "o/r", 5, run=fake({("gh", "pr", "view"): _R('{"state":"DRAFT"}')})), "")
     check("pr bad number", pr_state("github", "o/r", "5; rm", run=fake({})), "")
+    for bad in ("", "-x/y", "o/r/extra", "o r/x", "--repo=a/b", None):
+        check("github bad repo " + repr(bad), pr_state("github", bad, 5, run=fake({("gh", "pr", "view"): _R('{"state":"OPEN"}')})), "")
+    for bad in ("", "-p", "a//b", "a/b/c/d", "p;x"):
+        check("azure bad repo " + repr(bad), pr_state("azure", bad, 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"active"}')})), "")
+    check("azure org/project/repo ok", pr_state("azure", "acme/My Proj/repo", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"active"}')})), "open")
     check("pr unknown forge", pr_state("gitlab", "o/r", 5, run=fake({})), "")
     check("az pr completed", pr_state("azure", "p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"completed"}')})), "merged")
     check("az pr active", pr_state("azure", "p/r", 9, run=fake({("az", "repos", "pr", "show"): _R('{"status":"active"}')})), "open")

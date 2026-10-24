@@ -11,10 +11,14 @@ import sys
 TIMEOUT = 10
 
 
+_SAFE = ["-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "--no-optional-locks"]
+
+
 def _git(run, cwd, *args):
-    """Stdout of a git command run in cwd, or None if it failed."""
+    """Stdout of a git command run in cwd, or None if it failed. No hooks, no fsmonitor, no index writes."""
     try:
-        r = run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
+        r = run(["git", *_SAFE, *args], cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT,
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None
     return (r.stdout or "") if r.returncode == 0 else None
@@ -48,7 +52,7 @@ def known_repos(con, roots, run=subprocess.run) -> list:
         except OSError:
             pass
     seen, out = set(), []
-    for p in paths:
+    for p in dict.fromkeys(paths):
         if not isinstance(p, str):
             continue
         repo = _repo_of(p, run)
@@ -62,7 +66,7 @@ def _count(out):
     try:
         return int((out or "").strip())
     except ValueError:
-        return 0
+        return None
 
 
 def _entries(text):
@@ -89,12 +93,12 @@ def list_worktrees(repo, run=subprocess.run) -> list:
             branch = branch[len("refs/heads/"):]
         row = {"path": path, "branch": branch, "unpushed": 0, "dirty": False, "missing": not os.path.isdir(path)}
         if not row["missing"]:
-            status = _git(run, path, "status", "--porcelain")
-            row["dirty"] = bool((status or "").strip())
+            status = _git(run, path, "status", "--porcelain", "--ignore-submodules")
+            row["dirty"] = None if status is None else bool(status.strip())
             n = _git(run, path, "rev-list", "--count", "@{u}..HEAD")
             if n is None:
                 n = _git(run, path, "rev-list", "--count", "HEAD", "--not", "--remotes")
-            row["unpushed"] = _count(n)
+            row["unpushed"] = None if n is None else _count(n)
         rows.append(row)
     return rows
 
@@ -153,6 +157,22 @@ def _self_test() -> int:
     check("deleted folder is missing", (g["missing"], g["dirty"], g["unpushed"]), (True, False, 0))
     git(wt2, "push", "-q", "-u", "origin", "ahead")
     check("pushed branch with upstream", [r for r in list_worktrees(main) if r["branch"] == "ahead"][0]["unpushed"], 0)
+    # a git that fails every status and rev-list reads as unknown, not clean
+    real_run = subprocess.run
+    seen = []
+
+    def flaky(argv, **kw):
+        seen.append((argv, kw))
+        if "status" in argv or "rev-list" in argv:
+            raise subprocess.TimeoutExpired(argv, 10)
+        return real_run(argv, **kw)
+    ur = [r for r in list_worktrees(main, run=flaky) if not r["missing"]]
+    check("failed git is unknown", {(r["dirty"], r["unpushed"]) for r in ur}, {(None, None)})
+    check("safe flags on every call", all(a[0][:7] == ["git", "-c", "core.fsmonitor=false", "-c",
+          f"core.hooksPath={os.devnull}", "--no-optional-locks", "worktree"] or a[0][6] in ("status", "rev-list")
+          for a in seen), True)
+    check("optional locks off", all(a[1]["env"].get("GIT_OPTIONAL_LOCKS") == "0" for a in seen), True)
+    check("status ignores submodules", all("--ignore-submodules" in a[0] for a in seen if "status" in a[0]), True)
     check("not a repo", list_worktrees(base), [])
     check("git missing", list_worktrees(main, run=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError())), [])
 
