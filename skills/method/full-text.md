@@ -429,8 +429,8 @@ So the target is not fewer findings. It is earlier ones. A finding caught after 
 `interaction-surface.sh` prints the part the agent did not think of. For a diff it answers two questions: which unchanged files use a symbol the diff defines, and which unchanged files import a changed file. It finds candidates, it does not judge them. For each entry the author must produce one of two things before pushing: a test that crosses that boundary, or a sentence saying why that caller is unaffected. An entry with neither is where the critic finds its next defect.
 
 ```
-./interaction-surface.sh origin/master      # a branch
-./interaction-surface.sh --wip              # uncommitted work
+bin/interaction-surface.sh origin/master      # a branch
+bin/interaction-surface.sh --wip              # uncommitted work
 ```
 
 I checked it against a case whose answer I already knew. The pull request that added per-collection settings changed `src/related.ts` and left `src/screens/post-view.tsx` alone. The script names that exact pair. The defect that escaped that pull request was in that exact pair, and it was fixed two pull requests later. One local run, before the push, would have put it in front of the author.
@@ -534,8 +534,8 @@ Not one of these showed up as a failure. That is the whole problem. A stuck wait
 So this is not a rule to remember, because remembering is what failed. It is `agent-hygiene.sh`, run between batches. It reports and never deletes, because deciding what is live is the part a script cannot do.
 
 ```
-./agent-hygiene.sh                    # the current repository
-./agent-hygiene.sh ~/dev/a ~/dev/b    # several
+bin/agent-hygiene.sh                    # the current repository
+bin/agent-hygiene.sh ~/dev/a ~/dev/b    # several
 ```
 
 Two things learned writing it. Container workloads are excluded by parent process, because a poller inside a container is doing its job and a check that reports it every run teaches people to skip the output. And merged state has to come from the pull request, never from a commit count, because a squash merge leaves the original commits looking unmerged and a count will tell you nine branches have unlanded work when they have none.

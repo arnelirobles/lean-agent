@@ -60,7 +60,7 @@
 
 set -uo pipefail
 
-here() { # the directory this script really lives in, through the root heavy.sh symlink
+here() { # the directory this script really lives in, through any symlink to heavy.sh
   local src=${BASH_SOURCE[0]} dir
   while [ -L "$src" ]; do
     dir=$(cd -P "$(dirname "$src")" && pwd)
