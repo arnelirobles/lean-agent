@@ -110,8 +110,11 @@ def serve_tests(fails, me, d):
     import socket
     import threading
     from . import cli
-    env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "serve.db"), HOME=d)
-    env.pop("LEAN_SERVE_PORT", None)
+    home = os.path.join(d, "home")
+    env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "serve.db"), HOME=home, USERPROFILE=home,
+               APPDATA=os.path.join(home, "AppData"), XDG_CONFIG_HOME=os.path.join(home, "xdg"))
+    for name in ("LEAN_SERVE_PORT", "CLAUDE_PLUGIN_OPTION_SERVE_MODE", "CLAUDE_PLUGIN_OPTION_WORKTREE_ROOTS"):
+        env.pop(name, None)
 
     def free():
         with socket.socket() as s:
@@ -146,6 +149,19 @@ def serve_tests(fails, me, d):
         fails.append(f"serve where the page answers must print the urls and exit 0: {rc} {out!r}")
     srv.shutdown()
     srv.server_close()
+    from .web import server
+    held = server.make_server(0, "k")
+    try:
+        try:
+            server.make_server(held.server_address[1], "k")
+            fails.append("a second server on a held port must fail to bind")
+        except OSError:
+            pass
+    finally:
+        held.server_close()
+    rc, out, err = brain("serve", "--port", "99999")
+    if rc != 2 or len(err.splitlines()) != 1:
+        fails.append(f"a bad port is a one-line error, exit 2: {rc} {err!r}")
     srv = fake(b"something else")
     port = srv.server_address[1]
     rc, out, err = brain("serve", "--port", str(port))

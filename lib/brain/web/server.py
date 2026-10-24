@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -257,10 +258,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(303, b"", extra={"Location": "/?r=" + token})
 
 
+class Server(http.server.ThreadingHTTPServer):
+    # On Windows address reuse lets a second server bind a port that is in use, so ask for exclusive use there.
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self):
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def make_server(port, key, db_path=None, roots=None) -> http.server.ThreadingHTTPServer:
     if db_path:
         os.environ["LEAN_BRAIN_DB"] = db_path
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv = Server(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
     srv.app = App(srv.server_address[1], key, roots)
     return srv

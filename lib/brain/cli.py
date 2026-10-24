@@ -100,6 +100,7 @@ Memory files keep standing preferences. Run logs are scratch and can expire once
 brain. A ledger points to open items with a line like "open items: brain list --project X --status open".
 """
 import argparse
+import errno
 import socket
 import os
 import sys
@@ -347,7 +348,13 @@ def cmd_serve(a):
     from .web import install
     plat = install.platform_name()
     brain_path = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "bin", "brain"))
-    port = a.port or int(os.environ.get("LEAN_SERVE_PORT") or 8770)
+    try:
+        port = a.port or int(os.environ.get("LEAN_SERVE_PORT") or 8770)
+        if not 0 < port < 65536:
+            raise ValueError
+    except ValueError:
+        print("brain serve: the port must be a number from 1 to 65535", file=sys.stderr)
+        return 2
     roots = a.roots or os.environ.get("CLAUDE_PLUGIN_OPTION_WORKTREE_ROOTS", "")
     if a.uninstall:
         print("removed the login unit" if install.uninstall(plat) else "no login unit installed")
@@ -369,15 +376,20 @@ def cmd_serve(a):
     import secrets
     try:
         srv = server.make_server(port, secrets.token_urlsafe(32), roots=[r.strip() for r in roots.split(",") if r.strip()])
-    except OSError:
-        print(f"port {port} is in use", file=sys.stderr)
+    except OSError as ex:
+        print(f"port {port} is in use" if ex.errno == errno.EADDRINUSE else f"brain serve: {ex}", file=sys.stderr)
         return 1
     print(urls, flush=True)
     if a.idle_exit:
         db_file, state = store.db_path(), {}
 
         def watch():
-            while not idle_watch(db_file, a.idle_exit, state):
+            while True:
+                try:
+                    if idle_watch(db_file, a.idle_exit, state):
+                        break
+                except Exception:  # whatever goes wrong here must not stop the page
+                    pass
                 time.sleep(60)
             srv.shutdown()
         threading.Thread(target=watch, daemon=True).start()
