@@ -21,6 +21,14 @@ HEREDOC_MARK = re.compile(r"__lean_heredoc_(\d+)__")
 GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 _EVENT = {}  # the last event read, for the session id and cwd of a recorded fire
 _RECORD = "--self-test" not in sys.argv[1:]  # a hook's own self-test must not write to the real database
+if not _RECORD and not os.environ.get("LEAN_BRAIN_DB"):
+    # a self-test, and every hook it spawns, must write to a scratch brain and never the real one
+    import atexit
+    import shutil
+    import tempfile
+    _scratch = tempfile.mkdtemp(prefix="lean-selftest-brain-")
+    atexit.register(shutil.rmtree, _scratch, True)
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(_scratch, "brain.db")
 
 
 def _fire(outcome):
@@ -70,6 +78,7 @@ def note(event_name, text):
     """Print a non-blocking note that Claude reads with the tool result."""
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event_name, "additionalContext": text}}))
+    sys.stdout.flush()
     _fire("note")
     _keep_notice(text)
 
@@ -325,7 +334,7 @@ def self_test():
     global _RECORD, _EVENT
 
     failures = 0
-    saved_brain = os.environ.get("LEAN_BRAIN_DB")
+    saved_brain = os.environ.get("LEAN_BRAIN_DB")  # the scratch brain set at import
     saved_notices = os.environ.get("LEAN_NOTICES")
     scratch = tempfile.mkdtemp(prefix="hookkit-selftest-")
     os.environ["LEAN_BRAIN_DB"] = os.path.join(scratch, "brain.db")
@@ -471,6 +480,22 @@ def self_test():
                 check("locked brain returns within 2 s", time.time() - t0 < 2, True)
                 holder.close()
                 check("locked brain kept nothing", notice_rows(locked), [])
+
+        # a child of a self-test, with no LEAN_BRAIN_DB given, lands in the scratch brain and not the real one
+        import subprocess
+        child_env = dict(os.environ)
+        child_env.pop("LEAN_BRAIN_DB", None)
+        child_env.pop("LEAN_NOTICES", None)
+        code = ("import os, sys; sys.path.insert(0, sys.argv[1]); import hookkit; hookkit._RECORD = True;"
+                " hookkit.note('PreToolUse', 'child'); db = os.environ['LEAN_BRAIN_DB']; import sqlite3;"
+                " print(db); print(sqlite3.connect(db).execute('SELECT hook, text FROM notices').fetchall())")
+        done = subprocess.run([sys.executable, "-c", code, os.path.dirname(os.path.realpath(__file__)), "--self-test"],
+                              env=child_env, capture_output=True, text=True)
+        lines = done.stdout.strip().splitlines()
+        child_db, child_rows = (lines[-2], lines[-1]) if len(lines) >= 2 else ("", "")
+        real_db = os.path.realpath(os.path.expanduser("~/.local/share/lean/brain.db"))
+        check("child gets a scratch brain", bool(child_db) and os.path.realpath(child_db) != real_db, True)
+        check("child kept its notice in the scratch brain", child_rows, "[('-c', 'child')]")
     finally:
         _RECORD, _EVENT = False, {}
         shutil.rmtree(scratch, ignore_errors=True)
