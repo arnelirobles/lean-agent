@@ -9,10 +9,13 @@ the copyable command.
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
-_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff]+")
 
 
 def clean(s) -> str:
@@ -51,10 +54,15 @@ def work_prompt(item: dict) -> str:
                    "--note followed by one line on what you did.")
 
 
-def session_folder(item: dict) -> tuple:
+_WIN_BAD_FOLDER = re.compile(r'[&|<>^%!;"\r\n]')
+_WIN_SAFE_PROMPT = re.compile(r"^[A-Za-z0-9 #.,:()-]+$")
+
+
+def session_folder(item: dict, platform: str = None) -> tuple:
+    win = (platform or sys.platform).startswith("win")
     for key in ("session_cwd", "repo_dir", "repo"):
         p = item.get(key)
-        if isinstance(p, str) and p and os.path.isdir(p):
+        if isinstance(p, str) and p and os.path.isdir(p) and not (win and _WIN_BAD_FOLDER.search(p)):
             return p, ""
     gone = item.get("session_cwd") or item.get("repo_dir") or item.get("repo")
     home = os.path.expanduser("~")
@@ -79,17 +87,43 @@ def launch_argv(platform: str, folder: str, prompt: str):
     return None
 
 
-def copy_command(folder: str, prompt: str) -> str:
+def windows_prompt(item: dict):
+    """Built only from the integer id, a known kind and fixed text. None if it is not safe on a Windows command line."""
+    from brain.store import canon_kind
+    kind = canon_kind(str(item.get("kind") or ""))
+    i = _id(item)
+    if kind is None or i <= 0:
+        return None
+    verb = "Work on" if can_send(kind) else "Look at"
+    text = f"{verb} brain item #{i} ({kind}). Run: brain show {i}"
+    return text if _WIN_SAFE_PROMPT.match(text) else None
+
+
+def copy_command(folder: str, prompt: str, platform: str = None) -> str:
+    if (platform or sys.platform).startswith("win"):
+        if _WIN_BAD_FOLDER.search(folder) or not _WIN_SAFE_PROMPT.match(prompt):
+            raise ValueError("unsafe for a Windows command line")
+        return f'cd /d "{folder}" && claude "{prompt}"'
     return f"cd {shlex.quote(folder)} && claude {shlex.quote(prompt)}"
 
 
-def start_session(item: dict, run=subprocess.run) -> dict:
-    folder, note = session_folder(item)
-    prompt = work_prompt(item) if can_send(str(item.get("kind") or "")) else ask_prompt(item)
-    command = copy_command(folder, prompt)
-    argv = launch_argv(sys.platform, folder, prompt)
+def start_session(item: dict, run=subprocess.run, platform: str = None, which=shutil.which) -> dict:
+    platform = platform or sys.platform
+    folder, note = session_folder(item, platform)
+    if platform.startswith("win"):
+        prompt = windows_prompt(item)
+        if prompt is None:
+            return {"opened": False, "command": "", "note": "this item cannot be sent from Windows, run brain show <id> yourself"}
+    else:
+        prompt = work_prompt(item) if can_send(str(item.get("kind") or "")) else ask_prompt(item)
+    command = copy_command(folder, prompt, platform)
+    if platform.startswith("win"):
+        exe = which("claude") or ""
+        if exe.lower().endswith((".cmd", ".bat")):
+            return {"opened": False, "command": command, "note": "claude is a .cmd shim, copy the command"}
+    argv = launch_argv(platform, folder, prompt)
     if argv is None:
-        return {"opened": False, "command": command, "note": note or "no terminal to open here, copy the command"}
+        return {"opened": False, "command": command, "note": "no terminal to open here, copy the command"}
     try:
         run(argv, check=True, timeout=30, capture_output=True)
     except Exception as e:
@@ -163,6 +197,37 @@ def _self_test() -> int:
         check("ask used for non-sendable", calls[0][0][-1], ask_prompt(item))
     else:
         check("unsupported falls back", r["opened"], False)
+
+    check("clean strips feff", clean("a\ufeffb"), "a b")
+    hostile = {"id": 9, "kind": "risk", "project": "p&calc", "ref": "r|x", "title": 'a & b | c ; d ^ e %PATH% "q"\nrm',
+               "session_cwd": d}
+    wp = windows_prompt(hostile)
+    check("win prompt", wp, "Work on brain item #9 (risk). Run: brain show 9")
+    check("win bad kind", windows_prompt({**hostile, "kind": "x&y"}), None)
+    check("win bad id", windows_prompt({**hostile, "id": "9"}), None)
+    check("win argv", launch_argv("win32", d, wp), ["wt.exe", "-d", d, "claude", wp])
+    wins = []
+    r = start_session(hostile, run=lambda *a, **k: wins.append(a[0]), platform="win32", which=lambda n: "C:\\bin\\claude.exe")
+    check("win opened", r["opened"], True)
+    blob = " ".join(wins[0]) + r["command"]
+    check("win no hostile text", any(c in blob.replace(d, "") for c in '&|;^%"\n') and
+          r["command"] != f'cd /d "{d}" && claude "{wp}"', False)
+    check("win command", r["command"], f'cd /d "{d}" && claude "{wp}"')
+    check("win argv from item", wins[0], ["wt.exe", "-d", d, "claude", wp])
+    r = start_session(hostile, run=lambda *a, **k: wins.append(1), platform="win32", which=lambda n: "C:\\n\\claude.CMD")
+    check("cmd shim copy only", (r["opened"], len(wins)), (False, 1))
+    check("cmd shim has command", r["command"].startswith("cd /d "), True)
+    hf = os.path.join(d, "a&b")
+    os.mkdir(hf)
+    check("hostile folder to home", session_folder({"session_cwd": hf}, "win32"),
+          (os.path.expanduser("~"), f"folder {hf} is gone, opened in home"))
+    check("posix folder with & ok", session_folder({"session_cwd": hf}, "linux"), (hf, ""))
+    try:
+        copy_command(hf, wp, "win32")
+        check("copy refuses bad folder", "no raise", "raise")
+    except ValueError:
+        pass
+    check("win unsafe item refused", start_session({**hostile, "kind": "zzz"}, platform="win32")["opened"], False)
 
     print("self-test: ok" if not fails else f"self-test: {len(fails)} failed")
     return 1 if fails else 0
