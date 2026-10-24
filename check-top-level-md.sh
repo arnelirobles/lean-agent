@@ -1,1 +1,0 @@
-bin/check-top-level-md.sh

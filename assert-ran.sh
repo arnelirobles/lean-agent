@@ -1,1 +1,0 @@
-bin/assert-ran.sh

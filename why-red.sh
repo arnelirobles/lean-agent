@@ -1,1 +1,0 @@
-bin/why-red.sh

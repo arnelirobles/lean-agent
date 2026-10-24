@@ -1,1 +1,0 @@
-bin/pr-blockers.sh

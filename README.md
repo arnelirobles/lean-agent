@@ -76,7 +76,7 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 | Hooks | Three block (attribution and slop in public text, a bad commit author, files in a scratchpad root). The rest add a note and never stop the call. One of them hands the session a brain digest for its project at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
 | `lean-stats` | One local SQLite file of tokens, reviews, merges and hook fires. Nothing leaves the machine. | [Measure every batch](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) |
 
-Everything in the method still works without the plugin. The scripts at the root are links into `bin/`.
+Everything in the method still works without the plugin. Without it, run the scripts from `bin/` (for example `bin/holdout.sh`).
 
 ## The cycle
 

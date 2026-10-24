@@ -1,1 +1,0 @@
-bin/check-runtime.sh
