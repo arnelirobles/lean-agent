@@ -1130,6 +1130,13 @@ def run(brain_cli):
         if records.dismiss_notice(con, 999) or not records.dismiss_notice(con, n1) \
                 or not con.execute("SELECT dismissed_at FROM notices WHERE id=?", (n1,)).fetchone()[0]:
             fails.append("dismiss_notice must return False for a missing id and stamp an existing one")
+        rc_a, out_a, _ = run("notice", "list")
+        rc_b, out_b, _ = run("notice", "list", "--all")
+        rc_c, out_c, _ = run("notice", "dismiss", "999")
+        rc_d, out_d, _ = run("notice", "dismiss", str(n1 + 1))
+        if (rc_a, rc_b, rc_c, rc_d) != (0, 0, 1, 0) or len(out_b.splitlines()) != len(out_a.splitlines()) + 1 \
+                or out_d != f"dismissed {n1 + 1}" or f"dismissed" not in out_b:
+            fails.append(f"notice list hides dismissed ones, --all shows them, dismiss reports a missing id: {out_a!r} {out_b!r} {out_c!r} {out_d!r}")
         con.close()
         subprocess.run(["git", "-C", g, "checkout", "-q", "-b", "feat/x"], check=True, capture_output=True)
         jb = run("queue", "add", g, "B.csproj", "--tier", "fast", "--filter", "U")[1]

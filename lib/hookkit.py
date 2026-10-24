@@ -71,6 +71,21 @@ def note(event_name, text):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event_name, "additionalContext": text}}))
     _fire("note")
+    _keep_notice(text)
+
+
+def _keep_notice(text):
+    """Keep the note as a notice in brain for the web page. Never raises and never waits more than about a second."""
+    if not _RECORD or os.environ.get("LEAN_NOTICES") == "off":
+        return
+    try:
+        from brain import records, store
+        con = store.connect(timeout=1)
+        records.add_notice(con, os.path.basename(sys.argv[0]), text,
+                           str(_EVENT.get("session_id") or ""), str(_EVENT.get("cwd") or ""))
+        con.close()
+    except (SystemExit, Exception):  # a locked or newer database must not change the hook's output
+        pass
 
 
 def disabled(name, seg=None):
@@ -302,6 +317,7 @@ def gh_call(seg):
 def self_test():
     import contextlib
     import io
+    import shutil
     import tempfile
 
     import leanstats
@@ -309,6 +325,11 @@ def self_test():
     global _RECORD, _EVENT
 
     failures = 0
+    saved_brain = os.environ.get("LEAN_BRAIN_DB")
+    saved_notices = os.environ.get("LEAN_NOTICES")
+    scratch = tempfile.mkdtemp(prefix="hookkit-selftest-")
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(scratch, "brain.db")
+    os.environ.pop("LEAN_NOTICES", None)
 
     def check(name, got, want):
         nonlocal failures
@@ -405,6 +426,59 @@ def self_test():
                 check("a self-test run records nothing", os.path.exists(quiet), False)
         finally:
             _RECORD, _EVENT = False, {}
+
+    import sqlite3
+    import time
+
+    def notice_rows(path):
+        if not os.path.exists(path):
+            return None
+        con = sqlite3.connect(path)
+        try:
+            return [tuple(r) for r in con.execute("SELECT hook, text, session_id, cwd FROM notices")]
+        except sqlite3.Error:
+            return None
+        finally:
+            con.close()
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            bdb = os.path.join(tmp, "brain.db")
+            os.environ["LEAN_BRAIN_DB"] = bdb
+            os.environ.pop("LEAN_NOTICES", None)
+            with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "lean.db"), LEAN_STATS=None):
+                _RECORD, _EVENT = True, {"session_id": "s1", "cwd": "/w"}
+                check("note output with notices on", noted(), want_note)
+                check("note leaves one notice", notice_rows(bdb), [("hookkit.py", "hello", "s1", "/w")])
+                os.environ["LEAN_NOTICES"] = "off"
+                os.environ["LEAN_BRAIN_DB"] = off_db = os.path.join(tmp, "off.db")
+                noted()
+                check("LEAN_NOTICES=off records nothing", os.path.exists(off_db), False)
+                os.environ.pop("LEAN_NOTICES")
+                _RECORD = False
+                os.environ["LEAN_BRAIN_DB"] = quiet_db = os.path.join(tmp, "quiet-brain.db")
+                noted()
+                check("a self-test run keeps no notice", os.path.exists(quiet_db), False)
+                _RECORD = True
+                locked = os.path.join(tmp, "locked.db")
+                os.environ["LEAN_BRAIN_DB"] = locked
+                from brain import store
+                store.connect().close()
+                holder = sqlite3.connect(locked, isolation_level=None)
+                holder.execute("BEGIN EXCLUSIVE")
+                t0 = time.time()
+                check("locked brain, same note output", noted(), want_note)
+                check("locked brain returns within 2 s", time.time() - t0 < 2, True)
+                holder.close()
+                check("locked brain kept nothing", notice_rows(locked), [])
+    finally:
+        _RECORD, _EVENT = False, {}
+        shutil.rmtree(scratch, ignore_errors=True)
+        for key, val in (("LEAN_BRAIN_DB", saved_brain), ("LEAN_NOTICES", saved_notices)):
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

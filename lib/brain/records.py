@@ -1,3 +1,4 @@
+import sys
 from datetime import datetime, timedelta, timezone
 
 from .store import connect, now
@@ -49,4 +50,24 @@ def cmd_created(a):
         + " ORDER BY created_at DESC, id DESC LIMIT ?"
     for r in con.execute(sql, (a.limit,)):
         print(created_line(r))
+    return 0
+
+
+def notice_line(r):
+    state = f" [dismissed {r['dismissed_at']}]" if r["dismissed_at"] else ""
+    return f"{r['id']} {r['created_at']} {r['hook']}{state} {r['text']}"
+
+
+def cmd_notice(a):
+    con = connect()
+    if a.ncmd == "dismiss":
+        if not dismiss_notice(con, a.id):
+            print(f"no notice {a.id}", file=sys.stderr)
+            return 1
+        print(f"dismissed {a.id}")
+        return 0
+    sql = "SELECT * FROM notices" + ("" if a.all else " WHERE dismissed_at IS NULL OR dismissed_at=''") \
+        + " ORDER BY created_at DESC, id DESC LIMIT ?"
+    for r in con.execute(sql, (a.limit,)):
+        print(notice_line(r))
     return 0

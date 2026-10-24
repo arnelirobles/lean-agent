@@ -41,6 +41,8 @@
   brain activity import-baryovm [--file PATH]   reads BaryoVM's activity.jsonl from where the last import
             stopped, so a rerun adds nothing; a file that shrank is read from the start
   brain created list [--open] [--limit N]     pull requests, issues, releases and work items agents created, newest first
+  brain notice list [--all] [--limit N]       hook notes kept as notices, newest first; --all adds dismissed ones
+  brain notice dismiss ID
   brain resume [--project P] [--max N]
   brain digest [--project P | --all] [--quiet] [--recover]
   brain stats [--json]
@@ -99,7 +101,7 @@ from .store import norm_project, MODEL, PHASE, RESOLUTION, RUNNERS, SEVERITY, SO
 from .items import cmd_add, cmd_answers, cmd_close, cmd_list, cmd_reopen, cmd_run_add, cmd_session, cmd_show
 from .flaky import cmd_flaky_clear
 from .activity import cmd_activity
-from .records import cmd_created
+from .records import cmd_created, cmd_notice
 from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
 from .report import cmd_digest, cmd_export, cmd_resume, cmd_stats
 
@@ -267,6 +269,14 @@ def parser():
     q.add_argument("--open", action="store_true", help="only items not known to be closed or merged")
     q.add_argument("--limit", type=int, default=50)
     s.set_defaults(fn=cmd_created)
+    s = sub.add_parser("notice")
+    ns = s.add_subparsers(dest="ncmd", required=True)
+    q = ns.add_parser("list")
+    q.add_argument("--all", action="store_true", help="include dismissed notices")
+    q.add_argument("--limit", type=int, default=50)
+    q = ns.add_parser("dismiss")
+    q.add_argument("id", type=int)
+    s.set_defaults(fn=cmd_notice)
     s = sub.add_parser("resume")
     s.add_argument("--project", type=lower)
     s.add_argument("--max", type=int, default=40)

@@ -12,6 +12,11 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || exit 2
 
+# No self-test may reach the real brain database: a hook it spawns would migrate and write to it.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/lean-run-all.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+export LEAN_BRAIN_DB="$scratch/brain.db"
+
 # A while-read loop rather than mapfile, which macOS's bash 3.2 does not have.
 scripts=()
 while IFS= read -r s; do

@@ -169,7 +169,7 @@ def self_test():
         db = os.path.join(tmp, "lean.db")
         event = ev("gh pr merge 12 --squash", None, "PostToolUseFailure", error="Exit code 1",
                    session_id="s1", cwd="/w")
-        env = dict(os.environ, LEAN_DB=db)
+        env = dict(os.environ, LEAN_DB=db, LEAN_NOTICES="off")
         env.pop("LEAN_STATS", None)
         env.pop("LEAN_SKIP_PR_MERGE_BLOCKED", None)
         proc = subprocess.run([sys.executable, os.path.realpath(__file__)], input=json.dumps(event),
