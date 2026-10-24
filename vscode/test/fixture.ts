@@ -48,6 +48,7 @@ export const LATER = [
   `ALTER TABLE jobs ADD COLUMN commit_hash TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
 ];
 
 export const ACTIVITY = [
