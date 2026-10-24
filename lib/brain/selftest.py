@@ -185,19 +185,30 @@ def serve_tests(fails, me, d):
     import sqlite3
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, started_at TEXT, ended_at TEXT NOT NULL DEFAULT '')")
-    con.execute("INSERT INTO sessions VALUES ('a', '/x', 't', '')")
+    stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    con.execute("INSERT INTO sessions VALUES ('a', '/x', ?, '')", (stamp(10 ** 7 + 99000),))
     con.commit()
+    B = 10 ** 7
     st = {}
-    if cli.idle_watch(db, 30, st, now=0) or cli.idle_watch(db, 30, st, now=99999):
+    if cli.idle_watch(db, 30, st, now=B) or cli.idle_watch(db, 30, st, now=B + 99999):
         fails.append("idle-exit must not fire while a session is open")
     con.execute("UPDATE sessions SET ended_at='t2'")
     con.commit()
-    if cli.idle_watch(db, 30, st, now=99999 + 1799) or not cli.idle_watch(db, 30, st, now=99999 + 1800):
+    if cli.idle_watch(db, 30, st, now=B + 99999 + 1799) or not cli.idle_watch(db, 30, st, now=B + 99999 + 1800):
         fails.append("idle-exit must fire 30 minutes after the last open session")
-    con.execute("UPDATE sessions SET ended_at=''")
+    con.execute("UPDATE sessions SET ended_at='', started_at=?", (stamp(B + 99999 + 4000),))
     con.commit()
-    if cli.idle_watch(db, 30, st, now=99999 + 5000):
+    if cli.idle_watch(db, 30, st, now=B + 99999 + 5000):
         fails.append("an open session must reset the idle clock")
+    # a session that never wrote ended_at (crash, closed terminal) stops counting after 12 hours
+    con.execute("UPDATE sessions SET started_at=?", (stamp(B),))
+    con.commit()
+    st = {}
+    if cli.idle_watch(db, 30, st, now=B + 12 * 3600 - 1) or cli.idle_watch(db, 30, st, now=B + 12 * 3600 + 1000):
+        fails.append("a session under 12 hours old must count as open")
+    st = {}
+    if cli.idle_watch(db, 30, st, now=B + 12 * 3600 + 1) or not cli.idle_watch(db, 30, st, now=B + 12 * 3600 + 1 + 1800):
+        fails.append("a session open for over 12 hours must not keep the server running")
     con.execute("BEGIN EXCLUSIVE")
     if cli.idle_watch(db, 30, {"last": 0}, now=10 ** 6):
         fails.append("a locked database must count as a session open")

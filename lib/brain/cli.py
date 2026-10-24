@@ -328,13 +328,16 @@ def healthz(port, timeout=1.0):
 
 
 def idle_watch(db_file, minutes, state, now=None):
-    """True when no session has been open for `minutes`. An unreadable database counts as a session open."""
+    """True when no session has been open for `minutes`. An unreadable database counts as a session open.
+    A session row older than 12 hours does not count: a crashed session never writes ended_at."""
     import sqlite3
     now = time.time() if now is None else now
     try:
         con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2)
         try:
-            open_now = con.execute("SELECT 1 FROM sessions WHERE ended_at='' LIMIT 1").fetchone() is not None
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 12 * 3600))
+            open_now = con.execute("SELECT 1 FROM sessions WHERE ended_at='' AND started_at>? LIMIT 1",
+                                   (cutoff,)).fetchone() is not None
         finally:
             con.close()
     except sqlite3.Error:
