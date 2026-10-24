@@ -105,6 +105,95 @@ def connect_rows(path, query):
         con.close()
 
 
+def serve_tests(fails, me, d):
+    import http.server
+    import socket
+    import threading
+    from . import cli
+    env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "serve.db"), HOME=d)
+    env.pop("LEAN_SERVE_PORT", None)
+
+    def free():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def brain(*args):
+        r = subprocess.run([sys.executable, me, *args], env=env, capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    class Fake(http.server.BaseHTTPRequestHandler):
+        body = b"lean-brain 0"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(self.body)
+
+        def log_message(self, *a):
+            pass
+
+    def fake(body):
+        Fake.body = body
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Fake)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    srv = fake(b"lean-brain 0")
+    port = srv.server_address[1]
+    rc, out, _ = brain("serve", "--port", str(port))
+    if rc != 0 or f"http://leanagent.localhost:{port}" not in out or f"http://127.0.0.1:{port}" not in out:
+        fails.append(f"serve where the page answers must print the urls and exit 0: {rc} {out!r}")
+    srv.shutdown()
+    srv.server_close()
+    srv = fake(b"something else")
+    port = srv.server_address[1]
+    rc, out, err = brain("serve", "--port", str(port))
+    if rc != 1 or f"port {port} is in use" not in err or out:
+        fails.append(f"serve on a port held by something else: {rc} {out!r} {err!r}")
+    srv.shutdown()
+    srv.server_close()
+    port = free()
+    p = subprocess.Popen([sys.executable, me, "serve", "--port", str(port)], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+    try:
+        line = p.stdout.readline()
+        if f"http://leanagent.localhost:{port}" not in line or f"http://127.0.0.1:{port}" not in line:
+            fails.append(f"serve must print both urls: {line!r}")
+        if not cli.healthz(port, 5):
+            fails.append("a started serve must answer /healthz")
+    finally:
+        p.terminate()
+        p.wait(10)
+    db = os.path.join(d, "idle.db")
+    import sqlite3
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, started_at TEXT, ended_at TEXT NOT NULL DEFAULT '')")
+    con.execute("INSERT INTO sessions VALUES ('a', '/x', 't', '')")
+    con.commit()
+    st = {}
+    if cli.idle_watch(db, 30, st, now=0) or cli.idle_watch(db, 30, st, now=99999):
+        fails.append("idle-exit must not fire while a session is open")
+    con.execute("UPDATE sessions SET ended_at='t2'")
+    con.commit()
+    if cli.idle_watch(db, 30, st, now=99999 + 1799) or not cli.idle_watch(db, 30, st, now=99999 + 1800):
+        fails.append("idle-exit must fire 30 minutes after the last open session")
+    con.execute("UPDATE sessions SET ended_at=''")
+    con.commit()
+    if cli.idle_watch(db, 30, st, now=99999 + 5000):
+        fails.append("an open session must reset the idle clock")
+    con.execute("BEGIN EXCLUSIVE")
+    if cli.idle_watch(db, 30, {"last": 0}, now=10 ** 6):
+        fails.append("a locked database must count as a session open")
+    con.rollback()
+    if cli.idle_watch(os.path.join(d, "missing", "x.db"), 30, {"last": 0}, now=10 ** 6):
+        fails.append("an unreadable database must count as a session open")
+    con.close()
+    rc, out, _ = brain("serve", "--uninstall")
+    if rc != 0 or "no login unit" not in out:
+        fails.append(f"uninstall with no unit: {rc} {out!r}")
+
+
 def run(brain_cli):
     fails = []
     me = brain_cli
@@ -1166,6 +1255,7 @@ def run(brain_cli):
                 or con.execute("SELECT branch FROM jobs").fetchone()[0] != "":
             fails.append("a version 9 database must gain the new tables and column, stay at 9 and keep its rows")
         con.close()
+        serve_tests(fails, me, d)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

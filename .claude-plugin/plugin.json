@@ -13,5 +13,24 @@
     "brain": {
       "command": "${CLAUDE_PLUGIN_ROOT}/bin/brain-mcp"
     }
+  },
+  "userConfig": {
+    "serve_mode": {
+      "type": "string",
+      "title": "Brain page",
+      "description": "When the brain page server runs: always (from login, after brain serve --install always), session (started with a session, stops 30 minutes after the last one), or manual (brain serve)",
+      "options": [
+        "always",
+        "session",
+        "manual"
+      ],
+      "default": "manual"
+    },
+    "worktree_roots": {
+      "type": "string",
+      "title": "Worktree folders",
+      "description": "Comma-separated folders the brain page searches for git worktrees, besides the repositories brain already knows",
+      "default": ""
+    }
   }
 }

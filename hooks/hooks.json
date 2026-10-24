@@ -1,5 +1,5 @@
 {
-  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author and wait-loop checks that block, and notes on house style, stale test runs, unverified claims, containers for docs-only diffs and lessons.",
+  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author and wait-loop checks that block, and notes on house style, stale test runs, unverified claims, containers for docs-only diffs and lessons, and the start of the brain page server.",
   "hooks": {
     "SessionStart": [
       {
@@ -26,6 +26,15 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session-env.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/serve-start.py\"",
             "timeout": 10
           }
         ]
