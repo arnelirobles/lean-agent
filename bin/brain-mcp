@@ -475,7 +475,7 @@ def long_title_tests(fails, call, db):
 def self_test():
     fails = []
     me = os.path.realpath(__file__)
-    secret = "hunter2"
+    marker = "argv-marker-7f3"
     with tempfile.TemporaryDirectory() as d:
         d_root = d
         argv_log = os.path.join(d, "argv.log")
@@ -517,14 +517,14 @@ def self_test():
             if names != want:
                 fails.append(f"tools/list: missing {sorted(want - names)} extra {sorted(names - want)}")
             err, text = call("brain_add", project="demo", kind="question", ref="q1", title="a title",
-                             body=f"password is {secret}\nsecond line")
+                             body=f"marker is {marker}\nsecond line")
             if err or "added" not in text:
                 fails.append(f"brain_add: {err} {text!r}")
             err, text = call("brain_list", open=True, project="demo")
             if err or "q1" not in text:
                 fails.append(f"brain_list must show the item: {err} {text!r}")
             err, text = call("brain_show", id=1)
-            if err or secret not in text or "second line" not in text:
+            if err or marker not in text or "second line" not in text:
                 fails.append(f"brain_show must return the stdin body: {err} {text!r}")
             subprocess.run([sys.executable, BRAIN, "session", "start", "mcp-sess-1", "--cwd", os.path.realpath(os.getcwd())],
                            env=env, capture_output=True)
@@ -612,7 +612,7 @@ def self_test():
                 p.kill()
         if os.path.exists(argv_log):
             logged = open(argv_log).read()
-            if secret in logged:
+            if marker in logged:
                 fails.append("the body reached a brain argv")
             if "--body-file" not in logged or '"-"' not in logged:
                 fails.append("brain_add must pass --body-file -")
