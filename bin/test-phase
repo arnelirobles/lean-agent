@@ -1678,6 +1678,9 @@ def self_test():
         got = names("mtp", "\x1b[31mHang dump report\x1b[0m\nTests still running:\n  \x1b[1mAcme.C.Three\x1b[0m\n")
         if got[0] != ["Acme.C.Three"]:
             fails.append(f"mtp: colour codes in the output must not hide the names: {got}")
+        got = names("mtp", "", [("c-report.txt", "\x1b[31mHang dump report\x1b[0m\nTests still running:\n  \x1b[1mAcme.D.Four\x1b[0m\n")])
+        if got[0] != ["Acme.D.Four"]:
+            fails.append(f"mtp: colour codes in a report file must not hide the names: {got}")
         got = names("mtp", "$ dotnet test -- --hangdump\nRunning tests in Acme.Tests.dll\n  Acme.A.One\n")
         if got[0]:
             fails.append(f"mtp: a run that only started with --hangdump has no hang to read: {got}")
@@ -2315,9 +2318,11 @@ seq() {
 }
 case "$mode" in
   crash) seq Acme.CrashTests.Done Acme.CrashTests.Boom; echo "passed Acme.CrashTests.Done (1ms)"; exit 134 ;;
-  rerun)
+  rerun|rerunterm)
     case "$*" in
-      *FullyQualifiedName*) seq Acme.RerunHang.Other Acme.RerunHang.Boom; echo big > "$rd/hang.dmp"; exit 2 ;;
+      *FullyQualifiedName*) seq Acme.RerunHang.Other Acme.RerunHang.Boom${mode#rerun}; echo big > "$rd/hang.dmp"
+        echo "Passed!  - Failed: 0, Passed: 3, Skipped: 0, Total: 3"
+        [ "$mode" = rerunterm ] && kill -TERM $$; exit 2 ;;
       *) echo "failed Acme.RerunHang.Boom (1ms)"; exit 1 ;;
     esac ;;
   *) seq Acme.HangTests.Done Acme.HangTests.Sleeps; echo big > "$rd/hang.dmp"
@@ -2388,8 +2393,13 @@ esac
             fails.append(f"a hung rerun must show as stalled ({rc}): {out}")
         shown = subprocess.run([sys.executable, BRAIN, "show", rr[0].split()[0].lstrip("#")], env=env,
                                capture_output=True, text=True).stdout if rr else ""
-        if "hung: Acme.RerunHang.Boom" not in shown:
+        if "hung: Acme.RerunHang.Boom" not in shown or "unverified; alone: stalled" not in shown:
             fails.append(f"the rerun hang item must say it hung: {shown!r}")
+
+        # The same, ended by a signal: still a hang, not a kill.
+        rc, out, calls = hang_run("rerunterm", f"{repo_v} tests/T/Rt.csproj\n")
+        if not fails_of("Acme.RerunHang.Boomterm") or "killed" in out:
+            fails.append(f"a hung rerun ended by a signal is a hang, not killed ({rc}): {out}")
 
         # Extra arguments that own the results folder keep the user's files out of the cleanup.
         rc, out, calls = hang_run("hang", f"{repo_v} tests/T/Own.csproj args=--results-directory=mine\n")
