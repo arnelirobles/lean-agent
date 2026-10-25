@@ -20,7 +20,7 @@ The collection step can run as a `lean:retro` agent on the fast model (`LEAN_MOD
 
 `collect` reads the session transcripts and the merged pull requests into `~/.lean/lean.db`. `report`
 prints cost per change by model and by role, the escalation rate, findings by where they were caught,
-critic misses, fix rounds and hook fires, each with the count behind it. A line that says `no data`
+critic misses, fix rounds, hook fires and an Avoidable section (the share of tokens and USD in context above 80k, coordinator lookups, images carried in a long context, errored tool calls and wait loops, and Haiku's share of runs against the method's), each with the count behind it. A line that says `no data`
 is a gap in what was recorded, not a zero: say so in the retro and do not reason from it. For the raw
 row per pull request, run
 `REVIEW_LOG=<path to review-log.tsv> retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
@@ -48,6 +48,7 @@ Read the previous retro's accepted changes (the method's history, or `retro-log.
 | A family whose covering script exists but is still hand-rolled (`script-repeats`) | The method does not name the script: add it to the scripts block, or to the agent brief |
 | A step that needed a person in two or more changes | Automate it or script it with confirmations |
 | Fix rounds or cost per change rising | Name the step that grew and a change to it |
+| Any one Avoidable signal over 15% of the period's USD (or of its tokens) | A method change aimed at that signal: end batches earlier for context, send lookups to `lean:search`, a script for the errored calls, or a notify instead of a wait loop. Name the share that should fall and by when |
 | An escaped defect | A check that would have caught it, proven against that defect |
 | Reviews not logged | Make logging part of the review script |
 

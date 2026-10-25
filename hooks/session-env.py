@@ -2,10 +2,11 @@
 """Tie brain items to the Claude session that filed them, so an answer can go back to that session.
 
 SessionStart: writes LEAN_SESSION_ID and LEAN_SESSION_CWD to $CLAUDE_ENV_FILE, so `brain add` in this
-session stores them, and records the session as open in brain. SessionEnd: records it as ended. The
-extension resumes only an ended session, so it never starts a second copy of a live one.
+session stores them, and records the session as open in brain. SessionEnd: records it as ended, and
+starts `lean-stats collect --transcript` for that session in the background, so the numbers collect
+themselves. The extension resumes only an ended session, so it never starts a second copy of a live one.
 UserPromptSubmit: hands the session the answers to its questions that it has not had yet.
-Never fails the session. LEAN_SESSION_ENV=off turns it off.
+Never fails the session. LEAN_SESSION_ENV=off turns off the brain parts; LEAN_STATS=off stops the collect.
 
   session-env.py --self-test
 """
@@ -15,11 +16,13 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
 BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "brain")
+LEAN_STATS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "lean-stats")
 
 
 def brain(*args):
@@ -30,14 +33,28 @@ def brain(*args):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def collect_session(transcript):
+    """Start `lean-stats collect --transcript` detached and return the process, or None. Never waits, never raises."""
+    if os.environ.get("LEAN_STATS") == "off" or not isinstance(transcript, str) or not transcript.endswith(".jsonl"):
+        return None
+    try:
+        return subprocess.Popen([sys.executable, LEAN_STATS, "collect", "--transcript", transcript],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def main():
     event = hookkit.read_event()
+    name = event.get("hook_event_name")
+    if name == "SessionEnd":
+        collect_session(event.get("transcript_path"))
     if (os.environ.get("LEAN_SESSION_ENV") or "").lower() == "off":
         return 0
     sid, cwd = str(event.get("session_id") or ""), str(event.get("cwd") or "")
     if not re.fullmatch(r"[A-Za-z0-9-]{1,100}", sid):
         return 0
-    name = event.get("hook_event_name")
     if name == "SessionStart":
         env_file = os.environ.get("CLAUDE_ENV_FILE")
         if env_file:
@@ -110,6 +127,53 @@ def self_test():
         hook("SessionStart", sid="off-1")
         if "off-1" in open(env_file).read():
             fails.append("LEAN_SESSION_ENV=off must turn it off")
+        began = time.monotonic()
+        env["LEAN_STATS"] = "off"  # keep this check away from the real database
+        rc, out, err = hook("SessionEnd", raw=json_str({"hook_event_name": "SessionEnd", "session_id": "gone-1",
+                                                        "transcript_path": os.path.join(d, "none", "x.jsonl")}))
+        if rc != 0 or out or time.monotonic() - began > 5:
+            fails.append(f"SessionEnd with a missing transcript must be quick and quiet: {rc} {out!r} {err!r}")
+        del env["LEAN_STATS"]
+
+        import json
+        import leanstats
+        db = os.path.join(d, "lean.db")
+        proj = os.path.join(d, "projects", "proj")
+        os.makedirs(os.path.join(proj, "s1", "subagents"))
+        usage = {"input_tokens": 7, "output_tokens": 1}
+
+        def line(sid):
+            return json.dumps({"type": "assistant", "sessionId": sid, "cwd": d, "timestamp": "2026-10-02T01:00:00.000Z",
+                               "message": {"id": "m1", "model": "claude-sonnet-5-5", "usage": usage}}) + "\n"
+
+        for path, sid in ((os.path.join(proj, "s1.jsonl"), "s1"), (os.path.join(proj, "s2.jsonl"), "s2"),
+                          (os.path.join(proj, "s1", "subagents", "agent-a1.jsonl"), "s1")):
+            with open(path, "w") as fh:
+                fh.write(line(sid))
+        saved = {k: os.environ.get(k) for k in ("LEAN_DB", "LEAN_STATS")}
+        os.environ["LEAN_DB"] = db
+        os.environ.pop("LEAN_STATS", None)
+        try:
+            proc = collect_session(os.path.join(proj, "s1.jsonl"))
+            if proc is None or proc.wait() != 0:
+                fails.append("SessionEnd must start a collect for the session's transcript")
+            conn = leanstats.connect(db)
+            got = sorted(os.path.basename(r[0]) for r in conn.execute("SELECT source_path FROM agent_runs"))
+            conn.close()
+            if got != ["agent-a1.jsonl", "s1.jsonl"]:
+                fails.append(f"collect must import that session and its agents only: {got}")
+            os.environ["LEAN_STATS"] = "off"
+            if collect_session(os.path.join(proj, "s2.jsonl")) is not None:
+                fails.append("LEAN_STATS=off must stop the collect")
+            for odd in (None, 5, "notes.txt"):
+                if collect_session(odd) is not None:
+                    fails.append(f"a transcript path of {odd!r} must be ignored")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
     print("self-test: ok" if not fails else "self-test failed:\n  " + "\n  ".join(fails))
     return 1 if fails else 0
 

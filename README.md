@@ -51,6 +51,10 @@ Haiku is 20 times cheaper than Sonnet and faster, so work that only reads and re
 
 What this saves depends on how much of a change's cost was searching and running scripts. Most of it is the draft and the critic, which do not move. The Haiku split has not been measured on a batch yet. Run `lean-stats report` after one: it prints cost by role, and `search`, `gate` and `retro` are the Haiku roles. If they stay under a few percent of the spend, the saving is small and `LEAN_MODEL_FAST=sonnet` changes nothing that matters.
 
+`lean-stats` collects on its own: when a session ends, the SessionEnd hook starts `lean-stats collect --transcript` for that session and its subagents in the background. It never blocks the hook, and `LEAN_STATS=off` stops it. Each run stores counts only (no prompt, code or command text): peak context, turns over 80k, read-only lookup calls, image results, errored tool results and wait-loop calls. `lean-stats report` turns them into an Avoidable section. Each signal shows its share of the period's tokens and list price, and Haiku's share of runs is shown against the share of runs the method gives it. A turn counts toward a signal in whole, so the shares overlap and are an upper bound. Runs collected by an older lean-stats have no signals and are left out, not counted as zero.
+
+While a session runs, a hook tells the coordinator when it is costing the most. Once context passes `LEAN_CONTEXT_WARN` it adds a note, and again at each further 50k: the size, what a turn costs at list price, and to end the batch and resume from brain. After `LEAN_LOOKUP_WARN` read-only lookups by an Opus coordinator in one session it adds one note to send them to `lean:search` on the fast model. Subagents never get either note, and neither note blocks anything.
+
 ## Install
 
 ```bash
@@ -138,6 +142,8 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_MODEL_STRONG` | `opus` | The model that takes what the cheap steps could not close. |
 | `LEAN_MODEL_FAST` | `haiku` | The model for agents that read and report: code search, running the gates, the retro's fact collection. It never judges code. |
 | `LEAN_STATS` | on | `off` stops every `lean-stats` write. |
+| `LEAN_CONTEXT_WARN` | `100000` | Context size, in tokens, where the coordinator gets a cost note. `off` turns it off. |
+| `LEAN_LOOKUP_WARN` | `10` | Read-only lookups by an Opus coordinator before it is told to use `lean:search`. `off` turns it off. |
 | `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where `brain` keeps its database. |
 | `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing the brain digest. |
 
