@@ -19,7 +19,8 @@ or VersionOverride as an attribute (single or double quoted) or as a child eleme
 package.json gives dependencies, devDependencies, peerDependencies and optionalDependencies. A
 value like $(Var) is printed as unresolved. Paths under node_modules, bin, obj, .git, .claude,
 vendor, dist, .venv, target and .next are skipped. When more than 2000 files would be read, a
-"truncated" line says so. Names match without regard to case.
+"truncated" line says so, and a file over 1 MB is skipped with a "skipped" line. A user name or
+password in a registry URL is dropped before the URL is used and never shown. Names match without regard to case.
 
 A registry call has an overall limit of 10 seconds and 5 MB. When the registry cannot be
 reached, is too slow or too large, or does not know the package, the pins still print, the
@@ -50,6 +51,7 @@ DEFAULT_NPM = "https://registry.npmjs.org"
 SKIP_DIRS = {"node_modules", "bin", "obj", ".git", ".claude", "vendor", "dist", ".venv", "target", ".next"}
 MAX_FILES = 2000
 MAX_SEEN = 20000
+MAX_FILE_BYTES = 1024 * 1024
 PROJECT_EXT = (".csproj", ".props", ".targets", ".fsproj", ".vbproj")
 NAME = re.compile(r"[@A-Za-z0-9][@A-Za-z0-9._/-]{0,213}")
 TAG = re.compile(r"<(PackageVersion|PackageReference)\b((?:[^>\"']|\"[^\"]*\"|'[^']*')*?)(/?)>", re.I)
@@ -60,6 +62,25 @@ NPM_SECTIONS = ("dependencies", "devDependencies", "peerDependencies", "optional
 
 class RegistryError(Exception):
     pass
+
+
+def host_of(url):
+    """Host and port of url, never the user name or password."""
+    parts = urllib.parse.urlparse(url)
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    host = parts.hostname or "the registry"
+    return "%s:%d" % (host, port) if port else host
+
+
+def strip_userinfo(url):
+    """url without any user:password@ part."""
+    parts = urllib.parse.urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))
 
 
 class Deadline(Exception):
@@ -75,7 +96,7 @@ def fetch(url):
 
     One deadline covers connect and read together, and the body may not pass MAX_BYTES.
     """
-    host = urllib.parse.urlparse(url).netloc
+    host = host_of(url)
     end = time.monotonic() + TIMEOUT
     alarmed = hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
     if alarmed:
@@ -120,11 +141,11 @@ def npm_base():
             value = ""
     if not value.startswith(("http://", "https://")):
         value = DEFAULT_NPM
-    return value.rstrip("/")
+    return strip_userinfo(value).rstrip("/")
 
 
 def nuget_base():
-    return (os.environ.get("LEAN_NUGET_REGISTRY") or "https://api.nuget.org/v3-flatcontainer").rstrip("/")
+    return strip_userinfo(os.environ.get("LEAN_NUGET_REGISTRY") or "https://api.nuget.org/v3-flatcontainer").rstrip("/")
 
 
 def version_key(text):
@@ -189,13 +210,14 @@ def show_value(value):
 
 def project_pins(text, rel):
     pins = []
+    lowered = text.lower()
     for m in TAG.finditer(text):
         tag, raw, closed = m.group(1), m.group(2), m.group(3)
         attrs = {k.lower(): (v1 or v2) for k, v1, v2 in ATTR.findall(raw)}
         pkg = attrs.get("include") or attrs.get("update") or ""
         children = {}
         if not closed:
-            end = text.lower().find("</" + tag.lower(), m.end(), m.end() + 4000)
+            end = lowered.find("</" + tag.lower(), m.end(), m.end() + 4000)
             body = text[m.end():end if end >= 0 else m.end() + 4000]
             children = {k.lower(): v for k, v in CHILD.findall(body)}
         for key, label in (("versionoverride", "VersionOverride"), ("version", "")):
@@ -206,13 +228,17 @@ def project_pins(text, rel):
 
 
 def read_pins(root, name):
-    """([(ecosystem, relative path, version, where)], truncated) for name under root."""
+    """([(ecosystem, relative path, version, where)], notes) for name under root. Notes name what was cut or skipped."""
     want = name.lower()
     pins = []
     files, truncated = candidate_files(root)
+    notes = ["truncated: more than %d project files, the pins above may be incomplete" % MAX_FILES] if truncated else []
     for rel in files:
         low = os.path.basename(rel).lower()
         try:
+            if os.path.getsize(os.path.join(root, rel)) > MAX_FILE_BYTES:
+                notes.append("skipped: %s is over %d MB" % (rel, MAX_FILE_BYTES // (1024 * 1024)))
+                continue
             with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as f:
                 if low == "package.json":
                     data = json.load(f)
@@ -227,7 +253,7 @@ def read_pins(root, name):
                             pins.append(("nuget", prel, show_value(ver), where))
         except (OSError, ValueError):
             continue
-    return pins, truncated
+    return pins, notes
 
 
 def repo_root(cwd):
@@ -268,8 +294,7 @@ def lookup(name, ecosystem, root):
             lines.append("  %s  %s  %s (%s)" % (rel, ver, eco, where))
     else:
         lines.append("pinned here: nowhere")
-    if truncated:
-        lines.append("truncated: more than %d project files, the pins above may be incomplete" % MAX_FILES)
+    lines.extend(truncated)
     return "\n".join(lines), problems
 
 
@@ -303,7 +328,7 @@ def self_test():
             raise RegistryError("could not reach down.example: timed out")
         if url in registry:
             return registry[url]
-        raise RegistryError("not found on " + urllib.parse.urlparse(url).netloc)
+        raise RegistryError("not found on " + host_of(url))
 
     fetch = fake
     root = tempfile.mkdtemp(prefix="pkg-version-test-")
@@ -372,6 +397,12 @@ def self_test():
     text, _ = lookup("dup-pkg", "npm", repo)
     MAX_FILES = real_max
     check("truncated line when the cap is hit", "truncated: more than 1 project files" in text, text)
+    big = os.path.join(repo, "huge", "Big.csproj")
+    put("huge/Big.csproj", '<PackageReference Include="dup-pkg" Version="8.0.0" />' + " " * (2 * 1024 * 1024), repo)
+    text, _ = lookup("dup-pkg", "npm", repo)
+    check("2 MB project file is skipped and named", "skipped: huge/Big.csproj is over 1 MB" in text
+          and "8.0.0" not in text, text)
+    os.remove(big)
     text, _ = lookup("dup-pkg", "npm", repo)
     check("no truncated line under the cap", "truncated" not in text, text)
 
@@ -506,6 +537,17 @@ def self_test():
     p = subprocess.run([sys.executable, "-I", here, "left-pad", "--npm"], cwd=root, capture_output=True, text=True, env=env)
     check("registry down: exit 1, pins printed, reason on stderr",
           p.returncode == 1 and "^1.1.0" in p.stdout and "pkg-version: npm:" in p.stderr, "%s %s %s" % (p.returncode, p.stdout, p.stderr))
+
+    check("userinfo stripped from the npm base", (os.environ.__setitem__("LEAN_NPM_REGISTRY", "https://u:secret@h.example:8443/r/")
+          or npm_base()) == "https://h.example:8443/r")
+    os.environ["LEAN_NUGET_REGISTRY"] = "https://u:secret@h.example/n"
+    check("userinfo stripped from the nuget base", nuget_base() == "https://h.example/n", nuget_base())
+    check("host_of drops credentials", host_of("https://u:secret@h.example:8443/r") == "h.example:8443")
+    os.environ["LEAN_NPM_REGISTRY"] = "https://u:secret@127.0.0.1:9/"
+    p = subprocess.run([sys.executable, "-I", here, "left-pad", "--npm"], cwd=empty, capture_output=True, text=True,
+                       env=dict(os.environ))
+    check("credentials never reach stdout or stderr", p.returncode == 1 and "secret" not in p.stdout + p.stderr
+          and "u:" not in p.stdout + p.stderr and "127.0.0.1:9" in p.stderr, p.stdout + p.stderr)
 
     fetch = real_fetch
     os.environ.clear()
