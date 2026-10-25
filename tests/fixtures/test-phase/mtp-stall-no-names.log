@@ -1,0 +1,2 @@
+$ dotnet test --project BarakoCMS.Tests -- --filter-class '*AuditCursorTests*' --filter-class '*AuditPollTests*' --filter-class '*AuditListTests*' --filter-class '*AuditTenantIsolationTests*' --filter-class '*ContentTypeSpellingTests*' --filter-class '*ContentTypeNameIndexTests*' --filter-class '*AuditChainTests*' --output Detailed
+heavy.sh: stalled: no test progress for 600 s; likely load, not code
