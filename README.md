@@ -154,6 +154,9 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_LOOKUP_WARN` | `10` | Read-only lookups by an Opus coordinator before it is told to use `lean:search`. `off` turns it off. |
 | `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where `brain` keeps its database. |
 | `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing the brain digest. |
+| `LEAN_SCRIPT_NOTE` | on | `off` stops the note that names the script behind a hand-written command. |
+| `LEAN_NPM_REGISTRY` | `npm config get registry`, else `https://registry.npmjs.org` | The npm registry `pkg-version` asks. |
+| `LEAN_NUGET_REGISTRY` | `https://api.nuget.org/v3-flatcontainer` | The nuget flat container `pkg-version` asks. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
 
@@ -181,7 +184,7 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 
 ## Data
 
-lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`) and stats (`~/.lean/lean.db`). The `commit-author` hook reads the git author email to check it and stores nothing.
+lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`), stats (`~/.lean/lean.db`) and which script notes a session has seen (`~/.local/share/lean/script-note`, deleted after 14 days). The `commit-author` hook reads the git author email to check it and stores nothing.
 
 It sends data to other services only through tools you already run, and only where you point them:
 

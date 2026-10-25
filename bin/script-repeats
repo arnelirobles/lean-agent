@@ -88,6 +88,7 @@ def load_families(path=FAMILIES_FILE):
             "per_segment": bool(fam.get("per_segment")),
             "kind": fam.get("kind", "script"),
             "covered_by": fam.get("covered_by", "none"),
+            "usage": fam.get("usage"),
         })
     return out
 
@@ -293,7 +294,7 @@ def self_test():
     by_name = {f["name"]: f for f in fams}
     for want in ("style-slop-grep", "mutation-check", "versioned-plugin-path", "curl-smoke-check",
                  "inline-python-replace", "wait-loop", "pgrep", "direct-test-run",
-                 "package-version-lookup", "worktree-status-sweep", "graphql-review-threads"):
+                 "package-version-lookup", "image-or-search-lookup", "worktree-status-sweep", "graphql-review-threads"):
         assert want in by_name, "missing family " + want
 
     # every covering script that names a file exists in the repository
@@ -317,6 +318,11 @@ def self_test():
     assert hit("cat > notes.md <<'EOF'\npgrep until sleep 5\nEOF") == []
     assert hit("pip install pytest") == []
     assert hit("pytest -q tests") == ["direct-test-run"]
+    assert hit("for d in a b; do git -C $d status; done") == ["worktree-status-sweep"]
+    assert hit("for i in 1 2 3; do make build; done\ngit status") == []
+    assert hit("for i in 1 2; do make; done; git status") == []
+    assert hit("docker manifest inspect nginx:latest") == ["image-or-search-lookup"]
+    assert hit("npm view left-pad version") == ["package-version-lookup"]
     assert hit("cd app && dotnet test X.sln | tail -5") == ["direct-test-run"]
     assert hit("brain queue add r p --filter X && dotnet test --list-tests") == ["direct-test-run"]
     assert hit("brain queue add r p --filter 'ATests|BTests'") == []
@@ -392,7 +398,8 @@ def self_test():
     assert "(root)" in {project_of(root, os.path.join(root, "top.jsonl"))}
 
     text = render(res, fams, 7)
-    assert "needs a script (no cover, 3 or more projects): package-version-lookup" in text, text
+    assert "needs a script (no cover, 3 or more projects): none" in text, text
+    assert "package-version-lookup (pkg-version)" in text, text
     assert "pgrep (hooks/wait-loop.py)" in text
     assert "method text names it, agents use a path: versioned-plugin-path" in text
     assert "versioned-plugin-path (" not in text.split("hand-rolled despite a script:")[1].split("\n")[0]
