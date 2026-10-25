@@ -7,7 +7,9 @@ PostToolUse hook on every tool. For the main session only, never a subagent, it 
   - once per session after LEAN_LOOKUP_WARN read-only lookups (default 10) by an Opus
     coordinator: send them to lean:search on the fast model
 It only ever notes, never blocks. It reads the tail of the transcript, not the whole file, and
-keeps a small counter file per session in the temp directory.
+keeps a small counter file per session in a context-cost folder next to the lean-stats database
+(~/.lean/context-cost, 0700). The counters stay when a session is resumed, so a resumed session
+carries its count and the steps it was already told about.
 
   LEAN_CONTEXT_WARN=off   turn off the context note (a number sets the threshold)
   LEAN_LOOKUP_WARN=off    turn off the lookup note (a number sets the count)
@@ -16,8 +18,15 @@ keeps a small counter file per session in the temp directory.
 import json
 import os
 import re
+import stat
+import subprocess
 import sys
 import tempfile
+
+try:
+    import fcntl
+except ImportError:  # no flock on this platform: the counter can lose an update, nothing else changes
+    fcntl = None
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
@@ -42,8 +51,38 @@ def setting(name, default):
     return number if number > 0 else None
 
 
-def state_path(sid):
-    return os.path.join(tempfile.gettempdir(), "lean-context-cost", sid + ".json")
+SESSION_ID = re.compile(r"[A-Za-z0-9-]{1,100}")
+
+
+def state_dir():
+    """The counter folder, or None when it is not safe to use: a link, or not ours."""
+    path = os.path.join(os.path.dirname(leanstats.db_path()), "context-cost")
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        return None
+    if info.st_mode & 0o077:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            return None
+    return path
+
+
+def state_path(sid, suffix=".json"):
+    if not SESSION_ID.fullmatch(sid):
+        raise ValueError("bad session id")
+    folder = state_dir()
+    if folder is None:
+        raise OSError("no safe state folder")
+    return os.path.join(folder, sid + suffix)
 
 
 def load(sid):
@@ -57,10 +96,34 @@ def load(sid):
 
 def save(sid, state):
     path = state_path(sid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".tmp", "w") as fh:
-        json.dump(state, fh)
-    os.replace(path + ".tmp", path)
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(state, fh)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+class Locked:
+    """Holds the session's lock file for the whole load, change and save, so parallel hooks do not lose updates."""
+
+    def __init__(self, sid):
+        self.path = state_path(sid, ".lock")
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        if fcntl:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
 
 
 def is_subagent(event, path):
@@ -102,7 +165,7 @@ def main():
     event = hookkit.read_event()
     sid = str(event.get("session_id") or "")
     path = event.get("transcript_path")
-    if not re.fullmatch(r"[A-Za-z0-9-]{1,100}", sid) or not isinstance(path, str) or is_subagent(event, path):
+    if not SESSION_ID.fullmatch(sid) or not isinstance(path, str) or is_subagent(event, path):
         return 0
     limit, lookups = setting("LEAN_CONTEXT_WARN", CONTEXT_DEFAULT), setting("LEAN_LOOKUP_WARN", LOOKUP_DEFAULT)
     if limit is None and lookups is None:
@@ -110,9 +173,13 @@ def main():
     last = leanstats.last_usage(path)
     if not last:
         return 0
-    state = load(sid)
-    notes = [n for n in (context_note(last, state, limit), lookup_note(event, last, state, lookups)) if n]
-    save(sid, state)
+    try:
+        with Locked(sid):
+            state = load(sid)
+            notes = [n for n in (context_note(last, state, limit), lookup_note(event, last, state, lookups)) if n]
+            save(sid, state)
+    except (OSError, ValueError):
+        return 0
     if notes:
         hookkit.note("PostToolUse", " ".join(notes))
     return 0
@@ -130,9 +197,12 @@ def self_test():
             failures.append(f"{name}: got {got!r}, want {want!r}")
 
     with tempfile.TemporaryDirectory() as tmp:
-        saved_tmp = tempfile.tempdir
-        tempfile.tempdir = tmp
-        saved = {k: os.environ.pop(k, None) for k in ("LEAN_CONTEXT_WARN", "LEAN_LOOKUP_WARN")}
+        names = ("LEAN_CONTEXT_WARN", "LEAN_LOOKUP_WARN", "LEAN_DB", "LEAN_STATS", "HOME")
+        saved = {k: os.environ.get(k) for k in names}
+        for k in names[:4]:
+            os.environ.pop(k, None)
+        os.environ["HOME"] = os.path.join(tmp, "home")
+        os.environ["LEAN_DB"] = os.path.join(tmp, "lean.db")
         try:
             transcript = os.path.join(tmp, "s.jsonl")
 
@@ -220,6 +290,81 @@ def self_test():
             check("both notes can arrive together", ("120k tokens" in text, "lean:search" in text), (True, True))
             del os.environ["LEAN_LOOKUP_WARN"]
 
+            for value, want in (("0", None), ("-5", None), ("1", 1), (" 7 ", 7), ("off", None), ("", 9), ("3.5", 9)):
+                os.environ["LEAN_CONTEXT_WARN"] = value
+                check("setting %r" % value, setting("LEAN_CONTEXT_WARN", 9), want)
+            del os.environ["LEAN_CONTEXT_WARN"]
+            os.environ["LEAN_CONTEXT_WARN"] = "0"
+            check("a setting of 0 turns the context note off", fire(300000, sid="sess-16")[1], "")
+            del os.environ["LEAN_CONTEXT_WARN"]
+
+            folder = os.path.join(tmp, "context-cost")
+            check("the counters sit next to the database, private", (os.path.dirname(state_path("sess-7")) == folder,
+                                                                    stat.S_IMODE(os.lstat(folder).st_mode)), (True, 0o700))
+            check("no temp file is left behind", [n for n in os.listdir(folder) if n.endswith(".tmp")], [])
+            check("a counter file is not shared with the temp directory", os.path.exists(
+                os.path.join(tempfile.gettempdir(), "lean-context-cost")), False)
+            for bad in ("a/../b", "../x", "a.b", "", "x" * 101, "a b"):
+                try:
+                    state_path(bad)
+                    check("session id %r is refused" % bad, "accepted", "refused")
+                except ValueError:
+                    pass
+
+            here = os.path.join(tmp, "parallel")
+            os.makedirs(here)
+            log = os.path.join(here, "s.jsonl")
+            with open(log, "w") as fh:
+                fh.write(turn(1000))
+            env = dict(os.environ, LEAN_DB=os.path.join(here, "lean.db"), HOME=here)
+            event = json.dumps({"session_id": "par-1", "transcript_path": log, "tool_name": "Grep", "tool_input": {},
+                                "hook_event_name": "PostToolUse"})
+            procs = [subprocess.Popen([sys.executable, os.path.realpath(__file__)], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env) for _ in range(20)]
+            outs = [p.communicate(event) for p in procs]
+            check("parallel hooks all succeed", [p.returncode for p in procs], [0] * 20)
+            noted = [o for o, _ in outs if "read-only lookups" in o]
+            check("parallel hooks lose no count", json.load(open(os.path.join(here, "context-cost", "par-1.json")))["lookups"], 20)
+            check("and exactly one of them gives the lookup note", len(noted), 1)
+
+            os.environ["LEAN_DB"] = env["LEAN_DB"]
+            try:
+                with Locked("par-2"):
+                    held = subprocess.Popen([sys.executable, os.path.realpath(__file__)], stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+                    held.stdin.write(event.replace("par-1", "par-2"))
+                    held.stdin.close()
+                    try:
+                        held.wait(timeout=0.7)
+                        check("a hook waits for the session's lock", "finished", "waiting")
+                    except subprocess.TimeoutExpired:
+                        pass
+                check("and goes on when it is released", held.wait(timeout=10), 0)
+                held.stdout.close()
+                held.stderr.close()
+                check("having counted once", json.load(open(os.path.join(here, "context-cost", "par-2.json")))["lookups"], 1)
+            finally:
+                os.environ["LEAN_DB"] = os.path.join(tmp, "lean.db")
+
+            linked = os.path.join(tmp, "linked")
+            elsewhere = os.path.join(tmp, "elsewhere")
+            os.makedirs(linked)
+            os.makedirs(elsewhere)
+            os.symlink(elsewhere, os.path.join(linked, "context-cost"))
+            os.environ["LEAN_DB"] = os.path.join(linked, "lean.db")
+            check("a state folder that is a link is refused", (fire(300000, sid="sess-17")[:1], os.listdir(elsewhere)),
+                  ((0,), []))
+            os.environ["LEAN_DB"] = os.path.join(tmp, "lean.db")
+            real_uid = os.getuid
+            os.getuid = lambda: real_uid() + 1
+            try:
+                check("a state folder that is not ours is refused", state_dir(), None)
+            finally:
+                os.getuid = real_uid
+            os.chmod(folder, 0o755)
+            check("a loose folder is made private again", (state_dir() == folder, stat.S_IMODE(os.lstat(folder).st_mode)),
+                  (True, 0o700))
+
             for label, event in (("bad json", "not json"), ("a bad session id", {"session_id": "a/../b", "transcript_path": transcript}),
                                  ("no transcript", {"session_id": "sess-13"}),
                                  ("a missing transcript", {"session_id": "sess-14", "transcript_path": os.path.join(tmp, "no.jsonl")})):
@@ -245,9 +390,10 @@ def self_test():
             check("a 50 MB transcript is read from the tail", (code, "170k" in text or "150k" in text, took < 1.0),
                   (0, True, True))
         finally:
-            tempfile.tempdir = saved_tmp
             for key, value in saved.items():
-                if value is not None:
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
                     os.environ[key] = value
     print("self-test: ok" if not failures else "self-test failed:\n  " + "\n  ".join(failures))
     return 1 if failures else 0

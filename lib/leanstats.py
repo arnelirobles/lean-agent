@@ -379,7 +379,8 @@ def last_usage(path, chunk=262144, limit=16777216):
 
 def read_usage(path):
     """One dict per assistant message in a transcript: model, cwd, ts, session, five token counts and
-    tool counts (calls, lookups, waits, errors, images, after_image).
+    tool counts (calls, lookups, waits, errors, images, after_image). after_image is true while an
+    image is still in the context: a prompt under half the one before ends it, as a compaction does.
 
     Claude Code writes one row per content block and repeats the message's usage
     on each, so usage is counted once per message id and the last row wins; the
@@ -387,7 +388,7 @@ def read_usage(path):
     alone. Lines that are not JSON are skipped. Only counts are kept, never a command.
     """
     seen, order, extra = {}, [], {}
-    failed, pictured = set(), set()
+    failed, pictured, cleared = set(), set(), 0
     try:
         fh = open(path, errors="replace")
     except OSError:
@@ -409,8 +410,10 @@ def read_usage(path):
                 continue
             key = message.get("id") or f"row-{number}"
             if key not in seen:
+                if order and prompt_size(usage_of(row, message)) * 2 < prompt_size(seen[order[-1]]):
+                    cleared = len(pictured)  # a compaction drops the images from the context
                 order.append(key)
-                extra[key] = {"calls": {}, "after_image": bool(pictured)}
+                extra[key] = {"calls": {}, "after_image": len(pictured) > cleared}
             seen[key] = usage_of(row, message)
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
@@ -441,6 +444,7 @@ def signals(messages, kind):
 
     A turn counts toward a signal in whole, so the signals overlap and are an upper bound on what could
     be saved. Context is the part of a prompt above 80k. Lookups only count for a coordinator on Opus.
+    The lookup count is the coordinator's on Opus, the same turns the lookup share uses.
     Returns the six counts and a JSON text of {signal: [tokens, usd]}.
     """
     spent = {name: [0, 0.0] for name in SIGNALS}
@@ -467,7 +471,7 @@ def signals(messages, kind):
             add("error", m, whole, usd)
         if m.get("waits"):
             add("wait", m, whole, usd)
-    counts = (peak, turns, sum(m.get("lookups", 0) for m in messages), sum(m.get("images", 0) for m in messages),
+    counts = (peak, turns, sum(m.get("lookups", 0) for m in messages if kind == "main" and "opus" in m["model"]), sum(m.get("images", 0) for m in messages),
               sum(m.get("errors", 0) for m in messages), sum(m.get("waits", 0) for m in messages))
     return counts + (json.dumps({name: [tokens, round(usd, 6)] for name, (tokens, usd) in spent.items()}),)
 
@@ -600,13 +604,25 @@ def self_test():
                         "git fetch origin", "cat a 2>/dev/null", "ls 2>&1"):
             check("lookup: " + command, is_lookup(command), True)
         for command in ("git commit -m x", "git push", "sed -i s/a/b/ f", "sed s/a/b/ f", "find . -delete",
-                        "find . -exec rm {} ;", "cat a > b", "ls >> log", "gh pr merge 5", "gh pr comment 5",
+                        "find . -exec rm {} ;", "sed -ni s/a/b/ f", "sed -n --in-place s/a/b/ f", "cat a > b", "ls >> log", "gh pr merge 5", "gh pr comment 5",
                         "gh api x", "npm test", "git status && git add .", "cat a | sh", "", None, "x" * 3000):
             check("not a lookup: %r" % (command if command is None or len(command) < 60 else "long"),
                   is_lookup(command), False)
+        room = "ls " + "a" * (MAX_LOOKUP_COMMAND - 3)
+        check("a command at the length limit is still read", is_lookup(room), True)
+        check("a command over the limit is not read", is_lookup(room + "a"), False)
         check("wait: sleep then cat", is_wait_loop("sleep 5; cat out.txt"), True)
         check("wait: pgrep", is_wait_loop("pgrep -f dotnet"), True)
         check("wait: poll loop", is_wait_loop("until grep -q x f; do sleep 2; done"), True)
+        wait = _wait_loop()
+        real = wait.verdict
+        try:
+            wait.verdict = lambda command, cwd=".": ("note", "run tests with the queue")
+            check("a note from the wait guard is not a wait loop", is_wait_loop("sleep 5; cat out.txt"), False)
+            wait.verdict = lambda command, cwd=".": None
+            check("no verdict is not a wait loop", is_wait_loop("sleep 5; cat out.txt"), False)
+        finally:
+            wait.verdict = real
         check("a plain sleep is not a wait loop", is_wait_loop("sleep 2"), False)
         check("a note-only command is not a wait loop", is_wait_loop("dotnet test X"), False)
         with temp_env(LEAN_WAIT_GUARD="off"):
@@ -614,8 +630,9 @@ def self_test():
         check("Read, Grep and Glob are lookups", [tool_kind(n, {}) for n in ("Read", "Grep", "Glob", "Edit")],
               ["lookup", "lookup", "lookup", "other"])
 
-        def turn(mid, blocks, size=1000):
-            usage = {"input_tokens": 10, "cache_read_input_tokens": size, "output_tokens": 50}
+        def turn(mid, blocks, size=1000, written=0):
+            usage = {"input_tokens": 10, "cache_read_input_tokens": size, "cache_creation_input_tokens": written,
+                     "output_tokens": 50}
             return "".join(json.dumps({"type": "assistant", "sessionId": "s1", "message": {
                 "id": mid, "model": "claude-opus-5-5", "usage": usage, "content": [b] if b else []}}) + "\n"
                            for b in blocks or [None])
@@ -632,20 +649,35 @@ def self_test():
             fh.write(turn("a", [use("t1", "Bash", command="git status"), use("t2", "Bash", command="sleep 5; cat o.txt")],
                           size=90000))
             fh.write(result("t1") + result("t2", error=True))
-            fh.write(turn("b", [use("t3", "Read", file_path="/a")], size=100000))
+            fh.write(turn("b", [use("t3", "Read", file_path="/a")], size=70000, written=30000))
             fh.write(result("t3", image=True))
             fh.write(turn("c", [use("t4", "Bash", command="make > out.txt"), use("t4", "Bash", command="make > out.txt")],
                           size=120000))
+            fh.write(result("t4", error="yes"))
             fh.write(turn("d", []))
         got = read_usage(transcript)
         check("a message whose usage repeats across blocks is one message", len(got), 4)
-        check("usage is not counted twice", [m["cr"] for m in got], [90000, 100000, 120000, 1000])
+        check("usage is not counted twice", [m["cr"] for m in got], [90000, 70000, 120000, 1000])
+        check("cache writes are counted in the prompt", [prompt_size(m) for m in got], [90010, 100010, 120010, 1010])
         check("calls", [m["calls"] for m in got], [2, 1, 1, 0])
         check("lookups", [m["lookups"] for m in got], [1, 1, 0, 0])
         check("wait loops", [m["waits"] for m in got], [1, 0, 0, 0])
         check("errored results", [m["errors"] for m in got], [1, 0, 0, 0])
         check("image results", [m["images"] for m in got], [0, 1, 0, 0])
-        check("only later messages carry the image", [m["after_image"] for m in got], [False, False, True, True])
+        check("only later messages carry the image", [m["after_image"] for m in got], [False, False, True, False])
+        shrunk = os.path.join(tmp, "shrunk.jsonl")
+        with open(shrunk, "w") as fh:
+            fh.write(turn("a", [use("t1", "Read", file_path="/a")], size=150000))
+            fh.write(result("t1", image=True))
+            fh.write(turn("b", [], size=140000))
+            fh.write(turn("c", [], size=70000))
+            fh.write(turn("d", [], size=3000))
+            fh.write(turn("e", [use("t2", "Read", file_path="/b")], size=2000))
+            fh.write(result("t2", image=True))
+            fh.write(turn("f", [], size=2500))
+        check("an image stays in the context until a compaction",
+              [m["after_image"] for m in read_usage(shrunk)], [False, True, True, False, False, True])
+        check("images are still counted after a compaction", sum(m["images"] for m in read_usage(shrunk)), 2)
         check("no command text is kept", "git status" in json.dumps(got) or "sleep" in json.dumps(got), False)
         peak, turns, lookups, images, errors, waits, avoidable = signals(got, "main")
         check("counts", (peak, turns, lookups, images, errors, waits), (120010, 3, 2, 1, 1, 1))
@@ -658,6 +690,13 @@ def self_test():
         check("a subagent has no lookup share", json.loads(signals(got, "subagent")[6])["lookup"], [0, 0.0])
         check("sonnet has no lookup share", json.loads(signals([dict(m, model="claude-sonnet-5-5") for m in got], "main")[6])["lookup"][0], 0)
         check("a short run has none of the context signals", signals(got[3:], "main")[:2], (1010, 0))
+        edge = dict(model="claude-opus-5-5", cw1h=0, out=0, **{"in": 0, "cw": 0, "cr": 80000})
+        check("exactly 80k is not over", signals([edge], "main")[1], 0)
+        check("one token over is", signals([dict(edge, cr=80001)], "main")[1], 1)
+        check("a cache write counts toward the 80k", signals([dict(edge, cr=40000, cw=40001)], "main")[1], 1)
+        check("lookups are counted for an Opus coordinator only",
+              (signals([dict(edge, calls=2, lookups=2)], "main")[2], signals([dict(edge, calls=2, lookups=2)], "subagent")[2],
+               signals([dict(edge, calls=2, lookups=2, model="claude-sonnet-5-5")], "main")[2]), (2, 0, 0))
         last = last_usage(transcript)
         check("last_usage reads the last message", (last["cr"], last["in"]), (1000, 10))
         with open(transcript, "w") as fh:
@@ -665,6 +704,15 @@ def self_test():
             fh.write(json.dumps({"message": {"role": "user", "content": "x" * 600000}}) + "\n")
             fh.write("not json\n")
         check("last_usage widens its read past a long line", last_usage(transcript)["cr"], 5)
+        with open(transcript, "w") as fh:
+            fh.write(turn("a", [], size=7))
+            fh.write(json.dumps({"message": {"model": "<synthetic>", "usage": {"input_tokens": 0, "output_tokens": 0}}}) + "\n")
+        check("last_usage skips a synthetic message", last_usage(transcript)["cr"], 7)
+        tail = turn("z", [], size=999)
+        with open(transcript, "w") as fh:
+            fh.write("junk" + tail)
+        check("last_usage drops the partial first line of a window",
+              last_usage(transcript, chunk=len(tail), limit=len(tail)), None)
         check("last_usage on a missing file", last_usage(os.path.join(tmp, "absent.jsonl")), None)
 
         fires = os.path.join(tmp, "fires.db")
