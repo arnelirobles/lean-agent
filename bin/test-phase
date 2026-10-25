@@ -131,7 +131,8 @@ TEST_NAME = re.compile(r"[A-Za-z_][\w`<>+]*(?:\.[\w`<>+]+)+(?:\(.*\))?")
 # Arguments that already say where results go or what collects them: a hang run adds its own results folder and
 # deletes it, so it must not share one with these.
 OWN_OUTPUT = {"--results-directory", "-r", "--logger", "-l", "--collect", "--settings", "-s", "--diag", "-d"}
-HANG_FIRED = re.compile(r"(?i)hang ?dump (?:timeout|.*expired)|blame\b.*\bhang\b.*(?:timeout|exceeded|expired)|hang timeout")
+# VSTest's line is real (captured, SDK 10.0.103). The MTP alternative is a guess: HangDump never fired in a capture.
+HANG_FIRED = re.compile(r"The specified inactivity time of \d+ seconds has elapsed|(?i:hang ?dump (?:timeout|.*expired))")
 TEST_RESULT_LINE = re.compile(r"^(?:failed|passed|skipped)\s", re.I)
 # The hang timeout is this many seconds under the stall timeout, so the hang dump is taken before heavy.sh stops
 # the run (at least half the stall timeout, one second at the least).
@@ -173,7 +174,9 @@ class Dotnet:
             raise ValueError("a filter piece starts with -")
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
-            cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
+            # The hang arguments go before `--`: after it the SDK 10.0.103 rejected --results-directory as a
+            # directory argument, and ignored --list-tests.
+            cmd = ["dotnet", "test", "--project", project] + list(extra) + list(hang) + ["--"]
             # --filter-class matches the full class name. The fast tier takes a fragment, and so does a
             # name with no namespace in any tier, hence the wildcards. A rerun passes full names.
             # xunit v3 ORs repeated --filter-class, so one run covers every class (checked on 4.0.0:
@@ -183,7 +186,7 @@ class Dotnet:
                 cmd.append("--list-tests")
             for c in names:
                 cmd += ["--filter-class", f"*{c}*" if fast or "." not in c else c]
-            return cmd + ["--output", "Detailed"] + list(hang)
+            return cmd + ["--output", "Detailed"]
         cmd = ["dotnet", "test", project] + list(extra) + ["--logger", "console;verbosity=normal"]
         if names:
             cmd += ["--filter", "|".join("FullyQualifiedName~" + c for c in names)]
@@ -268,7 +271,8 @@ class Dotnet:
     @staticmethod
     def sequence_names(xml):
         try:
-            tests = [(t.get("Name"), t.get("Completed")) for t in ET.fromstring(xml.strip()).iter("Test") if t.get("Name")]
+            tests = [(t.get("DisplayName") or t.get("Name"), t.get("Completed"))
+                     for t in ET.fromstring(xml.strip()).iter("Test") if t.get("DisplayName") or t.get("Name")]
         except ET.ParseError:
             return []
         if any(c is not None for _, c in tests):
@@ -1632,14 +1636,15 @@ def self_test():
         if got[-2:] != ["--blame-hang-timeout", "540s"]:
             fails.append(f"hang arguments must end a vstest command: {got}")
         got = Dotnet.command("mtp", "T.csproj", "ATests", hang=["--hangdump"])
-        if got[-3:] != ["--output", "Detailed", "--hangdump"]:
-            fails.append(f"hang arguments must follow the MTP options: {got}")
+        if got[:5] != ["dotnet", "test", "--project", "T.csproj", "--hangdump"] or got[5] != "--":
+            fails.append(f"MTP hang arguments must come before the -- separator: {got}")
 
         def names(mode, text, files=()):
             d = os.path.join(hd, "names")
             shutil.rmtree(d, ignore_errors=True)
             os.makedirs(d)
             for n, body in files:
+                os.makedirs(os.path.dirname(os.path.join(d, n)), exist_ok=True)
                 open(os.path.join(d, n), "w").write(body)
             return Dotnet.hang_names(mode, text, d)
 
@@ -1649,9 +1654,21 @@ def self_test():
         got = names("vstest", "", [("Sequence_1.xml", fixture("vstest-sequence-plain.xml"))])
         if got[0] != ["TestProject.UnitTest1.TestMethodA"]:
             fails.append(f"vstest: without Completed marks the last test listed is the running one: {got}")
+        crash = {"names": ["A.B"], "fired": hang_fired(fixture("vstest-hang-console.txt"), False)}
+        if not is_hang(crash, 1):
+            fails.append("vstest: a hang whose output also says the test host crashed is still a hang")
         got = names("vstest", "", [("Sequence_1.xml", "<TestSequence></TestSequence>")])
         if got[0]:
             fails.append(f"vstest: an empty sequence file names nothing: {got}")
+        got = names("vstest", fixture("vstest-hang-console.txt"),
+                    [(os.path.join("9580e186", "Sequence_e1f4.xml"), fixture("vstest-sequence-real.xml")),
+                     (os.path.join("9580e186", "dotnet_66993_hangdump.dmp"), "dump")])
+        if got[0] != ['Capture.HangTests.Theory_with_a_string(s: "a&b \\"q\\" \'c\'")'] or got[2] != 2 or got[3] is not True:
+            fails.append(f"vstest: the captured sequence file in a subfolder, with its dump: {got}")
+        if not hang_fired(fixture("vstest-hang-console.txt"), False):
+            fails.append("vstest: the captured inactivity line shows the timer fired, though the output also says the host crashed")
+        if hang_fired(fixture("vstest-hang-console.txt").replace("The specified inactivity time of 30 seconds has elapsed", "x"), False):
+            fails.append("vstest: the crash lines alone are not proof of a hang")
         got = names("vstest", "", [("Sequence_1.xml", fixture("vstest-sequence-theory.xml"))])
         if got[0] != ['Acme.T.Theory(s: "a&b", t: \'c\', u: \'d\')']:
             fails.append(f"vstest: XML escapes in a theory argument must decode: {got}")
