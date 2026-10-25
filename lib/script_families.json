@@ -56,17 +56,24 @@
     },
     {
       "name": "package-version-lookup",
-      "regex": "hub\\.docker\\.com/v2|api\\.nuget\\.org|azuresearch[^\\s]{0,100}nuget|registry\\.npmjs\\.org|\\bnpm (view|info|show)\\b|\\bdotnet (package|nuget) search\\b|\\bdocker manifest inspect\\b",
-      "code": "\\b(curl|wget|npm|dotnet|docker|python3?|gh)\\b",
+      "regex": "api\\.nuget\\.org|azuresearch[^\\s]{0,100}nuget|registry\\.npmjs\\.org|\\bnpm (view|info|show)\\b",
+      "code": "\\b(curl|wget|npm|dotnet|python3?|gh)\\b",
       "raw": true,
       "covered_by": "pkg-version",
       "usage": "prints the latest stable version and what each project here pins. Run `pkg-version <name> [--nuget|--npm]`."
     },
     {
+      "name": "image-or-search-lookup",
+      "regex": "hub\\.docker\\.com/v2|\\bdotnet (package|nuget) search\\b|\\bdocker manifest inspect\\b",
+      "code": "\\b(curl|wget|dotnet|docker|python3?|gh)\\b",
+      "raw": true,
+      "covered_by": "none"
+    },
+    {
       "name": "worktree-status-sweep",
-      "regex": "\\bfor\\b[\\s\\S]{0,500}\\bgit\\b[^\\n]{0,200}\\b(status|worktree list)\\b|git worktree list[\\s\\S]{0,300}(xargs|while read)",
-      "covered_by": "where",
-      "usage": "prints repo, branch, dirty count, ahead and behind, open PR and checks in under 30 lines. Run `where`, or `where --all` for every worktree."
+      "regex": "\\bfor\\b[^;\\n]{0,200}[;\\n]\\s*do\\b(?:(?!\\bdone\\b)[\\s\\S]){0,500}?\\bgit\\b[^\\n;]{0,200}\\b(status|worktree list)\\b|git worktree list[\\s\\S]{0,300}(xargs|while read)",
+      "covered_by": "orient",
+      "usage": "prints repo, branch, dirty count, ahead and behind, open PR and checks in under 30 lines. Run `orient`, or `orient --all` for every worktree."
     },
     {
       "name": "graphql-review-threads",

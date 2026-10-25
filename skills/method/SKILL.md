@@ -43,7 +43,7 @@ The plugin's `bin/` is on PATH, so call these by name, not by a path. Use them i
 - `holdout.sh --spec <file>`: holds a change's production hunk out and requires its named test to fail. Use it for the mutation check, not a hand revert.
 - `replace`: exact text edit that fails unless the old text is there exactly once.
 - `wait-loop` hook (`hooks/wait-loop.py`): denies `sleep` and `pgrep` wait loops. Enqueue and end the turn instead.
-- `where [--all]`: repo, branch, dirty count, ahead and behind, open PR with its checks, and with `--all` one line per worktree. Use it instead of a status loop over worktrees.
+- `orient [--all]`: repo, branch, dirty count, ahead and behind, open PR with its checks, and with `--all` one line per worktree. Use it instead of a status loop over worktrees.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what each project in the repo pins. Use it instead of a curl to a registry.
 - `script-note` hook (`hooks/script-note.py`): when a command matches a family in `lib/script_families.json` that a script covers, or calls a script by its plugin cache path, it adds a one line note naming the script. Once per family per session, never a deny. `LEAN_SCRIPT_NOTE=off` turns it off.
 - `pr-blockers.sh <pr>`: every reason a pull request cannot merge, in one read-only call.
