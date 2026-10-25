@@ -33,6 +33,11 @@
   brain queue cancel ID                    a queued job; jobs waiting on it are cancelled too
   brain queue route ID --to remote|local|any [--force]   remote: only a remote lane claims it; local: only this
             machine (platform=apple); any: whichever lane is free. remote refuses an Apple job without --force
+  brain queue wait ID... [--timeout SECS] [--interval SECS]   blocks until every named job ends, then prints one
+            line per job (id, status, passed and failed of its run, the item ids it filed). Exit 0 when all are
+            done, 1 when any failed or was cancelled, 2 for an unknown id, 3 on timeout (default 7200 s; the
+            pending jobs and their state are printed). It polls the database every 15 s itself. Start it with
+            run_in_background and end the turn.
   brain queue next [--peek] [--where local|remote] [--host NAME]   (what test-phase uses to drain)
   brain queue finish ID --status done|failed | requeue ID --reason R   (requeue puts a running job back)
   brain activity add --source S --action A [--ts T] [--project P] [--target T] [--ok 0|1] [--duration-ms N]
@@ -80,7 +85,7 @@ Adding an open item with the same project, kind and ref does not make a new row:
 occurrences and moves last_seen, so a failure seen in ten runs is one line.
 
 The queue replaces wait loops. Never write a sleep or pgrep loop to wait for the test lane: enqueue and
-end the turn. bin/test-phase drains the queue, one drainer at a time, oldest ready job first. A job
+end the turn, or start `brain queue wait ID...` in the background for one wake-up when the jobs end. bin/test-phase drains the queue, one drainer at a time, oldest ready job first. A job
 whose --after job failed or was cancelled is cancelled with the reason. States: queued, running, done,
 failed, cancelled.
 
@@ -214,6 +219,10 @@ def parser():
     q = qs.add_parser("list")
     q.add_argument("--cycle")
     q.add_argument("--status", choices=JOB_STATUS)
+    q = qs.add_parser("wait")
+    q.add_argument("ids", type=int, nargs="+", metavar="ID")
+    q.add_argument("--timeout", type=float, default=7200, help="seconds before giving up (exit 3)")
+    q.add_argument("--interval", type=float, default=15, help="seconds between database polls")
     q = qs.add_parser("cancel")
     q.add_argument("id", type=int)
     q = qs.add_parser("bump")

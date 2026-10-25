@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Wait for a pull request's checks, or one pipeline run, and print only what failed.
+
+  pr-wait <pr> [--repo R]                                   checks of a pull request (GitHub, through gh)
+  pr-wait --provider azure <run-id> --org O --project P     one Azure Pipelines run (through az)
+  options: --interval SECS (default 30)  --timeout SECS (default 7200)  --tail N (default 40)
+  pr-wait --self-test
+
+The provider comes from the origin URL of the current folder (lib/forge.py kind_of); --provider overrides
+it. Where the URL says nothing (no remote, another host) it is GitHub. The provider classes are in
+lib/forge.py, with the interface they share.
+
+Run it with run_in_background and end the turn: one command, one wake-up. It polls on its own, so the
+agent never calls `gh pr checks` or `az pipelines runs show` twice for the same thing.
+
+Exit 0 green (one line), 1 red (each failed check by name, then the last N lines of its log, preceded by any
+known environmental cause why-red.sh finds in it), 2 a usage or tool error, 3 timeout (prints what was still
+pending). Check names and log lines come from CI: they are printed with control characters removed and never
+reach a shell.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import forge  # noqa: E402
+
+WHY_RED = os.path.join(HERE, "why-red.sh")
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def clean(text, width=300):
+    return CONTROL.sub("", text.replace("\r", ""))[:width]
+
+
+def why_red(text):
+    """The environmental causes why-red.sh names in a log, one line each."""
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+        f.write(text)
+    try:
+        r = subprocess.run(["bash", WHY_RED, f.name], capture_output=True, text=True)
+    finally:
+        os.unlink(f.name)
+    if r.returncode != 1:
+        return []
+    return [clean(l) for l in r.stdout.splitlines() if l.startswith("why-red:") and "scanned" not in l]
+
+
+def wait(provider, a, out):
+    deadline = time.monotonic() + a.timeout
+    while True:
+        checks = provider.checks()
+        pending = [c for c in checks if c["state"] == "pending"]
+        if not pending:
+            break
+        if time.monotonic() >= deadline:
+            print(f"pr-wait: timed out after {a.timeout:g}s waiting for {provider.label}; "
+                  f"{len(pending)} of {len(checks)} checks still pending: "
+                  + ", ".join(clean(c["name"], 80) for c in pending[:20]), file=out)
+            return 3
+        time.sleep(min(a.interval, max(0.0, deadline - time.monotonic())))
+    failed = [c for c in checks if c["state"] == "fail"]
+    if not failed:
+        print(f"pr-wait: {provider.label} green, {len(checks)} checks", file=out)
+        return 0
+    print(f"pr-wait: {provider.label} red, {len(failed)} of {len(checks)} checks failed", file=out)
+    for c in failed:
+        print(f"FAILED {clean(c['name'], 120)}", file=out)
+        log = provider.failed_log(c, a.tail)
+        for line in why_red(log) if log else []:
+            print("  " + line, file=out)
+        for line in log.splitlines()[-a.tail:]:
+            print("  | " + clean(line), file=out)
+    return 1
+
+
+def parse(argv):
+    p = argparse.ArgumentParser(prog="pr-wait", description="Wait for a pull request's checks or a pipeline run.")
+    p.add_argument("target", help="pull request number or URL (github), run id (azure)")
+    p.add_argument("--provider", choices=sorted(forge.CI_PROVIDERS), help="default: from the origin URL")
+    p.add_argument("--repo", help="github: OWNER/NAME, default the repository of the current folder")
+    p.add_argument("--org", help="azure: organization URL")
+    p.add_argument("--project", help="azure: project name")
+    p.add_argument("--interval", type=float, default=30)
+    p.add_argument("--timeout", type=float, default=7200)
+    p.add_argument("--tail", type=int, default=40)
+    return p.parse_args(argv)
+
+
+def main(argv, capture=forge.capture_command):
+    a = parse(argv)
+    kind = a.provider or forge.kind_of(forge.remote_url("."))
+    if kind == "unknown":
+        kind = "github"
+    try:
+        provider = forge.ci_provider(kind, a.target, a.repo, a.org, a.project, capture)
+        return wait(provider, a, sys.stdout)
+    except forge.CiError as ex:
+        print(f"pr-wait: {ex}", file=sys.stderr)
+        return 2
+
+
+class Stub:
+    """A provider that replays checks, for the wait loop and the output."""
+
+    def __init__(self, polls, logs=None, label="pull request 1"):
+        self.polls, self.logs, self.label, self.calls = polls, logs or {}, label, 0
+
+    def checks(self):
+        self.calls += 1
+        return self.polls[min(self.calls, len(self.polls)) - 1]
+
+    def failed_log(self, check, tail):
+        return self.logs.get(check["name"], "")
+
+
+def self_test():
+    import io
+    fails = []
+
+    class A:
+        interval, timeout, tail = 0.02, 5, 40
+
+    def go(provider, **kw):
+        a = A()
+        a.__dict__.update(kw)
+        out = io.StringIO()
+        return wait(provider, a, out), out.getvalue()
+
+    def check(label, ok, detail):
+        if not ok:
+            fails.append(f"{label}: {detail}")
+
+    def c(name, state):
+        return {"name": name, "state": state}
+
+    long = "".join(f"line {i}\n" for i in range(100))
+    rc, out = go(Stub([[c("a", "pass"), c("b", "pass")]]))
+    check("green", rc == 0 and out == "pr-wait: pull request 1 green, 2 checks\n", (rc, out))
+
+    stub = Stub([[c("a", "pass"), c("b", "fail"), c("c", "fail"), c("d", "pass")]],
+                {"b": long, "c": "x\nDotNet.Testcontainers.Builders.DockerUnavailableException: no docker\n"})
+    rc, out = go(stub)
+    lines = out.splitlines()
+    check("red names only the failures", rc == 1 and "FAILED b" in out and "FAILED c" in out
+          and "FAILED a" not in out and "FAILED d" not in out and "2 of 4" in lines[0], (rc, out))
+    check("red prints the last 40 lines", "line 99" in out and "line 60" in out and "line 59" not in out, out)
+    check("red runs why-red", "  why-red: docker unavailable" in out, out)
+    check("red is under 100 lines", len(lines) < 100, len(lines))
+
+    stub = Stub([[c("a", "pending")], [c("a", "pending")], [c("a", "pass")]])
+    rc, out = go(stub)
+    check("pending then green", rc == 0 and stub.calls == 3, (rc, out, stub.calls))
+
+    stub = Stub([[c("a", "pass"), c("slow", "pending"), c("late", "pending")]])
+    rc, out = go(stub, timeout=0.2)
+    check("timeout", rc == 3 and "slow, late" in out and "2 of 3" in out, (rc, out))
+    check("timeout polls on the interval, not in a spin", 3 <= stub.calls <= 15, stub.calls)
+
+    rc, out = go(Stub([[c("bad\x1b[2Jname\x07", "fail")]], {"bad\x1b[2Jname\x07": "ok\x1b]0;x\x07\n"}))
+    check("control characters are removed", "\x1b" not in out and "\x07" not in out, repr(out))
+
+    # End to end: the real script, a fake gh on PATH, no network.
+    with tempfile.TemporaryDirectory() as root:
+        row = {"name": "unit", "bucket": "fail", "link": "https://github.com/o/r/actions/runs/7/job/3"}
+        d, env = forge.make_scene(root, {"gh": forge.FAKE_GH, "az": "#!/bin/sh\necho az >> \"$FAKE_DIR/az-called\"\n"},
+                                  {"checks.json": [[row]], "log-3": "boom\n"})
+        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "12", "--repo", "o/r",
+                            "--provider", "github", "--interval", "0.05"],
+                           capture_output=True, text=True, env=env, cwd=root)
+        check("end to end red", r.returncode == 1 and "FAILED unit" in r.stdout and "| boom" in r.stdout,
+              (r.returncode, r.stdout, r.stderr))
+        check("end to end makes no az call", not os.path.exists(os.path.join(d, "az-called")), "az called")
+        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "5", "--provider", "azure"],
+                           capture_output=True, text=True, env=env, cwd=root)
+        check("azure without org and project exits 2", r.returncode == 2 and "--org" in r.stderr, (r.returncode, r.stderr))
+        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "5", "--provider", "gitlab"],
+                           capture_output=True, text=True, env=env, cwd=root)
+        check("a provider not wired exits 2", r.returncode == 2, (r.returncode, r.stderr))
+
+    if fails:
+        print("self-test failed:\n  " + "\n  ".join(str(f) for f in fails))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    sys.exit(main(sys.argv[1:]))

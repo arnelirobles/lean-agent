@@ -32,12 +32,15 @@ LANES = {"test-phase", "heavy.sh"}
 
 DENY_SLEEP_READ = (
     "Do not sleep and then read a file or task output. End the turn and wait for the "
-    "notification, or check a lane with `heavy.sh status <lane>`.")
+    "notification, or start `brain queue wait ID...` (test jobs) or `pr-wait` (checks) in the "
+    "background, or check a lane with `heavy.sh status <lane>`.")
 DENY_LOOP = (
     "Do not poll a file or process in a loop with sleep. End the turn and wait for the "
-    "notification, or check a lane with `heavy.sh status <lane>`.")
+    "notification, or start `brain queue wait ID...` (test jobs) or `pr-wait` (checks) in the "
+    "background, or check a lane with `heavy.sh status <lane>`.")
 DENY_PGREP = (
     "Do not use pgrep to wait on a process. End the turn and wait for the notification, "
+    "or start `brain queue wait ID...` (test jobs) or `pr-wait` (checks) in the background, "
     "or check a lane with `heavy.sh status <lane>`.")
 TURN_OFF = " LEAN_WAIT_GUARD=off turns this check off."
 NOTE_TEST = (
@@ -242,6 +245,12 @@ def self_test():
     if "LEAN_WAIT_GUARD=off" not in reason or "heavy.sh status" not in reason:
         print("FAIL deny reason names the fix and the off switch")
         failures += 1
+    for label, command in (("sleep", "sleep 100; cat x.output"), ("loop", "until grep -q x f; do sleep 1; done"),
+                           ("pgrep", "pgrep -f x")):
+        text = (verdict(command) or ("", ""))[1]
+        if "brain queue wait" not in text or "pr-wait" not in text:
+            print(f"FAIL {label} deny text names brain queue wait and pr-wait")
+            failures += 1
 
     # notes
     check("bare dotnet test notes", "dotnet test X | tail -20", "note")
