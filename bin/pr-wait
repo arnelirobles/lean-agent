@@ -63,6 +63,8 @@ def wait(provider, a, out):
             if first:
                 raise
             checks, errors, last_error = [], errors + 1, str(ex)
+            if errors >= a.max_errors:
+                raise forge.CiError(f"gave up after {errors} failed polls: {clean(last_error)}")
         first = False
         pending = [c for c in checks if c["state"] == "pending"]
         if checks and not pending:
@@ -96,6 +98,12 @@ def wait(provider, a, out):
     return 1
 
 
+def positive_int(text):
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError("must be a whole number, at least 1")
+    return int(text)
+
+
 def seconds(text):
     try:
         value = float(text)
@@ -110,7 +118,7 @@ def parse(argv):
     p = argparse.ArgumentParser(prog="pr-wait", description="Wait for a pull request's checks (github) or one "
                                 "pipeline run (azure). A check or run that ends in anything but success counts as "
                                 "failed, partiallySucceeded included. Zero checks reported yet counts as pending. "
-                                "Up to the timeout, a failed poll is retried; exit 2 is a bad argument, a missing "
+                                "Up to the timeout, a failed poll is retried, until --max-errors fail in a row; exit 2 is a bad argument, a missing "
                                 "tool or a first poll that fails.")
     p.add_argument("target", help="github: a pull request number or URL; azure: a pipeline RUN ID, not a pull request")
     p.add_argument("--provider", choices=sorted(forge.CI_PROVIDERS), help="default: from the origin URL")
@@ -119,6 +127,8 @@ def parse(argv):
     p.add_argument("--project", help="azure: project name")
     p.add_argument("--interval", type=seconds, default=30, help="seconds between polls, at least 1")
     p.add_argument("--timeout", type=seconds, default=7200)
+    p.add_argument("--max-errors", type=positive_int, default=5, metavar="N",
+                   help="give up with exit 2 after N failed polls in a row (default 5); a good poll resets the count")
     p.add_argument("--tail", type=int, default=40)
     return p.parse_args(argv)
 
@@ -158,7 +168,7 @@ def self_test():
     fails = []
 
     class A:
-        interval, timeout, tail = 0.02, 5, 40
+        interval, timeout, tail, max_errors = 0.02, 5, 40, 5
 
     def go(provider, **kw):
         a = A()
@@ -205,9 +215,20 @@ def self_test():
     stub = Stub([[c("a", "pending")], boom, boom, boom, boom, [c("a", "pass")]])
     rc, out = go(stub)
     check("transient poll errors are survived", rc == 0 and stub.calls == 6, (rc, out, stub.calls))
-    rc, out = go(Stub([[c("a", "pending")], boom]), timeout=0.2)
+    rc, out = go(Stub([[c("a", "pending")], boom]), timeout=0.2, max_errors=1000)
     check("errors to the deadline give 3 with the last error",
           rc == 3 and "last poll failed" in out and "HTTP 502 from gh" in out, (rc, out))
+    stub = Stub([[c("a", "pending")], boom])
+    try:
+        go(stub, timeout=60)
+        check("five failed polls in a row give up", False, "no error")
+    except forge.CiError as ex:
+        check("gives up on the fifth failure, before the deadline",
+              str(ex) == "gave up after 5 failed polls: HTTP 502 from gh" and stub.calls == 6, (str(ex), stub.calls))
+    stub = Stub([[c("a", "pending")], boom, boom, boom, boom, [c("a", "pending")], boom, boom, boom, boom,
+                 [c("a", "pass")]])
+    rc, out = go(stub)
+    check("a good poll resets the failure count", rc == 0 and stub.calls == 11, (rc, out, stub.calls))
     try:
         go(Stub([boom]))
         check("first poll failure raises", False, "no error")
