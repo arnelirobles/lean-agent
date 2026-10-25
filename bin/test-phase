@@ -37,6 +37,15 @@ go to brain as test-fail, flaky as flaky. A job that fails without naming a fail
 goes in as test-fail too. A stall is only a note, because the watchdog says it is likely load, not code;
 the note carries the passed and failed counts and the last test seen.
 
+A stalled .NET run is first asked who hung. Local runs get a hang timeout 60 s under --stall (half of it when
+--stall is short), so the test host names its running tests and writes a small dump before heavy.sh stops
+the run: `--blame-hang-timeout` with a mini dump on VSTest, `--hangdump --hangdump-timeout` on MTP when the
+test project references Microsoft.Testing.Extensions.HangDump. The dump goes under the run's log directory
+and is deleted once the names are read. Each named test becomes a test-fail item tagged hang with a body
+that says it hung; a test already open as a hang on the branch gets the tag hang-repeat too, because
+hanging on two runs is not load. When no name is found the stalled note stays and says why: no package,
+TEST_PHASE_HANGDUMP=off, remote lane, or a dump with no names in it.
+
 A job holds its lane from its first command to its last, so its alone reruns are not queued behind another
 session. A command that ends by a signal (exit 128 + n) is recorded as killed: no test-fail or flaky item is
 filed from it, and the job goes back to the queue once; a second kill fails it. A run that adds only
@@ -52,7 +61,9 @@ Logs are under the run directory: ${LEAN_TEST_PHASE_DIR:-~/.local/share/lean/tes
   --cycle      cycle label for a plan's jobs, runs and items (default: the run directory's name)
   --lane       heavy.sh lane (default dotnet)
   --stall      seconds without test progress before a command is stopped (default 600, 0 is off);
-               it starts when the command starts, so keep it above the build time
+               it starts when the command starts, so keep it above the build time. A local .NET run
+               also gets a hang timeout of stall minus 60 s (half of it when --stall is short) unless
+               TEST_PHASE_HANGDUMP=off; the project is built first so both clocks start together
   --fail-stall seconds of failures with no test passing before a command is stopped as stalled-failing
                (default 1200, 0 is off; TEST_PHASE_FAIL_STALL)
   --isolation-over  how many tests may fail together and pass alone before they are one isolation item (10)
@@ -95,6 +106,7 @@ import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
@@ -116,6 +128,15 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 FAILED = re.compile(r"^(?:failed|  Failed)\s+(\S.*?)\s*$")
 DURATION = re.compile(r"\s+\((?:\d+(?:\.\d+)?\s*(?:ms|s|m|h)\s*)+\)$|\s+\[[^\]]*\]$")
 TEST_NAME = re.compile(r"[A-Za-z_][\w`<>+]*(?:\.[\w`<>+]+)+(?:\(.*\))?")
+# Arguments that already say where results go or what collects them: a hang run adds its own results folder and
+# deletes it, so it must not share one with these.
+OWN_OUTPUT = {"--results-directory", "-r", "--logger", "-l", "--collect", "--settings", "-s", "--diag", "-d"}
+# VSTest's line is real (captured, SDK 10.0.103). The MTP alternative is a guess: HangDump never fired in a capture.
+HANG_FIRED = re.compile(r"The specified inactivity time of \d+ seconds has elapsed|(?i:hang ?dump (?:timeout|.*expired))")
+TEST_RESULT_LINE = re.compile(r"^(?:failed|passed|skipped)\s", re.I)
+# The hang timeout is this many seconds under the stall timeout, so the hang dump is taken before heavy.sh stops
+# the run (at least half the stall timeout, one second at the least).
+HANG_MARGIN = 60
 
 
 class Dotnet:
@@ -146,14 +167,16 @@ class Dotnet:
         return [c for c in cls if c]
 
     @classmethod
-    def command(cls, mode, project, cls_filter=None, fast=False, extra=(), probe=False):
+    def command(cls, mode, project, cls_filter=None, fast=False, extra=(), probe=False, hang=()):
         # probe lists instead of running: MTP exits 8 when the filter matches no test, whatever else it names.
         names = cls.classes(cls_filter)
         if any(c.startswith("-") for c in names):  # a piece read as a dotnet option instead of a class
             raise ValueError("a filter piece starts with -")
         # The VSTest console logger prints passed lines too, which is what the watchdog reads as progress.
         if mode == "mtp":
-            cmd = ["dotnet", "test", "--project", project] + list(extra) + ["--"]
+            # The hang arguments go before `--`: after it the SDK 10.0.103 rejected --results-directory as a
+            # directory argument, and ignored --list-tests.
+            cmd = ["dotnet", "test", "--project", project] + list(extra) + list(hang) + ["--"]
             # --filter-class matches the full class name. The fast tier takes a fragment, and so does a
             # name with no namespace in any tier, hence the wildcards. A rerun passes full names.
             # xunit v3 ORs repeated --filter-class, so one run covers every class (checked on 4.0.0:
@@ -167,7 +190,134 @@ class Dotnet:
         cmd = ["dotnet", "test", project] + list(extra) + ["--logger", "console;verbosity=normal"]
         if names:
             cmd += ["--filter", "|".join("FullyQualifiedName~" + c for c in names)]
-        return cmd
+        return cmd + list(hang)
+
+    @classmethod
+    def hang_args(cls, mode, repo, project, stall, outdir, extra=()):
+        """(arguments, why not). Arguments that make the test host name its running tests and write a small
+        dump under outdir before the stall watchdog stops the run: the hang timeout is HANG_MARGIN seconds
+        under the stall timeout, so the extension fires first. Empty arguments come with the reason, which
+        goes into the note that replaces the test-fail item."""
+        if os.environ.get("TEST_PHASE_HANGDUMP", "on") == "off":
+            return [], "hang dumps are off (TEST_PHASE_HANGDUMP=off)"
+        if not stall or stall <= 0:
+            return [], "the stall timeout is off, so there is no hang timeout to set"
+        mine = [x for x in extra if x.split("=", 1)[0] in OWN_OUTPUT or x.startswith(("--blame", "--collect", "--logger"))]
+        if mine:
+            return [], f"the extra arguments already set {mine[0]}, so the hang results folder would clash with it"
+        t = f"{max(stall - HANG_MARGIN, stall // 2, 1)}s"
+        if mode == "vstest":
+            return ["--blame-hang-timeout", t, "--blame-hang-dump-type", "mini", "--results-directory", outdir], ""
+        if not cls.has_hangdump(repo, project):
+            return [], "the test project does not reference Microsoft.Testing.Extensions.HangDump, so --hangdump is not available"
+        return ["--hangdump", "--hangdump-timeout", t, "--hangdump-type", "Mini", "--results-directory", outdir], ""
+
+    @staticmethod
+    def has_hangdump(repo, project):
+        """Whether the project, or a Directory.Build.props, .targets or Directory.Packages.props above it, has a
+        PackageReference or PackageVersion whose Include or Update names HangDump, or sets a property named for
+        it (MSTest.Sdk's EnableMicrosoftTestingExtensionsHangDump). A comment or other text does not count."""
+        top = os.path.abspath(repo)
+        d = os.path.dirname(os.path.abspath(os.path.join(repo, project)))
+        files = [os.path.join(repo, project)]
+        while True:
+            files += [os.path.join(d, n) for n in ("Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props")]
+            if d == top or os.path.dirname(d) == d:
+                break
+            d = os.path.dirname(d)
+        for f in files:
+            try:
+                root = ET.parse(f).getroot()
+            except (OSError, ET.ParseError):
+                continue
+            for el in root.iter():
+                tag = el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) else ""
+                if tag in ("PackageReference", "PackageVersion") and \
+                        "hangdump" in (el.get("Include", "") + el.get("Update", "")).lower():
+                    return True
+                if "hangdump" in tag.lower() and (el.text or "").strip().lower() == "true":
+                    return True
+        return False
+
+    @classmethod
+    def hang_names(cls, mode, text, outdir):
+        """(test names still running when the hang timeout fired, where they came from, files in outdir, whether a
+        dump file is among them).
+        VSTest writes a Sequence xml: tests marked Completed="False" are running, and without that mark the last
+        one listed is. MTP's own output is read for a list that follows a hang dump line; so are small text
+        files in outdir. Dump files are never opened."""
+        found = []
+        for dirpath, _, names in os.walk(outdir):
+            found += [os.path.join(dirpath, n) for n in sorted(names)]
+        out, source = [], ""
+        if mode == "vstest":
+            for f in found:
+                if "sequence" in os.path.basename(f).lower() and f.lower().endswith(".xml"):
+                    out, source = cls.sequence_names(open(f, errors="replace").read()), "blame-hang sequence file"
+                    if out:
+                        break
+        else:
+            texts = [("hang dump output", ANSI.sub("", text))]
+            for f in found:
+                if not f.lower().endswith((".dmp", ".core")) and os.path.getsize(f) < 2_000_000:
+                    texts.append(("hang dump report", ANSI.sub("", open(f, errors="replace").read())))
+            for label, t in texts:
+                out = cls.hang_listing(t)
+                if out:
+                    source = label
+                    break
+        return out, source, len(found), any(f.lower().endswith((".dmp", ".core")) for f in found)
+
+    @staticmethod
+    def sequence_names(xml):
+        try:
+            tests = [(t.get("DisplayName") or t.get("Name"), t.get("Completed"))
+                     for t in ET.fromstring(xml.strip()).iter("Test") if t.get("DisplayName") or t.get("Name")]
+        except ET.ParseError:
+            return []
+        if any(c is not None for _, c in tests):
+            running = [n for n, c in tests if (c or "").lower() == "false"]
+        else:
+            running = [tests[-1][0]] if tests else []
+        return list(dict.fromkeys(running))
+
+    @staticmethod
+    def hang_listing(text):
+        """Test names listed after a line about the running or pending tests, within 40 lines of a hang dump line."""
+        lines = text.splitlines()
+        out, armed, i = [], 0, 0
+        marker = re.compile(r"(?i)\b(pending|in[- ]progress|still running|were running|was running|running)\b.*\btests?\b"
+                            r"|\btests?\b.*\b(pending|in[- ]progress|still running|running|hung)\b")
+        while i < len(lines):
+            l = lines[i].strip()
+            if l.startswith("$ "):  # the command line names --hangdump, which is not a report of one
+                i += 1
+                continue
+            if re.search(r"(?i)hang ?dump", l):
+                armed = 40
+            elif armed:
+                armed -= 1
+            if armed and marker.search(l) and not TEST_RESULT_LINE.match(l):
+                tail = l.split(":", 1)[1] if ":" in l else ""
+                for piece in tail.split(","):
+                    piece = DURATION.sub("", piece.strip())
+                    if TEST_NAME.fullmatch(piece):
+                        out.append(piece)
+                j = i + 1
+                while j < len(lines):
+                    item = DURATION.sub("", re.sub(r"^[\s\-*\u2022]+", "", lines[j]).strip())
+                    if not item:
+                        if out or j > i + 1:
+                            break
+                    elif TEST_NAME.fullmatch(item):
+                        out.append(item)
+                    else:
+                        break
+                    j += 1
+                i = j
+                continue
+            i += 1
+        return list(dict.fromkeys(out))
 
     @staticmethod
     def failures(text):
@@ -454,13 +604,13 @@ def add_item(row, kind, ref, severity, body, run_id, ctx, tags=()):
     brain(args, stdin=mask(body))  # the body goes by stdin, not argv, where any user's ps could read it
 
 
-def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start, project, lane=LOCAL):
+def record_run(row, ctx, tier, mode, rc, text, started, ended, wait, load_start, project, lane=LOCAL, stalled=False):
     passed, failed, skipped = ctx["runner"].counts(text)
     load_end = lr.remote_load(lane.remote) if lane.remote else load1()
     out = brain(["run-add", "--cycle", ctx["cycle"], "--project", row["project"], "--repo", ctx["repo"],
                  "--test-project", tp_name(project), "--runner", mode, "--tier", tier,
                  "--started", str(started), "--ended", str(ended), "--passed", str(passed),
-                 "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc in (76, 78) else "0",
+                 "--failed", str(failed), "--skipped", str(skipped), "--stalled", "1" if rc in (76, 78) or stalled else "0",
                  "--exit-code", str(rc)]
                 + (["--host", lane.remote.name] if lane.remote else [])
                 + (["--lane-wait", str(wait)] if wait is not None else [])
@@ -496,8 +646,8 @@ def safe(s):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")[:60]
 
 
-def tier_note(rc):
-    return {0: "pass", 75: "busy", 76: "stalled", 78: "stalled-failing"}.get(rc, "fail")
+def tier_note(rc, hung=False):
+    return "stalled" if hung else {0: "pass", 75: "busy", 76: "stalled", 78: "stalled-failing"}.get(rc, "fail")
 
 
 def signal_of(rc):
@@ -532,6 +682,58 @@ def earlier_items(row, ctx):
                 if any(t.startswith("tp:") and t != mine for t in tags):
                     out["shared"].add(int(m.group(1)))  # another test project saw this name too
     return out
+
+
+def hang_seen(runner, text):
+    """The counts a hung run printed. A hung run prints no summary, so these are often zero: say so."""
+    p, f, _ = runner.counts(text)
+    return f"{p} passed, {f} failed before the hang" if p or f else "no counts, the run did not finish"
+
+
+def hang_fired(text, dumped):
+    """Whether the hang timer fired: a dump file was written, or the output says so. A Sequence file alone is not
+    evidence, because the blame collector writes one on a crash too."""
+    body = "\n".join(l for l in ANSI.sub("", text).splitlines() if not l.startswith("$ "))
+    return bool(dumped or HANG_FIRED.search(body))
+
+
+def is_hang(hang, rc):
+    """A run the hang timeout ended: names, the timer fired, and not a pass, a busy lane or heavy.sh's own
+    failing-only stop. A signal exit is still a hang when the timer fired; one without it is a crash."""
+    return bool(hang.get("names")) and bool(hang.get("fired")) and rc not in (0, 75, 78)
+
+
+def no_name_reason(hang, text):
+    """Why a stalled run has no test name, for the note that stays."""
+    if hang.get("why"):
+        return hang["why"]
+    if "names" not in hang:
+        return "this run was not started with a hang timeout (remote lane or not a .NET run)"
+    if hang.get("files") or "createdump" in text:
+        return "the hang dump was written and deleted, but no test name could be read from it or from the run's output"
+    return "no hang dump was written before the stall timeout, so the run printed no test names"
+
+
+def file_hang(row, hang, a, run_id, ctx, stem, seen):
+    """One test-fail item per test the hang dump named as still running. A test already open as a hang on this
+    branch hung on an earlier run too, so it is tagged hang-repeat: not load."""
+    where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
+    before = set()
+    text = brain(["list", "--open", "--kind", "test-fail", "--project", row["project"], "--tag", "hang"]) or ""
+    for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important) occ=\d+ last=\S+(?: tags=(\S+))?$", text, re.M):
+        if m.group(2) == where:
+            before.add(m.group(3))
+    names = hang["names"]
+    row["notes"].append(f"hung: {', '.join(names[:3])}" + (f" and {len(names) - 3} more" if len(names) > 3 else ""))
+    for n in names:
+        again = n in before
+        body = (f"hung again: this test was running when the hang timeout fired on an earlier run too, so this is a hang, "
+                f"not load. " if again else
+                f"hung: this test was still running after {a.stall} s without test progress. ") \
+            + f"Named by the {hang['source']}. {seen}. Log: {stem}.log"
+        add_item(row, "test-fail", n, "important", body, run_id, ctx,
+                 tags=("hang", "hang-repeat") if again else ("hang",))
+    row["real"] += len(names)
 
 
 def file_results(row, labelled, a, run_id, ctx, stem):
@@ -715,16 +917,26 @@ def _run_job(job, a, run_dir, runner, lane, hold):
             lr.send_env(remote, job["id"], cfg.env_file, dest=dest)
         synced.append(1)
 
+    hang_info = {}  # the last tier's hang dump: names, source, why not
+
     def tier(name, cls_filter, log, probe=False):
         if remote:
             prepare()
+        hang_info.clear()
+        hargs, outdir = [], (log[:-4] if log.endswith(".log") else log) + "-hang"
+        if runner is Dotnet and not remote and not probe:
+            hargs, why = Dotnet.hang_args(mode, repo, project, a.stall, outdir, extra)
+            if hargs and build_args(extra) is None:  # the build step below cannot take these arguments
+                hargs, why = [], "the extra arguments are test-only, so the build cannot run first"
+            hang_info["why"] = why
         build = mark = None
         if kept.get("dest"):  # the folder holds a build, or this command makes it
             build = ["dotnet", "build", project] + build_args(extra) if kept.get("mark") else None
             mark = kept.pop("mark", None)
         # A probe follows a run that built, so it never builds again.
         cmd = runner.command(mode, project, cls_filter, name == "fast",
-                             extra + ["--no-build"] if kept.get("dest") or probe else extra, probe)
+                             extra + ["--no-build"] if kept.get("dest") or probe or hargs else extra, probe,
+                             **({"hang": hargs} if hargs else {}))
         if remote:
             before = lr.remote_load(remote)
             ssh = lr.ssh_argv(remote, "sh", "-c", lr.run_script(remote, cfg, job["id"], cmd, kept.get("dest"), build, mark,
@@ -737,12 +949,34 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                 raise LaneProblem(problem)
         else:
             before = load1()
-            rc, text, started, ended, wait = heavy(a.lane, cmd, repo, log, a.stall, hold=hold, fail_stall=a.fail_stall,
+            brc = 0
+            if hargs:
+                # Build first: heavy.sh's stall clock starts with the command, the host's hang timer with the
+                # tests, so a long build inside `dotnet test` would let heavy.sh stop the run before the hang
+                # timer fires.
+                brc, text, started, ended, wait = heavy(a.lane, ["dotnet", "build", project] + build_args(extra), repo,
+                                                        (log[:-4] if log.endswith(".log") else log) + "-build.log",
+                                                        a.stall, hold=hold)
+            if brc == 0:
+                rc, text, t0, ended, wait2 = heavy(a.lane, cmd, repo, log, a.stall, hold=hold, fail_stall=a.fail_stall,
                                                    progress=getattr(runner, "progress", None))
+                if hargs:
+                    wait = (wait or 0) + (wait2 or 0)
+                else:
+                    started, wait = t0, wait2
+            else:
+                rc, hargs = brc, []
+        if hargs:  # read the names, then delete the dump: a Full one is hundreds of megabytes
+            try:
+                names, source, files, dumped = Dotnet.hang_names(mode, text, outdir)
+                hang_info.update(names=names, source=source, files=files, fired=hang_fired(text, dumped))
+                hang_info["hung"] = is_hang(hang_info, rc)
+            finally:
+                shutil.rmtree(outdir, ignore_errors=True)
         if probe:
             return rc, text, None
         return rc, text, record_run(row, ctx, "fast" if name == "full" and cls_filter else name, mode, rc, text, started,
-                                    ended, wait, before, project, lane)
+                                    ended, wait, before, project, lane, stalled=bool(hang_info.get("hung")))
 
     try:
         rc, text, run_id = tier(job["tier"], job["filter"] or None, stem + ".log")
@@ -750,8 +984,10 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         row["result"], row["lane_problem"] = "requeued", str(e)
         return row
     row["rc"], row["run_id"] = rc, run_id
-    row["result"] = tier_note(rc)
-    if signal_of(rc):  # killed from outside: what it printed before that says nothing about the tests
+    hang = dict(hang_info)  # read now: the reruns below overwrite it
+    hung = bool(hang.get("hung"))  # the hang timeout may end the run before heavy.sh does
+    row["result"] = tier_note(rc, hung)
+    if signal_of(rc) and not hung:  # killed from outside: what it printed before that says nothing about the tests
         row["result"] = "killed"
         row["notes"].append(f"killed by signal {signal_of(rc)}, nothing filed")
         p_, f_, _ = runner.counts(text)
@@ -762,10 +998,17 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         failing.setdefault(name, detail)
     facts = stall_facts(text) if rc in (76, 78) else None
     seen = f"passed {facts[0]}, failed {facts[1]}, last test: {facts[2]}" if facts else "no counts in the log"
-    if rc == 76:
-        row["notes"].append("stalled, likely load" + (f" ({facts[0]} passed, {facts[1]} failed)" if facts else ""))
+    if hung:
+        seen = hang_seen(runner, text)
+    if hung:
+        file_hang(row, hang, a, run_id, ctx, stem, seen)
+    elif rc == 76:
+        why = no_name_reason(hang, text)
+        row["notes"].append("stalled, likely load" + (f" ({facts[0]} passed, {facts[1]} failed)" if facts else "")
+                            + f"; no test name: {why}")
         add_item(row, "note", f"stalled: {project}", "info",
-                 f"no test progress for {a.stall} s, stopped by heavy.sh. {seen}. Log: {stem}.log", run_id, ctx)
+                 f"no test progress for {a.stall} s, stopped by heavy.sh. {seen}. No test name found: {why}. "
+                 f"Log: {stem}.log", run_id, ctx)
     elif rc == 78:
         row["notes"].append(f"stalled-failing: only failures for {a.fail_stall} s"
                             + (f" ({facts[0]} passed, {facts[1]} failed)" if facts else ""))
@@ -812,16 +1055,21 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     labelled = []  # (name, label, body), filed once every rerun is in, so a job killed on the way files none
     for cls, names in by_class.items():
         log = f"{stem}-class-{safe(cls)}.log"
-        rrc, rtext = 75, ""  # a rerun that could not run proves nothing: unverified
+        rrc, rtext, rhang = 75, "", {}  # a rerun that could not run proves nothing: unverified
         if not lost:
             try:
                 rrc, rtext, _ = tier("rerun", cls, log)
+                rhang = dict(hang_info)  # each rerun has its own hang dump
             except LaneProblem as e:
                 lost = row["lane_rest"] = str(e)
                 row["notes"].append(f"rerun not run: {lost}")
             except ValueError as e:  # a file name vitest would read as an option
                 row["notes"].append(f"rerun of {cls} not run: {e}")
-        if signal_of(rrc):
+        rhung = bool(rhang.get("hung"))
+        if rhung:  # the class hung alone: the test names it, and the failure is not proven flaky
+            row["result"] = "stalled"
+            file_hang(row, rhang, a, run_id, ctx, log[:-4], hang_seen(runner, rtext))
+        if signal_of(rrc) and not rhung:
             row["result"] = "killed"
             row["notes"].append(f"killed by signal {signal_of(rrc)} in a rerun, nothing filed")
             p_, f_, _ = runner.counts(rtext)
@@ -832,7 +1080,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         rpassed = runner.counts(rtext)[0]
         for name in names:
             # A rerun that named no failure is not proof: a crash or build error names none either.
-            if rrc in (75, 76, 78):
+            if rhung or rrc in (75, 76, 78):
                 label = "unverified"
             elif rrc == 0 or (rpassed > 0 and name not in again):
                 label = "flaky"
@@ -840,7 +1088,8 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                 label = "unverified"
             else:
                 label = "real"
-            labelled.append((name, label, f"{label}; alone: {tier_note(rrc)}. Log: {log}\n{failing[name]}"))
+            labelled.append((name, label, f"{label}; alone: {tier_note(rrc, rhung)}"
+                             + (f", hung: {', '.join(rhang['names'][:3])}" if rhung else "") + f". Log: {log}\n{failing[name]}"))
     file_results(row, labelled, a, run_id, ctx, stem)
     return row
 
@@ -1329,6 +1578,149 @@ def self_test():
     def fixture(name):
         return open(os.path.join(fix, name), errors="replace").read()
 
+    # Hang dumps: the arguments, and the names read from each runner's fixtures.
+    with tempfile.TemporaryDirectory() as hd:
+        os.makedirs(os.path.join(hd, "tests", "T"))
+        os.makedirs(os.path.join(hd, "empty"))
+        csproj = os.path.join(hd, "tests", "T", "T.csproj")
+        open(csproj, "w").write("<Project/>")
+        out = os.path.join(hd, "out")
+        got, why = Dotnet.hang_args("vstest", hd, "tests/T/T.csproj", 600, out)
+        if got != ["--blame-hang-timeout", "540s", "--blame-hang-dump-type", "mini", "--results-directory", out] or why:
+            fails.append(f"vstest hang arguments wrong: {got} {why}")
+        got, why = Dotnet.hang_args("mtp", hd, "tests/T/T.csproj", 600, out)
+        if got or "HangDump" not in why:
+            fails.append(f"mtp without the HangDump package must fall back and say why: {got} {why!r}")
+        open(csproj, "w").write('<Project><ItemGroup><PackageReference Include="Microsoft.Testing.Extensions.HangDump" /></ItemGroup></Project>')
+        got, why = Dotnet.hang_args("mtp", hd, "tests/T/T.csproj", 600, out)
+        if got != ["--hangdump", "--hangdump-timeout", "540s", "--hangdump-type", "Mini", "--results-directory", out] or why:
+            fails.append(f"mtp hang arguments wrong with the package: {got} {why}")
+        open(csproj, "w").write("<Project/>")
+        props = os.path.join(hd, "tests", "Directory.Build.props")
+        open(props, "w").write("<Project><!-- Microsoft.Testing.Extensions.HangDump --><PropertyGroup><Note>HangDump</Note></PropertyGroup></Project>")
+        if Dotnet.has_hangdump(hd, "tests/T/T.csproj"):
+            fails.append("a comment or a text value that mentions HangDump must not count as the package")
+        open(props, "w").write('<Project><ItemGroup><PackageReference Include="Microsoft.Testing.Extensions.HangDump" /></ItemGroup></Project>')
+        if not Dotnet.has_hangdump(hd, "tests/T/T.csproj"):
+            fails.append("a Directory.Build.props above the project that references HangDump must count")
+        os.remove(props)
+        open(os.path.join(hd, "Directory.Packages.props"), "w").write(
+            '<Project><ItemGroup><PackageVersion Include="Microsoft.Testing.Extensions.HangDump" Version="2.0.0" /></ItemGroup></Project>')
+        if not Dotnet.has_hangdump(hd, "tests/T/T.csproj"):
+            fails.append("a Directory.Packages.props PackageVersion for HangDump must count")
+        os.remove(os.path.join(hd, "Directory.Packages.props"))
+        open(csproj, "w").write("<Project><PropertyGroup><EnableMicrosoftTestingExtensionsHangDump>true</EnableMicrosoftTestingExtensionsHangDump></PropertyGroup></Project>")
+        if not Dotnet.has_hangdump(hd, "tests/T/T.csproj"):
+            fails.append("the MSTest.Sdk HangDump property set to true must count")
+        open(csproj, "w").write("<Project/>")
+        open(csproj, "w").write('<Project><ItemGroup><PackageReference Include="Microsoft.Testing.Extensions.HangDump" /></ItemGroup></Project>')
+        for bad in (["--results-directory", "mine"], ["--results-directory=mine"], ["--logger", "trx"], ["-l", "trx"],
+                    ["--collect", "Code Coverage"], ["--settings", "x.runsettings"], ["--blame"], ["--diag", "d.log"]):
+            got, why = Dotnet.hang_args("mtp", hd, "tests/T/T.csproj", 600, out, bad)
+            if got or "clash" not in why:
+                fails.append(f"extra arguments {bad} already own the results folder, so no hang arguments: {got} {why!r}")
+        got, why = Dotnet.hang_args("mtp", hd, "tests/T/T.csproj", 600, out, ["-c", "Release"])
+        if not got or why:
+            fails.append(f"build-only extra arguments must leave the hang arguments on: {got} {why!r}")
+        got, why = Dotnet.hang_args("vstest", hd, "tests/T/T.csproj", 100, out)
+        if got[1] != "50s":
+            fails.append(f"the hang timeout is half the stall timeout when stall minus 60 is less than that: {got}")
+        open(csproj, "w").write("<Project/>")
+        got, why = Dotnet.hang_args("mtp", hd, "tests/T/T.csproj", 0, out)
+        if got or not why:
+            fails.append(f"no stall timeout means no hang timeout: {got} {why!r}")
+        got, why = Dotnet.hang_args("vstest", hd, "tests/T/T.csproj", 2, out)
+        if got[1] != "1s":
+            fails.append(f"the hang timeout must stay under a short stall timeout and above zero: {got}")
+        got = Dotnet.command("vstest", "T.csproj", "ATests", hang=["--blame-hang-timeout", "540s"])
+        if got[-2:] != ["--blame-hang-timeout", "540s"]:
+            fails.append(f"hang arguments must end a vstest command: {got}")
+        got = Dotnet.command("mtp", "T.csproj", "ATests", hang=["--hangdump"])
+        if got[:5] != ["dotnet", "test", "--project", "T.csproj", "--hangdump"] or got[5] != "--":
+            fails.append(f"MTP hang arguments must come before the -- separator: {got}")
+
+        def names(mode, text, files=()):
+            d = os.path.join(hd, "names")
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d)
+            for n, body in files:
+                os.makedirs(os.path.dirname(os.path.join(d, n)), exist_ok=True)
+                open(os.path.join(d, n), "w").write(body)
+            return Dotnet.hang_names(mode, text, d)
+
+        got = names("vstest", "", [("Sequence_1.xml", fixture("vstest-sequence-completed.xml"))])
+        if got[0] != ["Acme.HangTests.Waits_forever", "Acme.HangTests.Holds_a_lock"] or got[2] != 1:
+            fails.append(f"vstest: tests marked not completed are the running ones: {got}")
+        got = names("vstest", "", [("Sequence_1.xml", fixture("vstest-sequence-plain.xml"))])
+        if got[0] != ["TestProject.UnitTest1.TestMethodA"]:
+            fails.append(f"vstest: without Completed marks the last test listed is the running one: {got}")
+        crash = {"names": ["A.B"], "fired": hang_fired(fixture("vstest-hang-console.txt"), False)}
+        if not is_hang(crash, 1):
+            fails.append("vstest: a hang whose output also says the test host crashed is still a hang")
+        got = names("vstest", "", [("Sequence_1.xml", "<TestSequence></TestSequence>")])
+        if got[0]:
+            fails.append(f"vstest: an empty sequence file names nothing: {got}")
+        got = names("vstest", fixture("vstest-hang-console.txt"),
+                    [(os.path.join("9580e186", "Sequence_e1f4.xml"), fixture("vstest-sequence-real.xml")),
+                     (os.path.join("9580e186", "dotnet_66993_hangdump.dmp"), "dump")])
+        if got[0] != ['Capture.HangTests.Theory_with_a_string(s: "a&b \\"q\\" \'c\'")'] or got[2] != 2 or got[3] is not True:
+            fails.append(f"vstest: the captured sequence file in a subfolder, with its dump: {got}")
+        if not hang_fired(fixture("vstest-hang-console.txt"), False):
+            fails.append("vstest: the captured inactivity line shows the timer fired, though the output also says the host crashed")
+        if hang_fired(fixture("vstest-hang-console.txt").replace("The specified inactivity time of 30 seconds has elapsed", "x"), False):
+            fails.append("vstest: the crash lines alone are not proof of a hang")
+        got = names("vstest", "", [("Sequence_1.xml", fixture("vstest-sequence-theory.xml"))])
+        if got[0] != ['Acme.T.Theory(s: "a&b", t: \'c\', u: \'d\')']:
+            fails.append(f"vstest: XML escapes in a theory argument must decode: {got}")
+        got = names("vstest", "", [("Sequence_1.xml", "<TestSequence><Test Name=")])
+        if got[0]:
+            fails.append(f"vstest: a cut-off sequence file names nothing: {got}")
+        got = names("mtp", fixture("mtp-hangdump-names.log"))
+        if got[0] != ["Acme.HangTests.Waits_forever", "Acme.HangTests.Holds_a_lock(x: 1)"] or "output" not in got[1]:
+            fails.append(f"mtp: names after a hang dump line: {got}")
+        got = names("mtp", "", [("hang-report.txt", "Hang dump report\nTests still running:\n  Acme.A.One\n"), ("x.dmp", "Acme.B.Two")])
+        if got[0] != ["Acme.A.One"] or got[2] != 2:
+            fails.append(f"mtp: names from a report file in the results folder, never from a dump: {got}")
+        for log in ("mtp-stall-no-names.log", "mtp-stall-createdump.log"):
+            got = names("mtp", fixture(log))
+            if got[0]:
+                fails.append(f"mtp: the real stalled log {log} has no test name to find: {got}")
+        report = "Hang dump report\nTests still running:\n  Acme.B.Two\n"
+        got = names("mtp", "", [("a.dmp", report), ("b.core", report), ("c-report.txt", report.replace("B.Two", "A.One"))])
+        if got[0] != ["Acme.A.One"] or got[3] is not True:
+            fails.append(f"mtp: .dmp and .core files are never read, and they are what shows the timer fired: {got}")
+        got = names("mtp", "", [("c-report.txt", report)])
+        if got[0] != ["Acme.B.Two"] or got[3] is not False:
+            fails.append(f"mtp: a report file alone is not a dump: {got}")
+        got = names("mtp", "\x1b[31mHang dump report\x1b[0m\nTests still running:\n  \x1b[1mAcme.C.Three\x1b[0m\n")
+        if got[0] != ["Acme.C.Three"]:
+            fails.append(f"mtp: colour codes in the output must not hide the names: {got}")
+        got = names("mtp", "", [("c-report.txt", "\x1b[31mHang dump report\x1b[0m\nTests still running:\n  \x1b[1mAcme.D.Four\x1b[0m\n")])
+        if got[0] != ["Acme.D.Four"]:
+            fails.append(f"mtp: colour codes in a report file must not hide the names: {got}")
+        got = names("mtp", "$ dotnet test -- --hangdump\nRunning tests in Acme.Tests.dll\n  Acme.A.One\n")
+        if got[0]:
+            fails.append(f"mtp: a run that only started with --hangdump has no hang to read: {got}")
+        for rc_, want in ((0, False), (75, False), (78, False), (1, True), (2, True), (76, True), (134, True), (143, True)):
+            if is_hang({"names": ["A.B"], "fired": True}, rc_) is not want:
+                fails.append(f"is_hang with rc {rc_} should be {want}")
+        if is_hang({"names": ["A.B"], "fired": False}, 2) or is_hang({"names": [], "fired": True}, 2) or is_hang({}, 2):
+            fails.append("a hang needs names and evidence the timer fired")
+        if "2 passed, 1 failed before the hang" not in hang_seen(Dotnet, "Failed!  - Failed: 1, Passed: 2, Skipped: 0, Total: 3\n") \
+                or "did not finish" not in hang_seen(Dotnet, ""):
+            fails.append("a hang note carries the counts the run printed, or says it printed none")
+        if hang_fired("", False) or hang_fired("$ dotnet test --hangdump --hangdump-timeout 540s\nfailed A.B (1ms)\n", False):
+            fails.append("no dump file and no hang line in the output means the timer did not fire")
+        if not hang_fired("", True) or not hang_fired(fixture("mtp-hangdump-names.log"), False):
+            fails.append("a dump file, or the hang line in the output, shows the timer fired")
+        why = no_name_reason({"why": "the test project does not reference X"}, "")
+        if "does not reference X" not in why:
+            fails.append(f"a missing package must be the reason: {why!r}")
+        if "written and deleted" not in no_name_reason({"names": [], "files": 0}, fixture("mtp-stall-createdump.log")):
+            fails.append("a createdump line in a log with no name must be the reason")
+        if "no hang dump" not in no_name_reason({"names": [], "files": 0}, fixture("mtp-stall-no-names.log")):
+            fails.append("a silent stall with no dump must say no hang dump was written")
+
     for name, want in (("vstest-detailed-summary.log", (7, 0, 0)), ("vstest-detailed-failed.log", (6, 3, 1))):
         if Dotnet.counts(fixture(name)) != want:
             fails.append(f"detailed VSTest summary {name}: {Dotnet.counts(fixture(name))}, want {want}")
@@ -1466,6 +1858,7 @@ echo "Passed!  - Failed: 0"; exit 0
                    HEAVY_LOCK_DIR=os.path.join(d, "locks"), LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"),
                    HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
         env.pop("TEST_PHASE_RUNNER", None)
+        env["TEST_PHASE_HANGDUMP"] = "off"  # the runs below compare exact command lines; the hang run turns it on
         repo_v = os.path.join(d, "vrepo")
         repo_m = os.path.join(d, "mrepo")
         for r in (repo_v, repo_m):
@@ -1919,6 +2312,119 @@ echo "Passed!  - Failed: 0"; exit 0
         if "resolution: flaky-cleared" not in shown:
             fails.append(f"the 5th passing run must close the flaky item as flaky-cleared: {closed} {shown!r}")
 
+        # A hang the blame collector names: a test-fail tagged hang, the dump deleted; the same test on a second
+        # run is tagged hang-repeat. The shim acts by $FAKE_DIR/hangmode: hang, crash (a Sequence file, no dump,
+        # exit 134), term (a hang that ends by SIGTERM), rerun (the full run fails one test, its rerun hangs),
+        # exit1 (a hang that exits 1), exit0 (a dump but exit 0). A build call (no --results-directory) passes.
+        hangmode = os.path.join(d, "hangmode")
+
+        def hang_shim():
+            with open(shim, "w") as fh:
+                fh.write('''#!/bin/sh
+echo "$*" >> "$FAKE_LOG"
+rd=; prev=
+for a in "$@"; do [ "$prev" = --results-directory ] && rd=$a; prev=$a; done
+[ -n "$rd" ] || exit 0
+mode=$(cat "$FAKE_DIR/hangmode")
+mkdir -p "$rd"
+seq() {
+  { echo '<TestSequence>'
+    echo "<Test Name=\\"$1\\" Source=\\"x\\" Completed=\\"True\\" />"
+    echo "<Test Name=\\"$2\\" Source=\\"x\\" Completed=\\"False\\" />"
+    echo '</TestSequence>'; } > "$rd/Sequence_1.xml"
+}
+case "$mode" in
+  crash) seq Acme.CrashTests.Done Acme.CrashTests.Boom; echo "passed Acme.CrashTests.Done (1ms)"; exit 134 ;;
+  rerun|rerunterm)
+    case "$*" in
+      *FullyQualifiedName*) seq Acme.RerunHang.Other Acme.RerunHang.Boom${mode#rerun}; echo big > "$rd/hang.dmp"
+        echo "Passed!  - Failed: 0, Passed: 3, Skipped: 0, Total: 3"
+        [ "$mode" = rerunterm ] && kill -TERM $$; exit 2 ;;
+      *) echo "failed Acme.RerunHang.Boom (1ms)"; exit 1 ;;
+    esac ;;
+  *) seq Acme.HangTests.Done Acme.HangTests.Sleeps; echo big > "$rd/hang.dmp"
+     echo "  Passed Acme.HangTests.Done [1 ms]"
+     case "$mode" in term) kill -TERM $$ ;; exit1) exit 1 ;; exit0) exit 0 ;; *) exit 2 ;; esac ;;
+esac
+''')
+
+        def hang_run(mode_, plan, *extra_):
+            open(hangmode, "w").write(mode_)
+            env["TEST_PHASE_HANGDUMP"] = "on"
+            try:
+                return run(plan, *extra_)
+            finally:
+                env["TEST_PHASE_HANGDUMP"] = "off"
+
+        def fails_of(ref):
+            return [l for l in brain_list("--kind", "test-fail").splitlines() if ref in l]
+
+        hang_shim()
+        rc, out, calls = hang_run("hang", f"{repo_v} tests/T/Hangs.csproj\n")
+        hung = fails_of("Acme.HangTests.Sleeps")
+        if rc != 1 or len(hung) != 1 or "tags=hang" not in hung[0] or "hang-repeat" in hung[0] or "HangTests.Done" in brain_list("--kind", "test-fail") \
+                or len(calls) < 2 or not calls[0].startswith("build ") or "--no-build" not in calls[1] \
+                or "--blame-hang-timeout 540s" not in calls[1] or "--no-build" in calls[0] or "--blame-hang" in calls[0]:
+            fails.append(f"a hang the blame collector names must file one test-fail tagged hang, after a build of its own ({rc}): {hung} {calls} {out}")
+        if "stalled" not in out:
+            fails.append(f"a hung run must show as stalled in the table: {out}")
+        shown = subprocess.run([sys.executable, BRAIN, "show", hung[0].split()[0].lstrip("#")], env=env,
+                               capture_output=True, text=True).stdout if hung else ""
+        if "hung:" not in shown or "sequence file" not in shown or "no counts, the run did not finish" not in shown:
+            fails.append(f"the hang item must say the test hung, where the name came from, and the counts: {shown!r}")
+        left = [os.path.join(r, f) for r, _, fs in os.walk(os.path.join(d, "runs")) for f in fs if f.endswith((".dmp", ".xml"))]
+        if left:
+            fails.append(f"the hang dump must be deleted once the names are read: {left}")
+        con = sqlite3.connect(env["LEAN_BRAIN_DB"])
+        hrun = con.execute("SELECT stalled FROM runs WHERE test_project='Hangs.csproj' AND exit_code=2").fetchall()
+        con.close()
+        if hrun != [(1,)]:
+            fails.append(f"a hung run must be recorded as stalled: {hrun}")
+        hang_run("hang", f"{repo_v} tests/T/Hangs.csproj again=second\n")
+        hung = fails_of("Acme.HangTests.Sleeps")
+        if len(hung) != 1 or "occ=2" not in hung[0] or "hang-repeat" not in hung[0]:
+            fails.append(f"a test that hangs on two runs must be tagged hang-repeat on the same item: {hung}")
+
+        # The host ends a hang with rc 1, or by a signal: still a hang. A dump with rc 0 is a pass, not a hang.
+        for mode_, test_, occ_ in (("exit1", "Hx1", "occ=3"), ("term", "Hx2", "occ=4")):
+            rc, out, calls = hang_run(mode_, f"{repo_v} tests/T/{test_}.csproj\n")
+            hung = fails_of("Acme.HangTests.Sleeps")
+            if occ_ not in (hung[0] if hung else "") or "stalled" not in out or "killed" in out:
+                fails.append(f"a hang that ends {mode_} is still a hang, never killed ({rc}): {hung} {out}")
+        before_hang = brain_list("--kind", "test-fail")
+        rc, out, calls = hang_run("exit0", f"{repo_v} tests/T/Hx0.csproj\n")
+        if brain_list("--kind", "test-fail") != before_hang or "stalled" in out:
+            fails.append(f"a run that exits 0 is a pass even with a dump in the folder ({rc}): {out}")
+
+        # A crash writes a Sequence file too: with no dump and no hang line it is killed, not a hang.
+        rc, out, calls = hang_run("crash", f"{repo_v} tests/T/Crash.csproj\n")
+        if fails_of("Acme.CrashTests.Boom") or "killed" not in out:
+            fails.append(f"a crash with a Sequence file and no dump must be killed, nothing filed ({rc}): {fails_of('CrashTests')} {out}")
+
+        # A class that failed in the full run and hangs when rerun alone is a hang, not flaky.
+        rc, out, calls = hang_run("rerun", f"{repo_v} tests/T/Rr.csproj\n")
+        rr = fails_of("Acme.RerunHang.Boom")
+        if len(rr) != 1 or "hang" not in rr[0].split("tags=")[-1] or "RerunHang" in brain_list("--kind", "flaky"):
+            fails.append(f"a failed test whose class hangs on rerun must be filed as a hang, never flaky ({rc}): {rr} {out}")
+        if "stalled" not in out:
+            fails.append(f"a hung rerun must show as stalled ({rc}): {out}")
+        shown = subprocess.run([sys.executable, BRAIN, "show", rr[0].split()[0].lstrip("#")], env=env,
+                               capture_output=True, text=True).stdout if rr else ""
+        if "hung: Acme.RerunHang.Boom" not in shown or "unverified; alone: stalled" not in shown:
+            fails.append(f"the rerun hang item must say it hung: {shown!r}")
+
+        # The same, ended by a signal: still a hang, not a kill.
+        rc, out, calls = hang_run("rerunterm", f"{repo_v} tests/T/Rt.csproj\n")
+        if not fails_of("Acme.RerunHang.Boomterm") or "killed" in out:
+            fails.append(f"a hung rerun ended by a signal is a hang, not killed ({rc}): {out}")
+
+        # Extra arguments that own the results folder keep the user's files out of the cleanup.
+        rc, out, calls = hang_run("hang", f"{repo_v} tests/T/Own.csproj args=--results-directory=mine\n")
+        if any("--blame-hang" in c for c in calls):
+            fails.append(f"extra --results-directory must switch the hang arguments off: {calls}")
+        env.pop("TEST_PHASE_HANGDUMP", None)
+        env["TEST_PHASE_HANGDUMP"] = "off"
+
         # A stall: a silent hang is stopped and only noted, not logged as a failing test.
         put("full", "", 0)
         with open(shim, "w") as fh:
@@ -1929,6 +2435,8 @@ echo "Passed!  - Failed: 0"; exit 0
         note = [l for l in brain_list("--kind", "note").splitlines() if "stalled: tests/T/T.csproj" in l]
         shown = subprocess.run([sys.executable, BRAIN, "show", note[0].split()[0].lstrip("#")], env=env,
                                capture_output=True, text=True).stdout if note else ""
+        if "No test name found: hang dumps are off" not in shown:
+            fails.append(f"a stall with no name must keep the note and say why: {shown!r}")
         if "passed 1, failed 0" not in shown:
             fails.append(f"a stall note must carry the passed and failed counts: {shown!r}")
         # Only failures for --fail-stall seconds: stopped as stalled-failing with the counts.

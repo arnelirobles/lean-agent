@@ -1,0 +1,15 @@
+$ dotnet test --project tests/BarakoCMS.Tickets.Tests -- --output Detailed
+  [testcontainers.org 00:00:04.67] Docker container 93a3ae816dd3 ready
+  info: Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider[45]
+        Using ephemeral data protection provider. Payloads will be undecipherable upon application shutdown.
+  [createdump] Gathering state for process 61625
+  [createdump] Writing minidump with heap to file /tmp/pro-modules/tickets-hang.dmp
+  [createdump] Written 582504808 bytes (35553 pages) to core file
+  [createdump] Target process is alive
+  [createdump] Dump successfully written in 10446ms
+
+The following exception occurred when running the test module with RunCommand '/r/tests/BarakoCMS.Tickets.Tests/bin/Debug/net10.0/BarakoCMS.Tickets.Tests' and RunArguments '':
+
+System.InvalidOperationException: A test session start event was received without a corresponding test session end.
+   at Microsoft.DotNet.Cli.Commands.Test.TestApplication.RunAsync()
+heavy.sh: stalled: no test progress for 600 s; likely load, not code

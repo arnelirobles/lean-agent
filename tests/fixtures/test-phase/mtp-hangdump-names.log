@@ -1,0 +1,13 @@
+$ dotnet test --project tests/Acme.Tests -- --filter-class '*HangTests*' --output Detailed --hangdump --hangdump-timeout 540s --hangdump-type Mini
+# Constructed from the documented options, not captured. The real stalled logs (mtp-stall-*.log) never named a
+# test, so this is the shape the parser accepts. Check it against a real HangDump run.
+passed Acme.HangTests.Fast (3ms)
+
+[+1/x0/?0] Acme.Tests.dll (net10.0|arm64)(9m 00s)
+
+[HangDump] Hang dump timeout of 00:09:00 expired, taking a dump of the test host.
+[HangDump] Tests that were running:
+  Acme.HangTests.Waits_forever
+  - Acme.HangTests.Holds_a_lock(x: 1)
+[createdump] Writing minidump with heap to file /tmp/run/hang.dmp
+[createdump] Dump successfully written in 410ms
