@@ -140,6 +140,7 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_STATS` | on | `off` stops every `lean-stats` write. |
 | `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where `brain` keeps its database. |
 | `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing the brain digest. |
+| `LEAN_SCRIPT_NOTE` | on | `off` stops the note that names the script behind a hand-written command. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
 
@@ -167,7 +168,7 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 
 ## Data
 
-lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`) and stats (`~/.lean/lean.db`). The `commit-author` hook reads the git author email to check it and stores nothing.
+lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`), stats (`~/.lean/lean.db`) and which script notes a session has seen (`~/.local/share/lean/script-note`, deleted after 14 days). The `commit-author` hook reads the git author email to check it and stores nothing.
 
 It sends data to other services only through tools you already run, and only where you point them:
 

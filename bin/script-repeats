@@ -392,7 +392,8 @@ def self_test():
     assert "(root)" in {project_of(root, os.path.join(root, "top.jsonl"))}
 
     text = render(res, fams, 7)
-    assert "needs a script (no cover, 3 or more projects): package-version-lookup" in text, text
+    assert "needs a script (no cover, 3 or more projects): none" in text, text
+    assert "package-version-lookup (pkg-version)" in text, text
     assert "pgrep (hooks/wait-loop.py)" in text
     assert "method text names it, agents use a path: versioned-plugin-path" in text
     assert "versioned-plugin-path (" not in text.split("hand-rolled despite a script:")[1].split("\n")[0]

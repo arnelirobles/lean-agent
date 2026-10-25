@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Look up a package: the latest stable version, and what each project in this repo pins.
+
+  pkg-version <name> [--nuget|--npm]
+  pkg-version --self-test
+
+The latest stable version comes from the registry: npm's `latest` tag, or the highest version
+without a pre-release suffix on nuget.org. With neither flag, the registries are chosen by
+what the repository pins (package.json means npm, Directory.Packages.props and *.csproj mean
+nuget), and when it pins nothing, npm is tried first and then nuget.
+
+The pins are read from the repository the command runs in (the git top level, else the current
+directory): Directory.Packages.props and other *.props or *.targets (PackageVersion and
+PackageReference with a Version), *.csproj (PackageReference with a Version), and package.json
+(dependencies, devDependencies, peerDependencies, optionalDependencies). node_modules, bin, obj
+and .git are skipped. Names match without regard to case.
+
+A registry call has a 10 second limit. When the registry cannot be reached or does not know
+the package, the pins still print, the reason goes to stderr, and the exit code is 1.
+LEAN_NPM_REGISTRY and LEAN_NUGET_REGISTRY replace the registry base URLs.
+
+Exit 0 on success, 1 on a registry problem, 2 on a bad call.
+
+Python 3 standard library, runs under python3 -I.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 10
+NPM = os.environ.get("LEAN_NPM_REGISTRY") or "https://registry.npmjs.org"
+NUGET = os.environ.get("LEAN_NUGET_REGISTRY") or "https://api.nuget.org/v3-flatcontainer"
+SKIP_DIRS = {"node_modules", "bin", "obj", ".git"}
+MAX_FILES = 5000
+NAME = re.compile(r"[@A-Za-z0-9][@A-Za-z0-9._/-]{0,213}")
+TAG = re.compile(r"<(PackageVersion|PackageReference)\b([^>]*)>", re.I)
+ATTR = re.compile(r"([A-Za-z]+)\s*=\s*\"([^\"]*)\"")
+NPM_SECTIONS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+
+
+class RegistryError(Exception):
+    pass
+
+
+def fetch(url):
+    """The JSON at url. RegistryError with a plain reason when it cannot be had."""
+    host = urllib.parse.urlparse(url).netloc
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RegistryError("not found on %s" % host)
+        raise RegistryError("%s answered %d" % (host, exc.code))
+    except urllib.error.URLError as exc:
+        raise RegistryError("could not reach %s: %s" % (host, exc.reason))
+    except (OSError, ValueError) as exc:
+        raise RegistryError("no usable answer from %s within %ds: %s" % (host, TIMEOUT, exc))
+
+
+def version_key(text):
+    return tuple(int(p) if p.isdigit() else 0 for p in re.split(r"[.+]", text.split("-")[0])[:4])
+
+
+def latest_npm(name):
+    data = fetch("%s/%s/latest" % (NPM, urllib.parse.quote(name, safe="@")))
+    version = data.get("version") if isinstance(data, dict) else None
+    if not isinstance(version, str):
+        raise RegistryError("registry.npmjs.org has no latest version for %s" % name)
+    return version
+
+
+def latest_nuget(name):
+    data = fetch("%s/%s/index.json" % (NUGET, urllib.parse.quote(name.lower(), safe="")))
+    versions = data.get("versions") if isinstance(data, dict) else None
+    stable = [v for v in versions or [] if isinstance(v, str) and "-" not in v]
+    if not stable:
+        raise RegistryError("api.nuget.org has no stable version of %s" % name)
+    return max(stable, key=version_key)
+
+
+def read_pins(root, name):
+    """[(ecosystem, relative path, version, where)] for name under root."""
+    want = name.lower()
+    pins, seen = [], 0
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for fname in sorted(files):
+            seen += 1
+            if seen > MAX_FILES:
+                return pins
+            low = fname.lower()
+            path = os.path.join(folder, fname)
+            rel = os.path.relpath(path, root)
+            try:
+                if low == "package.json":
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        data = json.load(f)
+                    for section in NPM_SECTIONS:
+                        deps = data.get(section) if isinstance(data, dict) else None
+                        for dep, ver in (deps.items() if isinstance(deps, dict) else []):
+                            if dep.lower() == want and isinstance(ver, str):
+                                pins.append(("npm", rel, ver, section))
+                elif low.endswith((".csproj", ".props", ".targets", ".fsproj", ".vbproj")):
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                    for m in TAG.finditer(text):
+                        attrs = {k.lower(): v for k, v in ATTR.findall(m.group(2))}
+                        pkg = attrs.get("include") or attrs.get("update") or ""
+                        if pkg.lower() == want and attrs.get("version"):
+                            pins.append(("nuget", rel, attrs["version"], m.group(1)))
+            except (OSError, ValueError):
+                continue
+    return pins
+
+
+def repo_root(cwd):
+    try:
+        p = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return cwd
+    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else cwd
+
+
+def lookup(name, ecosystem, root):
+    """(text, problems) for a package."""
+    pins = read_pins(root, name)
+    if ecosystem:
+        order = [ecosystem]
+    else:
+        order = [e for e in ("npm", "nuget") if any(p[0] == e for p in pins)] or ["npm", "nuget"]
+    guessing = not ecosystem and not pins
+    lines, problems = [], []
+    found = False
+    for eco in order:
+        try:
+            lines.append("%s latest on %s: %s" % (name, eco, (latest_npm if eco == "npm" else latest_nuget)(name)))
+            found = True
+        except RegistryError as exc:
+            problems.append("pkg-version: %s: %s" % (eco, exc))
+        if guessing and found:
+            break
+    if guessing and found:
+        problems = []
+    if pins:
+        lines.append("pinned here:")
+        for eco, rel, ver, where in pins:
+            lines.append("  %s  %s  %s (%s)" % (rel, ver, eco, where))
+    else:
+        lines.append("pinned here: nowhere")
+    return "\n".join(lines), problems
+
+
+def self_test():
+    failures = []
+
+    def check(label, ok, detail=""):
+        if not ok:
+            failures.append("FAIL %s %s" % (label, detail))
+
+    global fetch
+    real_fetch = fetch
+    asked = []
+    registry = {
+        "https://registry.npmjs.org/left-pad/latest": {"version": "1.3.0"},
+        "https://registry.npmjs.org/@scope%2Fpkg/latest": {"version": "2.0.1"},
+        "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json": {
+            "versions": ["12.0.3", "13.0.1", "13.0.3", "13.0.10-beta1", "9.0.1", "13.0.9"]},
+        "https://api.nuget.org/v3-flatcontainer/onlypre/index.json": {"versions": ["1.0.0-rc1"]},
+    }
+
+    def fake(url):
+        asked.append(url)
+        if "down.example" in url:
+            raise RegistryError("could not reach down.example: timed out")
+        if url in registry:
+            return registry[url]
+        raise RegistryError("not found on " + urllib.parse.urlparse(url).netloc)
+
+    fetch = fake
+    root = tempfile.mkdtemp(prefix="pkg-version-test-")
+
+    def put(rel, text):
+        full = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+
+    put("Directory.Packages.props", '<Project><ItemGroup>\n<PackageVersion Include="Newtonsoft.Json" Version="12.0.3" />\n'
+        '<PackageVersion Version="1.0.0" Include="Other.Pkg" />\n</ItemGroup></Project>')
+    put("src/App/App.csproj", '<Project><ItemGroup><PackageReference Include="newtonsoft.json" Version="13.0.1" />'
+        '<PackageReference Include="Newtonsoft.Json" /></ItemGroup></Project>')
+    put("web/package.json", json.dumps({"dependencies": {"left-pad": "^1.1.0", "@scope/pkg": "2.0.0"},
+                                         "devDependencies": {"left-pad": "~1.2.0"}}))
+    put("web/node_modules/left-pad/package.json", json.dumps({"dependencies": {"left-pad": "9.9.9"}}))
+    put("src/App/obj/x.csproj", '<PackageReference Include="Newtonsoft.Json" Version="0.0.1" />')
+    put("broken/package.json", "{ not json")
+
+    pins = read_pins(root, "Newtonsoft.Json")
+    got = sorted((rel, ver) for _, rel, ver, _ in pins)
+    check("nuget pins from props and csproj, no node_modules or obj",
+          got == [("Directory.Packages.props", "12.0.3"), (os.path.join("src", "App", "App.csproj"), "13.0.1")], str(got))
+    npins = sorted((ver, where) for _, _, ver, where in read_pins(root, "left-pad"))
+    check("npm pins from both sections", npins == [("^1.1.0", "dependencies"), ("~1.2.0", "devDependencies")], str(npins))
+
+    text, problems = lookup("Newtonsoft.Json", None, root)
+    check("nuget chosen from the pins", "Newtonsoft.Json latest on nuget: 13.0.9" in text and not problems, text)
+    check("pre-release and lower versions skipped", "13.0.10-beta1" not in text and "9.0.1" not in text, text)
+    check("only the nuget registry was asked", asked == ["https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json"],
+          str(asked))
+    check("pin lines", "  Directory.Packages.props  12.0.3  nuget (PackageVersion)" in text
+          and "13.0.1  nuget (PackageReference)" in text, text)
+
+    del asked[:]
+    text, problems = lookup("left-pad", None, root)
+    check("npm chosen from package.json", "left-pad latest on npm: 1.3.0" in text and not problems
+          and asked == ["https://registry.npmjs.org/left-pad/latest"], text + str(asked))
+    text, _ = lookup("@scope/pkg", "npm", root)
+    check("scoped npm name", "latest on npm: 2.0.1" in text and "2.0.0" in text, text)
+
+    text, problems = lookup("Newtonsoft.Json", "npm", root)
+    check("flag overrides the pins", "latest on" not in text and problems and "not found" in problems[0], text + str(problems))
+    check("pins still print when the registry fails", "Directory.Packages.props" in text, text)
+
+    del asked[:]
+    text, problems = lookup("newtonsoft.json", "nuget", tempfile.mkdtemp(prefix="pkg-version-empty-"))
+    check("unpinned package still gets the latest", "latest on nuget: 13.0.9" in text and "pinned here: nowhere" in text, text)
+    del asked[:]
+    text, problems = lookup("left-pad", None, tempfile.mkdtemp(prefix="pkg-version-empty-"))
+    check("no pins, no flag: npm first, stop at the first answer",
+          "latest on npm: 1.3.0" in text and not problems and len(asked) == 1, text + str(asked))
+    text, problems = lookup("onlypre", "nuget", root)
+    check("only pre-releases", "latest on" not in text and problems and "no stable version" in problems[0], str(problems))
+    text, problems = lookup("down.example", "npm", root)
+    check("unreachable registry is a clear error", problems == ["pkg-version: npm: could not reach down.example: timed out"],
+          str(problems))
+    text, problems = lookup("nothing-here", None, tempfile.mkdtemp(prefix="pkg-version-empty-"))
+    check("unknown everywhere reports both registries", len(problems) == 2, str(problems))
+
+    fetch = real_fetch
+    # the real fetch: a closed local port is an error, not a hang
+    try:
+        real_fetch("http://127.0.0.1:9/x")
+        check("closed port", False, "no error")
+    except RegistryError as exc:
+        check("closed port message", "could not reach 127.0.0.1:9" in str(exc) or "no usable answer" in str(exc), str(exc))
+
+    here = os.path.realpath(__file__)
+    for args, want in (([], 2), (["--bogus"], 2), (["a", "b"], 2), (["--npm"], 2), (["bad name!"], 2),
+                       (["-x"], 2), (["x", "--npm", "--nuget"], 2)):
+        p = subprocess.run([sys.executable, "-I", here] + args, capture_output=True, text=True)
+        check("usage error %r" % (args,), p.returncode == want and "usage" in p.stderr, "%s %s" % (p.returncode, p.stderr))
+    env = dict(os.environ, LEAN_NPM_REGISTRY="http://127.0.0.1:9", LEAN_NUGET_REGISTRY="http://127.0.0.1:9")
+    p = subprocess.run([sys.executable, "-I", here, "left-pad", "--npm"], cwd=root, capture_output=True, text=True, env=env)
+    check("registry down: exit 1, pins printed, reason on stderr",
+          p.returncode == 1 and "^1.1.0" in p.stdout and "pkg-version: npm:" in p.stderr, "%s %s %s" % (p.returncode, p.stdout, p.stderr))
+
+    for f in failures:
+        print(f)
+    print("self-test: ok" if not failures else "self-test: %d failed" % len(failures))
+    return 1 if failures else 0
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
+    flags = [a for a in argv if a in ("--npm", "--nuget")]
+    names = [a for a in argv if a not in ("--npm", "--nuget")]
+    if len(flags) > 1 or len(names) != 1 or not NAME.fullmatch(names[0]):
+        print("usage: pkg-version <name> [--nuget|--npm]", file=sys.stderr)
+        return 2
+    eco = flags[0][2:] if flags else None
+    text, problems = lookup(names[0], eco, repo_root(os.getcwd()))
+    print(text)
+    for line in problems:
+        print(line, file=sys.stderr)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

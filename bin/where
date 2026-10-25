@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Orient in a repository in one call.
+
+  where [--all]
+  where --self-test
+
+Prints, in under 30 lines: the repository, the branch, how many files are dirty, how far the
+branch is ahead of and behind its upstream and the default branch, and the open pull request
+for the branch with a summary of its checks. With --all, one line per worktree: path, branch,
+dirty count, ahead and behind the same two refs, and the age of the last commit. More than 20
+worktrees are cut off with a count.
+
+The pull request comes from `gh pr view`, with a 10 second limit. Without gh, without a
+login, or without a pull request, that line says so and the rest still prints. Read only:
+nothing is fetched, so ahead and behind are as of the last fetch.
+
+Exit 2 outside a git repository.
+
+Python 3 standard library, runs under python3 -I.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+MAX_WORKTREES = 20
+
+
+def run(cmd, cwd, timeout=10):
+    """(returncode, stdout) of a command, or (1, "") when it cannot run or runs too long."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return p.returncode, p.stdout.strip()
+
+
+def git(cwd, *args):
+    return run(["git", "-C", cwd] + list(args), cwd)
+
+
+def default_ref(cwd):
+    code, out = git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if code == 0 and out:
+        return out
+    for ref in ("origin/main", "origin/master"):
+        if git(cwd, "rev-parse", "--verify", "--quiet", ref)[0] == 0:
+            return ref
+    return ""
+
+
+def count(cwd, head, base):
+    """Commits head is ahead of and behind base, or None."""
+    if not base:
+        return None
+    code, out = git(cwd, "rev-list", "--left-right", "--count", "%s...%s" % (head, base))
+    parts = out.split()
+    if code != 0 or len(parts) != 2:
+        return None
+    return int(parts[0]), int(parts[1])
+
+
+def show(pair):
+    return "ahead %d behind %d" % pair if pair else "none"
+
+
+def short(pair):
+    return "+%d/-%d" % pair if pair else "none"
+
+
+def dirty(cwd):
+    code, out = git(cwd, "status", "--porcelain")
+    return len(out.splitlines()) if code == 0 and out else 0
+
+
+def age(cwd, head="HEAD"):
+    code, out = git(cwd, "log", "-1", "--format=%ct", head)
+    if code != 0 or not out.isdigit():
+        return "no commits"
+    secs = max(0, int(time.time()) - int(out))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return "%d%s" % (secs // size, unit)
+    return "now"
+
+
+def upstream(cwd, branch):
+    code, out = git(cwd, "rev-parse", "--abbrev-ref", "%s@{upstream}" % branch)
+    return out if code == 0 and out else ""
+
+
+def summarize_checks(rollup):
+    ok = bad = wait = 0
+    for item in rollup or []:
+        state = (item.get("conclusion") or item.get("state") or item.get("status") or "").upper()
+        if state in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            ok += 1
+        elif state in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+            bad += 1
+        else:
+            wait += 1
+    return "%d pass, %d fail, %d pending" % (ok, bad, wait) if ok + bad + wait else "no checks"
+
+
+def pull_request(cwd, branch):
+    if not branch:
+        return "none (detached HEAD)"
+    code, out = run(["gh", "pr", "view", branch, "--json", "number,state,statusCheckRollup"], cwd)
+    if code != 0:
+        return "none, or gh is not available"
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return "gh answered with something unreadable"
+    if data.get("state") not in (None, "OPEN"):
+        return "none open"
+    return "#%s, checks: %s" % (data.get("number"), summarize_checks(data.get("statusCheckRollup")))
+
+
+def current_branch(cwd):
+    code, out = git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
+    return out if code == 0 else ""
+
+
+def worktrees(cwd):
+    code, out = git(cwd, "worktree", "list", "--porcelain")
+    found, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line:
+            if cur.get("path"):
+                found.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[9:]
+        elif line.startswith("branch "):
+            cur["branch"] = line[7:].replace("refs/heads/", "", 1)
+        elif line == "bare":
+            cur["bare"] = True
+    return [w for w in found if not w.get("bare")]
+
+
+def report(cwd, every):
+    code, top = git(cwd, "rev-parse", "--show-toplevel")
+    if code != 0 or not top:
+        return None
+    base = default_ref(top)
+    branch = current_branch(top)
+    up = upstream(top, branch) if branch else ""
+    lines = [
+        "repo: %s (%s)" % (os.path.basename(top), top),
+        "branch: %s" % (branch or "(detached HEAD)"),
+        "dirty: %d" % dirty(top),
+        "upstream: %s %s" % (up or "none", show(count(top, "HEAD", up) if up else None)),
+        "default: %s %s" % (base or "none found", show(count(top, "HEAD", base))),
+        "pr: %s" % pull_request(top, branch),
+    ]
+    if every:
+        trees = worktrees(top)
+        lines.append("worktrees: %d" % len(trees))
+        for w in trees[:MAX_WORKTREES]:
+            path, name = w["path"], w.get("branch", "")
+            wup = upstream(path, name) if name else ""
+            lines.append("  %s | %s | dirty %d | up %s | default %s | %s" % (
+                path, name or "(detached)", dirty(path),
+                short(count(path, "HEAD", wup) if wup else None), short(count(path, "HEAD", base)), age(path)))
+        if len(trees) > MAX_WORKTREES:
+            lines.append("  ... %d more" % (len(trees) - MAX_WORKTREES))
+    return "\n".join(lines)
+
+
+def self_test():
+    failures = []
+
+    def check(label, ok, detail=""):
+        if not ok:
+            failures.append("FAIL %s %s" % (label, detail))
+
+    tmp = tempfile.mkdtemp(prefix="where-test-")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com", GIT_CONFIG_GLOBAL="/dev/null")
+    os.environ.update(env)
+
+    def g(cwd, *args):
+        p = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, text=True)
+        assert p.returncode == 0, (args, p.stderr)
+        return p.stdout
+
+    origin = os.path.join(tmp, "origin.git")
+    repo = os.path.join(tmp, "repo")
+    feature = os.path.join(tmp, "feature-tree")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+    g(repo, "remote", "add", "origin", origin)
+    open(os.path.join(repo, "a.txt"), "w").write("a\n")
+    g(repo, "add", ".")
+    g(repo, "commit", "-q", "-m", "first")
+    g(repo, "push", "-q", "-u", "origin", "main")
+    g(repo, "remote", "set-head", "origin", "main")
+    g(repo, "worktree", "add", "-q", "-b", "feat/x", feature)
+    g(feature, "push", "-q", "-u", "origin", "feat/x")
+    for n in ("one", "two"):
+        open(os.path.join(feature, n + ".txt"), "w").write(n)
+        g(feature, "add", ".")
+        g(feature, "commit", "-q", "-m", n)
+    open(os.path.join(repo, "dirty1.txt"), "w").write("x")
+    open(os.path.join(repo, "a.txt"), "a").write("more\n")
+
+    fake = os.path.join(tmp, "bin")
+    os.mkdir(fake)
+    gh = os.path.join(fake, "gh")
+    with open(gh, "w") as f:
+        f.write("#!/bin/sh\ncase \"$3\" in feat/x) echo '{\"number\":42,\"state\":\"OPEN\",\"statusCheckRollup\":"
+                "[{\"conclusion\":\"SUCCESS\"},{\"conclusion\":\"FAILURE\"},{\"status\":\"IN_PROGRESS\"},"
+                "{\"state\":\"SUCCESS\"}]}';; *) exit 1;; esac\n")
+    os.chmod(gh, 0o755)
+    os.environ["PATH"] = fake + os.pathsep + os.environ["PATH"]
+
+    text = report(repo, False)
+    check("one repo, no --all", text and "worktrees" not in text and "branch: main" in text, text)
+    check("dirty count", "dirty: 2" in text, text)
+    check("upstream and default", "upstream: origin/main ahead 0 behind 0" in text
+          and "default: origin/main ahead 0 behind 0" in text, text)
+    check("no pr on main", "pr: none" in text, text)
+
+    text = report(feature, False)
+    check("ahead of upstream and default", "upstream: origin/feat/x ahead 2 behind 0" in text
+          and "default: origin/main ahead 2 behind 0" in text, text)
+    check("pr number and check summary", "pr: #42, checks: 2 pass, 1 fail, 1 pending" in text, text)
+    open(os.path.join(feature, "three.txt"), "w").write("3")
+    g(feature, "add", ".")
+    g(feature, "commit", "-q", "-m", "three")
+    text = report(feature, False)
+    check("ahead of its upstream", "upstream: origin/feat/x ahead 3 behind 0" in text, text)
+
+    text = report(repo, True)
+    lines = text.splitlines()
+    check("under 30 lines", len(lines) < 30, str(len(lines)))
+    check("worktree count", "worktrees: 2" in text, text)
+    main_line = [l for l in lines if l.startswith("  ") and "| main |" in l]
+    feat_line = [l for l in lines if l.startswith("  ") and "| feat/x |" in l]
+    check("dirty worktree line", main_line and "dirty 2" in main_line[0] and main_line[0].rstrip().endswith("now"),
+          str(main_line))
+    check("ahead worktree line", feat_line and "dirty 0" in feat_line[0] and "up +3/-0" in feat_line[0]
+          and "default +3/-0" in feat_line[0], str(feat_line))
+    check("path on the worktree line", feat_line and os.path.basename(feature) in feat_line[0], str(feat_line))
+
+    g(feature, "checkout", "-q", "--detach")
+    check("detached head", "branch: (detached HEAD)" in report(feature, False))
+
+    for i in range(25):
+        g(repo, "worktree", "add", "-q", "-b", "extra%d" % i, os.path.join(tmp, "wt%d" % i))
+    text = report(repo, True)
+    check("many worktrees stay under 30 lines", len(text.splitlines()) < 30 and "... 7 more" in text,
+          str(len(text.splitlines())))
+
+    outside = tempfile.mkdtemp(prefix="where-outside-")
+    check("outside a repository", report(outside, False) is None)
+    p = subprocess.run([sys.executable, "-I", os.path.realpath(__file__)], cwd=outside, capture_output=True, text=True)
+    check("exit 2 outside a repository", p.returncode == 2 and "not a git repository" in p.stderr, p.stderr)
+    p = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "--all"], cwd=repo, capture_output=True, text=True)
+    check("runs under -I", p.returncode == 0 and "repo: repo" in p.stdout, p.stderr)
+    p = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "--bogus"], capture_output=True, text=True)
+    check("unknown option", p.returncode == 2, p.stderr)
+
+    for f in failures:
+        print(f)
+    print("self-test: ok" if not failures else "self-test: %d failed" % len(failures))
+    return 1 if failures else 0
+
+
+def main(argv):
+    if argv == ["--self-test"]:
+        return self_test()
+    if argv not in ([], ["--all"]):
+        print("usage: where [--all]", file=sys.stderr)
+        return 2
+    text = report(os.getcwd(), argv == ["--all"])
+    if text is None:
+        print("where: not a git repository", file=sys.stderr)
+        return 2
+    print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
