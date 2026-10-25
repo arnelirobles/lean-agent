@@ -3,6 +3,7 @@
 
 usage: test-phase [PLAN] [--cycle C] [--lane L] [--stall S] [--fail-stall S] [--isolation-over N] [--run-dir D]
        [--project NAME] [--branch B]
+       test-phase --doctor [DIR]
        test-phase --self-test
 
 The cycle this serves: code everything with builds only, queue the test runs, drain the queue once,
@@ -74,6 +75,20 @@ Every command is also recorded as a row in brain's runs table (tier fast, full o
 spent waiting for the lane, load average at start and end, passed, failed, skipped, stalled, exit code),
 and each item points at the run that showed it. `brain stats` reads them.
 
+Prerequisites. A repository may list what its tests need in .lean/test-needs (Docker reachable, a path
+such as a sibling checkout (looked for from the main checkout), an environment variable set, a command on PATH, optionally GNU or a minimum
+version; see lib/test_needs.py). Before a local job starts, test-phase checks them and runs
+check-runtime.sh. If anything is missing the job fails with the missing piece named, one blocker goes to
+brain, and no test runs, so no test-fail item is filed. Values of environment variables are never printed.
+`test-phase --doctor [DIR]` runs the same checks alone (DIR defaults to the repository root) and exits 1 when
+something is missing. Remote lanes skip the check, since the files and variables it reads are this machine's.
+
+When a run's failures mostly share one machine cause (DockerUnavailableException, the Testcontainers
+ResourceReaper failing to start, Npgsql "Failed to connect to"; added together, at least 3 and more than half), they are not
+filed as tests: one blocker for the run names the cause and the count, and those tests are not rerun, so
+none of them can become a flaky item. Other failures are filed unverified, not rerun. A remote lane rests
+afterwards, and a later passing full run closes the blocker.
+
 Remote lanes. When ~/.config/lean/remotes.ini names SSH hosts, the one drainer runs one lane per host next
 to the local lane, each claiming the next ready job with `brain queue next`. A remote lane copies the job's
 worktree to the host, runs the same test command in a capped container there, and streams the output back
@@ -115,6 +130,10 @@ try:
     import heavy_lock as hl
 except ImportError:  # without the helper a job takes the lane command by command, as before
     hl = None
+try:
+    import test_needs as tn
+except ImportError:  # without the module no prerequisite or environment check runs
+    tn = None
 try:
     import lean_remote as lr
 except ImportError:  # a copy of test-phase without its module still drains the local lane
@@ -332,7 +351,10 @@ class Dotnet:
             if not TEST_NAME.fullmatch(name) or name in seen:
                 continue
             seen.add(name)
-            out.append((name, "\n".join(lines[i:i + 12])))
+            end = i + 1
+            while end < min(i + 12, len(lines)) and not FAILED.match(lines[end]):
+                end += 1
+            out.append((name, "\n".join(lines[i:end])))
         return out
 
     @staticmethod
@@ -667,6 +689,20 @@ def stall_facts(text):
     return (int(found[-1][0]), int(found[-1][1]), found[-1][2]) if found else None
 
 
+def close_blockers(row, ctx, project):
+    """Close this project's open environment and test-needs blockers on this branch. A full run passed, so both are over."""
+    where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
+    text = brain(["list", "--open", "--kind", "blocker", "--project", row["project"]]) or ""
+    closed = 0
+    for m in re.finditer(r"^#(\d+) open \S+ (\S+) (.+?) (?:minor|important|info) occ=", text, re.M):
+        ref = m.group(3)
+        if m.group(2) == where and (ref == f"test-needs: {project}"
+                                    or (ref.startswith("environment: ") and ref.endswith(f": {project}"))):
+            if brain(["close", m.group(1), "--resolution", "fixed", "--note", "a full run of the test project passed"]) is not None:
+                closed += 1
+    return closed
+
+
 def earlier_items(row, ctx):
     """Item ids by test name: this branch's open flaky items, and its open order-dependent test-fails."""
     where = row["project"] + ("@" + ctx["branch"] if ctx["branch"] else "")
@@ -871,6 +907,19 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         row["notes"].append(f"bad filter: {e}")
         return row
 
+    if tn and not remote:
+        try:
+            missing = tn.preflight(repo)
+        except Exception as e:  # noqa: BLE001  a bad file must not crash the lane
+            missing = [f"MISSING {tn.NEEDS}: cannot check ({type(e).__name__}: {e})"]
+        if missing:
+            row["result"] = "blocked"
+            row["notes"].append(f"{len(missing)} test prerequisite(s) missing, nothing ran")
+            add_item(row, "blocker", f"test-needs: {project}", "important",
+                     f"The tests of {project} did not run. Missing before the run:\n" + "\n".join(missing)
+                     + f"\nCheck again with `test-phase --doctor {repo}`.", None, ctx)
+            return row
+
     synced = []
     kept = {}  # a reused build folder: its path, and the mark and project while its build still has to run
 
@@ -996,6 +1045,21 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         return row
     for name, detail in runner.failures(text):
         failing.setdefault(name, detail)
+    cause = tn.environmental(failing) if tn else None
+    if cause:  # the machine failed, not the tests: one blocker, and none of these is rerun or counted as flaky
+        label, hint, names, counts = cause
+        total = len(failing)
+        for n in names:
+            del failing[n]
+        row["env"], row["env_label"] = len(names), label
+        row["notes"].append(f"environment: {label}, {len(names)} of {total} failures")
+        add_item(row, "blocker", f"environment: {label}: {project}", "important",
+                 f"{len(names)} of {total} failures in {project} come from the machine, not the code: "
+                 + ", ".join(f"{k} {v}" for k, v in counts.items())
+                 + f". {hint}. They are not test failures and were not rerun. Log: {stem}.log\n"
+                 + "\n".join(names[:5]), run_id, ctx)
+        if remote:  # the host is the problem, so this lane should not take the next job at once
+            row["lane_rest"] = f"environment: {label}"
     facts = stall_facts(text) if rc in (76, 78) else None
     seen = f"passed {facts[0]}, failed {facts[1]}, last test: {facts[2]}" if facts else "no counts in the log"
     if hung:
@@ -1017,12 +1081,12 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                  f"Log: {stem}.log", run_id, ctx)
     elif rc == 75:
         row["notes"].append("lane busy, nothing ran")
-    elif job["filter"] and not failing and matched_none(rc, text):
+    elif job["filter"] and not failing and not row.get("env") and matched_none(rc, text):
         row["result"] = "fail"
         row["notes"].append("filter matched no test")
         add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
                  f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
-    elif rc != 0 and not failing:
+    elif rc != 0 and not failing and not row.get("env"):
         tail = "\n".join(text.splitlines()[-15:])
         add_item(row, "test-fail", f"run-failed: {project}", "important",
                  f"exit {rc} with no failing test named. Log: {stem}.log\n{tail}", run_id, ctx)
@@ -1051,12 +1115,15 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                    or "").splitlines()
         if cleared:
             row["notes"].append(f"{len(cleared)} flaky closed after 5 passing runs")
+        closed = close_blockers(row, ctx, project)
+        if closed:
+            row["notes"].append(f"{closed} blocker(s) closed, the full run passed")
     lost = None
     labelled = []  # (name, label, body), filed once every rerun is in, so a job killed on the way files none
     for cls, names in by_class.items():
         log = f"{stem}-class-{safe(cls)}.log"
         rrc, rtext, rhang = 75, "", {}  # a rerun that could not run proves nothing: unverified
-        if not lost:
+        if not lost and not row.get("env"):  # an environmental run proves nothing by rerunning
             try:
                 rrc, rtext, _ = tier("rerun", cls, log)
                 rhang = dict(hang_info)  # each rerun has its own hang dump
@@ -1088,8 +1155,9 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                 label = "unverified"
             else:
                 label = "real"
-            labelled.append((name, label, f"{label}; alone: {tier_note(rrc, rhung)}"
-                             + (f", hung: {', '.join(rhang['names'][:3])}" if rhung else "") + f". Log: {log}\n{failing[name]}"))
+            how = (f"not rerun, environment down ({row['env_label']})" if row.get("env")
+                   else f"alone: {tier_note(rrc, rhung)}" + (f", hung: {', '.join(rhang['names'][:3])}" if rhung else ""))
+            labelled.append((name, label, f"{label}; {how}. Log: {log}\n{failing[name]}"))
     file_results(row, labelled, a, run_id, ctx, stem)
     return row
 
@@ -1326,7 +1394,7 @@ def table(rows, show_host=False):
 
 
 def is_bad(r):
-    if r["result"] in ("stalled", "stalled-failing", "killed", "busy", "error"):
+    if r["result"] in ("stalled", "stalled-failing", "killed", "busy", "error", "blocked"):
         return True
     if r["real"]:
         return True
@@ -1344,7 +1412,17 @@ def main(argv):
     p.add_argument("--project")
     p.add_argument("--branch")
     p.add_argument("--cycle")
+    p.add_argument("--doctor", nargs="?", const="", metavar="DIR")
     a = p.parse_args(argv)
+    if a.doctor is not None:
+        if not tn:
+            print("test-phase: lib/test_needs.py is missing", file=sys.stderr)
+            return 2
+        target = a.doctor or tn.repo_root()
+        if not os.path.isdir(target):
+            print(f"test-phase: {target} is not a directory", file=sys.stderr)
+            return 2
+        return tn.doctor(os.path.abspath(target))
     stamp = time.strftime("%Y%m%d-%H%M%S")
     cycle = a.cycle or stamp
     if a.plan:
@@ -1545,6 +1623,139 @@ def vitest_checks(fails, fixture):
 # Fake credentials for the self-test, joined at runtime so secret scanners do not flag the source.
 FAKE_PW = "fake-pw-7f3"
 FAKE_ENV = "POSTGRES_" + "PASSWORD=" + FAKE_PW + "\n"
+
+
+def needs_checks(fails):
+    """Test prerequisites and environmental runs, on their own brain database and their own fake dotnet."""
+    with tempfile.TemporaryDirectory() as d:
+        shims = os.path.join(d, "shims")
+        os.mkdir(shims)
+        with open(os.path.join(shims, "dotnet"), "w") as fh:  # prints the file named for the project, with its exit code
+            fh.write('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\nf="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
+        os.chmod(os.path.join(shims, "dotnet"), 0o755)
+        env = dict(os.environ, PATH=shims + os.pathsep + os.environ["PATH"], FAKE_DIR=d, HOME=d,
+                   FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"),
+                   LEAN_DB=os.path.join(d, "lean.db"), HEAVY_LOCK_DIR=os.path.join(d, "locks"),
+                   LEAN_TEST_PHASE_DIR=os.path.join(d, "runs"), HEAVY_WAIT="20", TEST_PHASE_REMOTES="off")
+        env.pop("TEST_PHASE_RUNNER", None)
+        me = os.path.realpath(__file__)
+
+        def repo(name):
+            os.makedirs(os.path.join(d, name, "tests", "T"))
+            return os.path.join(d, name)
+
+        def output(project, text, rc):
+            open(os.path.join(d, "out-" + project), "w").write(text)
+            open(os.path.join(d, "out-" + project + ".rc"), "w").write(str(rc))
+
+        def run(path, project):
+            open(os.path.join(d, "plan.txt"), "w").write(f"{path} tests/T/{project}\n")
+            open(env["FAKE_LOG"], "w").close()
+            r = subprocess.run([sys.executable, me, os.path.join(d, "plan.txt")], env=env, capture_output=True,
+                               text=True, timeout=240)
+            return r.returncode, r.stdout + r.stderr, open(env["FAKE_LOG"]).read().splitlines()
+
+        def items(proj, kind, closed=False):
+            """[(id, ref)] with the exact ref, so one name never matches part of another."""
+            state = ["--status", "closed"] if closed else ["--open"]
+            got = subprocess.run([sys.executable, BRAIN, "list", *state, "--kind", kind, "--project", proj], env=env,
+                                 capture_output=True, text=True).stdout
+            return [(m.group(1), m.group(2)) for m in re.finditer(
+                r"^#(\d+) \w+ \S+ \S+ (.+?) (?:minor|important|info) occ=", got, re.M)]
+
+        def show(i):
+            return subprocess.run([sys.executable, BRAIN, "show", i], env=env, capture_output=True, text=True).stdout
+
+        docker = "  Error Message:\n   Testcontainers.Builders.DockerUnavailableException : Docker is either not running.\n"
+        # 1,800 Docker failures are one blocker for the run, no test-fail, no flaky, and nothing is rerun.
+        r_d = repo("envdocker")
+        output("Dk.csproj", "".join(f"  Failed Dk.Tests.T{i} [1 ms]\n{docker}" for i in range(1800))
+               + "Failed!  - Failed:  1800, Passed:     0, Skipped:     0, Total:  1800\n", 1)
+        rc, out, calls = run(r_d, "Dk.csproj")
+        ref = "environment: docker unavailable: tests/T/Dk.csproj"
+        got = items("envdocker", "blocker")
+        if rc != 1 or [r for _, r in got] != [ref]:
+            fails.append(f"1800 Docker failures must be exactly one blocker and exit 1 ({rc}): {got} {out}")
+        if items("envdocker", "test-fail") or items("envdocker", "flaky"):
+            fails.append("an environmental run must file no test-fail or flaky item")
+        if len(calls) != 1:
+            fails.append(f"an environmental run must not rerun any class: {len(calls)} calls")
+        if got and "docker unavailable 1800" not in show(got[0][0]):
+            fails.append(f"the blocker must count each cause: {show(got[0][0])!r}")
+        # A passing full run of the project closes the blocker.
+        output("Dk.csproj", "Passed!  - Failed:     0, Passed:     5, Skipped:     0, Total:     5\n", 0)
+        rc, out, calls = run(r_d, "Dk.csproj")
+        if rc != 0 or items("envdocker", "blocker") or [r for _, r in items("envdocker", "blocker", True)] != [ref]:
+            fails.append(f"a passing full run must close the environment blocker ({rc}): {items('envdocker', 'blocker')} {out}")
+
+        # A real failure followed by Docker failures: the real one is kept, unverified, and worded as not rerun.
+        r_r = repo("envreal")
+        output("Rl.csproj", "  Failed Rl.Real.Breaks [1 ms]\n   Assert.Equal() Failure\n"
+               + "".join(f"  Failed Rl.D.T{i} [1 ms]\n{docker}" for i in range(3))
+               + "Failed!  - Failed: 4, Passed: 0, Skipped: 0, Total: 4\n", 1)
+        detail = dict(Dotnet.failures(open(os.path.join(d, "out-Rl.csproj")).read()))
+        if "Docker" in detail.get("Rl.Real.Breaks", "Docker"):
+            fails.append(f"a failure's detail must stop at the next failure: {detail.get('Rl.Real.Breaks')!r}")
+        rc, out, calls = run(r_r, "Rl.csproj")
+        tf = items("envreal", "test-fail")
+        if [r for _, r in tf] != ["Rl.Real.Breaks"] or len(calls) != 1 \
+                or [r for _, r in items("envreal", "blocker")] != ["environment: docker unavailable: tests/T/Rl.csproj"]:
+            fails.append(f"a real failure before Docker ones must be filed, with no rerun: {tf} {len(calls)} {out}")
+        elif "not rerun, environment down" not in show(tf[0][0]) or "busy" in show(tf[0][0]):
+            fails.append(f"a failure not rerun must say so: {show(tf[0][0])!r}")
+
+        # Missing prerequisites: one blocker naming each, no test runs, no value printed, no test-fail.
+        r_n = repo("needrefuse")
+        os.makedirs(os.path.join(r_n, ".lean"))
+        env["LEAN_NEEDS_SET"] = "topsecret-value-123"
+        env.pop("LEAN_NEEDS_UNSET", None)
+        needs_file = os.path.join(r_n, ".lean", "test-needs")
+        open(needs_file, "w").write("env LEAN_NEEDS_SET  # present\nenv LEAN_NEEDS_UNSET\npath ../not-here\n")
+        output("Nn.csproj", "Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1\n", 0)
+        rc, out, calls = run(r_n, "Nn.csproj")
+        nb = items("needrefuse", "blocker")
+        body = show(nb[0][0]) if nb else ""
+        if rc != 1 or [r for _, r in nb] != ["test-needs: tests/T/Nn.csproj"] or calls \
+                or "LEAN_NEEDS_UNSET is not set" not in body or "../not-here" not in body \
+                or "topsecret-value-123" in body + out:
+            fails.append(f"missing prerequisites must be one blocker, no run, no value shown ({rc}): {nb} {calls} {body!r}")
+        if items("needrefuse", "test-fail"):
+            fails.append("a refusal must not be a test-fail")
+        ql = subprocess.run([sys.executable, BRAIN, "queue", "list"], env=env, capture_output=True, text=True).stdout
+        if not re.search(r"failed.*test prerequisite\(s\) missing", ql):
+            fails.append(f"a refused job must finish failed with the reason: {ql}")
+        dr = subprocess.run([sys.executable, me, "--doctor", r_n], env=env, capture_output=True, text=True)
+        if dr.returncode != 1 or "MISSING env: LEAN_NEEDS_UNSET is not set" not in dr.stdout \
+                or "ok      env LEAN_NEEDS_SET" not in dr.stdout or "topsecret-value-123" in dr.stdout + dr.stderr:
+            fails.append(f"--doctor must report the missing piece and exit 1: {dr.returncode} {dr.stdout!r}")
+        open(needs_file, "w").write("env LEAN_NEEDS_SET\n")
+        dr = subprocess.run([sys.executable, me, "--doctor", r_n], env=env, capture_output=True, text=True)
+        if dr.returncode != 0:
+            fails.append(f"--doctor must exit 0 when everything is met: {dr.returncode} {dr.stdout!r}")
+        rc, out, calls = run(r_n, "Nn.csproj")
+        if rc != 0 or items("needrefuse", "blocker") or len(calls) != 1:
+            fails.append(f"met prerequisites must run the tests and close the blocker ({rc}): {items('needrefuse', 'blocker')}")
+
+        # The runtime check joins in, and an unreadable file is a blocker, not a crash.
+        r_t = repo("needruntime")
+        os.makedirs(os.path.join(r_t, ".lean"))
+        open(os.path.join(r_t, ".lean", "test-needs"), "w").write("env LEAN_NEEDS_SET\n")
+        open(os.path.join(r_t, "package.json"), "w").write('{"engines":{"node":">=999.0.0"}}')
+        output("Rt.csproj", "Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1\n", 0)
+        rc, out, calls = run(r_t, "Rt.csproj")
+        nb = items("needruntime", "blocker")
+        if rc != 1 or calls or len(nb) != 1 or "runtime:" not in show(nb[0][0]):
+            fails.append(f"check-runtime must be part of the check ({rc}): {nb} {calls}")
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            r_p = repo("needunreadable")
+            os.makedirs(os.path.join(r_p, ".lean"))
+            pf = os.path.join(r_p, ".lean", "test-needs")
+            open(pf, "w").write("env LEAN_NEEDS_SET\n")
+            os.chmod(pf, 0)
+            rc, out, calls = run(r_p, "Rt.csproj")
+            nb = items("needunreadable", "blocker")
+            if rc != 1 or "Traceback" in out or calls or len(nb) != 1 or "cannot check" not in show(nb[0][0]):
+                fails.append(f"an unreadable test-needs file must be a blocker, not a crash ({rc}): {nb} {out}")
 
 
 def self_test():
@@ -2552,7 +2763,7 @@ exit 0
                 (f"tests/{x[0]}/{x[1]}.csproj", net) for x in ("TPlain", "TFail", "TStall", "TLost", "TOff", "TStale")):
             os.makedirs(os.path.dirname(os.path.join(rrepo, name)), exist_ok=True)
             open(os.path.join(rrepo, name), "w").write(text)
-        for x in ("T/Hs", "U/Hs", "T/Plain", "T/Fail", "T/Stall", "T/Lost", "T/Off", "T/Stale"):
+        for x in ("T/Hs", "U/Hs", "T/Plain", "T/Fail", "T/Docker", "T/Stall", "T/Lost", "T/Off", "T/Stale"):
             open(os.path.join(rrepo, "tests", x + ".csproj"), "w").write(net)
         subprocess.run(["git", "init", "-q", rrepo], check=True)
         open(os.path.join(d, "rrepo.env"), "w").write(FAKE_ENV)
@@ -2689,6 +2900,15 @@ exit 0
                 or "Acme.RemoteTests.Breaks" not in brain_list("--open") or leftovers() != ([], []):
             fails.append(f"remote fail and rerun ({rc}): {runs_of('Fail.csproj')} {leftovers()} {out}")
 
+        # A host whose Docker is down is an environment blocker, not test failures, and its lane rests.
+        qadd(rrepo, "tests/Apple/Apple.csproj", "--cycle", "r4b")
+        qadd(rrepo, "tests/T/Docker.csproj", "--cycle", "r4b")
+        rc, out, _ = rdrain()
+        if rc != 1 or "lane remote-dev rests: environment: docker unavailable" not in out \
+                or "environment: docker unavailable: tests/T/Docker.csproj" not in brain_list("--kind", "blocker") \
+                or "Acme.DockerTests" in brain_list("--kind", "test-fail") or runs_of("Docker.csproj") != [("full", "dev")]:
+            fails.append(f"a remote environmental result must be one blocker and rest the lane ({rc}): {out}")
+
         # A stall on the host is stopped, noted, and cleaned up after. The window counts the copy and the
         # container setup too, which on a loaded machine can pass 3 s before the test starts.
         qadd(rrepo, "tests/Apple/Apple.csproj", "--cycle", "r5")
@@ -2794,6 +3014,7 @@ exit 0
         if f'"id": {stale}' not in got or f"job #{stale} failed" not in qlist("--cycle", "r7") \
                 or leftovers() != ([], []):
             fails.append(f"a stale remote job needs its host cleaned: {got!r} {qlist('--cycle', 'r7')} {leftovers()}")
+    needs_checks(fails)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
