@@ -1381,8 +1381,8 @@ def needs_checks(fails):
     with tempfile.TemporaryDirectory() as d:
         shims = os.path.join(d, "shims")
         os.mkdir(shims)
-        with open(os.path.join(shims, "dotnet"), "w") as fh:  # prints the file named for the project, with its exit code
-            fh.write('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\nf="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
+        with open(os.path.join(shims, "dotnet"), "w") as fh:  # a build passes; a test prints the file named for the project, with its exit code
+            fh.write('#!/bin/sh\necho "$*" >> "$FAKE_LOG"\n[ "$1" = build ] && exit 0\nf="$FAKE_DIR/out-$(basename "$2")"\ncat "$f"\nexit "$(cat "$f.rc")"\n')
         os.chmod(os.path.join(shims, "dotnet"), 0o755)
         env = dict(os.environ, PATH=shims + os.pathsep + os.environ["PATH"], FAKE_DIR=d, HOME=d,
                    FAKE_LOG=os.path.join(d, "calls.log"), LEAN_BRAIN_DB=os.path.join(d, "brain.db"),
