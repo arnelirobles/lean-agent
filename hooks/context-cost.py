@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 try:
     import fcntl
@@ -56,7 +57,7 @@ SESSION_ID = re.compile(r"[A-Za-z0-9-]{1,100}")
 
 def state_dir():
     """The counter folder, or None when it is not safe to use: a link, or not ours."""
-    path = os.path.join(os.path.dirname(leanstats.db_path()), "context-cost")
+    path = os.path.join(os.path.dirname(os.path.abspath(leanstats.db_path())), "context-cost")
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         try:
@@ -66,9 +67,11 @@ def state_dir():
         info = os.lstat(path)
     except OSError:
         return None
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    if not stat.S_ISDIR(info.st_mode):
         return None
-    if info.st_mode & 0o077:
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        return None
+    if hasattr(os, "getuid") and info.st_mode & 0o077:
         try:
             os.chmod(path, 0o700)
         except OSError:
@@ -87,15 +90,38 @@ def state_path(sid, suffix=".json"):
 
 def load(sid):
     try:
-        with open(state_path(sid)) as fh:
+        fd = os.open(state_path(sid), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd) as fh:
             state = json.load(fh)
         return state if isinstance(state, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
+KEEP_DAYS = 14
+
+
+def prune(folder, sid):
+    """Remove the counter and lock files of sessions untouched for KEEP_DAYS, never the current one."""
+    cutoff = time.time() - KEEP_DAYS * 86400
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        stem, dot, ext = name.rpartition(".")
+        if not dot or ext not in ("json", "lock") or stem == sid:
+            continue
+        try:
+            if os.lstat(os.path.join(folder, name)).st_mtime < cutoff:
+                os.unlink(os.path.join(folder, name))
+        except OSError:
+            pass
+
+
 def save(sid, state):
     path = state_path(sid)
+    prune(os.path.dirname(path), sid)
     fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
@@ -361,6 +387,42 @@ def self_test():
                 check("a state folder that is not ours is refused", state_dir(), None)
             finally:
                 os.getuid = real_uid
+            old = time.time() - 15 * 86400
+            for name in ("gone-1.json", "gone-1.lock", "fresh-1.json", "sess-18.lock"):
+                with open(os.path.join(folder, name), "w") as fh:
+                    fh.write("{}")
+            for name in ("gone-1.json", "gone-1.lock", "sess-18.lock"):
+                os.utime(os.path.join(folder, name), (old, old))
+            fire(1000, sid="sess-18")
+            check("counters untouched for 14 days are removed", sorted(n for n in os.listdir(folder) if n.startswith(("gone", "fresh"))),
+                  ["fresh-1.json"])
+            check("the current session's old lock is kept", os.path.exists(os.path.join(folder, "sess-18.lock")), True)
+
+            os.mkdir(os.path.join(tmp, "rel"))
+            cwd_before = os.getcwd()
+            os.chdir(os.path.join(tmp, "rel"))
+            os.environ["LEAN_DB"] = "rel.db"
+            try:
+                check("a relative LEAN_DB still keeps state", "300k tokens" in fire(300000, sid="sess-19")[1], True)
+                check("beside the database", os.path.exists(os.path.join(tmp, "rel", "context-cost", "sess-19.json")), True)
+            finally:
+                os.chdir(cwd_before)
+                os.environ["LEAN_DB"] = os.path.join(tmp, "lean.db")
+
+            link = os.path.join(folder, "sess-20.json")
+            os.symlink(os.path.join(elsewhere, "x.json"), link)
+            with open(os.path.join(elsewhere, "x.json"), "w") as fh:
+                fh.write('{"lookups": 99}')
+            check("a state file that is a link is not read", load("sess-20"), {})
+            os.unlink(link)
+
+            real_getuid = os.getuid
+            del os.getuid
+            try:
+                check("without getuid the owner check is skipped", state_dir(), folder)
+                check("and the hook still notes", "300k tokens" in fire(300000, sid="sess-21")[1], True)
+            finally:
+                os.getuid = real_getuid
             os.chmod(folder, 0o755)
             check("a loose folder is made private again", (state_dir() == folder, stat.S_IMODE(os.lstat(folder).st_mode)),
                   (True, 0o700))
