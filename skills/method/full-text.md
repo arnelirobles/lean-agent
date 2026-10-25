@@ -598,6 +598,8 @@ calls over three and a half hours.
 None of this shows up as a failure. The task list just shows something waiting patiently, which is
 indistinguishable from something working.
 
+To wait, start the wait command in the background and end the turn: `brain queue wait ID...` for test jobs, `pr-wait` for a pull request's checks or a pipeline run. Each polls on its own, with a timeout that exits 3 and names what was pending. Never call `brain queue list`, `gh pr checks` or `az pipelines runs show` twice in a row for the same thing.
+
 Three rules, in order of how much they buy:
 
 1. **Bound every loop.** A deadline turns a stuck wait into a report. `for i in $(seq 1 60); do ...
