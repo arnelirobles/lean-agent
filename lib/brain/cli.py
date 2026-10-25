@@ -221,8 +221,8 @@ def parser():
     q.add_argument("--status", choices=JOB_STATUS)
     q = qs.add_parser("wait")
     q.add_argument("ids", type=int, nargs="+", metavar="ID")
-    q.add_argument("--timeout", type=float, default=7200, help="seconds before giving up (exit 3)")
-    q.add_argument("--interval", type=float, default=15, help="seconds between database polls")
+    q.add_argument("--timeout", type=seconds, default=7200, help="seconds before giving up (exit 3), at least 1")
+    q.add_argument("--interval", type=seconds, default=15, help="seconds between database polls, at least 1")
     q = qs.add_parser("cancel")
     q.add_argument("id", type=int)
     q = qs.add_parser("bump")
@@ -288,6 +288,16 @@ def parser():
     s.add_argument("--status", choices=STATUS)
     s.set_defaults(fn=cmd_export)
     return p
+
+
+def seconds(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 second")
+    return value
 
 
 def main(argv):

@@ -1107,7 +1107,7 @@ def run(brain_cli):
         run("queue", "finish", w[0], "--status", "done", "--run-id", rid)
         run("queue", "finish", w[1], "--status", "failed", "--reason", "tests failed", "--run-id", rid)
         run("queue", "cancel", w[2])
-        fast = ("--interval", "0.05", "--timeout", "5")
+        fast = ("--interval", "1", "--timeout", "5")
         rc, out, _ = run("queue", "wait", w[0], *fast)
         if rc != 0 or out != f"job #{w[0]} done passed=9 failed=1 items=#1":
             fails.append(f"queue wait on a done job: {rc} {out!r}")
@@ -1121,14 +1121,18 @@ def run(brain_cli):
         rc, out, err = run("queue", "wait", w[0], "9999", *fast)
         if rc != 2 or out or "no job #9999" not in err:
             fails.append(f"queue wait on an unknown id must exit 2 and print no job line: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "wait", w[3], w[0], "--interval", "0.05", "--timeout", "0.4")
+        rc, out, err = run("queue", "wait", w[3], w[0], "--interval", "1", "--timeout", "1")
         if rc != 3 or f"job #{w[3]} queued" not in out or "(still queued)" not in out or "timed out" not in err \
                 or f"job #{w[0]} done" not in out:
             fails.append(f"queue wait timeout must exit 3 and print the pending state: {rc} {out!r} {err!r}")
         run("queue", "next")  # claims w[3]; w[4] stays queued behind it
-        proc = subprocess.Popen([sys.executable, me, "queue", "wait", w[3], "--interval", "0.05", "--timeout", "20"],
+        proc = subprocess.Popen([sys.executable, me, "queue", "wait", w[3], "--interval", "1", "--timeout", "20"],
                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         run("queue", "finish", w[3], "--status", "done")
+        for bad in ("0", "-1"):
+            rc, _, err = run("queue", "wait", w[0], "--interval", bad)
+            if rc != 2 or "at least 1" not in err:
+                fails.append(f"queue wait --interval {bad} must be refused with exit 2: {rc} {err!r}")
         out, _ = proc.communicate(timeout=30)
         if proc.returncode != 0 or f"job #{w[3]} done" not in out:
             fails.append(f"queue wait must return when a running job finishes: {proc.returncode} {out!r}")

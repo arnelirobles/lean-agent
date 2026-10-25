@@ -53,15 +53,26 @@ def why_red(text):
 
 def wait(provider, a, out):
     deadline = time.monotonic() + a.timeout
+    first, errors, last_error, checks = True, 0, "", []
     while True:
-        checks = provider.checks()
+        try:
+            checks, errors = provider.checks(), 0
+        except forge.ToolMissing:
+            raise
+        except forge.CiError as ex:
+            if first:
+                raise
+            checks, errors, last_error = [], errors + 1, str(ex)
+        first = False
         pending = [c for c in checks if c["state"] == "pending"]
-        if not pending:
+        if checks and not pending:
             break
         if time.monotonic() >= deadline:
-            print(f"pr-wait: timed out after {a.timeout:g}s waiting for {provider.label}; "
-                  f"{len(pending)} of {len(checks)} checks still pending: "
-                  + ", ".join(clean(c["name"], 80) for c in pending[:20]), file=out)
+            why = (f"last poll failed ({errors} in a row): {clean(last_error)}" if errors
+                   else "no checks reported yet" if not checks
+                   else f"{len(pending)} of {len(checks)} checks still pending: "
+                   + ", ".join(clean(c["name"], 80) for c in pending[:20]))
+            print(f"pr-wait: timed out after {a.timeout:g}s waiting for {provider.label}; {why}", file=out)
             return 3
         time.sleep(min(a.interval, max(0.0, deadline - time.monotonic())))
     failed = [c for c in checks if c["state"] == "fail"]
@@ -71,7 +82,13 @@ def wait(provider, a, out):
     print(f"pr-wait: {provider.label} red, {len(failed)} of {len(checks)} checks failed", file=out)
     for c in failed:
         print(f"FAILED {clean(c['name'], 120)}", file=out)
-        log = provider.failed_log(c, a.tail)
+        try:
+            log = provider.failed_log(c, a.tail)
+        except forge.CiError as ex:
+            print(f"  log not fetched: {clean(str(ex))}", file=out)
+            log = ""
+        if not log and c.get("link"):
+            print(f"  no log; see {clean(c['link'])}", file=out)
         for line in why_red(log) if log else []:
             print("  " + line, file=out)
         for line in log.splitlines()[-a.tail:]:
@@ -79,15 +96,29 @@ def wait(provider, a, out):
     return 1
 
 
+def seconds(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 second")
+    return value
+
+
 def parse(argv):
-    p = argparse.ArgumentParser(prog="pr-wait", description="Wait for a pull request's checks or a pipeline run.")
-    p.add_argument("target", help="pull request number or URL (github), run id (azure)")
+    p = argparse.ArgumentParser(prog="pr-wait", description="Wait for a pull request's checks (github) or one "
+                                "pipeline run (azure). A check or run that ends in anything but success counts as "
+                                "failed, partiallySucceeded included. Zero checks reported yet counts as pending. "
+                                "Up to the timeout, a failed poll is retried; exit 2 is a bad argument, a missing "
+                                "tool or a first poll that fails.")
+    p.add_argument("target", help="github: a pull request number or URL; azure: a pipeline RUN ID, not a pull request")
     p.add_argument("--provider", choices=sorted(forge.CI_PROVIDERS), help="default: from the origin URL")
     p.add_argument("--repo", help="github: OWNER/NAME, default the repository of the current folder")
     p.add_argument("--org", help="azure: organization URL")
     p.add_argument("--project", help="azure: project name")
-    p.add_argument("--interval", type=float, default=30)
-    p.add_argument("--timeout", type=float, default=7200)
+    p.add_argument("--interval", type=seconds, default=30, help="seconds between polls, at least 1")
+    p.add_argument("--timeout", type=seconds, default=7200)
     p.add_argument("--tail", type=int, default=40)
     return p.parse_args(argv)
 
@@ -113,7 +144,10 @@ class Stub:
 
     def checks(self):
         self.calls += 1
-        return self.polls[min(self.calls, len(self.polls)) - 1]
+        item = self.polls[min(self.calls, len(self.polls)) - 1]
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def failed_log(self, check, tail):
         return self.logs.get(check["name"], "")
@@ -162,6 +196,33 @@ def self_test():
     check("timeout", rc == 3 and "slow, late" in out and "2 of 3" in out, (rc, out))
     check("timeout polls on the interval, not in a spin", 3 <= stub.calls <= 15, stub.calls)
 
+    rc, out = go(Stub([[], [], [c("a", "pass")]]))
+    check("zero checks is pending, not green", rc == 0 and "green, 1 checks" in out, (rc, out))
+    rc, out = go(Stub([[]]), timeout=0.2)
+    check("zero checks to the deadline", rc == 3 and "no checks reported yet" in out, (rc, out))
+
+    boom = forge.CiError("HTTP 502 from gh")
+    stub = Stub([[c("a", "pending")], boom, boom, boom, boom, [c("a", "pass")]])
+    rc, out = go(stub)
+    check("transient poll errors are survived", rc == 0 and stub.calls == 6, (rc, out, stub.calls))
+    rc, out = go(Stub([[c("a", "pending")], boom]), timeout=0.2)
+    check("errors to the deadline give 3 with the last error",
+          rc == 3 and "last poll failed" in out and "HTTP 502 from gh" in out, (rc, out))
+    try:
+        go(Stub([boom]))
+        check("first poll failure raises", False, "no error")
+    except forge.CiError:
+        pass
+    try:
+        go(Stub([[c("a", "pending")], forge.ToolMissing("cannot run gh")]))
+        check("missing tool raises", False, "no error")
+    except forge.ToolMissing:
+        pass
+
+    rc, out = go(Stub([[dict(c("ext", "fail"), link="https://ci.example/b/1\x1b[2J")]]))
+    check("a failed check with no log prints its link", rc == 1 and "  no log; see https://ci.example/b/1[2J" in out
+          and "\x1b" not in out, (rc, out))
+
     rc, out = go(Stub([[c("bad\x1b[2Jname\x07", "fail")]], {"bad\x1b[2Jname\x07": "ok\x1b]0;x\x07\n"}))
     check("control characters are removed", "\x1b" not in out and "\x07" not in out, repr(out))
 
@@ -171,11 +232,20 @@ def self_test():
         d, env = forge.make_scene(root, {"gh": forge.FAKE_GH, "az": "#!/bin/sh\necho az >> \"$FAKE_DIR/az-called\"\n"},
                                   {"checks.json": [[row]], "log-3": "boom\n"})
         r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "12", "--repo", "o/r",
-                            "--provider", "github", "--interval", "0.05"],
+                            "--provider", "github"],
                            capture_output=True, text=True, env=env, cwd=root)
         check("end to end red", r.returncode == 1 and "FAILED unit" in r.stdout and "| boom" in r.stdout,
               (r.returncode, r.stdout, r.stderr))
         check("end to end makes no az call", not os.path.exists(os.path.join(d, "az-called")), "az called")
+        for bad in ("0", "-1", "0.5", "x"):
+            r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "12", "--interval", bad],
+                               capture_output=True, text=True, env=env, cwd=root)
+            check(f"interval {bad} is refused with exit 2", r.returncode == 2, (r.returncode, r.stderr))
+        before = len(forge.read_calls(d))
+        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "--provider", "github", "--", "--web"],
+                           capture_output=True, text=True, env=env, cwd=root)
+        check("a flag-shaped target never reaches gh", r.returncode == 2 and len(forge.read_calls(d)) == before
+              and "pull request number" in r.stderr, (r.returncode, r.stderr, forge.read_calls(d)))
         r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "5", "--provider", "azure"],
                            capture_output=True, text=True, env=env, cwd=root)
         check("azure without org and project exits 2", r.returncode == 2 and "--org" in r.stderr, (r.returncode, r.stderr))

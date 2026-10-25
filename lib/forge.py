@@ -14,12 +14,15 @@ CI providers. bin/pr-wait waits on checks through a provider from ci_provider(ki
 kind_of returns. A provider is a class with this interface, nothing more:
 
   label                       what the one-line result calls the target ("pull request 12")
-  checks(target) -> list      one call to the CI system. Each check is a dict with "name" and "state"
-                              ("pass", "fail" or "pending"), plus whatever failed_log needs to find its log
+  checks() -> list            one call to the CI system. Each check is a dict with "name" and "state"
+                              ("pass", "fail" or "pending"), plus whatever failed_log needs to find its log;
+                              "link" is printed when a failed check has no log. An empty list means the CI
+                              system has reported no checks yet, which the caller treats as pending
   failed_log(check, tail)     the last `tail` lines of a failed check's log, or "" when none is available
 
 GitHub (gh) and Azure (az) are the two. The constructor takes the CLI's options (repo; org and project) and
-a `capture(argv) -> (exit code, stdout)` function, which tests replace. A failed CLI raises CiError.
+a `capture(argv) -> (exit code, stdout, stderr)` function, which tests replace. A CLI that fails raises
+CiError; a CLI that is not installed raises ToolMissing (a CiError the caller never retries).
 To add a provider, write the class, add its kind to CI_PROVIDERS and give it a test function with its own fake
 CLI (see github_ci_test and azure_ci_test). Commands run as argument lists, never through a shell, and
 what they print is untrusted.
@@ -131,13 +134,26 @@ class CiError(Exception):
     pass
 
 
+class ToolMissing(CiError):
+    pass
+
+
 def capture_command(argv, timeout=600):
-    """(exit code, stdout) of a command, whatever the exit code. A missing tool raises CiError."""
+    """(exit code, stdout, stderr) of a command, whatever the exit code."""
     try:
         r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as ex:
-        raise CiError(f"cannot run {argv[0]}: {getattr(ex, 'strerror', None) or ex}")
-    return r.returncode, r.stdout
+    except OSError as ex:
+        raise ToolMissing(f"cannot run {argv[0]}: {ex.strerror}")
+    except subprocess.SubprocessError as ex:
+        raise CiError(f"{argv[0]} did not finish: {ex}")
+    return r.returncode, r.stdout, r.stderr
+
+
+def first_line(text, width=200):
+    for line in (text or "").splitlines():
+        if line.strip():
+            return "".join(ch for ch in line.strip() if ch >= " " and ch != "\x7f")[:width]
+    return ""
 
 
 def json_out(out, what):
@@ -154,7 +170,9 @@ class GitHubCi:
         self.repo, self.capture, self.label = repo, capture, ""
 
     def target(self, pr):
-        self.pr, self.label = pr, f"pull request {pr}"
+        if not (re.fullmatch(r"\d+", pr) or re.fullmatch(r"https://[^/\s]+/[^/\s]+/[^/\s]+/pull/\d+/?", pr)):
+            raise CiError(f"github target must be a pull request number or URL, not {first_line(pr, 60)!r}")
+        self.pr, self.label = pr, f"github pull request {pr}"
         return self
 
     def _repo(self):
@@ -162,7 +180,11 @@ class GitHubCi:
 
     def checks(self):
         # One call per poll. gh exits 8 while checks are pending and 1 when one failed, with JSON either way.
-        rc, out = self.capture(["gh", "pr", "checks", self.pr, *self._repo(), "--json", "name,bucket,link"])
+        rc, out, err = self.capture(["gh", "pr", "checks", self.pr, *self._repo(), "--json", "name,bucket,link"])
+        if not out.strip():
+            if "no checks reported" in err.lower():
+                return []
+            raise CiError(f"gh pr checks exit {rc}: {first_line(err) or 'no output'}")
         buckets = {"pass": "pass", "skipping": "pass", "fail": "fail", "cancel": "fail"}
         return [{"name": r.get("name", ""), "state": buckets.get(r.get("bucket"), "pending"),
                  "link": r.get("link", "")} for r in json_out(out, f"gh pr checks (exit {rc})")]
@@ -174,7 +196,10 @@ class GitHubCi:
         argv = ["gh", "run", "view", m.group(1), *self._repo(), "--log-failed"]
         if m.group(2):
             argv += ["--job", m.group(2)]
-        return "".join(self.capture(argv)[1].splitlines(True)[-tail:])
+        rc, out, err = self.capture(argv)
+        if rc != 0:
+            raise CiError(f"gh run view exit {rc}: {first_line(err)}")
+        return "".join(out.splitlines(True)[-tail:])
 
 
 class AzureCi:
@@ -184,38 +209,58 @@ class AzureCi:
         self.org, self.project, self.capture, self.label = org, project, capture, ""
 
     def target(self, run_id):
-        self.run_id, self.label = str(run_id), f"pipeline run {run_id}"
+        if not re.fullmatch(r"\d+", str(run_id)):
+            raise CiError(f"azure target must be a pipeline run id (digits), not {first_line(str(run_id), 60)!r}")
+        self.run_id = str(run_id)
+        self.label = f"azure pipeline run {run_id} (the target is a run id, not a pull request)"
         return self
 
     def checks(self):
-        rc, out = self.capture(["az", "pipelines", "runs", "show", "--id", self.run_id, "--org", self.org,
-                                "--project", self.project, "--output", "json"])
+        rc, out, err = self.capture(["az", "pipelines", "runs", "show", "--id", self.run_id, "--org", self.org,
+                                     "--project", self.project, "--output", "json"])
+        if not out.strip():
+            raise CiError(f"az pipelines runs show exit {rc}: {first_line(err) or 'no output'}")
         run = json_out(out, f"az pipelines runs show (exit {rc})")
         if run.get("status") != "completed":
             return [{"name": f"run {self.run_id}", "state": "pending"}]
-        if run.get("result") == "succeeded":
+        if run.get("result") == "succeeded":  # partiallySucceeded is not: it falls through to red
             return [{"name": f"run {self.run_id}", "state": "pass"}]
         return self._failed_tasks() or [{"name": f"run {self.run_id} ({run.get('result')})", "state": "fail"}]
 
     def _invoke(self, resource, route, *extra):
-        return self.capture(["az", "devops", "invoke", "--area", "build", "--resource", resource, "--org", self.org,
-                             "--route-parameters", f"project={self.project}", f"buildId={self.run_id}", *route,
-                             "--api-version", "7.1", *extra])
+        rc, out, err = self.capture(["az", "devops", "invoke", "--area", "build", "--resource", resource,
+                                     "--org", self.org, "--route-parameters", f"project={self.project}",
+                                     f"buildId={self.run_id}", *route, "--api-version", "7.1", *extra])
+        if rc != 0:
+            print(f"pr-wait: az devops invoke {resource} exit {rc}: {first_line(err)}", file=sys.stderr)
+        return rc, out
 
     def _failed_tasks(self):
+        rc, out = self._invoke("timeline", [], "--output", "json")
         try:
-            records = json_out(self._invoke("timeline", [], "--output", "json")[1], "az devops invoke").get("records", [])
-        except (CiError, AttributeError):
+            records = json.loads(out).get("records", []) if rc == 0 else []
+        except (ValueError, AttributeError):
+            print("pr-wait: az devops invoke timeline gave no JSON", file=sys.stderr)
             return []
         return [{"name": r.get("name", ""), "state": "fail", "log_id": (r.get("log") or {}).get("id")}
-                for r in records if r.get("type") == "Task" and r.get("result") in ("failed", "canceled")]
+                for r in records if r.get("type") == "Task"
+                and r.get("result") in ("failed", "canceled", "succeededWithIssues")]
 
     def failed_log(self, check, tail):
         if not check.get("log_id"):
             return ""
-        out = self._invoke("logs", [f"logId={check['log_id']}"], "--http-method", "GET",
-                           "--accept-media-type", "text/plain")[1]
-        return "".join(out.splitlines(True)[-tail:])
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+            path = f.name
+        try:
+            rc, out = self._invoke("logs", [f"logId={check['log_id']}"], "--http-method", "GET",
+                                   "--accept-media-type", "text/plain", "--out-file", path)
+            if rc != 0:
+                return ""
+            with open(path, errors="replace") as f:
+                return "".join(f.readlines()[-tail:])
+        finally:
+            os.unlink(path)
 
 
 CI_PROVIDERS = {"github": GitHubCi, "azure": AzureCi}
@@ -276,19 +321,33 @@ a = sys.argv[1:]
 def val(flag):
     return a[a.index(flag) + 1] if flag in a else ""
 def log(n):
-    sys.stdout.write(open(os.path.join(d, "log-" + n)).read())
+    text = open(os.path.join(d, "log-" + n)).read()
+    if "--out-file" in a:
+        open(val("--out-file"), "w").write(text)
+    else:
+        sys.stdout.write(text)
 """
 FAKE_GH = FAKE_CLI + """
 if a[:2] == ["pr", "checks"]:
-    print(json.dumps(seq("checks.json"))); sys.exit(8)
+    item = seq("checks.json")
+    if isinstance(item, str):
+        sys.stderr.write(item + "\\n"); sys.exit(1)
+    print(json.dumps(item)); sys.exit(8)
 if a[:2] == ["run", "view"]:
+    if not os.path.exists(os.path.join(d, "log-" + (val("--job") or a[2]))):
+        sys.stderr.write("log not found\\n"); sys.exit(1)
     log(val("--job") or a[2]); sys.exit(0)
 sys.exit(9)
 """
 FAKE_AZ = FAKE_CLI + """
 if a[:3] == ["pipelines", "runs", "show"]:
-    print(json.dumps(seq("run.json"))); sys.exit(0)
+    item = seq("run.json")
+    if isinstance(item, str):
+        sys.stderr.write(item + "\\n"); sys.exit(1)
+    print(json.dumps(item)); sys.exit(0)
 if a[:2] == ["devops", "invoke"] and val("--resource") == "timeline":
+    if not os.path.exists(os.path.join(d, "timeline.json")):
+        sys.stderr.write("TF401019: forbidden\\nsecond line\\n"); sys.exit(1)
     print(open(os.path.join(d, "timeline.json")).read()); sys.exit(0)
 if a[:2] == ["devops", "invoke"] and val("--resource") == "logs":
     log([x for x in a if x.startswith("logId=")][0][6:]); sys.exit(0)
@@ -315,7 +374,7 @@ def make_scene(root, tools, files):
 def fake_capture(env):
     def capture(argv, timeout=600):
         r = subprocess.run(argv, capture_output=True, text=True, env=env)
-        return r.returncode, r.stdout
+        return r.returncode, r.stdout, r.stderr
     return capture
 
 
@@ -339,7 +398,7 @@ def github_ci_test(check, root):
                     row("e", "pending")]], {"5": "".join(f"line {i}\n" for i in range(100))})
     got = ci.checks()
     check("github states", [c["state"] for c in got], ["pass", "pass", "fail", "fail", "pending"])
-    check("github label", ci.label, "pull request 12")
+    check("github label", ci.label, "github pull request 12")
     check("github passes the repo", any("--repo o/r" in c for c in read_calls(d)), True)
     tail = ci.failed_log(got[2], 40).splitlines()
     check("github log tail", (len(tail), tail[0], tail[-1]), (40, "line 60", "line 99"))
@@ -348,8 +407,23 @@ def github_ci_test(check, root):
     check("github never calls az", os.path.exists(os.path.join(d, "az-called")), False)
     d, ci = scene([[]])
     check("github no checks", ci.checks(), [])
+    d, ci = scene(["no checks reported on the 'x' branch", "HTTP 502: bad gateway"])
+    check("github empty stdout with 'no checks reported' is an empty list", ci.checks(), [])
     try:
-        GitHubCi(None, lambda argv: (1, "not json")).target("1").checks()
+        ci.checks()
+        check("github other empty-stdout error", "no error", "CiError")
+    except CiError as ex:
+        check("github error names the exit code and message", str(ex), "gh pr checks exit 1: HTTP 502: bad gateway")
+    for bad in ("--web", "12; rm -rf", "", "https://github.com/o/r/issues/3"):
+        try:
+            GitHubCi("o/r", fake_capture({})).target(bad)
+            check(f"github target {bad!r} refused", "no error", "CiError")
+        except CiError:
+            pass
+    check("github accepts a PR URL", GitHubCi().target("https://github.com/o/r/pull/12").pr,
+          "https://github.com/o/r/pull/12")
+    try:
+        GitHubCi(None, lambda argv: (1, "not json", "")).target("1").checks()
         check("github bad output", "no error", "CiError")
     except CiError:
         pass
@@ -370,7 +444,7 @@ def azure_ci_test(check, root):
     d, ci = scene([{"status": "inProgress"}, {"status": "completed", "result": "succeeded"}])
     check("azure pending", [c["state"] for c in ci.checks()], ["pending"])
     check("azure green", [c["state"] for c in ci.checks()], ["pass"])
-    check("azure label", ci.label, "pipeline run 5")
+    check("azure label", ci.label, "azure pipeline run 5 (the target is a run id, not a pull request)")
     d, ci = scene([{"status": "completed", "result": "failed"}], {"7": "".join(f"line {i}\n" for i in range(100))})
     got = ci.checks()
     check("azure failed tasks", [(c["name"], c["state"]) for c in got], [("Test", "fail"), ("Pack", "fail")])
@@ -378,6 +452,36 @@ def azure_ci_test(check, root):
     check("azure log tail", (len(tail), tail[0], tail[-1]), (40, "line 60", "line 99"))
     check("azure task without a log", ci.failed_log(got[1], 40), "")
     check("azure never calls gh", os.path.exists(os.path.join(d, "gh-called")), False)
+    d, ci = scene([{"status": "completed", "result": "partiallySucceeded"}])
+    timeline_with_issue = {"records": [{"type": "Task", "name": "Lint", "result": "succeededWithIssues", "log": {"id": 2}}]}
+    with open(os.path.join(d, "timeline.json"), "w") as f:
+        json.dump(timeline_with_issue, f)
+    check("azure partiallySucceeded is red", [(c["name"], c["state"]) for c in ci.checks()], [("Lint", "fail")])
+    d, ci = scene([{"status": "completed", "result": "partiallySucceeded"}])
+    os.unlink(os.path.join(d, "timeline.json"))
+    import io
+    err = io.StringIO()
+    old, sys.stderr = sys.stderr, err
+    try:
+        got = ci.checks()
+    finally:
+        sys.stderr = old
+    check("azure timeline failure still reports red", [(c["name"], c["state"]) for c in got],
+          [("run 5 (partiallySucceeded)", "fail")])
+    check("azure timeline failure is shown with exit code and first line", err.getvalue(),
+          "pr-wait: az devops invoke timeline exit 1: TF401019: forbidden\n")
+    d, ci = scene(["TF400813: not authorized"])
+    try:
+        ci.checks()
+        check("azure runs show failure", "no error", "CiError")
+    except CiError as ex:
+        check("azure runs show failure message", str(ex), "az pipelines runs show exit 1: TF400813: not authorized")
+    for bad in ("abc", "--x", "5 6"):
+        try:
+            AzureCi("o", "p").target(bad)
+            check(f"azure target {bad!r} refused", "no error", "CiError")
+        except CiError:
+            pass
     try:
         ci_provider("azure", "5")
         check("azure needs org and project", "no error", "CiError")
