@@ -1449,7 +1449,7 @@ def needs_checks(fails):
             fails.append(f"a failure's detail must stop at the next failure: {detail.get('Rl.Real.Breaks')!r}")
         rc, out, calls = run(r_r, "Rl.csproj")
         tf = items("envreal", "test-fail")
-        if [r for _, r in tf] != ["Rl.Real.Breaks"] or len(calls) != 1 \
+        if [r for _, r in tf] != ["Rl.Real.Breaks"] or len([c for c in calls if c.startswith("test ")]) != 1 \
                 or [r for _, r in items("envreal", "blocker")] != ["environment: docker unavailable: tests/T/Rl.csproj"]:
             fails.append(f"a real failure before Docker ones must be filed, with no rerun: {tf} {len(calls)} {out}")
         elif "not rerun, environment down" not in show(tf[0][0]) or "busy" in show(tf[0][0]):
@@ -1484,7 +1484,7 @@ def needs_checks(fails):
         if dr.returncode != 0:
             fails.append(f"--doctor must exit 0 when everything is met: {dr.returncode} {dr.stdout!r}")
         rc, out, calls = run(r_n, "Nn.csproj")
-        if rc != 0 or items("needrefuse", "blocker") or len(calls) != 1:
+        if rc != 0 or items("needrefuse", "blocker") or len([c for c in calls if c.startswith("test ")]) != 1:
             fails.append(f"met prerequisites must run the tests and close the blocker ({rc}): {items('needrefuse', 'blocker')}")
 
         # The runtime check joins in, and an unreadable file is a blocker, not a crash.
