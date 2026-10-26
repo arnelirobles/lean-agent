@@ -328,12 +328,27 @@ def tool_kind(name, tool_input):
     return "other"
 
 
+IMAGE_READ_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+IMAGE_TOOL_WORDS = ("take_screenshot",)  # also matches browser_take_screenshot
+
+
+def is_image_call(name, tool_input):
+    """True when the tool call returns an image: Read of an image file, or a screenshot tool."""
+    if not isinstance(name, str):
+        return False
+    if name == "Read" and isinstance(tool_input, dict):
+        path = tool_input.get("file_path")
+        return isinstance(path, str) and path.lower().endswith(IMAGE_READ_EXTENSIONS)
+    return any(word in name for word in IMAGE_TOOL_WORDS)
+
+
 def usage_of(row, message):
     usage = message["usage"]
     split = usage.get("cache_creation")
     split = split if isinstance(split, dict) else {}
     written = int(usage.get("cache_creation_input_tokens") or 0)
     return {
+        "id": message.get("id") or "",
         "model": message.get("model") or "",
         "cwd": row.get("cwd") or "",
         "ts": row.get("timestamp") or "",
@@ -510,6 +525,18 @@ def self_test():
         return json.dumps({"message": message, "cwd": cwd, "sessionId": "s1",
                            "timestamp": "2026-10-02T01:00:00.000Z"}) + "\n"
 
+    for label, name, tool_input, want in (
+            ("a png read", "Read", {"file_path": "/a/shot.PNG"}, True),
+            ("a webp read", "Read", {"file_path": "x.webp"}, True),
+            ("a jpeg read", "Read", {"file_path": "x.jpeg"}, True),
+            ("a text read", "Read", {"file_path": "x.py"}, False),
+            ("a read with no path", "Read", {}, False),
+            ("a browser screenshot", "mcp__plugin_playwright_playwright__browser_take_screenshot", {}, True),
+            ("a devtools screenshot", "mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_screenshot", {}, True),
+            ("a snapshot is text", "mcp__plugin_playwright_playwright__browser_snapshot", {}, False),
+            ("a png path in Bash", "Bash", {"file_path": "x.png"}, False),
+            ("no name", None, {}, False)):
+        check("image call: " + label, is_image_call(name, tool_input), want)
     check("family by name", family("claude-haiku-4-5"), "haiku")
     check("unknown family is opus", family("something-new"), "opus")
     check("family of a versioned id", family("claude-fable-5-1"), "fable")
