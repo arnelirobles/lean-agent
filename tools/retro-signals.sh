@@ -4,7 +4,7 @@
 #   retro-signals.sh --since 2026-09-24 owner/repo [owner/repo ...]   one TSV row per merged pull request
 #   retro-signals.sh --self-test                                       checks the parsing on a fixture
 #
-# After the rows it prints a script repeats section (bin/script-repeats): the families of commands agents
+# After the rows it prints a script repeats section (tools/script-repeats): the families of commands agents
 # wrote by hand in the last SCRIPT_REPEATS_DAYS days (default 7), with counts only. SCRIPT_REPEATS_ROOT
 # points it at another transcript directory.
 #

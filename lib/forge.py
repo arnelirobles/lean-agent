@@ -10,7 +10,7 @@
 
 REPO is owner/name (always GitHub) or a clone URL. A host other than GitHub prints one line and exits 2.
 
-CI providers. bin/pr-wait waits on checks through a provider from ci_provider(kind, ...), kind being what
+CI providers. tools/pr-wait waits on checks through a provider from ci_provider(kind, ...), kind being what
 kind_of returns. A provider is a class with this interface, nothing more:
 
   label                       what the one-line result calls the target ("pull request 12")
@@ -356,7 +356,7 @@ sys.exit(9)
 
 
 def make_scene(root, tools, files):
-    """A folder with fake CLIs ({name: script}) in bin/ and data files. Returns (dir, env with PATH and FAKE_DIR)."""
+    """A folder with fake CLIs ({name: script}) in a bin folder and data files. Returns (dir, env with PATH and FAKE_DIR)."""
     import tempfile
     d = tempfile.mkdtemp(dir=root)
     os.mkdir(os.path.join(d, "bin"))

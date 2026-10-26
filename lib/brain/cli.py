@@ -85,7 +85,7 @@ Adding an open item with the same project, kind and ref does not make a new row:
 occurrences and moves last_seen, so a failure seen in ten runs is one line.
 
 The queue replaces wait loops. Never write a sleep or pgrep loop to wait for the test lane: enqueue and
-end the turn, or start `brain queue wait ID...` in the background for one wake-up when the jobs end. bin/test-phase drains the queue, one drainer at a time, oldest ready job first. A job
+end the turn, or start `brain queue wait ID...` in the background for one wake-up when the jobs end. tools/test-phase drains the queue, one drainer at a time, oldest ready job first. A job
 whose --after job failed or was cancelled is cancelled with the reason. States: queued, running, done,
 failed, cancelled.
 

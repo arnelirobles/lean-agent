@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lane lock and stall watchdog for bin/heavy.sh, for machines without util-linux flock (macOS).
+"""Lane lock and stall watchdog for tools/heavy.sh, for machines without util-linux flock (macOS).
 
   heavy_lock.py probe <lockfile>                          exit 0 if free, 1 if held
   heavy_lock.py run <lockfile> <wait> <marker> <cmd...>   take the lock, run cmd at nice 19
@@ -22,7 +22,7 @@ the group is stopped and this exits 78 with "stalled-failing". Passed and failed
 "[+N/xM]" counter when the output has one, else from result lines. Both stall messages end with
 "(passed P, failed F, last test: NAME)". The two watchdogs are independent: either, both or neither may be set.
 
-HEAVY_HELD=<lock path>:<pid>:<nonce> says the caller already holds the lane lock for the whole job (bin/test-phase
+HEAVY_HELD=<lock path>:<pid>:<nonce> says the caller already holds the lane lock for the whole job (tools/test-phase
 does, so a job's alone reruns keep the lane). run then takes no lock, waits for none and reaps no orphan.
 It counts only when the lock path is this lane's, <lock>.held holds the nonce (claim() writes it), the lock is
 held, and pid is one of our parents; otherwise the lane is taken as usual. The command does not inherit it.
