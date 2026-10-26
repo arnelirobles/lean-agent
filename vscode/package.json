@@ -30,6 +30,11 @@
         "icon": "$(graph)"
       },
       {
+        "command": "leanBrain.openPage",
+        "title": "Lean Brain: Open brain page",
+        "icon": "$(link-external)"
+      },
+      {
         "command": "leanBrain.refresh",
         "title": "Lean Brain: Refresh",
         "icon": "$(refresh)"

@@ -21,6 +21,14 @@ HEREDOC_MARK = re.compile(r"__lean_heredoc_(\d+)__")
 GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 _EVENT = {}  # the last event read, for the session id and cwd of a recorded fire
 _RECORD = "--self-test" not in sys.argv[1:]  # a hook's own self-test must not write to the real database
+if not _RECORD and not os.environ.get("LEAN_BRAIN_DB"):
+    # a self-test, and every hook it spawns, must write to a scratch brain and never the real one
+    import atexit
+    import shutil
+    import tempfile
+    _scratch = tempfile.mkdtemp(prefix="lean-selftest-brain-")
+    atexit.register(shutil.rmtree, _scratch, True)
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(_scratch, "brain.db")
 
 
 def _fire(outcome):
@@ -78,7 +86,23 @@ def note(event_name, text):
     """Print a non-blocking note that Claude reads with the tool result."""
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event_name, "additionalContext": text}}))
+    sys.stdout.flush()
     _fire("note")
+    _keep_notice(text)
+
+
+def _keep_notice(text):
+    """Keep the note as a notice in brain for the web page. Never raises and never waits more than about a second."""
+    if not _RECORD or os.environ.get("LEAN_NOTICES") == "off":
+        return
+    try:
+        from brain import records, store
+        con = store.connect(timeout=1)
+        records.add_notice(con, os.path.basename(sys.argv[0]), text,
+                           str(_EVENT.get("session_id") or ""), str(_EVENT.get("cwd") or ""))
+        con.close()
+    except (SystemExit, Exception):  # a locked or newer database must not change the hook's output
+        pass
 
 
 def disabled(name, seg=None):
@@ -310,6 +334,7 @@ def gh_call(seg):
 def self_test():
     import contextlib
     import io
+    import shutil
     import tempfile
 
     import leanstats
@@ -317,6 +342,11 @@ def self_test():
     global _RECORD, _EVENT
 
     failures = 0
+    saved_brain = os.environ.get("LEAN_BRAIN_DB")  # the scratch brain set at import
+    saved_notices = os.environ.get("LEAN_NOTICES")
+    scratch = tempfile.mkdtemp(prefix="hookkit-selftest-")
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(scratch, "brain.db")
+    os.environ.pop("LEAN_NOTICES", None)
 
     def check(name, got, want):
         nonlocal failures
@@ -416,6 +446,75 @@ def self_test():
     check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
     check("tool_path quotes a path with a space", tool_path("brain", "/a b/tools"), "'/a b/tools/brain'")
     check("tool_path leaves a plain path bare", tool_path("brain", "/a/tools"), "/a/tools/brain")
+
+    import sqlite3
+    import time
+
+    def notice_rows(path):
+        if not os.path.exists(path):
+            return None
+        con = sqlite3.connect(path)
+        try:
+            return [tuple(r) for r in con.execute("SELECT hook, text, session_id, cwd FROM notices")]
+        except sqlite3.Error:
+            return None
+        finally:
+            con.close()
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            bdb = os.path.join(tmp, "brain.db")
+            os.environ["LEAN_BRAIN_DB"] = bdb
+            os.environ.pop("LEAN_NOTICES", None)
+            with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "lean.db"), LEAN_STATS=None):
+                _RECORD, _EVENT = True, {"session_id": "s1", "cwd": "/w"}
+                check("note output with notices on", noted(), want_note)
+                check("note leaves one notice", notice_rows(bdb), [("hookkit.py", "hello", "s1", "/w")])
+                os.environ["LEAN_NOTICES"] = "off"
+                os.environ["LEAN_BRAIN_DB"] = off_db = os.path.join(tmp, "off.db")
+                noted()
+                check("LEAN_NOTICES=off records nothing", os.path.exists(off_db), False)
+                os.environ.pop("LEAN_NOTICES")
+                _RECORD = False
+                os.environ["LEAN_BRAIN_DB"] = quiet_db = os.path.join(tmp, "quiet-brain.db")
+                noted()
+                check("a self-test run keeps no notice", os.path.exists(quiet_db), False)
+                _RECORD = True
+                locked = os.path.join(tmp, "locked.db")
+                os.environ["LEAN_BRAIN_DB"] = locked
+                from brain import store
+                store.connect().close()
+                holder = sqlite3.connect(locked, isolation_level=None)
+                holder.execute("BEGIN EXCLUSIVE")
+                t0 = time.time()
+                check("locked brain, same note output", noted(), want_note)
+                check("locked brain returns within 2 s", time.time() - t0 < 2, True)
+                holder.close()
+                check("locked brain kept nothing", notice_rows(locked), [])
+
+        # a child of a self-test, with no LEAN_BRAIN_DB given, lands in the scratch brain and not the real one
+        import subprocess
+        child_env = dict(os.environ)
+        child_env.pop("LEAN_BRAIN_DB", None)
+        child_env.pop("LEAN_NOTICES", None)
+        code = ("import os, sys; sys.path.insert(0, sys.argv[1]); import hookkit; hookkit._RECORD = True;"
+                " hookkit.note('PreToolUse', 'child'); db = os.environ['LEAN_BRAIN_DB']; import sqlite3;"
+                " print(db); print(sqlite3.connect(db).execute('SELECT hook, text FROM notices').fetchall())")
+        done = subprocess.run([sys.executable, "-c", code, os.path.dirname(os.path.realpath(__file__)), "--self-test"],
+                              env=child_env, capture_output=True, text=True)
+        lines = done.stdout.strip().splitlines()
+        child_db, child_rows = (lines[-2], lines[-1]) if len(lines) >= 2 else ("", "")
+        real_db = os.path.realpath(os.path.expanduser("~/.local/share/lean/brain.db"))
+        check("child gets a scratch brain", bool(child_db) and os.path.realpath(child_db) != real_db, True)
+        check("child kept its notice in the scratch brain", child_rows, "[('-c', 'child')]")
+    finally:
+        _RECORD, _EVENT = False, {}
+        shutil.rmtree(scratch, ignore_errors=True)
+        for key, val in (("LEAN_BRAIN_DB", saved_brain), ("LEAN_NOTICES", saved_notices)):
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

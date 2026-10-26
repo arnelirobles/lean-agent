@@ -33,6 +33,15 @@ def git_out(repo, *args):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def current_branch(repo):
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True,
+                           timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def cancel_dependents(con, job_id, reason):
     for r in con.execute("SELECT id FROM jobs WHERE status='queued' AND after_id=?", (job_id,)).fetchall():
         con.execute("UPDATE jobs SET status='cancelled', reason=?, ended_at=? WHERE id=?", (reason, now(), r["id"]))
@@ -225,13 +234,13 @@ def cmd_queue(a):
                                  f"would not be the commit {commit[:8]}; commit first, or pass --again \"reason\"")
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
-                " enqueued_at, status, reason, ended_at, args, platform, commit_hash, session_id, session_cwd)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " enqueued_at, status, reason, ended_at, args, platform, commit_hash, session_id, session_cwd, branch)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.cycle, project, repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
                  f"dependency #{a.after} {dep['status']}" if dead else
                  (f"again: {again}" if again else ""), now() if dead else None, a.args,
-                 platform, commit, session, session_cwd))
+                 platform, commit, session, session_cwd, current_branch(repo)))
             con.execute("COMMIT")
         except BaseException:
             if con.in_transaction:

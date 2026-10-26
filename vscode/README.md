@@ -1,5 +1,7 @@
 # Lean Brain for VS Code
 
+This panel is deprecated and will be retired. Use the brain page instead: run `tools/brain serve` from the plugin folder and open `http://leanagent.localhost:8770`, or run `Lean Brain: Open brain page`.
+
 A read-mostly dashboard over the lean-agent brain database. It reads the SQLite file and never writes it. The only changes it makes go through `tools/brain` (close, reopen, and closing a question as answered).
 
 ## What it shows

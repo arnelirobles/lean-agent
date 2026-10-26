@@ -12,12 +12,17 @@ set -uo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root" || exit 2
 
+# No self-test may reach the real brain database: a hook it spawns would migrate and write to it.
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/lean-run-all.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+export LEAN_BRAIN_DB="$scratch/brain.db"
+
 # A while-read loop rather than mapfile, which macOS's bash 3.2 does not have.
 scripts=()
 while IFS= read -r s; do
   [ "$(basename "$s")" = "run-all.sh" ] && continue
   scripts+=("$s")
-done < <(grep -l -- '--self-test' tools/* hooks/*.py lib/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
+done < <(grep -l -- '--self-test' tools/* hooks/*.py lib/*.py lib/brain/web/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
 if [ "${#scripts[@]}" -eq 0 ]; then
   echo "run-all: found no scripts with a --self-test" >&2
   exit 1

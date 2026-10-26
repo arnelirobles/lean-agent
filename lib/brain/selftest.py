@@ -7,6 +7,7 @@ import time
 
 from .store import KIND, MIGRATIONS, connect, migrate_1
 from .queue import detect_platform, project_of
+from . import records
 
 
 DIGEST_MAX = 2048
@@ -102,6 +103,122 @@ def connect_rows(path, query):
         return con.execute(query).fetchall()
     finally:
         con.close()
+
+
+def serve_tests(fails, me, d):
+    import http.server
+    import socket
+    import threading
+    from . import cli
+    home = os.path.join(d, "home")
+    env = dict(os.environ, LEAN_BRAIN_DB=os.path.join(d, "serve.db"), HOME=home, USERPROFILE=home,
+               APPDATA=os.path.join(home, "AppData"), XDG_CONFIG_HOME=os.path.join(home, "xdg"))
+    for name in ("LEAN_SERVE_PORT", "CLAUDE_PLUGIN_OPTION_SERVE_MODE", "CLAUDE_PLUGIN_OPTION_WORKTREE_ROOTS"):
+        env.pop(name, None)
+
+    def free():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def brain(*args):
+        r = subprocess.run([sys.executable, me, *args], env=env, capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    class Fake(http.server.BaseHTTPRequestHandler):
+        body = b"lean-brain 0"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(self.body)
+
+        def log_message(self, *a):
+            pass
+
+    def fake(body):
+        Fake.body = body
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Fake)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    srv = fake(b"lean-brain 0")
+    port = srv.server_address[1]
+    rc, out, _ = brain("serve", "--port", str(port))
+    if rc != 0 or f"http://leanagent.localhost:{port}" not in out or f"http://127.0.0.1:{port}" not in out:
+        fails.append(f"serve where the page answers must print the urls and exit 0: {rc} {out!r}")
+    srv.shutdown()
+    srv.server_close()
+    from .web import server
+    held = server.make_server(0, "k")
+    try:
+        try:
+            server.make_server(held.server_address[1], "k")
+            fails.append("a second server on a held port must fail to bind")
+        except OSError:
+            pass
+    finally:
+        held.server_close()
+    rc, out, err = brain("serve", "--port", "99999")
+    if rc != 2 or len(err.splitlines()) != 1:
+        fails.append(f"a bad port is a one-line error, exit 2: {rc} {err!r}")
+    srv = fake(b"something else")
+    port = srv.server_address[1]
+    rc, out, err = brain("serve", "--port", str(port))
+    if rc != 1 or f"port {port} is in use" not in err or out:
+        fails.append(f"serve on a port held by something else: {rc} {out!r} {err!r}")
+    srv.shutdown()
+    srv.server_close()
+    port = free()
+    p = subprocess.Popen([sys.executable, me, "serve", "--port", str(port)], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+    try:
+        line = p.stdout.readline()
+        if f"http://leanagent.localhost:{port}" not in line or f"http://127.0.0.1:{port}" not in line:
+            fails.append(f"serve must print both urls: {line!r}")
+        if not cli.healthz(port, 5):
+            fails.append("a started serve must answer /healthz")
+    finally:
+        p.terminate()
+        p.wait(10)
+    db = os.path.join(d, "idle.db")
+    import sqlite3
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, started_at TEXT, ended_at TEXT NOT NULL DEFAULT '')")
+    stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    con.execute("INSERT INTO sessions VALUES ('a', '/x', ?, '')", (stamp(10 ** 7 + 99000),))
+    con.commit()
+    B = 10 ** 7
+    st = {}
+    if cli.idle_watch(db, 30, st, now=B) or cli.idle_watch(db, 30, st, now=B + 99999):
+        fails.append("idle-exit must not fire while a session is open")
+    con.execute("UPDATE sessions SET ended_at='t2'")
+    con.commit()
+    if cli.idle_watch(db, 30, st, now=B + 99999 + 1799) or not cli.idle_watch(db, 30, st, now=B + 99999 + 1800):
+        fails.append("idle-exit must fire 30 minutes after the last open session")
+    con.execute("UPDATE sessions SET ended_at='', started_at=?", (stamp(B + 99999 + 4000),))
+    con.commit()
+    if cli.idle_watch(db, 30, st, now=B + 99999 + 5000):
+        fails.append("an open session must reset the idle clock")
+    # a session that never wrote ended_at (crash, closed terminal) stops counting after 12 hours
+    con.execute("UPDATE sessions SET started_at=?", (stamp(B),))
+    con.commit()
+    st = {}
+    if cli.idle_watch(db, 30, st, now=B + 12 * 3600 - 1) or cli.idle_watch(db, 30, st, now=B + 12 * 3600 + 1000):
+        fails.append("a session under 12 hours old must count as open")
+    st = {}
+    if cli.idle_watch(db, 30, st, now=B + 12 * 3600 + 1) or not cli.idle_watch(db, 30, st, now=B + 12 * 3600 + 1 + 1800):
+        fails.append("a session open for over 12 hours must not keep the server running")
+    con.execute("BEGIN EXCLUSIVE")
+    if cli.idle_watch(db, 30, {"last": 0}, now=10 ** 6):
+        fails.append("a locked database must count as a session open")
+    con.rollback()
+    if cli.idle_watch(os.path.join(d, "missing", "x.db"), 30, {"last": 0}, now=10 ** 6):
+        fails.append("an unreadable database must count as a session open")
+    con.close()
+    rc, out, _ = brain("serve", "--uninstall")
+    if rc != 0 or "no login unit" not in out:
+        fails.append(f"uninstall with no unit: {rc} {out!r}")
 
 
 def run(brain_cli):
@@ -1136,6 +1253,74 @@ def run(brain_cli):
         out, _ = proc.communicate(timeout=30)
         if proc.returncode != 0 or f"job #{w[3]} done" not in out:
             fails.append(f"queue wait must return when a running job finishes: {proc.returncode} {out!r}")
+
+        # Created items, notices and the branch of a job, added without a schema bump.
+        env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = os.path.join(d, "v10.db")
+        con = connect()
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "9" \
+                or not {"created", "notices"} <= {r[0] for r in con.execute("SELECT name FROM sqlite_master")} \
+                or not any(r[1] == "branch" for r in con.execute("PRAGMA table_info(jobs)")):
+            fails.append("a fresh database must stay at schema version 9 and have the created and notices tables and jobs.branch")
+        con.close()
+        con = connect()  # a second connect is a no-op
+        u = "https://github.com/o/r/pull/1"
+        c1 = records.add_created(con, "pr", "github", "o/r", "feat/x", u, 1, "t", "s-1", "/w")
+        c2 = records.add_created(con, "pr", "github", "o/r", "feat/x", u, 1, "t", "s-1", "/w")
+        if c1 != c2 or con.execute("SELECT COUNT(*) FROM created").fetchone()[0] != 1:
+            fails.append(f"add_created twice with one url must keep one row: {c1} {c2}")
+        records.set_state(con, u, "merged")
+        row = con.execute("SELECT state, state_checked_at FROM created WHERE url=?", (u,)).fetchone()
+        if row["state"] != "merged" or not row["state_checked_at"]:
+            fails.append("set_state must store the state and when it was checked")
+        n1 = records.add_notice(con, "h", "text", "s-1", "/w")
+        n2 = records.add_notice(con, "h", "text", "s-1", "/w")
+        records.add_notice(con, "h", "other", "s-1", "/w")
+        if n1 != n2 or con.execute("SELECT COUNT(*) FROM notices").fetchone()[0] != 2:
+            fails.append("the same notice inside 10 minutes must be added once")
+        con.execute("UPDATE notices SET created_at='2020-01-01T00:00:00Z'")
+        con.commit()
+        if records.add_notice(con, "h", "text", "s-1", "/w") in (n1, n2):
+            fails.append("the same notice after 10 minutes must be added again")
+        if records.dismiss_notice(con, 999) or not records.dismiss_notice(con, n1) \
+                or not con.execute("SELECT dismissed_at FROM notices WHERE id=?", (n1,)).fetchone()[0]:
+            fails.append("dismiss_notice must return False for a missing id and stamp an existing one")
+        rc_a, out_a, _ = run("notice", "list")
+        rc_b, out_b, _ = run("notice", "list", "--all")
+        rc_c, out_c, _ = run("notice", "dismiss", "999")
+        rc_d, out_d, _ = run("notice", "dismiss", str(n1 + 1))
+        if (rc_a, rc_b, rc_c, rc_d) != (0, 0, 1, 0) or len(out_b.splitlines()) != len(out_a.splitlines()) + 1 \
+                or out_d != f"dismissed {n1 + 1}" or f"dismissed" not in out_b:
+            fails.append(f"notice list hides dismissed ones, --all shows them, dismiss reports a missing id: {out_a!r} {out_b!r} {out_c!r} {out_d!r}")
+        con.close()
+        subprocess.run(["git", "-C", g, "checkout", "-q", "-b", "feat/x"], check=True, capture_output=True)
+        jb = run("queue", "add", g, "B.csproj", "--tier", "fast", "--filter", "U")[1]
+        if connect_rows(env["LEAN_BRAIN_DB"], f"SELECT branch FROM jobs WHERE id={jb}")[0]["branch"] != "feat/x":
+            fails.append("queue add must store the branch of the repo")
+        jn = run("queue", "add", os.path.join(d, "nogit"), "B.csproj", "--tier", "fast", "--filter", "U")[1]
+        if connect_rows(env["LEAN_BRAIN_DB"], f"SELECT branch FROM jobs WHERE id={jn}")[0]["branch"] != "":
+            fails.append("queue add outside git must store an empty branch")
+        v9 = os.path.join(d, "v9.db")
+        con = sq.connect(v9)
+        con.row_factory = sq.Row
+        con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        for m in MIGRATIONS[:9]:
+            m(con)
+        con.execute("INSERT INTO meta VALUES ('schema_version', '9')")
+        con.execute("INSERT INTO items (project, kind, ref, title, status, occurrences, first_seen, last_seen)"
+                    " VALUES ('p','note','r','r','open',1,'2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
+        con.execute("INSERT INTO jobs (cycle, project, repo_dir, test_project, tier, enqueued_by, enqueued_at, status)"
+                    " VALUES ('c','p','/r','T','full','me','2026-10-18T00:00:00Z','done')")
+        con.commit()
+        con.close()
+        env["LEAN_BRAIN_DB"] = os.environ["LEAN_BRAIN_DB"] = v9
+        con = connect()
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != "9" \
+                or con.execute("SELECT COUNT(*) FROM created").fetchone()[0] != 0 \
+                or con.execute("SELECT COUNT(*) FROM items").fetchone()[0] != 1 \
+                or con.execute("SELECT branch FROM jobs").fetchone()[0] != "":
+            fails.append("a version 9 database must gain the new tables and column, stay at 9 and keep its rows")
+        con.close()
+        serve_tests(fails, me, d)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

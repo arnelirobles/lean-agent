@@ -140,6 +140,24 @@ Brain never holds secrets, tokens or passwords.
 
 brain's code lives in `lib/brain/`, and `tools/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub; GitLab and Azure DevOps come with tracker support.
 
+## Brain page
+
+`brain serve` serves a page over the brain database at `http://leanagent.localhost:8770` (also `http://127.0.0.1:8770`, printed at start). Use `--port N` or `LEAN_SERVE_PORT` for another port. It listens on 127.0.0.1 only and accepts only the Host values `leanagent.localhost`, `localhost`, `127.0.0.1` and `[::1]`. Chrome, Edge and Firefox send `*.localhost` to your machine with no setup. The plugin never edits your hosts file.
+
+The page is meant for a single-user machine. Another local user who takes port 8770 before you could serve a fake page, and the server does not guard against that.
+
+Three modes, set with the plugin's `serve_mode` setting:
+
+- `manual` (default): you run `brain serve` yourself.
+- `session`: the SessionStart hook starts the server when a session opens. It stops after 30 minutes with no open session. A session that started more than 12 hours ago and never closed does not count as open.
+- `always`: the server starts at login. Run `brain serve --install always` once to write the login entry: a launchd agent on macOS, a systemd user unit on Linux, or a Startup folder `.cmd` on Windows. No admin rights. Until that entry exists, the SessionStart hook starts the server when a session opens and leaves it running. `brain serve --uninstall` removes the entry.
+
+`worktree_roots` is a comma-separated list of folders the page searches for git worktrees, besides the repositories brain already knows. `brain serve --roots A,B` does the same for one run.
+
+The session button on an item starts Claude Code on it. On macOS it opens Terminal. On Windows it opens a Windows Terminal tab; if that fails, or `claude` is a `.cmd` shim, the page shows the command to copy, with a note to paste it into Command Prompt. On Linux the page shows the `claude` command to copy.
+
+The VS Code panel is deprecated. It shows a notice once per version and `Lean Brain: Open brain page` opens the page.
+
 ## Settings
 
 Set these in the `env` block of your Claude Code settings. The defaults run the method as written.
@@ -191,6 +209,7 @@ lean-agent has no service of its own and keeps nothing off your machine. What it
 It sends data to other services only through tools you already run, and only where you point them:
 
 - GitHub, through your `gh` login: the adversarial review posts review threads, `lean-stats` and `pr-blockers` read pull requests and checks. The hooks only read the command an agent is about to run; they call nothing.
+- GitHub and Azure DevOps, from the brain page, through your own `gh` and `az` logins. The page stores no credentials. A CLI that is missing or logged out shows as such in its section.
 - Your own SSH hosts, when `~/.config/lean/remotes.ini` names any: `test-phase` copies the repository there with rsync and runs the tests in Docker. Without that file, no code is copied off the machine.
 - A URL you pass to `check-deployed-sha.sh`, which it fetches with curl.
 - A package registry, when you run `pkg-version`: it sends the package name to the nuget flat container (api.nuget.org, or `LEAN_NUGET_REGISTRY`) or the npm registry (`LEAN_NPM_REGISTRY`, else your npm config, else registry.npmjs.org). Credentials in a registry URL are dropped before the call.
