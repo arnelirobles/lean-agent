@@ -6,7 +6,7 @@ PreToolUse hook on Bash. It adds a note, never a deny, in two cases:
     "`<script>` does this: <usage>". Once per family per session.
   - the command calls a lean-agent script by its .../plugins/cache/lean-agent/lean-agent/
     <version>/tools/ path (or the older bin/ one): the versioned path breaks after an upgrade, use
-    ${CLAUDE_PLUGIN_ROOT}/tools/<name>. Once per session.
+    the absolute tools path. Once per session.
 A family whose covering script is a hook (wait-loop, pgrep) gets no note here, nor does
 direct-test-run (wait-loop.py notes that one), nor does a command that already names the
 covering script.
@@ -69,7 +69,7 @@ def with_tools_path(usage):
     if not names:
         return usage
     pat = re.compile(r"`(" + "|".join(re.escape(n) for n in names) + r")(?=[ `])")
-    return pat.sub(lambda m: "`" + TOOLS + "/" + m.group(1), usage)
+    return pat.sub(lambda m: "`" + hookkit.tool_path(m.group(1)), usage)
 
 
 def candidates(command):
@@ -89,8 +89,8 @@ def candidates(command):
         if name == PATH_FAMILY:
             m = BIN_PATH.search(command[:module.CAP])
             if m:
-                out.append((name, "Call `%s` as ${CLAUDE_PLUGIN_ROOT}/tools/%s, not by its versioned plugin cache "
-                            "path, which breaks after an upgrade." % (m.group(1), m.group(1))))
+                out.append((name, "Call `%s` as %s, not by its versioned plugin cache "
+                            "path, which breaks after an upgrade." % (m.group(1), hookkit.tool_path(m.group(1)))))
             continue
         script = fam["covered_by"]
         usage = fam["usage"]
@@ -247,7 +247,7 @@ def self_test():
         rc, text, err = fire(command, "fam-" + name)
         check(name + " note", rc == 0 and text.startswith("`%s` does this: " % script) and not err, repr(text))
         check(name + " usage from the shared file", with_tools_path(meta[name]["usage"]) in text, repr(text))
-        check(name + " usage runs the script by its absolute path", ("`" + TOOLS + "/") in text, repr(text))
+        check(name + " usage runs the script by its absolute path", ("`" + hookkit.tool_path(script)) in text, repr(text))
         rc, again, _ = fire(command, "fam-" + name)
         check(name + " once per session", rc == 0 and again == "", repr(again))
         rc, other, _ = fire(command, "fam-" + name + "-b")
@@ -279,7 +279,7 @@ def self_test():
     check("wait-loop family gets no note here", fire("pgrep -f dotnet", "pg")[1] == "")
     check("a command naming the script gets no note", fire("holdout.sh --spec x.md  # mutation", "named")[1] == "")
     rc, text, _ = fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/style-scan --help", "vp")
-    check("versioned path note", "`style-scan`" in text and "CLAUDE_PLUGIN_ROOT" in text, repr(text))
+    check("versioned path note", "`style-scan`" in text and hookkit.tool_path("style-scan") in text and "CLAUDE_PLUGIN_ROOT" not in text, repr(text))
     check("versioned path once", fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/replace x", "vp")[1] == "")
     check("hooks path is not noted",
           fire("python3 ~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/hooks/wait-loop.py --self-test", "vh")[1] == "")

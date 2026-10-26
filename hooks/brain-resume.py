@@ -41,7 +41,7 @@ def main():
     event = hookkit.read_event()
     text = digest(str(event.get("cwd") or ""), event.get("source") == "compact")  # only a compaction loses state
     if text:
-        hookkit.note("SessionStart", f"Brain digest for this project (full list: {BRAIN} list --project NAME --status open). "
+        hookkit.note("SessionStart", f"Brain digest for this project (full list: {hookkit.tool_path("brain")} list --project NAME --status open). "
                      "Do not work around a blocker.\n" + text)
     return 0
 

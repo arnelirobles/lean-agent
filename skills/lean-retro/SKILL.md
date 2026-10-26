@@ -23,7 +23,7 @@ prints cost per change by model and by role, the escalation rate, findings by wh
 critic misses, fix rounds, hook fires and an Avoidable section (the share of tokens and USD in context above 80k, coordinator lookups, images carried in a long context, errored tool calls and wait loops, and Haiku's share of runs against the method's), each with the count behind it. A line that says `no data`
 is a gap in what was recorded, not a zero: say so in the retro and do not reason from it. For the raw
 row per pull request, run
-`REVIEW_LOG=<path to review-log.tsv> retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
+`REVIEW_LOG=<path to review-log.tsv> ${CLAUDE_PLUGIN_ROOT}/tools/retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
 
 `${CLAUDE_PLUGIN_ROOT}/tools/retro-signals.sh` ends with a script repeats section from `${CLAUDE_PLUGIN_ROOT}/tools/script-repeats --days 7`: per family of hand-written commands, the uses, transcripts and projects, and the script that covers it. It prints family names, counts and normalised command shapes (quoted strings, paths, numbers, hashes and unfamiliar words replaced), never transcript text. Run `${CLAUDE_PLUGIN_ROOT}/tools/script-repeats` alone to change the window.
 

@@ -125,5 +125,5 @@ if __name__ == "__main__":
     for p in found:
         print(p)
     if not found:
-        print("ok: scripts are named by bare command and listed in the scripts block")
+        print("ok: no skill or README names a script by a stale bin or versioned path, and every self-testing script in tools/ is listed in the scripts block")
     sys.exit(1 if found else 0)

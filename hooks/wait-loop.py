@@ -29,24 +29,23 @@ SLEEP_READERS = {"cat", "tail", "head", "grep", "egrep", "fgrep", "rg", "less", 
 LOOP_READERS = SLEEP_READERS | {"ls", "stat", "test", "[", "[["}
 SHELLS = {"bash", "sh", "zsh"}
 LANES = {"test-phase", "heavy.sh"}
-TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
 
 DENY_SLEEP_READ = (
     "Do not sleep and then read a file or task output. End the turn and wait for the "
-    f"notification, or start `{TOOLS}/brain queue wait ID...` (test jobs) or `{TOOLS}/pr-wait` (checks) in the "
-    f"background, or check a lane with `{TOOLS}/heavy.sh status <lane>`.")
+    f"notification, or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the "
+    f"background, or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
 DENY_LOOP = (
     "Do not poll a file or process in a loop with sleep. End the turn and wait for the "
-    f"notification, or start `{TOOLS}/brain queue wait ID...` (test jobs) or `{TOOLS}/pr-wait` (checks) in the "
-    f"background, or check a lane with `{TOOLS}/heavy.sh status <lane>`.")
+    f"notification, or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the "
+    f"background, or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
 DENY_PGREP = (
     "Do not use pgrep to wait on a process. End the turn and wait for the notification, "
-    f"or start `{TOOLS}/brain queue wait ID...` (test jobs) or `{TOOLS}/pr-wait` (checks) in the background, "
-    f"or check a lane with `{TOOLS}/heavy.sh status <lane>`.")
+    f"or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the background, "
+    f"or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
 TURN_OFF = " LEAN_WAIT_GUARD=off turns this check off."
 NOTE_TEST = (
     "This runs tests outside the lane lock, and its failures never reach brain. Queue it: "
-    f"`{TOOLS}/brain queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
+    f"`{hookkit.tool_path('brain')} queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
 
 
 def is_off(segs):
@@ -243,13 +242,13 @@ def self_test():
     check("off switch environment", "pgrep -f dotnet", None)
     del os.environ["LEAN_WAIT_GUARD"]
     reason = (verdict("pgrep x") or ("", ""))[1]
-    if "LEAN_WAIT_GUARD=off" not in reason or f"`{TOOLS}/heavy.sh status" not in reason:
+    if "LEAN_WAIT_GUARD=off" not in reason or f"`{hookkit.tool_path('heavy.sh')} status" not in reason:
         print("FAIL deny reason names the fix and the off switch")
         failures += 1
     for label, command in (("sleep", "sleep 100; cat x.output"), ("loop", "until grep -q x f; do sleep 1; done"),
                            ("pgrep", "pgrep -f x")):
         text = (verdict(command) or ("", ""))[1]
-        if f"`{TOOLS}/brain queue wait" not in text or f"`{TOOLS}/pr-wait" not in text:
+        if f"`{hookkit.tool_path('brain')} queue wait" not in text or f"`{hookkit.tool_path('pr-wait')}" not in text:
             print(f"FAIL {label} deny text names brain queue wait and pr-wait")
             failures += 1
 
@@ -276,7 +275,7 @@ def self_test():
         context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
     except (ValueError, KeyError):
         context = ""
-    if rc != 0 or f"`{TOOLS}/brain queue add" not in context or err:
+    if rc != 0 or f"`{hookkit.tool_path('brain')} queue add" not in context or err:
         print(f"FAIL main note: rc={rc} out={out!r} err={err!r}")
         failures += 1
     for label, stdin in (("junk stdin", "not json"), ("non-string command", '{"tool_input":{"command":5}}'),

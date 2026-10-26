@@ -20,6 +20,7 @@ The three role settings take a Claude Code model alias (sonnet, opus, haiku, fab
 and apply only with LEAN_MODELS=mixed.
 """
 import os
+import shlex
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
@@ -113,9 +114,8 @@ def message(env):
 
 def tools_note():
     """Where the scripts are. They are not on PATH, so a bare `brain` or `style-scan` is not found."""
-    root = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools")
-    return ("lean-agent tools are not on PATH. Run them as %s/<name>, for example %s/brain list."
-            % (os.path.normpath(root), os.path.normpath(root)))
+    root = shlex.quote(hookkit.TOOLS)
+    return "lean-agent tools are not on PATH. Run them as %s/<name>, for example %s." % (root, hookkit.tool_path("brain") + " list")
 
 
 def main():
@@ -183,7 +183,7 @@ def self_test():
            ("are both opus",), ("cost the most",))
     expect("fast steps in one session", {"LEAN_AGENTS": "one"}, ("fast steps", "run in the session itself"))
     note = tools_note()
-    if "/tools/<name>" not in note or not os.path.isfile(note.split(" as ")[1].split("/<name>")[0] + "/brain"):
+    if "/tools/<name>" not in note or not os.path.isfile(hookkit.TOOLS + "/brain"):
         print(f"FAIL tools note should name a real tools folder: {note}")
         failures += 1
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
