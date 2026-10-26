@@ -8,12 +8,13 @@ PostToolUse (notes):
     size, what the turn costs at list price, the running total spent since it passed the
     threshold, and to /compact or file what is open in brain and continue in a fresh session
   - once per session after LEAN_LOOKUP_WARN read-only lookups (default 10) by an Opus
-    coordinator: send them to lean:search on the fast model
-  - with LEAN_IMAGE_MODE=note, a note after each image tool result (Read of an image file, a
-    screenshot tool) once context is above LEAN_IMAGE_CONTEXT tokens (default 60000)
+    coordinator, Read included: send them to lean:search on the fast model
+  - with LEAN_IMAGE_MODE=note, a note after the first image tool result of a turn (Read of an
+    image file or a pdf with pages, a screenshot or thumbnail tool) once context is above LEAN_IMAGE_CONTEXT tokens (default 60000)
 PreToolUse (blocks, exit 2 with the reason on stderr, both off by default):
   - LEAN_LOOKUP_MODE=block: an Opus coordinator that has made more than LEAN_LOOKUP_WARN
-    read-only lookups since it last started an Agent has the next lookup refused
+    read-only lookups since it last started an Agent has the next Grep, Glob or read-only Bash
+    search refused. Read counts but is never refused, since an Edit needs a Read first
   - LEAN_IMAGE_MODE=block: above LEAN_IMAGE_CONTEXT tokens a tool that returns an image is refused
 
 It reads the tail of the transcript, not the whole file, and keeps a small counter file per
@@ -185,10 +186,9 @@ def context_note(last, state, limit):
     cost = leanstats.message_cost(last)
     state["over_id"] = last["id"]
     state["over_usd"] = state.get("over_usd", 0.0) + cost
-    return (f"Context is {size // 1000}k tokens. This turn cost about {cost:.2f} USD at list price, "
-            f"{state['over_usd']:.2f} USD spent since it passed {limit // 1000}k, and every later turn costs more. "
-            "Run /compact, or file what is open with `" + hookkit.tool_path("brain") + " add` and continue "
-            "in a fresh session. LEAN_CONTEXT_WARN=off turns this note off.")
+    return (f"Context is {size // 1000}k tokens. This turn cost about {cost:.2f} USD, at least "
+            f"{state['over_usd']:.2f} USD since it passed {limit // 1000}k. Run /compact, or file what is "
+            "open with `brain add` and start a fresh session.")
 
 
 def lookup_note(event, last, state, limit):
@@ -207,36 +207,36 @@ def lookup_note(event, last, state, limit):
             "instead. LEAN_LOOKUP_WARN=off turns this note off.")
 
 
-def image_note(event, last, limit):
-    """A note after an image tool result once the context is above the limit (note mode)."""
+def image_note(event, last, state, limit):
+    """A note after an image tool result once the context is above the limit, once per turn (note mode)."""
     if limit is None or not leanstats.is_image_call(event.get("tool_name"), event.get("tool_input")):
         return None
     size = leanstats.prompt_size(last)
-    if size <= limit:
+    if size <= limit or (last["id"] and last["id"] == state.get("image_id")):
         return None
+    state["image_id"] = last["id"]
     return (f"That image stays in the {size // 1000}k context and is paid for again on every later turn. "
             "Have a subagent look at images and report in text. LEAN_IMAGE_MODE=block refuses image tools "
             "above this size, LEAN_IMAGE_CONTEXT=off turns this note off.")
 
 
 REFUSE_LOOKUP = ("{n} read-only lookups since the last delegation, on Opus. Refused. Start a lean:search "
-                 "agent on the fast model with the questions and read its answer. Starting any Agent resets "
-                 "the count. LEAN_LOOKUP_MODE=note stops this refusal, LEAN_LOOKUP_WARN=off turns it off.")
+                 "agent on the fast model with the questions and read its answer. Read is never refused. "
+                 "Starting any Agent resets the count. LEAN_LOOKUP_MODE=note stops this refusal, LEAN_LOOKUP_WARN=off turns it off.")
 REFUSE_IMAGE = ("The context is {k}k tokens and an image would stay in it for every later turn. Refused. Have "
                 "a subagent open the image or take the screenshot and report in text. LEAN_IMAGE_MODE=note "
                 "stops this refusal, LEAN_IMAGE_CONTEXT=off turns it off.")
 
 
 def pre(event, sid):
-    """PreToolUse: reset the lookup count on an Agent, refuse a lookup or image tool past its limit. 0 or 2."""
+    """PreToolUse: reset the lookup count on an Agent, refuse a search or image tool past its limit. 0 or 2."""
     name, tool_input = event.get("tool_name"), event.get("tool_input")
     lookups, images = mode("LEAN_LOOKUP_MODE") == "block", mode("LEAN_IMAGE_MODE") == "block"
     if name in AGENT_TOOLS:
-        if lookups:
-            with Locked(sid):
-                state = load(sid)
-                state["since_agent"] = 0
-                save(sid, state)
+        with Locked(sid):
+            state = load(sid)
+            state["since_agent"] = 0
+            save(sid, state)
         return 0
     if images and leanstats.is_image_call(name, tool_input):
         limit = setting("LEAN_IMAGE_CONTEXT", IMAGE_DEFAULT)
@@ -244,7 +244,7 @@ def pre(event, sid):
         if last and leanstats.prompt_size(last) > limit:
             print(REFUSE_IMAGE.format(k=leanstats.prompt_size(last) // 1000), file=sys.stderr)
             return 2
-    if lookups and leanstats.tool_kind(name, tool_input) == "lookup":
+    if lookups and name != "Read" and leanstats.tool_kind(name, tool_input) == "lookup":
         limit = setting("LEAN_LOOKUP_WARN", LOOKUP_DEFAULT)
         if limit is None:
             return 0
@@ -279,7 +279,7 @@ def main():
         with Locked(sid):
             state = load(sid)
             notes = [n for n in (context_note(last, state, limit), lookup_note(event, last, state, lookups),
-                                 image_note(event, last, pictures)) if n]
+                                 image_note(event, last, state, pictures)) if n]
             save(sid, state)
     except (OSError, ValueError):
         return 0
@@ -338,7 +338,7 @@ def self_test():
             check("below the threshold is quiet", fire(60000), (0, "", ""))
             check("just under it is quiet", fire(99999), (0, "", ""))
             code, text, err = fire(100000)
-            check("at the threshold it notes", (code, err, "100k tokens" in text, "brain" in text, "USD at list price" in text),
+            check("at the threshold it notes", (code, err, "100k tokens" in text, "brain" in text, "USD, at least" in text),
                   (0, "", True, True, True))
             cost = leanstats.message_cost(leanstats.usage_of({}, {"model": "claude-opus-5-5", "usage": {
                 "input_tokens": 1, "cache_read_input_tokens": 99999, "output_tokens": 10}}))
@@ -348,18 +348,20 @@ def self_test():
                     "input_tokens": 1, "cache_read_input_tokens": size - 1, "output_tokens": 10}}))
 
             text = fire(120000)[1]
-            check("a later turn notes again, with the running total", ("120k tokens" in text, "%.2f USD spent since it passed 100k" % (
+            check("a later turn notes again, with the running total", ("120k tokens" in text, "%.2f USD since it passed 100k" % (
                 cost_of(100000) + cost_of(120000)) in text), (True, True))
             check("the note names compact and brain", ("/compact" in text, "brain" in text), (True, True))
+            check("the note is short and has no path or later-turn clause", (len(text) < 200, "/" in text.replace("/compact", ""),
+                                                                           "later turn" in text), (True, False, False))
             text = fire(130000)[1]
             check("every turn notes", "130k tokens" in text, True)
-            check("the total adds each turn", "%.2f USD spent" % (cost_of(100000) + cost_of(120000) + cost_of(130000)) in text, True)
+            check("the total adds each turn", "%.2f USD since" % (cost_of(100000) + cost_of(120000) + cost_of(130000)) in text, True)
             check("a second call in the same turn is quiet", fire(130000, append=False)[1], "")
             check("the next turn notes", "150k tokens" in fire(150000)[1], True)
             check("a compaction below the threshold is quiet", fire(30000)[1], "")
             text = fire(110000)[1]
             check("and the threshold notes again after it, with the total started over",
-                  ("110k tokens" in text, "%.2f USD spent" % cost_of(110000) in text), (True, True))
+                  ("110k tokens" in text, "%.2f USD since" % cost_of(110000) in text), (True, True))
 
             os.environ["LEAN_CONTEXT_WARN"] = "50000"
             check("the threshold is a setting", "60k tokens" in fire(60000, sid="sess-2")[1], True)
@@ -425,12 +427,24 @@ def self_test():
                   (2, "", True, True))
             check("a git log is refused too", fire(1000, sid="lk-2", phase="PreToolUse", **glog)[0], 2)
             check("a write is never refused", fire(1000, sid="lk-2", phase="PreToolUse", name="Edit")[0], 0)
+            check("Read is never refused", fire(1000, sid="lk-2", phase="PreToolUse", name="Read",
+                                                 tool_input={"file_path": "/a/b.py"})[0], 0)
+            check("Glob is refused", fire(1000, sid="lk-2", phase="PreToolUse", name="Glob")[0], 2)
+            before = load("lk-2")["lookups"]
+            fire(1000, sid="lk-2", name="Read", tool_input={"file_path": "/a/b.py"})
+            check("but Read still counts", load("lk-2")["lookups"], before + 1)
             check("a git push is never refused", fire(1000, sid="lk-2", phase="PreToolUse", **gpush)[0], 0)
-            check("a refusal does not count", load("lk-2")["since_agent"], 4)
+            check("a refusal does not count", load("lk-2")["since_agent"], 5)
+            check("a refusal text says Read is not refused", "Read is never refused" in fire(1000, sid="lk-2", phase="PreToolUse", **grep)[2], True)
             check("starting an Agent is allowed", fire(1000, sid="lk-2", phase="PreToolUse", name="Agent")[0], 0)
             check("and resets the count", load("lk-2")["since_agent"], 0)
             check("so a lookup is allowed again", fire(1000, sid="lk-2", phase="PreToolUse", **grep)[0], 0)
-            check("the total count is kept", load("lk-2")["lookups"], 4)
+            check("the total count is kept", load("lk-2")["lookups"], 5)
+
+            fire(1000, sid="lk-4", name="Grep")
+            fire(1000, sid="lk-4", name="Grep")
+            check("note mode: an Agent resets the count too", (load("lk-4")["since_agent"],
+                  fire(1000, sid="lk-4", phase="PreToolUse", name="Agent")[0], load("lk-4")["since_agent"]), (2, 0, 0))
 
             with Locked("lk-3"):
                 save("lk-3", {"since_agent": 99})
@@ -458,7 +472,21 @@ def self_test():
             check("not at 60k", "That image" in fire(60000, sid="im-1", **png)[1], False)
             check("not for a text file", "That image" in fire(70000, sid="im-1", name="Read", tool_input={"file_path": "a.py"})[1],
                   False)
-            check("a screenshot tool notes", ["That image" in fire(70000, sid="im-1", **shot)[1] for shot in shots], [True, True])
+            more = ({"name": "mcp__plugin_figma_figma__get_screenshot"},
+                    {"name": "mcp__claude_ai_Google_Slides__read_slide_page_thumbnail"},
+                    {"name": "Read", "tool_input": {"file_path": "/a/b.pdf", "pages": "1-2"}})
+            check("figma, slide thumbnail and pdf pages notes", ["That image" in fire(70100 + i, sid="im-1", **shot)[1]
+                                                                                for i, shot in enumerate(more)],
+                  [True] * 3)
+            check("a pdf without pages is not an image", "That image" in fire(70200, sid="im-1", name="Read",
+                  tool_input={"file_path": "/a/b.pdf"})[1], False)
+            check("a screenshot tool notes", ["That image" in fire(70300 + i, sid="im-1", **shot)[1]
+                                                                  for i, shot in enumerate(shots)], [True, True])
+            first = fire(75000, sid="im-3", **png)[1]
+            second = fire(75000, sid="im-3", append=False, **png)[1]
+            third = fire(75000, sid="im-3", append=False, **shots[0])[1]
+            check("three image calls in one turn give one note", ("That image" in first, second, third), (True, "", ""))
+            check("the next turn notes again", "That image" in fire(76000, sid="im-3", **png)[1], True)
             check("note mode never refuses", fire(70000, sid="im-1", phase="PreToolUse", **png), (0, "", ""))
             os.environ["LEAN_IMAGE_CONTEXT"] = "1000"
             check("the size is a setting", "That image" in fire(2000, sid="im-1", **png)[1], True)

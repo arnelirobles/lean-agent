@@ -329,17 +329,20 @@ def tool_kind(name, tool_input):
 
 
 IMAGE_READ_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
-IMAGE_TOOL_WORDS = ("take_screenshot",)  # also matches browser_take_screenshot
+IMAGE_TOOL_WORDS = ("screenshot", "thumbnail")  # matches browser_take_screenshot, get_screenshot, read_slide_page_thumbnail
 
 
 def is_image_call(name, tool_input):
-    """True when the tool call returns an image: Read of an image file, or a screenshot tool."""
+    """True when the tool call returns an image: Read of an image file or of a pdf with pages, or a screenshot or thumbnail tool."""
     if not isinstance(name, str):
         return False
     if name == "Read" and isinstance(tool_input, dict):
         path = tool_input.get("file_path")
-        return isinstance(path, str) and path.lower().endswith(IMAGE_READ_EXTENSIONS)
-    return any(word in name for word in IMAGE_TOOL_WORDS)
+        if not isinstance(path, str):
+            return False
+        path = path.lower()
+        return path.endswith(IMAGE_READ_EXTENSIONS) or (path.endswith(".pdf") and bool(tool_input.get("pages")))
+    return any(word in name.lower() for word in IMAGE_TOOL_WORDS)
 
 
 def usage_of(row, message):
@@ -533,6 +536,11 @@ def self_test():
             ("a read with no path", "Read", {}, False),
             ("a browser screenshot", "mcp__plugin_playwright_playwright__browser_take_screenshot", {}, True),
             ("a devtools screenshot", "mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_screenshot", {}, True),
+            ("a figma screenshot", "mcp__plugin_figma_figma__get_screenshot", {}, True),
+            ("a slide thumbnail", "mcp__claude_ai_Google_Slides__read_slide_page_thumbnail", {}, True),
+            ("a computer-use screenshot", "screenshot", {}, True),
+            ("a pdf read with pages", "Read", {"file_path": "/a/b.PDF", "pages": "1-3"}, True),
+            ("a pdf read without pages", "Read", {"file_path": "/a/b.pdf"}, False),
             ("a snapshot is text", "mcp__plugin_playwright_playwright__browser_snapshot", {}, False),
             ("a png path in Bash", "Bash", {"file_path": "x.png"}, False),
             ("no name", None, {}, False)):
