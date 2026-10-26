@@ -191,6 +191,8 @@ It sends data to other services only through tools you already run, and only whe
 - GitHub, through your `gh` login: the adversarial review posts review threads, `lean-stats` and `pr-blockers` read pull requests and checks. The hooks only read the command an agent is about to run; they call nothing.
 - Your own SSH hosts, when `~/.config/lean/remotes.ini` names any: `test-phase` copies the repository there with rsync and runs the tests in Docker. Without that file, no code is copied off the machine.
 - A URL you pass to `check-deployed-sha.sh`, which it fetches with curl.
+- A package registry, when you run `pkg-version`: it sends the package name to the nuget flat container (api.nuget.org, or `LEAN_NUGET_REGISTRY`) or the npm registry (`LEAN_NPM_REGISTRY`, else your npm config, else registry.npmjs.org). Credentials in a registry URL are dropped before the call.
+- Azure DevOps, through your `az` login, when you run `pr-wait --provider azure` or run it in a folder whose origin is Azure DevOps: it reads a pipeline run, its timeline and the failed logs.
 
 ## Requirements
 
