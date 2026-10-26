@@ -17,6 +17,12 @@ case "$*" in
   *FullyQualifiedName~Acme.RemoteTests*)
     echo "  Failed Acme.RemoteTests.Breaks [3 ms]"
     echo "Failed!  - Failed:     1, Passed:     0, Skipped:     0, Total:     1"; exit 1 ;;
+  *Docker.csproj*)
+    for i in 1 2 3; do
+      echo "  Failed Acme.DockerTests.T$i [3 ms]"
+      echo "   Testcontainers.Builders.DockerUnavailableException : Docker is either not running."
+    done
+    echo "Failed!  - Failed:     3, Passed:     0, Skipped:     0, Total:     3"; exit 1 ;;
   *Fail.csproj*)
     echo "  Failed Acme.RemoteTests.Breaks [3 ms]"
     echo "Failed!  - Failed:     1, Passed:     2, Skipped:     0, Total:     3"; exit 1 ;;

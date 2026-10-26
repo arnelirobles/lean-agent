@@ -2,6 +2,7 @@
 """Collect and report what the lean-agent loop did, from one SQLite file.
 
   lean-stats collect [--since YYYY-MM-DD] [owner/repo ...]
+  lean-stats collect --transcript <session.jsonl>
   lean-stats report  [--since YYYY-MM-DD] [--markdown]
   lean-stats import-reviews <review-log.tsv>
   lean-stats log-review <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" \\
@@ -217,13 +218,19 @@ def transcript_files(root):
     return sorted(found)
 
 
+RUN_COLUMNS = ("run_id", "session_id", "kind", "role", "model", "repo", "pr", "branch", "started_at", "ended_at",
+               "tokens_in", "tokens_cache_write", "tokens_cache_write_1h", "tokens_cache_read", "tokens_out",
+               "source_path", "usd", "peak_context", "turns_over_80k", "lookup_calls", "image_results",
+               "errored_results", "wait_loop_calls", "avoidable")
+
+
 def run_row(run_id, kind, role, model, repo, pr, branch, messages, path):
     stamps = sorted(m["ts"] for m in messages if m["ts"])
     return (run_id, next((m["session"] for m in messages if m["session"]), ""), kind, role, model, repo, pr, branch,
             stamps[0] if stamps else "", stamps[-1] if stamps else "",
             sum(m["in"] for m in messages), sum(m["cw"] for m in messages), sum(m["cw1h"] for m in messages),
             sum(m["cr"] for m in messages), sum(m["out"] for m in messages), path,
-            sum(leanstats.message_cost(m) for m in messages))
+            sum(leanstats.message_cost(m) for m in messages)) + leanstats.signals(messages, kind)
 
 
 def agent_rows(path, kind, messages, repo_of):
@@ -249,11 +256,20 @@ def agent_rows(path, kind, messages, repo_of):
     return [run_row(agent_id, kind, role, model, repo, pr, branch, messages, path)]
 
 
-def collect_transcripts(conn, root, since, repo_of):
-    """Import every changed transcript under root. Returns (imported, unchanged)."""
+def session_files(transcript):
+    """(path, kind) for one session: its main transcript and the agents under it."""
+    stem = transcript[:-len(".jsonl")] if transcript.endswith(".jsonl") else transcript
+    found = [(transcript, "main")] if os.path.isfile(transcript) else []
+    found += [(p, "subagent") for p in glob.glob(os.path.join(stem, "subagents", "agent-*.jsonl"))]
+    found += [(p, "workflow") for p in glob.glob(os.path.join(stem, "subagents", "workflows", "*", "agent-*.jsonl"))]
+    return sorted(found)
+
+
+def collect_transcripts(conn, root, since, repo_of, files=None):
+    """Import every changed transcript under root, or just the given (path, kind) files. Returns (imported, unchanged)."""
     cutoff = time.mktime(time.strptime(since, "%Y-%m-%d")) if since else 0
     imported = unchanged = 0
-    for path, kind in transcript_files(root):
+    for path, kind in (transcript_files(root) if files is None else files):
         try:
             stat = os.stat(path)
         except OSError:
@@ -261,13 +277,15 @@ def collect_transcripts(conn, root, since, repo_of):
         if stat.st_mtime < cutoff:
             continue
         known = conn.execute("SELECT size, mtime FROM imports WHERE path = ?", (path,)).fetchone()
-        if known and known["size"] == stat.st_size and known["mtime"] == stat.st_mtime:
+        if known and known["size"] == stat.st_size and known["mtime"] == stat.st_mtime and not conn.execute(
+                "SELECT 1 FROM agent_runs WHERE source_path = ? AND avoidable IS NULL", (path,)).fetchone():
             unchanged += 1
             continue
         rows = agent_rows(path, kind, leanstats.read_usage(path), repo_of)
         with leanstats.tx(conn):
             conn.execute("DELETE FROM agent_runs WHERE source_path = ?", (path,))
-            conn.executemany("INSERT OR REPLACE INTO agent_runs VALUES (%s)" % ", ".join("?" * 17), rows)
+            conn.executemany("INSERT OR REPLACE INTO agent_runs (%s) VALUES (%s)" % (
+                ", ".join(RUN_COLUMNS), ", ".join("?" * len(RUN_COLUMNS))), rows)
             conn.execute("INSERT OR REPLACE INTO imports (path, size, mtime) VALUES (?, ?, ?)",
                          (path, stat.st_size, stat.st_mtime))
         imported += 1
@@ -328,7 +346,17 @@ def collect_changes(conn, repos, since, run=run_command, which=shutil.which):
 
 
 def cmd_collect(conn, args):
-    """Import transcripts, and merged pull requests for any repositories named."""
+    """Import transcripts, and merged pull requests for any repositories named.
+
+    With --transcript <path> it imports only that session's transcript and its agents.
+    """
+    if "--transcript" in args:
+        i = args.index("--transcript")
+        if i + 1 >= len(args) or len(args) != 2:
+            raise ValueError("--transcript takes one transcript path and nothing else")
+        imported, unchanged = collect_transcripts(conn, "", "", make_repo_of(), session_files(args[i + 1]))
+        print(f"transcripts: {imported} imported, {unchanged} unchanged")
+        return 0
     since, _, repos = options(args)
     bad = [r for r in repos if not re.fullmatch(r"[\w.-]+/[\w.-]+", r)]
     if bad:
@@ -370,6 +398,64 @@ def run_tokens(run):
 
 def share(part, whole):
     return f"{100 * part / whole:.0f}%"
+
+
+AVOIDABLE = (
+    ("context", "Avoidable: context above 80k", "turns_over_80k", "turns over 80k"),
+    ("lookup", "Avoidable: coordinator lookups", "lookup_calls", "read-only lookup calls by coordinators on opus"),
+    ("image", "Avoidable: images carried in a long context", "image_results", "image results"),
+    ("error", "Avoidable: errored tool calls", "errored_results", "errored tool results"),
+    ("wait", "Avoidable: wait loops", "wait_loop_calls", "wait-loop calls"),
+)
+FAST_ROLES = ("search", "gate", "retro")
+
+
+def ratio(part, whole):
+    return share(part, whole) if whole else "0%"
+
+
+def is_fast(model, fast):
+    """Whether a run's model is the configured fast model: its family, or the setting's own text for a model outside the families."""
+    return leanstats.family(model) == fast if fast in leanstats.FAMILIES else fast in model.lower()
+
+
+def avoidable_rows(runs):
+    """The Avoidable section: each usage signal as a share of the tokens and list price of the runs that have signals."""
+    known = [run for run in runs if run["avoidable"] is not None]
+    rows = []
+    if known:
+        tokens, usd = sum(run_tokens(run) for run in known), sum(run_cost(run) for run in known)
+        spent = {name: [0, 0.0] for name, _, _, _ in AVOIDABLE}
+        for run in known:
+            try:
+                found = json.loads(run["avoidable"])
+            except ValueError:
+                found = {}
+            for name, pair in spent.items():
+                part = found.get(name) or [0, 0]
+                pair[0] += part[0]
+                pair[1] += part[1]
+        unknown = len(runs) - len(known)
+        for name, label, column, noun in AVOIDABLE:
+            calls = sum(run[column] or 0 for run in known)
+            basis = f"{calls} {noun}"
+            if name == "context":
+                basis += f", peak {max(run['peak_context'] or 0 for run in known) // 1000}k"
+            basis += f"; {spent[name][1]:.2f} of {usd:.2f} USD at list price, over {len(known)} runs"
+            if unknown:
+                basis += f"; {unknown} older runs have no signals"
+            rows.append((label, f"{ratio(spent[name][0], tokens)} of tokens, {ratio(spent[name][1], usd)} of USD", basis))
+    else:
+        rows += [(label, NO_DATA, "") for _, label, _, _ in AVOIDABLE]
+    fast = (os.environ.get("LEAN_MODEL_FAST") or "haiku").strip().lower() or "haiku"
+    if runs:
+        ran = sum(1 for run in runs if is_fast(run["model"], fast))
+        meant = sum(1 for run in runs if run["role"] in FAST_ROLES)
+        rows.append((f"{fast.capitalize()} share of runs", f"{ratio(ran, len(runs))} ran on {fast}, the method gives it {ratio(meant, len(runs))}",
+                     f"{ran} of {len(runs)} runs; {meant} have a read-and-report role ({', '.join(FAST_ROLES)})"))
+    else:
+        rows.append((f"{fast.capitalize()} share of runs", NO_DATA, ""))
+    return rows
 
 
 def measures(conn, since=""):
@@ -488,7 +574,7 @@ def measures(conn, since=""):
                     f"of tokens in {len(runs)} runs"))
     else:
         out.append(("Unattributed", NO_DATA, ""))
-    return out
+    return out + avoidable_rows(runs)
 
 
 def render(rows, since, markdown, today):
@@ -770,16 +856,20 @@ def test_report(check, tmp):
     check("and has every line", [label for label, _, _ in empty], [
         "Changes merged", "Cost per change", "Escalation rate", "Findings by where caught", "Refuted share",
         "Escaped after merge", "Critic misses", "Fix rounds per change", "Hook fires", "Hooks with no fire",
-        "Unattributed"])
+        "Unattributed", "Avoidable: context above 80k", "Avoidable: coordinator lookups",
+        "Avoidable: images carried in a long context", "Avoidable: errored tool calls", "Avoidable: wait loops",
+        "Haiku share of runs"])
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         check("report on an empty database exits 0", cmd_report(conn, []), 0)
-    check("and prints no data", out.getvalue().count("no data"), 11)
+    check("and prints no data", out.getvalue().count("no data"), 17)
 
     million = 1000000
 
     def run(run_id, role, model, repo, pr, branch, tokens_in, ended="2026-10-01T05:00:00.000Z"):
-        conn.execute("INSERT INTO agent_runs VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'p', NULL)",
+        conn.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, pr, branch, started_at, ended_at, "
+                     "tokens_in, tokens_cache_write, tokens_cache_write_1h, tokens_cache_read, tokens_out, source_path, usd) "
+                     "VALUES (?, 's', 'subagent', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'p', NULL)",
                      (run_id, role, model, repo, pr, branch, ended, ended, tokens_in))
 
     conn.execute("INSERT INTO changes VALUES ('o/r', 7, 'fix-a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 2, 0, 0)")
@@ -822,13 +912,17 @@ def test_report(check, tmp):
     with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "unchecked.db")):
         bare = leanstats.connect()
         bare.execute("INSERT INTO changes VALUES ('o/u', 1, 'a', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', NULL, NULL, NULL)")
-        bare.execute("INSERT INTO agent_runs VALUES ('u1', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 1, '', "
+        bare.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, pr, branch, started_at, ended_at, "
+                     "tokens_in, tokens_cache_write, tokens_cache_write_1h, tokens_cache_read, tokens_out, source_path, usd) "
+                     "VALUES ('u1', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 1, '', "
                      "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p', NULL)")
         unchecked = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
         check("a hunted change with no review and no signals is no data, not zero", unchecked,
               ("no data", "1 changes hunted on sonnet, none with a review logged or signals collected"))
         bare.execute("INSERT INTO changes VALUES ('o/u', 2, 'b', '2026-09-30T00:00:00Z', '2026-10-01T00:00:00Z', 0, 0, 0)")
-        bare.execute("INSERT INTO agent_runs VALUES ('u2', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 2, '', "
+        bare.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, pr, branch, started_at, ended_at, "
+                     "tokens_in, tokens_cache_write, tokens_cache_write_1h, tokens_cache_read, tokens_out, source_path, usd) "
+                     "VALUES ('u2', 's', 'subagent', 'hunt', 'claude-sonnet-5-5', 'o/u', 2, '', "
                      "'2026-10-01T05:00:00.000Z', '2026-10-01T05:00:00.000Z', 1, 0, 0, 0, 0, 'p', NULL)")
         partly = {label: (value, basis) for label, value, basis in measures(bare)}["Critic misses"]
         check("only checked changes are counted", partly[0], "0")
@@ -851,13 +945,170 @@ def test_report(check, tmp):
     conn.close()
 
 
+def test_avoidable(check, tmp):
+    old = os.path.join(tmp, "old.db")
+    saved = list(leanstats.MIGRATIONS)
+    try:
+        del leanstats.MIGRATIONS[2:]
+        with leanstats.temp_env(LEAN_DB=old):
+            before = leanstats.connect()
+            before.execute("INSERT INTO agent_runs (run_id, kind, role, source_path) VALUES ('legacy', 'main', 'coordinator', 'p')")
+            before.close()
+    finally:
+        leanstats.MIGRATIONS[:] = saved
+    with leanstats.temp_env(LEAN_DB=old):
+        after = leanstats.connect()
+        found = after.execute("SELECT peak_context, turns_over_80k, lookup_calls, image_results, errored_results, "
+                              "wait_loop_calls, avoidable FROM agent_runs").fetchone()
+        check("a row from before the signals reads as unknown, not zero", tuple(found), (None,) * 7)
+        check("and is left out of the section",
+              avoidable_rows(after.execute("SELECT * FROM agent_runs").fetchall())[0][1], NO_DATA)
+        after.close()
+
+    conn = leanstats.connect()
+    zero = json.dumps({name: [0, 0.0] for name, _, _, _ in AVOIDABLE})
+    spent = json.dumps({"context": [200000, 1.0], "lookup": [100000, 0.5], "image": [0, 0.0],
+                        "error": [50000, 0.25], "wait": [0, 0.0]})
+
+    def run(run_id, kind, role, model, tokens_in, avoidable, turns=0, lookups=0, peak=0):
+        conn.execute("INSERT INTO agent_runs (run_id, kind, role, model, tokens_in, source_path, started_at, ended_at, "
+                     "peak_context, turns_over_80k, lookup_calls, image_results, errored_results, wait_loop_calls, avoidable) "
+                     "VALUES (?, ?, ?, ?, ?, 'p', '2026-10-01', '2026-10-01', ?, ?, ?, 0, 0, 0, ?)",
+                     (run_id, kind, role, model, tokens_in, peak, turns, lookups, avoidable))
+
+    run("c", "main", "coordinator", "claude-opus-5-5", 1000000, spent, turns=3, lookups=7, peak=150000)  # 4 USD
+    run("g", "subagent", "gate", "claude-haiku-5-5", 1000000, zero)                                       # 0.10 USD
+    run("s", "subagent", "search", "claude-sonnet-5-5", 500000, None)                                      # no signals
+    got = {label: (value, basis) for label, value, basis in measures(conn)}
+    check("context share", got["Avoidable: context above 80k"][0], "10% of tokens, 24% of USD")
+    check("lookup share", got["Avoidable: coordinator lookups"][0], "5% of tokens, 12% of USD")
+    check("a signal with none is 0%", got["Avoidable: wait loops"][0], "0% of tokens, 0% of USD")
+    check("context basis", got["Avoidable: context above 80k"][1],
+          "3 turns over 80k, peak 150k; 1.00 of 4.10 USD at list price, over 2 runs; 1 older runs have no signals")
+    check("lookup basis counts the coordinator's calls", got["Avoidable: coordinator lookups"][1].startswith(
+        "7 read-only lookup calls by coordinators on opus;"), True)
+    check("haiku against the method", got["Haiku share of runs"],
+          ("33% ran on haiku, the method gives it 67%", "1 of 3 runs; 2 have a read-and-report role (search, gate, retro)"))
+    with leanstats.temp_env(LEAN_MODEL_FAST="sonnet"):
+        check("the fast model comes from the setting", dict((l, v) for l, v, _ in measures(conn))["Sonnet share of runs"],
+              "33% ran on sonnet, the method gives it 67%")
+    with leanstats.temp_env(LEAN_MODEL_FAST="gemma"):
+        rows = dict((l, v) for l, v, _ in measures(conn))
+        check("a fast model outside the families is labelled as set", rows.get("Gemma share of runs"),
+              "0% ran on gemma, the method gives it 67%")
+        check("and is not read as opus", "Opus share of runs" in rows, False)
+    run("x", "subagent", "search", "claude-gemma-1", 10, zero)
+    with leanstats.temp_env(LEAN_MODEL_FAST="gemma"):
+        check("a model whose id holds the setting counts as fast",
+              dict((l, v) for l, v, _ in measures(conn))["Gemma share of runs"].split(" ran")[0], "25%")
+    conn.execute("DELETE FROM agent_runs WHERE run_id = 'x'")
+    text = render(measures(conn), "", False, "2026-10-02")
+    check("the section prints", "Avoidable: wait loops: 0% of tokens, 0% of USD" in text, True)
+    conn.close()
+
+
+def test_collect_session(check, tmp):
+    def message(mid, block, size, model="claude-opus-5-5", sid="x"):
+        usage = {"input_tokens": 10, "cache_read_input_tokens": size, "output_tokens": 5}
+        return json.dumps({"type": "assistant", "cwd": "/a", "sessionId": sid, "timestamp": "2026-10-02T01:00:00.000Z",
+                           "message": {"id": mid, "model": model, "usage": usage, "content": [block]}}) + "\n"
+
+    def result(tid, error):
+        return json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": error, "content": "SECRETOUTPUT"}]}}) + "\n"
+
+    def write(path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    root = os.path.join(tmp, "projects", "proj")
+    for name in ("one", "two", "three"):
+        write(os.path.join(root, name + ".jsonl"),
+              message("m1", {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "git status SECRETCMD"}},
+                      90000, sid=name) + result("t1", True))
+        write(os.path.join(root, name, "subagents", "agent-" + name + ".jsonl"),
+              message("m1", {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/SECRETPATH"}},
+                      1000, model="claude-sonnet-5-5", sid=name))
+    conn = leanstats.connect()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("collect for one session", cmd_collect(conn, ["--transcript", os.path.join(root, "one.jsonl")]), 0)
+    check("it says what it imported", out.getvalue().strip(), "transcripts: 2 imported, 0 unchanged")
+    check("exactly that session and its agent are stored", sorted(r[0] for r in conn.execute(
+        "SELECT source_path FROM agent_runs")), sorted([os.path.join(root, "one.jsonl"),
+                                                        os.path.join(root, "one", "subagents", "agent-one.jsonl")]))
+    main_run = conn.execute("SELECT * FROM agent_runs WHERE kind = 'main'").fetchone()
+    check("signals are stored", (main_run["peak_context"], main_run["turns_over_80k"], main_run["lookup_calls"],
+                                 main_run["errored_results"], main_run["image_results"], main_run["wait_loop_calls"]),
+          (90010, 1, 1, 1, 0, 0))
+    kept = " ".join(str(value) for r in conn.execute("SELECT * FROM agent_runs") for value in tuple(r))
+    check("no command, path or output text is stored", [w for w in ("SECRET", "git status") if w in kept], [])
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_collect(conn, ["--transcript", os.path.join(root, "one.jsonl")])
+    check("again it reads nothing new", conn.execute("SELECT COUNT(*) FROM imports").fetchone()[0], 2)
+    for bad in (["--transcript"], ["--transcript", "a", "b"]):
+        try:
+            cmd_collect(conn, bad)
+            check("bad arguments are refused: %s" % bad, "accepted", "refused")
+        except ValueError:
+            pass
+    with contextlib.redirect_stdout(io.StringIO()):
+        check("a missing transcript imports nothing", cmd_collect(conn, ["--transcript", os.path.join(root, "gone.jsonl")]), 0)
+    write(os.path.join(root, "ghost", "subagents", "agent-g.jsonl"), message("m1", {"type": "text"}, 5, sid="ghost"))
+    os.makedirs(os.path.join(root, "dir.jsonl"))
+    check("a main transcript that is missing or a directory is not listed",
+          [kind for _, kind in session_files(os.path.join(root, "ghost.jsonl"))], ["subagent"])
+    check("a directory named like a transcript is not a main transcript", session_files(os.path.join(root, "dir.jsonl")), [])
+
+    one = os.path.join(root, "one.jsonl")
+    conn.execute("UPDATE agent_runs SET avoidable = NULL, peak_context = NULL WHERE source_path = ?", (one,))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cmd_collect(conn, ["--transcript", one])
+    check("a file whose runs have no signals is read again", out.getvalue().strip(), "transcripts: 1 imported, 1 unchanged")
+    check("and its signals are filled in", conn.execute(
+        "SELECT peak_context, avoidable IS NOT NULL FROM agent_runs WHERE source_path = ?", (one,)).fetchone()[:], (90010, 1))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cmd_collect(conn, ["--transcript", one])
+    check("once filled in it is left alone", out.getvalue().strip(), "transcripts: 0 imported, 2 unchanged")
+    conn.close()
+
+    procs = [subprocess.Popen([sys.executable, os.path.join(ROOT, "bin", "lean-stats"), "collect", "--transcript",
+                               os.path.join(root, name + ".jsonl")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for name in ("one", "two", "three") * 2]
+    check("sessions ending together all succeed", [p.wait() for p in procs], [0] * 6)
+    conn = leanstats.connect()
+    check("and the file holds each session once", conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0], 6)
+    conn.close()
+    with leanstats.temp_env(LEAN_STATS="off"):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["collect", "--transcript", os.path.join(root, "two.jsonl")])
+        check("LEAN_STATS=off stops it", (code, "nothing read or written" in out.getvalue()), (0, True))
+
+
+def test_self_tests_leave_the_real_database(check, tmp):
+    home = os.path.join(tmp, "realhome")
+    os.makedirs(home)
+    env = {k: v for k, v in os.environ.items() if k not in ("LEAN_DB", "LEAN_STATS", "LEAN_BRAIN_DB")}
+    env["HOME"] = home
+    for rel in ("lib/leanstats.py", "hooks/session-env.py", "hooks/context-cost.py"):
+        result = subprocess.run([sys.executable, os.path.join(ROOT, rel), "--self-test"], env=env,
+                                capture_output=True, text=True, timeout=300)
+        check("%s self-test passes under a fresh HOME" % rel, (result.returncode, result.stdout.strip().splitlines()[-1:]),
+              (0, ["self-test: ok"]))
+        check("%s self-test makes no default database" % rel, os.path.exists(os.path.join(home, ".lean", "lean.db")), False)
+
+
 COMMANDS = {
     "log-review": cmd_log_review,
     "import-reviews": cmd_import_reviews,
     "collect": cmd_collect,
     "report": cmd_report,
 }
-TESTS = [test_reviews, test_transcripts, test_changes, test_report]
+TESTS = [test_reviews, test_transcripts, test_changes, test_report, test_avoidable, test_collect_session, test_self_tests_leave_the_real_database]
 
 
 def main(argv):

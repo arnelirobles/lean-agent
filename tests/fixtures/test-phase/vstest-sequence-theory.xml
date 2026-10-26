@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Constructed, not captured: a theory whose string argument holds characters XML escapes. -->
+<TestSequence>
+  <Test Name="Acme.T.Fast" Source="Acme.Tests.dll" Completed="True" />
+  <Test Name="Acme.T.Theory(s: &quot;a&amp;b&quot;, t: &apos;c&apos;, u: &#39;d&#39;)" Source="Acme.Tests.dll" Completed="False" />
+</TestSequence>

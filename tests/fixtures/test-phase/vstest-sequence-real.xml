@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<TestSequence>
+  <Test Name="Capture.HangTests.Passes" DisplayName="Capture.HangTests.Passes" Source="/private/tmp/hang-capture/vs/bin/Debug/net10.0/Vs.dll" Completed="True" />
+  <Test Name="Capture.HangTests.Theory_with_a_string" DisplayName="Capture.HangTests.Theory_with_a_string(s: &quot;a&amp;b \&quot;q\&quot; 'c'&quot;)" Source="/private/tmp/hang-capture/vs/bin/Debug/net10.0/Vs.dll" Completed="False" />
+</TestSequence>
