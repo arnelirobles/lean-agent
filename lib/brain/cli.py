@@ -40,12 +40,21 @@
   brain activity list [--source S] [--project P] [--since 24h] [--failed] [--limit N]      newest first
   brain activity import-baryovm [--file PATH]   reads BaryoVM's activity.jsonl from where the last import
             stopped, so a rerun adds nothing; a file that shrank is read from the start
+  brain created list [--open] [--limit N]     pull requests, issues, releases and work items agents created, newest first
+  brain notice list [--all] [--limit N]       hook notes kept as notices, newest first; --all adds dismissed ones
+  brain notice dismiss ID
   brain resume [--project P] [--max N]
   brain digest [--project P | --all] [--quiet] [--recover]
   brain stats [--json]
   brain export [--format md|json] [--project P] [--status S]
   brain session start|end|status ID [--cwd DIR]
   brain answers --session ID
+  brain serve [--port N] [--roots A,B] [--idle-exit MIN] [--install always|session|manual | --uninstall]
+            the brain page at http://leanagent.localhost:PORT (also http://127.0.0.1:PORT), port 8770 or
+            $LEAN_SERVE_PORT. A second serve on a port where the page already answers prints its address and
+            exits 0. --idle-exit stops it after MIN minutes with no open session. --install always starts it
+            at login (launchd, systemd user unit or Windows Startup folder; no admin rights); the other two
+            modes remove that and leave the start to the plugin's serve_mode setting. --uninstall removes it
   brain --self-test
 
 The file is ${LEAN_BRAIN_DB:-~/.local/share/lean/brain.db}, one sqlite database with a schema version
@@ -91,13 +100,19 @@ Memory files keep standing preferences. Run logs are scratch and can expire once
 brain. A ledger points to open items with a line like "open items: brain list --project X --status open".
 """
 import argparse
+import errno
 import socket
 import os
+import sys
+import threading
+import time
+import urllib.request
 
 from .store import norm_project, MODEL, PHASE, RESOLUTION, RUNNERS, SEVERITY, SOURCE, STATUS, TIERS
 from .items import cmd_add, cmd_answers, cmd_close, cmd_list, cmd_reopen, cmd_run_add, cmd_session, cmd_show
 from .flaky import cmd_flaky_clear
 from .activity import cmd_activity
+from .records import cmd_created, cmd_notice
 from .queue import JOB_STATUS, JOB_TIERS, cmd_queue
 from .report import cmd_digest, cmd_export, cmd_resume, cmd_stats
 
@@ -259,6 +274,20 @@ def parser():
     q = acs.add_parser("import-baryovm")
     q.add_argument("--file", help="default $BARYOVM_HOME/activity.jsonl, or ~/.baryovm/activity.jsonl")
     s.set_defaults(fn=cmd_activity)
+    s = sub.add_parser("created")
+    cs = s.add_subparsers(dest="ccmd", required=True)
+    q = cs.add_parser("list")
+    q.add_argument("--open", action="store_true", help="only items not known to be closed or merged")
+    q.add_argument("--limit", type=int, default=50)
+    s.set_defaults(fn=cmd_created)
+    s = sub.add_parser("notice")
+    ns = s.add_subparsers(dest="ncmd", required=True)
+    q = ns.add_parser("list")
+    q.add_argument("--all", action="store_true", help="include dismissed notices")
+    q.add_argument("--limit", type=int, default=50)
+    q = ns.add_parser("dismiss")
+    q.add_argument("id", type=int)
+    s.set_defaults(fn=cmd_notice)
     s = sub.add_parser("resume")
     s.add_argument("--project", type=lower)
     s.add_argument("--max", type=int, default=40)
@@ -278,7 +307,100 @@ def parser():
     s.add_argument("--project", type=lower)
     s.add_argument("--status", choices=STATUS)
     s.set_defaults(fn=cmd_export)
+    s = sub.add_parser("serve")
+    s.add_argument("--port", type=int)
+    s.add_argument("--roots", default="", help="comma-separated folders to look for worktrees in")
+    s.add_argument("--idle-exit", type=int, metavar="MIN")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--install", choices=("always", "session", "manual"))
+    g.add_argument("--uninstall", action="store_true")
+    s.set_defaults(fn=cmd_serve)
     return p
+
+
+def healthz(port, timeout=1.0):
+    """True when the brain page answers on this port."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=timeout) as r:
+            return r.read(64).startswith(b"lean-brain")
+    except (OSError, ValueError):
+        return False
+
+
+def idle_watch(db_file, minutes, state, now=None):
+    """True when no session has been open for `minutes`. An unreadable database counts as a session open.
+    A session row older than 12 hours does not count: a crashed session never writes ended_at."""
+    import sqlite3
+    now = time.time() if now is None else now
+    try:
+        con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2)
+        try:
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 12 * 3600))
+            open_now = con.execute("SELECT 1 FROM sessions WHERE ended_at='' AND started_at>? LIMIT 1",
+                                   (cutoff,)).fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        open_now = True
+    if open_now or "last" not in state:
+        state["last"] = now
+    return now - state["last"] >= minutes * 60
+
+
+def cmd_serve(a):
+    from .web import install
+    plat = install.platform_name()
+    brain_path = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "bin", "brain"))
+    try:
+        port = a.port or int(os.environ.get("LEAN_SERVE_PORT") or 8770)
+        if not 0 < port < 65536:
+            raise ValueError
+    except ValueError:
+        print("brain serve: the port must be a number from 1 to 65535", file=sys.stderr)
+        return 2
+    roots = a.roots or os.environ.get("CLAUDE_PLUGIN_OPTION_WORKTREE_ROOTS", "")
+    if a.uninstall:
+        print("removed the login unit" if install.uninstall(plat) else "no login unit installed")
+        return 0
+    if a.install:
+        if a.install != "always":
+            gone = install.uninstall(plat)
+            print(("removed the login unit; " if gone else "") + f"mode {a.install}: set serve_mode in the plugin settings")
+            return 0
+        path, started = install.install(plat, sys.executable, brain_path, port, roots)
+        print(f"wrote {path}" + ("" if started else " (could not start it now; it starts at the next login)"))
+        return 0
+    urls = f"http://leanagent.localhost:{port}  (also http://127.0.0.1:{port})"
+    if healthz(port):
+        print(urls)
+        return 0
+    from .web import server
+    from . import store
+    import secrets
+    try:
+        srv = server.make_server(port, secrets.token_urlsafe(32), roots=[r.strip() for r in roots.split(",") if r.strip()])
+    except OSError as ex:
+        print(f"port {port} is in use" if ex.errno == errno.EADDRINUSE else f"brain serve: {ex}", file=sys.stderr)
+        return 1
+    print(urls, flush=True)
+    if a.idle_exit:
+        db_file, state = store.db_path(), {}
+
+        def watch():
+            while True:
+                try:
+                    if idle_watch(db_file, a.idle_exit, state):
+                        break
+                except Exception:  # whatever goes wrong here must not stop the page
+                    pass
+                time.sleep(60)
+            srv.shutdown()
+        threading.Thread(target=watch, daemon=True).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def main(argv):

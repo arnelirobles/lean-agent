@@ -184,7 +184,7 @@ Size and retention (my call): a bundle is capped at 200 MB and uploaded in chunk
 
 ### Dashboard
 
-Anyone on the team, and the owner most of all, should be able to open one page and see what is happening. That page is the VS Code dashboard for a developer and barakoBrew for the team. Both read the same events.
+Anyone on the team, and the owner most of all, should be able to open one page and see what is happening. That page is the brain page (`brain serve`) for a developer and barakoBrew for the team. Both read the same events.
 
 Extra events recorded for it:
 

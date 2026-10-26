@@ -130,6 +130,16 @@ def cmd_show(a):
     return 0
 
 
+def close_item(con, item_id, resolution, note="", wontfix=False, delivered=False, commit=""):
+    """Close an open item in one statement. False when it is not open (already closed, or gone)."""
+    t = now()
+    cur = con.execute("UPDATE items SET status=?, resolution=?, closed_at=?, body=body || ?, answer_delivered_at=?,"
+                      " commit_hash=COALESCE(NULLIF(?, ''), commit_hash) WHERE id=? AND status='open'",
+                      ("wontfix" if wontfix else "closed", resolution, t, ("\n\nclosed: " + note) if note else "",
+                       t if delivered else "", commit or "", item_id))
+    return cur.rowcount > 0
+
+
 def cmd_close(a):
     con = connect()
     with con:
@@ -138,12 +148,8 @@ def cmd_close(a):
             sys.exit(f"brain: #{a.id} is already {r['status']}")
         if not a.resolution and not a.wontfix:
             sys.exit(f"brain: close needs --resolution ({', '.join(RESOLUTION)}), or --wontfix")
-        body = r["body"] + (("\n\nclosed: " + a.note) if a.note else "")
-        t = now()
-        con.execute("UPDATE items SET status=?, resolution=?, closed_at=?, body=?, answer_delivered_at=?,"
-                    " commit_hash=COALESCE(NULLIF(?, ''), commit_hash) WHERE id=?",
-                    ("wontfix" if a.wontfix else "closed", a.resolution, t, body, t if a.delivered else "",
-                     a.commit, a.id))
+        if not close_item(con, a.id, a.resolution, a.note, wontfix=a.wontfix, delivered=a.delivered, commit=a.commit):
+            sys.exit(f"brain: #{a.id} is already {get(con, a.id)['status']}")
         add_tags(con, a.id, a.tag)
         print("closed: " + line(con, get(con, a.id)))
     return 0
