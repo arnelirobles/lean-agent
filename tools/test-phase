@@ -11,7 +11,7 @@ read `brain list --open`, fix, run again. Nobody waits in a loop: `brain queue a
 and one drainer (start it as a background task) takes the oldest ready job, runs it, and repeats until
 nothing is ready. A second test-phase while one is draining says so and exits 0; the running drainer
 picks up whatever was enqueued. A job whose --after job failed or was cancelled is cancelled with the
-reason. Every command goes through bin/heavy.sh in one lane, so sessions on one machine queue instead
+reason. Every command goes through tools/heavy.sh in one lane, so sessions on one machine queue instead
 of loading the database together; ask whether the lane is free with `heavy.sh status dotnet`.
 
 PLAN is optional. When given, its lines are enqueued first. One project per line, blank lines and lines

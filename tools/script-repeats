@@ -302,7 +302,7 @@ def self_test():
         cov = fam["covered_by"]
         if cov == "none" or fam["kind"] != "script":
             continue
-        path = os.path.join(REPO, cov if "/" in cov else os.path.join("bin", cov))
+        path = os.path.join(REPO, cov if "/" in cov else os.path.join("tools", cov))
         if cov == "hooks/wait-loop.py" and not os.path.exists(path):
             continue
         assert os.path.exists(path), "%s: covered_by %s does not exist" % (fam["name"], cov)
@@ -338,7 +338,7 @@ def self_test():
     assert shape("curl acme-client") == "curl W"
     assert shape("mysql -uroot -pS3cretPass db") == "W -u -p W"
     assert shape("git status --short") == "git status --short"
-    assert shape("./bin/style-scan --base main") == "style-scan --base W"
+    assert shape("./tools/style-scan --base main") == "style-scan --base W"
     leaks = ["acmecorp-sync", "acme-deploy", "acme-client", "S3cretPass", "uroot", "secret-client"]
 
     # a root with several projects
@@ -368,7 +368,7 @@ def self_test():
         "until grep -q done out.txt; do sleep 15; done",
         "python3 - <<'X'\ns=open(p).read()\ns=s.replace(a,b)\nX",
         "for d in a b; do git -C $d status; done",
-        "ls ~/.claude/plugins/lean-agent/lean-agent/1.9.0/bin/brain",
+        "ls ~/.claude/plugins/lean-agent/lean-agent/1.9.0/tools/brain",
         "curl -s https://api.example.com/health",
         "echo hello",
     ], junk=True)

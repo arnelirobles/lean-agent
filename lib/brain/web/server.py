@@ -435,7 +435,7 @@ def _self_test() -> int:
     check("answer closes", (st["status"], st["resolution"]), ("closed", "answered"))
     check("answer stored as note", st["body"].endswith("\n\nclosed: <b>go with B</b>"), True)
     check("answer escaped on page", "<b>go with B</b>" not in p, True)
-    cli = __import__("subprocess").run([sys.executable, os.path.join(HERE, "..", "..", "..", "bin", "brain"), "answers",
+    cli = __import__("subprocess").run([sys.executable, os.path.join(HERE, "..", "..", "..", "tools", "brain"), "answers",
                                         "--session", "sess-1"], capture_output=True, text=True,
                                        env={**os.environ, "LEAN_BRAIN_DB": db})
     check("brain answers returns it", "<b>go with B</b>" in cli.stdout, True)

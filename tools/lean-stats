@@ -292,7 +292,7 @@ def collect_transcripts(conn, root, since, repo_of, files=None):
     return imported, unchanged
 
 
-RETRO = os.path.join(ROOT, "bin", "retro-signals.sh")
+RETRO = os.path.join(ROOT, "tools", "retro-signals.sh")
 
 
 def run_command(cmd, timeout=600):
@@ -1075,7 +1075,7 @@ def test_collect_session(check, tmp):
     check("once filled in it is left alone", out.getvalue().strip(), "transcripts: 0 imported, 2 unchanged")
     conn.close()
 
-    procs = [subprocess.Popen([sys.executable, os.path.join(ROOT, "bin", "lean-stats"), "collect", "--transcript",
+    procs = [subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "lean-stats"), "collect", "--transcript",
                                os.path.join(root, name + ".jsonl")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
              for name in ("one", "two", "three") * 2]
     check("sessions ending together all succeed", [p.wait() for p in procs], [0] * 6)

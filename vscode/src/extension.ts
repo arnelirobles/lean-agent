@@ -165,7 +165,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 
   function findOrWarn(): string | undefined {
     const brain = cli.findBrain(userSetting("brainPath"));
-    if (!brain) void vscode.window.showWarningMessage("Lean Brain: bin/brain not found. Set leanBrain.brainPath.");
+    if (!brain) void vscode.window.showWarningMessage("Lean Brain: tools/brain not found. Set leanBrain.brainPath.");
     return brain;
   }
 

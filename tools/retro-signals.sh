@@ -4,7 +4,7 @@
 #   retro-signals.sh --since 2026-09-24 owner/repo [owner/repo ...]   one TSV row per merged pull request
 #   retro-signals.sh --self-test                                       checks the parsing on a fixture
 #
-# After the rows it prints a script repeats section (bin/script-repeats): the families of commands agents
+# After the rows it prints a script repeats section (tools/script-repeats): the families of commands agents
 # wrote by hand in the last SCRIPT_REPEATS_DAYS days (default 7), with counts only. SCRIPT_REPEATS_ROOT
 # points it at another transcript directory.
 #
@@ -32,7 +32,7 @@ repeats_section() {
   if command -v timeout >/dev/null 2>&1; then bound="timeout 120"
   elif command -v gtimeout >/dev/null 2>&1; then bound="gtimeout 120"; fi
   printf '\n# script repeats\n'
-  $bound python3 -I "$lib/../bin/script-repeats" --days "${SCRIPT_REPEATS_DAYS:-7}" ${SCRIPT_REPEATS_ROOT:+--root "$SCRIPT_REPEATS_ROOT"} \
+  $bound python3 -I "$lib/../tools/script-repeats" --days "${SCRIPT_REPEATS_DAYS:-7}" ${SCRIPT_REPEATS_ROOT:+--root "$SCRIPT_REPEATS_ROOT"} \
     || echo "script-repeats failed"
 }
 

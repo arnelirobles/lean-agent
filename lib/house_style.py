@@ -2,7 +2,7 @@
 
 ATTRIBUTION catches agent attribution (an AI Co-Authored-By, a session link, a
 "Generated with" line). SLOP catches dashes, arrow glyphs and filler words.
-The hooks and bin/style-scan import this file so there is one list to edit.
+The hooks and tools/style-scan import this file so there is one list to edit.
 The patterns are written so this file does not match itself: `\\bword\\b` in
 source has a letter before the word, so the word boundary is not there.
 

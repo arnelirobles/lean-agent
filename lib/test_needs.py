@@ -17,7 +17,7 @@ starting with # are skipped:
     command NAME gnu          NAME is on PATH and `NAME --version` says GNU
     command NAME >=22.11      NAME is on PATH and `NAME --version` is at least that
 
-With a test-needs file, bin/check-runtime.sh runs as part of the same check, for a run and for --doctor.
+With a test-needs file, tools/check-runtime.sh runs as part of the same check, for a run and for --doctor.
 A "#" after whitespace starts a comment at the end of a line.
 
 environmental() reads the other side: a run where most failures share one cause that is not the
@@ -30,7 +30,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-RUNTIME = os.path.join(HERE, "..", "bin", "check-runtime.sh")
+RUNTIME = os.path.join(HERE, "..", "tools", "check-runtime.sh")
 NEEDS = os.path.join(".lean", "test-needs")
 KINDS = ("docker", "path", "env", "command")
 
@@ -135,7 +135,7 @@ def _which(name):
 
 
 def runtime_problems(repo):
-    """The MISMATCH lines of bin/check-runtime.sh, [] when it passes or is not installed."""
+    """The MISMATCH lines of tools/check-runtime.sh, [] when it passes or is not installed."""
     if not os.path.isfile(RUNTIME):
         return []
     r = _run(["bash", RUNTIME, repo], repo, 120)

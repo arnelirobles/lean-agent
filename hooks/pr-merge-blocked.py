@@ -113,7 +113,7 @@ def note_for(event):
     if not failed and not REFUSAL.search(text):
         return None
     num, repo = merge_target(args)
-    cmd = "pr-blockers.sh %s%s" % (num or "<pr-number>", " -R " + repo if repo else "")
+    cmd = "%s %s%s" % (hookkit.tool_path("pr-blockers.sh"), num or "<pr-number>", " -R " + repo if repo else "")
     msg = (
         "That merge did not go through. Do not diagnose it one blocker at a time. Run once:\n\n"
         "    %s\n\n"
@@ -147,7 +147,7 @@ def self_test():
         e.update(kw)
         return e
 
-    case("failure event", ev("gh pr merge 12 --squash", None, "PostToolUseFailure", error="Exit code 1"), "pr-blockers.sh 12")
+    case("failure event", ev("gh pr merge 12 --squash", None, "PostToolUseFailure", error="Exit code 1"), hookkit.tool_path("pr-blockers.sh") + " 12")
     case("event name echoed", ev("gh pr merge 12", None, "PostToolUseFailure", error="x"), '"hookEventName": "PostToolUseFailure"')
     case("repo flag", ev("gh pr merge 5 -R o/r --squash", None, "PostToolUseFailure"), "pr-blockers.sh 5 -R o/r")
     case("url form", ev("gh pr merge https://github.com/o/r/pull/8", None, "PostToolUseFailure"), "pr-blockers.sh 8 -R o/r")

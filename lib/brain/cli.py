@@ -94,7 +94,7 @@ Adding an open item with the same project, kind and ref does not make a new row:
 occurrences and moves last_seen, so a failure seen in ten runs is one line.
 
 The queue replaces wait loops. Never write a sleep or pgrep loop to wait for the test lane: enqueue and
-end the turn, or start `brain queue wait ID...` in the background for one wake-up when the jobs end. bin/test-phase drains the queue, one drainer at a time, oldest ready job first. A job
+end the turn, or start `brain queue wait ID...` in the background for one wake-up when the jobs end. tools/test-phase drains the queue, one drainer at a time, oldest ready job first. A job
 whose --after job failed or was cancelled is cancelled with the reason. States: queued, running, done,
 failed, cancelled.
 
@@ -369,7 +369,7 @@ def idle_watch(db_file, minutes, state, now=None):
 def cmd_serve(a):
     from .web import install
     plat = install.platform_name()
-    brain_path = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "bin", "brain"))
+    brain_path = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "tools", "brain"))
     try:
         port = a.port or int(os.environ.get("LEAN_SERVE_PORT") or 8770)
         if not 0 < port < 65536:

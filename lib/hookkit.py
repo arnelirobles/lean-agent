@@ -43,6 +43,14 @@ def _fire(outcome):
         pass
 
 
+TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
+
+
+def tool_path(name, base=None):
+    """The absolute path of a plugin tool, quoted so it can be pasted into a shell."""
+    return shlex.quote(os.path.join(base or TOOLS, name))
+
+
 def run(main):
     """Run a hook's main and exit with its code; an internal error exits 0."""
     try:
@@ -435,6 +443,9 @@ def self_test():
                 check("a self-test run records nothing", os.path.exists(quiet), False)
         finally:
             _RECORD, _EVENT = False, {}
+    check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
+    check("tool_path quotes a path with a space", tool_path("brain", "/a b/tools"), "'/a b/tools/brain'")
+    check("tool_path leaves a plain path bare", tool_path("brain", "/a/tools"), "/a/tools/brain")
 
     import sqlite3
     import time

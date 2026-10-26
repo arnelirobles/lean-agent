@@ -21,8 +21,8 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
-BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "brain")
-LEAN_STATS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "lean-stats")
+BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")
+LEAN_STATS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "lean-stats")
 
 
 def brain(*args):

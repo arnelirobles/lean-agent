@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
 import hookkit  # noqa: E402
 
-BRAIN = os.path.join(HERE, "..", "bin", "brain")
+BRAIN = os.path.join(HERE, "..", "tools", "brain")
 MODES = ("always", "session", "manual")
 
 
@@ -86,7 +86,7 @@ def start(mode, spawner=spawn, probe=answering, installed=None, stale=None, rein
     spawner((["--idle-exit", "30"] if mode == "session" else []) + (["--roots", roots] if roots else []))
     if mode == "always" and noted("install-noted"):
         said.append("The brain page was started for this session. "
-                    "`brain serve --install always` starts it at every login instead.")
+                    f"`{hookkit.tool_path('brain')} serve --install always` starts it at every login instead.")
     return "started", said
 
 

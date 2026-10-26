@@ -10,7 +10,7 @@
 
 REPO is owner/name (always GitHub) or a clone URL. A host other than GitHub prints one line and exits 2.
 
-CI providers. bin/pr-wait waits on checks through a provider from ci_provider(kind, ...), kind being what
+CI providers. tools/pr-wait waits on checks through a provider from ci_provider(kind, ...), kind being what
 kind_of returns. A provider is a class with this interface, nothing more:
 
   label                       what the one-line result calls the target ("pull request 12")
@@ -356,7 +356,7 @@ sys.exit(9)
 
 
 def make_scene(root, tools, files):
-    """A folder with fake CLIs ({name: script}) in bin/ and data files. Returns (dir, env with PATH and FAKE_DIR)."""
+    """A folder with fake CLIs ({name: script}) in a bin folder and data files. Returns (dir, env with PATH and FAKE_DIR)."""
     import tempfile
     d = tempfile.mkdtemp(dir=root)
     os.mkdir(os.path.join(d, "bin"))
@@ -547,7 +547,7 @@ def self_test():
     check("azure CLI exit", r.returncode, 2)
     check("azure CLI message", r.stderr.strip(), "forge: azure is not supported yet; only GitHub is")
 
-    retro = os.path.join(os.path.dirname(here), "..", "bin", "retro-signals.sh")
+    retro = os.path.join(os.path.dirname(here), "..", "tools", "retro-signals.sh")
     r = subprocess.run(["bash", retro, "--since", "2026-10-01", "https://dev.azure.com/o/p/_git/r"],
                        capture_output=True, text=True)
     check("retro-signals on azure exits 2", r.returncode, 2)

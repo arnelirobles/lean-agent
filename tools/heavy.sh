@@ -48,7 +48,7 @@
 # messages end with "(passed P, failed F, last test: NAME)". It works with or without HEAVY_STALL.
 #
 # HEAVY_HELD=<lock path>:<pid>:<nonce> means the caller (that pid, one of our parents) already holds this lane's lock
-# for a whole job (bin/test-phase takes it once per job, so a job's alone reruns cannot lose the lane to
+# for a whole job (tools/test-phase takes it once per job, so a job's alone reruns cannot lose the lane to
 # another session). heavy.sh then runs the command without taking or waiting for the lock. A value for another
 # lane, for a lane nobody holds, or for a pid that is not our parent is ignored, and the command never sees it.
 #
