@@ -183,9 +183,8 @@ def self_test():
     failures = 0
     import pwd
 
-    if os.environ.get("HOME", "") == pwd.getpwuid(os.getuid()).pw_dir:
-        print("self-test: set HOME to a temporary directory first")
-        return 1
+    if os.environ.get("HOME", "") == pwd.getpwuid(os.getuid()).pw_dir:  # the seen file must not land in the real home
+        os.environ["HOME"] = tempfile.mkdtemp(prefix="script-note-home-")
     os.environ.pop("LEAN_SCRIPT_NOTE", None)
 
     def check(label, ok, detail=""):
