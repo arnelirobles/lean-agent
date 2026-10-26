@@ -1,6 +1,6 @@
 {
   "name": "lean-agent",
-  "version": "1.15.0",
+  "version": "1.16.0",
   "description": "Run coding agents over a backlog without burning a plan: agent-ready tickets, scripted gates, an adversarial critic, and a retro that improves the method from numbers.",
   "author": {
     "name": "Arnel Robles",
@@ -11,7 +11,7 @@
   "license": "MIT",
   "mcpServers": {
     "brain": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/brain-mcp"
+      "command": "${CLAUDE_PLUGIN_ROOT}/tools/brain-mcp"
     }
   }
 }

@@ -8,7 +8,7 @@ PreToolUse hook on Bash. It denies:
     pgrep; a loop reading redirected input (done < file) is not a poll
   - pgrep
 It looks inside bash -c, sh -c and zsh -c arguments too. It adds a note (never a deny)
-on dotnet test, npx vitest, go test and pytest run outside bin/test-phase and heavy.sh.
+on dotnet test, npx vitest, go test and pytest run outside test-phase and heavy.sh.
 The note only fires when the brain script is present, since it names `brain queue add`.
 Quoted strings and heredoc bodies are not commands, so a sleep inside them passes. A
 run_in_background command is checked the same way. A hook error never fails the session.
@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
-BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "brain")
+BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")
 KEYWORDS = {"do", "then", "else", "elif", "!", "{", "}", "time"}
 LOOP_OPEN = {"until", "while", "for"}
 SLEEP_READERS = {"cat", "tail", "head", "grep", "egrep", "fgrep", "rg", "less", "more", "wc"}
@@ -257,7 +257,7 @@ def self_test():
     check("npx vitest notes", "npx vitest run", "note")
     check("go test notes", "cd svc && go test ./...", "note")
     check("pytest notes", "python3 -m pytest -q", "note")
-    check("test inside test-phase passes", "bin/test-phase run -- dotnet test X", None)
+    check("test inside test-phase passes", "tools/test-phase run -- dotnet test X", None)
     check("test inside heavy.sh passes", "heavy.sh run lane dotnet test X", None)
     check("queued test passes", "brain queue add repo proj --filter 'dotnet test'", None)
     check("dotnet build is quiet", "dotnet build X", None)

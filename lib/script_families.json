@@ -1,5 +1,5 @@
 {
-  "_note": "name; regex (Python re); covered_by (a script in bin/ or hooks/, or none); optional: raw (match the command text as written, default is the text with quoted strings and heredoc bodies dropped), code (a regex that must match the code text first), per_segment (match each part split on ; && || |), exclude (a segment that does not count), kind (method: covered by the method text, not a script). Spans are bounded so a long command cannot make a match slow. Edit here, not in bin/script-repeats or hooks/script-note.py. usage is the one line hooks/script-note.py shows for a family with a covering script.",
+  "_note": "name; regex (Python re); covered_by (a script in tools/ or hooks/, or none); optional: raw (match the command text as written, default is the text with quoted strings and heredoc bodies dropped), code (a regex that must match the code text first), per_segment (match each part split on ; && || |), exclude (a segment that does not count), kind (method: covered by the method text, not a script). Spans are bounded so a long command cannot make a match slow. Edit here, not in tools/script-repeats or hooks/script-note.py. usage is the one line hooks/script-note.py shows for a family with a covering script.",
   "families": [
     {
       "name": "style-slop-grep",
@@ -17,7 +17,7 @@
     },
     {
       "name": "versioned-plugin-path",
-      "regex": "lean-agent/lean-agent/\\d+\\.\\d+\\.\\d+/(bin|hooks|lib)/",
+      "regex": "lean-agent/lean-agent/\\d+\\.\\d+\\.\\d+/(bin|tools|hooks|lib)/",
       "raw": true,
       "kind": "method",
       "covered_by": "scripts block in skills/method/SKILL.md"

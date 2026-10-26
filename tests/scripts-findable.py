@@ -3,11 +3,11 @@
 
 Two rules, both from issue 68:
 
-1. No skill, full-text.md or the README names a script by ${CLAUDE_PLUGIN_ROOT}/bin/ or by a
-   versioned plugin path. The plugin's bin is on PATH, so the bare name works, and a versioned
-   path breaks after an upgrade.
-2. Every script in bin/ that has a --self-test is named in the "Scripts on PATH" block of
-   skills/method/SKILL.md. Only scripts that exist in bin/ are checked.
+1. No skill, full-text.md or the README names a script by the old ${CLAUDE_PLUGIN_ROOT}/bin/ or by a
+   versioned plugin path. Scripts live in tools/ and are not on PATH; the path to use is
+   ${CLAUDE_PLUGIN_ROOT}/tools/<name>, and a versioned path breaks after an upgrade.
+2. Every script in tools/ that has a --self-test is named in the "Scripts" block of
+   skills/method/SKILL.md. Only scripts that exist in tools/ are checked.
 
   tests/scripts-findable.py              check this repository, exit 1 on a problem
   tests/scripts-findable.py --self-test  check the checks against small fixtures, then the repository
@@ -19,7 +19,7 @@ import sys
 
 ROOT = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 METHOD = "skills/method/SKILL.md"
-BLOCK_HEADING = "## Scripts on PATH"
+BLOCK_HEADING = "## Scripts\n"
 
 # Not commands an agent runs: the MCP server entry point and a shared module.
 NOT_COMMANDS = {"brain-mcp", "lean_remote.py"}
@@ -36,7 +36,7 @@ def path_problems(name, text):
     for n, line in enumerate(text.splitlines(), 1):
         for pat in PATH_PATTERNS:
             if pat.search(line):
-                out.append(f"{name}:{n}: names a script by path, use the bare command: {line.strip()[:100]}")
+                out.append(f"{name}:{n}: names a script by a stale path, use CLAUDE_PLUGIN_ROOT/tools/<name>: {line.strip()[:100]}")
                 break
     return out
 
@@ -54,9 +54,9 @@ def missing_from_block(block, names):
     return [n for n in names if not re.search(r"`" + re.escape(n) + r"[ `]", block)]
 
 
-def self_test_scripts(bin_dir):
+def self_test_scripts(tools_dir):
     names = []
-    for path in sorted(glob.glob(os.path.join(bin_dir, "*"))):
+    for path in sorted(glob.glob(os.path.join(tools_dir, "*"))):
         if not os.path.isfile(path):
             continue
         name = os.path.basename(path)
@@ -79,9 +79,9 @@ def check_repo():
     with open(os.path.join(ROOT, METHOD)) as f:
         block = scripts_block(f.read())
     if block is None:
-        problems.append(f'{METHOD}: no "{BLOCK_HEADING}" block')
+        problems.append(f'{METHOD}: no "{BLOCK_HEADING.strip()}" block')
     else:
-        for n in missing_from_block(block, self_test_scripts(os.path.join(ROOT, "bin"))):
+        for n in missing_from_block(block, self_test_scripts(os.path.join(ROOT, "tools"))):
             problems.append(f"{METHOD}: {n} has a --self-test but is missing from the scripts block")
     return problems
 
@@ -98,7 +98,7 @@ def self_test():
     expect("quoted braced form", len(path_problems("x", 'run "${CLAUDE_PLUGIN_ROOT}"/bin/brain')), 1)
     expect("quoted unbraced form", len(path_problems("x", 'run "$CLAUDE_PLUGIN_ROOT"/bin/brain')), 1)
     expect("versioned path", len(path_problems("x", "~/.claude/plugins/cache/x/lean-agent/1.9.0/bin/brain")), 1)
-    expect("bare name", path_problems("x", "run brain list"), [])
+    expect("tools path", path_problems("x", "run ${CLAUDE_PLUGIN_ROOT}/tools/brain list"), [])
     expect("skill path is not a bin path", path_problems("x", "${CLAUDE_PLUGIN_ROOT}/skills/method/full-text.md"), [])
 
     doc = f"# t\n{BLOCK_HEADING}\n- `style-scan`: a\n- `a.sh <x>`: b\n- `c.sh`, `d.py`: e\n## Next\n- `missing.sh`: f\n"

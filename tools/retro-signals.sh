@@ -32,7 +32,7 @@ repeats_section() {
   if command -v timeout >/dev/null 2>&1; then bound="timeout 120"
   elif command -v gtimeout >/dev/null 2>&1; then bound="gtimeout 120"; fi
   printf '\n# script repeats\n'
-  $bound python3 -I "$lib/../bin/script-repeats" --days "${SCRIPT_REPEATS_DAYS:-7}" ${SCRIPT_REPEATS_ROOT:+--root "$SCRIPT_REPEATS_ROOT"} \
+  $bound python3 -I "$lib/../tools/script-repeats" --days "${SCRIPT_REPEATS_DAYS:-7}" ${SCRIPT_REPEATS_ROOT:+--root "$SCRIPT_REPEATS_ROOT"} \
     || echo "script-repeats failed"
 }
 

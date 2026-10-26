@@ -547,7 +547,7 @@ def self_test():
     check("azure CLI exit", r.returncode, 2)
     check("azure CLI message", r.stderr.strip(), "forge: azure is not supported yet; only GitHub is")
 
-    retro = os.path.join(os.path.dirname(here), "..", "bin", "retro-signals.sh")
+    retro = os.path.join(os.path.dirname(here), "..", "tools", "retro-signals.sh")
     r = subprocess.run(["bash", retro, "--since", "2026-10-01", "https://dev.azure.com/o/p/_git/r"],
                        capture_output=True, text=True)
     check("retro-signals on azure exits 2", r.returncode, 2)

@@ -17,7 +17,7 @@ scripts=()
 while IFS= read -r s; do
   [ "$(basename "$s")" = "run-all.sh" ] && continue
   scripts+=("$s")
-done < <(grep -l -- '--self-test' bin/* hooks/*.py lib/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
+done < <(grep -l -- '--self-test' tools/* hooks/*.py lib/*.py skills/*/*.sh skills/*/*.py tests/*.py tests/*.sh 2>/dev/null | sort -u)
 if [ "${#scripts[@]}" -eq 0 ]; then
   echo "run-all: found no scripts with a --self-test" >&2
   exit 1
@@ -59,17 +59,17 @@ fi
 # installs, made after the current version was tagged, never reaches anyone until the version moves.
 version=$(python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')
 if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-  if git diff --quiet "v$version" HEAD -- skills hooks bin lib .claude-plugin; then
+  if git diff --quiet "v$version" HEAD -- skills hooks tools lib .claude-plugin; then
     echo "ok   version $version matches its tag"
   else
-    echo "FAIL skills, hooks, bin or lib changed since v$version: bump the version in .claude-plugin/plugin.json"
+    echo "FAIL skills, hooks, tools or lib changed since v$version: bump the version in .claude-plugin/plugin.json"
     failed=$((failed + 1))
   fi
 else
   echo "ok   version $version is not tagged yet; tag v$version when it merges"
 fi
 
-missing=$(grep -L -- '--self-test' bin/* hooks/*.py 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')
+missing=$(grep -L -- '--self-test' tools/* hooks/*.py 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')
 [ -n "$missing" ] && echo "no self-test: $missing"
 
 for script in "${scripts[@]}"; do

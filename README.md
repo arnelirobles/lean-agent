@@ -72,7 +72,7 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 | `/lean-agent:shape-ticket` | Writes an issue in the agent-ready shape, after searching for one it belongs to. | [Shape the ticket](https://github.com/arnelirobles/lean-agent/wiki/Shape-the-Ticket) |
 | `/lean-agent:adversarial-review` | The critic: one agent hunts, a second tries to refute. | [Adversarial critic](https://github.com/arnelirobles/lean-agent/wiki/Adversarial-Critic) |
 | `/lean-agent:lean-retro` | The retro that changes the method from numbers. | [Self-improving retro](https://github.com/arnelirobles/lean-agent/wiki/Self-Improving-Retro) |
-| Scripts in `bin/` | Preflight, holdout, needs-review, cost, hygiene and more, on the agent's PATH. Each has a `--self-test`. | [Scripts](https://github.com/arnelirobles/lean-agent/wiki/Scripts) |
+| Scripts in `tools/` | Preflight, holdout, needs-review, cost, hygiene and more. Each has a `--self-test`. | [Scripts](https://github.com/arnelirobles/lean-agent/wiki/Scripts) |
 | `test-phase` | Drains the test queue in brain through `heavy.sh` with a stall watchdog, one drainer at a time. Takes a plan file too (one project per line). Sorts failures into flaky and real, logs every command as a run, and writes the failures to brain. | [The cycle](#the-cycle) |
 | `brain` | A local SQLite list of open failures, deferred minors, questions, blockers, running agents and next steps, plus the test queue, with tags, runs and stats. `brain resume` prints what is open for a project, and `brain digest` a 2 KB summary of it (counts, blockers, questions, running jobs, stale agents). | [The cycle](#the-cycle) |
 | `brain-mcp` | An MCP server (the plugin registers it as `brain`) that gives a session eleven tools over the brain database: `brain_list` (open items, newest first, 50 lines unless `limit` says otherwise), `brain_show`, `brain_add`, `brain_close`, `brain_queue_list` (queued and running unless `status` says otherwise), `brain_queue_add`, `brain_queue_cancel`, `brain_queue_bump`, `brain_queue_route`, `brain_digest` and `brain_stats`. It runs the `brain` CLI, sends a body on stdin, and does not expose `queue next` or `queue finish`, which only the drainer uses. | [The cycle](#the-cycle) |
@@ -80,7 +80,7 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 | Hooks | Three block (attribution and slop in public text, a bad commit author, files in a scratchpad root). The rest add a note and never stop the call. One of them hands the session a brain digest for its project at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
 | `lean-stats` | One local SQLite file of tokens, reviews, merges and hook fires. Nothing leaves the machine. | [Measure every batch](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) |
 
-Everything in the method still works without the plugin. Without it, run the scripts from `bin/` (for example `bin/holdout.sh`).
+Everything in the method still works without the plugin. Without it, run the scripts from `tools/` (for example `tools/holdout.sh`).
 
 ## The cycle
 
@@ -98,7 +98,9 @@ test-phase                     # again, to see the list empty
 brain stats                    # flaky rate, lane wait and duration per test project
 ```
 
-The plugin's `bin` directory is on PATH, so these run by name. Without that (older Claude Code, a plain shell), run them from the plugin's `bin` directory.
+The scripts live in the plugin's `tools/` directory and are not on PATH, so a bare `brain` or `test-phase` is not found. Call them by path: `${CLAUDE_PLUGIN_ROOT}/tools/brain list` in a skill or hook, or the install folder in a shell (the folder matching `~/.claude/plugins/*/lean-agent/lean-agent/*/tools`, one per installed version). The session start note prints the absolute folder. To get bare names back, put that folder on your own PATH in your shell profile, for example `export PATH="$(ls -d ~/.claude/plugins/*/lean-agent/lean-agent/*/tools | sort -V | tail -1):$PATH"` (it picks the newest installed version each time a shell starts), or symlink the tools you use into a folder already on PATH. The examples above use bare names for brevity.
+
+Upgrading from 1.15.0 or earlier: `bin/` is gone. Anything you scripted against `bin/<name>`, or against the old bare names that Claude Code put on PATH, needs the `tools/` path. The brain MCP server and the hooks move on their own.
 
 Nobody waits in a loop. A session adds jobs with `brain queue add` (it returns at once) and ends its turn. The orchestrator starts one `test-phase` as a background task and gets one notice when it exits. `test-phase` takes the oldest job whose `--after` job is done, runs it, records the run and the failures, and repeats until nothing is ready. A second `test-phase` while one drains says so and exits 0. A job whose dependency failed or was cancelled is cancelled with the reason. `brain queue list` and `brain resume` show queued and running jobs; `brain queue cancel ID` drops a queued one. `brain queue bump ID` moves a queued job, and the queued jobs chained after it with `--after`, to the front; the last one bumped runs first, and the list marks bumped jobs `bumped`. `brain queue move ID up` or `down` swaps a queued job with its neighbour in run order, and refuses to put a job ahead of the job it waits on. `brain queue list --status queued` lists jobs in the order they will run. Adding a job that is already queued (same folder, project, filter, tier, `--after` and arguments) prints the queued job's id instead of adding a second, so agents that ask for the same run share one build. A fast filter can name several classes joined by `|`, for example `--filter 'OrderTests|InvoiceTests'`; test-phase passes one `--filter-class` per class under MTP (xunit v3 runs the union of repeated ones) and one `FullyQualifiedName~` term per class under VSTest. Under MTP it then lists each class alone, and a class that matches no test fails the job and is named, since the union hides it while another class matches.
 
@@ -136,7 +138,7 @@ What goes where:
 
 Brain never holds secrets, tokens or passwords.
 
-brain's code lives in `lib/brain/`, and `bin/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub; GitLab and Azure DevOps come with tracker support.
+brain's code lives in `lib/brain/`, and `tools/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub; GitLab and Azure DevOps come with tracker support.
 
 ## Settings
 
@@ -202,7 +204,7 @@ It sends data to other services only through tools you already run, and only whe
 
 ## Contributing
 
-A change to `skills/`, `hooks/`, `bin/` or `lib/` moves the version in `.claude-plugin/plugin.json`, and the merge is tagged `v<version>`. `tests/run-all.sh` runs every `--self-test`, lists scripts that have none, and fails when those folders changed since the current version's tag. CI runs it on Ubuntu for every pull request.
+A change to `skills/`, `hooks/`, `tools/` or `lib/` moves the version in `.claude-plugin/plugin.json`, and the merge is tagged `v<version>`. `tests/run-all.sh` runs every `--self-test`, lists scripts that have none, and fails when those folders changed since the current version's tag. CI runs it on Ubuntu for every pull request.
 
 A script that works on any repository belongs here, as a pull request with its test and a line on the [Scripts](https://github.com/arnelirobles/lean-agent/wiki/Scripts) page. See [Scripts, not instructions](https://github.com/arnelirobles/lean-agent/wiki/Scripts-Not-Instructions#4a-the-second-time-an-agent-reasons-its-way-through-something-it-becomes-a-script).
 

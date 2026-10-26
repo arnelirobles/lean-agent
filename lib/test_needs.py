@@ -30,7 +30,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-RUNTIME = os.path.join(HERE, "..", "bin", "check-runtime.sh")
+RUNTIME = os.path.join(HERE, "..", "tools", "check-runtime.sh")
 NEEDS = os.path.join(".lean", "test-needs")
 KINDS = ("docker", "path", "env", "command")
 

@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { emptyDb } from "./fixture";
 
 const BRAIN_LIB = path.join(__dirname, "..", "..", "lib", "brain");
-/** brain's source: bin/brain only starts the package in lib/brain. */
+/** brain's source: tools/brain only starts the package in lib/brain. */
 const brainSource = () =>
   fs.readdirSync(BRAIN_LIB).filter((f) => f.endsWith(".py")).sort()
     .map((f) => fs.readFileSync(path.join(BRAIN_LIB, f), "utf8")).join("\n");

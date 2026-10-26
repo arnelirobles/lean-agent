@@ -5,7 +5,7 @@ SessionStart hook. The method assumes many agents (a drafter, a fresh critic, a
 refuter, up to four changes in flight) and a mix of models (a cheap one drafts,
 an expensive one takes what the critic cannot close, a fast one reads and reports). A strong enough model can
 make one or both of those not worth it, so each is a setting. Set them in the
-env block of Claude Code settings. The defaults print nothing.
+env block of Claude Code settings. The defaults add nothing to the one line that gives the tools path.
 
   LEAN_AGENTS=many   default: subagents for drafting, hunting and refuting
   LEAN_AGENTS=one    everything in this session, no subagents or workflows
@@ -111,9 +111,16 @@ def message(env):
     return " ".join(parts) or None
 
 
+def tools_note():
+    """Where the scripts are. They are not on PATH, so a bare `brain` or `style-scan` is not found."""
+    root = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools")
+    return ("lean-agent tools are not on PATH. Run them as %s/<name>, for example %s/brain list."
+            % (os.path.normpath(root), os.path.normpath(root)))
+
+
 def main():
     hookkit.read_event()
-    text = message(os.environ)
+    text = " ".join(p for p in (tools_note(), message(os.environ)) if p)
     if text:
         hookkit.note("SessionStart", text)
     return 0
@@ -175,6 +182,10 @@ def self_test():
     expect("every role the same model", {"LEAN_MODEL_CHEAP": "opus", "LEAN_MODEL_FAST": "opus"},
            ("are both opus",), ("cost the most",))
     expect("fast steps in one session", {"LEAN_AGENTS": "one"}, ("fast steps", "run in the session itself"))
+    note = tools_note()
+    if "/tools/<name>" not in note or not os.path.isfile(note.split(" as ")[1].split("/<name>")[0] + "/brain"):
+        print(f"FAIL tools note should name a real tools folder: {note}")
+        failures += 1
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

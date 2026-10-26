@@ -5,12 +5,13 @@ PreToolUse hook on Bash. It adds a note, never a deny, in two cases:
   - the command matches a family in lib/script_families.json that has a covering script:
     "`<script>` does this: <usage>". Once per family per session.
   - the command calls a lean-agent script by its .../plugins/cache/lean-agent/lean-agent/
-    <version>/bin/ path: call it by name, since bin is on PATH. Once per session.
+    <version>/tools/ path (or the older bin/ one): the versioned path breaks after an upgrade, use
+    ${CLAUDE_PLUGIN_ROOT}/tools/<name>. Once per session.
 A family whose covering script is a hook (wait-loop, pgrep) gets no note here, nor does
 direct-test-run (wait-loop.py notes that one), nor does a command that already names the
 covering script.
 
-The family patterns are not copied. bin/script-repeats owns them and its load_families and
+The family patterns are not copied. tools/script-repeats owns them and its load_families and
 classify do the matching, so the retro's count and this note read the same file. Each
 family may carry a `usage` line in that file; no usage, no note.
 
@@ -36,9 +37,9 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
 import hookkit  # noqa: E402
 
-REPEATS = os.path.join(HERE, "..", "bin", "script-repeats")
+REPEATS = os.path.join(HERE, "..", "tools", "script-repeats")
 PATH_FAMILY = "versioned-plugin-path"
-BIN_PATH = re.compile(r"lean-agent/lean-agent/\d+\.\d+\.\d+/bin/([A-Za-z0-9][\w.-]*)")
+BIN_PATH = re.compile(r"lean-agent/lean-agent/\d+\.\d+\.\d+/(?:bin|tools)/([A-Za-z0-9][\w.-]*)")
 SID = re.compile(r"[A-Za-z0-9-]{1,100}")
 MAX_AGE = 14 * 86400
 SKIP_FAMILIES = {"direct-test-run"}
@@ -47,7 +48,7 @@ _REPEATS = None
 
 
 def repeats():
-    """bin/script-repeats as a module, loaded once per process without writing bytecode."""
+    """tools/script-repeats as a module, loaded once per process without writing bytecode."""
     global _REPEATS
     if _REPEATS is None:
         sys.dont_write_bytecode = True
@@ -76,8 +77,8 @@ def candidates(command):
         if name == PATH_FAMILY:
             m = BIN_PATH.search(command[:module.CAP])
             if m:
-                out.append((name, "Call `%s` by name, not by its plugin cache path. The plugin's bin "
-                            "is on PATH and the path breaks after an upgrade." % m.group(1)))
+                out.append((name, "Call `%s` as ${CLAUDE_PLUGIN_ROOT}/tools/%s, not by its versioned plugin cache "
+                            "path, which breaks after an upgrade." % (m.group(1), m.group(1))))
             continue
         script = fam["covered_by"]
         usage = fam["usage"]
@@ -264,9 +265,9 @@ def self_test():
     check("unrelated command", fire("ls -la && echo hi", "plain")[1] == "")
     check("wait-loop family gets no note here", fire("pgrep -f dotnet", "pg")[1] == "")
     check("a command naming the script gets no note", fire("holdout.sh --spec x.md  # mutation", "named")[1] == "")
-    rc, text, _ = fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/bin/style-scan --help", "vp")
-    check("versioned path note", "`style-scan`" in text and "by name" in text, repr(text))
-    check("versioned path once", fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/bin/replace x", "vp")[1] == "")
+    rc, text, _ = fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/style-scan --help", "vp")
+    check("versioned path note", "`style-scan`" in text and "CLAUDE_PLUGIN_ROOT" in text, repr(text))
+    check("versioned path once", fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/replace x", "vp")[1] == "")
     check("hooks path is not noted",
           fire("python3 ~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/hooks/wait-loop.py --self-test", "vh")[1] == "")
     rc, text, _ = fire("pytest -q; npm view left-pad version; curl -s https://example.com/h", "two")
@@ -367,7 +368,7 @@ def self_test():
     p = subprocess.run([sys.executable, "-I", os.path.realpath(__file__)], input=json.dumps(
         {"tool_input": {"command": "npm view left-pad version"}, "session_id": "cli-1"}), capture_output=True, text=True)
     check("runs under python3 -I", p.returncode == 0 and "pkg-version" in p.stdout and not p.stderr, p.stderr)
-    check("no bytecode written next to bin/script-repeats",
+    check("no bytecode written next to tools/script-repeats",
           not [f for f in os.listdir(os.path.dirname(os.path.realpath(REPEATS))) if f.endswith(".pyc")])
 
     print("self-test: ok" if failures == 0 else "self-test: %d failed" % failures)

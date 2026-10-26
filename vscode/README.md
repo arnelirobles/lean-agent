@@ -1,6 +1,6 @@
 # Lean Brain for VS Code
 
-A read-mostly dashboard over the lean-agent brain database. It reads the SQLite file and never writes it. The only changes it makes go through `bin/brain` (close, reopen, and closing a question as answered).
+A read-mostly dashboard over the lean-agent brain database. It reads the SQLite file and never writes it. The only changes it makes go through `tools/brain` (close, reopen, and closing a question as answered).
 
 ## What it shows
 
@@ -30,5 +30,5 @@ The fonts in `media/fonts` (Plus Jakarta Sans, IBM Plex Mono) are licensed under
 ## Settings
 
 - `leanBrain.dbPath`: path to brain.db. Empty uses `LEAN_BRAIN_DB`, then `~/.local/share/lean/brain.db`.
-- `leanBrain.brainPath`: path to `bin/brain`. Empty uses `brain` on PATH, then the newest lean-agent plugin in `~/.claude/plugins/cache/lean-agent/lean-agent/*/bin/brain`.
+- `leanBrain.brainPath`: path to `tools/brain`. Empty uses `brain` on PATH, then the newest lean-agent plugin in `~/.claude/plugins/cache/lean-agent/lean-agent/*/tools/brain` (`bin/brain` for plugin versions before 1.16.0).
 - `leanBrain.claudeCommand`: path to the claude executable. Empty uses the absolute PATH entries, then `~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin` and `/usr/local/bin`, since an editor started from the Dock does not get the shell's PATH.

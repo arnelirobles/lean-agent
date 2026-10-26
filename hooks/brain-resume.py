@@ -17,7 +17,7 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
-BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "brain")
+BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")
 
 
 def db_path():
