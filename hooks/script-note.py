@@ -60,6 +60,18 @@ def repeats():
     return _REPEATS
 
 
+TOOLS = os.path.normpath(os.path.join(HERE, "..", "tools"))
+
+
+def with_tools_path(usage):
+    """Put the absolute tools folder in front of each script name a usage line tells the model to run."""
+    names = sorted((n for n in os.listdir(TOOLS) if os.path.isfile(os.path.join(TOOLS, n))), key=len, reverse=True)
+    if not names:
+        return usage
+    pat = re.compile(r"`(" + "|".join(re.escape(n) for n in names) + r")(?=[ `])")
+    return pat.sub(lambda m: "`" + TOOLS + "/" + m.group(1), usage)
+
+
 def candidates(command):
     """(family, note) for each family the command belongs to, before the once-per-session cut."""
     module = repeats()
@@ -88,7 +100,7 @@ def candidates(command):
             code = module.strip_prose(command[:module.CAP])
         if re.search(r"(?<![\w.-])" + re.escape(script) + r"(?![\w-])", code):
             continue
-        out.append((name, "`%s` does this: %s" % (script, usage)))
+        out.append((name, "`%s` does this: %s" % (script, with_tools_path(usage))))
     return out
 
 
@@ -234,7 +246,8 @@ def self_test():
     for name, script, command in covered:
         rc, text, err = fire(command, "fam-" + name)
         check(name + " note", rc == 0 and text.startswith("`%s` does this: " % script) and not err, repr(text))
-        check(name + " usage from the shared file", meta[name]["usage"] in text, repr(text))
+        check(name + " usage from the shared file", with_tools_path(meta[name]["usage"]) in text, repr(text))
+        check(name + " usage runs the script by its absolute path", ("`" + TOOLS + "/") in text, repr(text))
         rc, again, _ = fire(command, "fam-" + name)
         check(name + " once per session", rc == 0 and again == "", repr(again))
         rc, other, _ = fire(command, "fam-" + name + "-b")

@@ -168,7 +168,7 @@ def context_note(last, state, limit):
     state["step"] = step
     return (f"Context is {size // 1000}k tokens. A turn at this size costs about "
             f"{leanstats.message_cost(last):.2f} USD at list price, and every later turn costs more. "
-            "End the batch and resume from brain: file what is open with `brain add`, then continue "
+            "End the batch and resume from brain: file what is open with `" + os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")) + " add`, then continue "
             "in a fresh session. LEAN_CONTEXT_WARN=off turns this note off.")
 
 
