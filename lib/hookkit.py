@@ -64,11 +64,10 @@ def marker_file(sid):
 
 
 def tools_on_path():
-    """True when the tools folder is on PATH for this session. SessionStart sees CLAUDE_ENV_FILE; any other
-    event needs the marker session-env wrote for its session id (the marker names the folder, so an upgrade
-    does not match an old one). PATH naming the folder counts too."""
-    if _EVENT.get("hook_event_name") == "SessionStart" and os.environ.get("CLAUDE_ENV_FILE"):
-        return True
+    """True when the tools folder is on PATH for this session: PATH names it, or the marker session-env
+    writes once the PATH line has landed in the env file names it (so an upgrade does not match an old one).
+    CLAUDE_ENV_FILE alone never counts: SessionStart hooks run in parallel, so session-env may not have
+    written it yet, or the write may have failed."""
     if TOOLS in [os.path.normpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]:
         return True
     marker = marker_file(_EVENT.get("session_id"))
@@ -487,9 +486,10 @@ def self_test():
         os.environ["HOME"] = home
         _EVENT = {}
         check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
-        os.environ["CLAUDE_ENV_FILE"] = "/tmp/env"
+        os.environ["CLAUDE_ENV_FILE"] = os.path.join(home, "no-such-dir", "env")  # session-env cannot write it
         _EVENT = {"hook_event_name": "SessionStart", "session_id": "m-1"}
-        check("tool_path is the bare name at SessionStart with CLAUDE_ENV_FILE set", tool_path("brain"), "brain")
+        check("SessionStart with an unwritable env file and no marker gives the absolute path",
+              tool_path("brain"), shlex.quote(os.path.join(TOOLS, "brain")))
         _EVENT = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
         check("CLAUDE_ENV_FILE alone does not count outside SessionStart", tools_on_path(), False)
         os.environ.pop("CLAUDE_ENV_FILE")

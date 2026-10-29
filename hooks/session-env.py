@@ -44,7 +44,9 @@ def path_line():
 
 
 def ours(line):
-    """True for a PATH line this hook wrote, for this tools folder or any other lean-agent version's."""
+    """True for a PATH line this hook wrote: for this tools folder, or for another lean-agent version's in the
+    plugin cache (<...>/plugins/cache/<marketplace>/lean-agent/<version>/tools). Any other folder, a dev
+    checkout included, belongs to someone else and stays."""
     m = PATH_LINE.fullmatch(line)
     if not m:
         return False
@@ -57,9 +59,44 @@ def ours(line):
     folder = os.path.normpath(parts[0])
     if folder == hookkit.TOOLS:
         return True
-    return os.path.basename(folder) == "tools" and (
-        "lean-agent" in folder.split(os.sep)
-        or os.path.exists(os.path.join(os.path.dirname(folder), "hooks", "session-env.py")))
+    p = folder.split(os.sep)
+    return len(p) >= 7 and p[-1] == "tools" and p[-3] == "lean-agent" and p[-5] == "cache" and p[-6] == "plugins"
+
+
+def _locked(env_file):
+    """Open env_file (creating it) and hold an exclusive flock on it, so two copies of this hook do not
+    lose each other's lines. Returns the fd, or None where flock does not exist. Retries when the file was
+    replaced while we waited, since the lock is on the old inode then."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    for _ in range(10):
+        fd = os.open(env_file, os.O_RDONLY | os.O_CREAT, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.fstat(fd).st_ino == os.stat(env_file).st_ino:
+                return fd
+        except OSError:
+            pass
+        os.close(fd)
+    raise OSError("env file keeps changing")
+
+
+def _replace(env_file, text, mode):
+    """Write text to a temp file beside env_file and rename it over, so a crash never leaves half a file."""
+    fd, tmp = tempfile.mkstemp(prefix=".lean-env-", suffix=".tmp", dir=os.path.dirname(os.path.abspath(env_file)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, env_file)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_env(env_file, sid=None, cwd="", session=True):
@@ -68,7 +105,8 @@ def write_env(env_file, sid=None, cwd="", session=True):
     the PATH line comes last: a PowerShell session reads the file only if every line is a plain assignment,
     and the newest tools folder must win over an old version's. The PATH line appends, so a tool named like a
     system command does not shadow it. With no sid, or session False (LEAN_SESSION_ENV=off), only the PATH
-    line is written and any LEAN_SESSION lines stay.
+    line is written and any LEAN_SESSION lines stay. The read and the write happen under a lock, the write
+    goes through a temp file and a rename, and the file keeps its mode and its line endings.
     The marker, for hooks that never see the env file, is written only when the PATH line landed."""
     new = []
     session = bool(sid and session)
@@ -77,24 +115,38 @@ def write_env(env_file, sid=None, cwd="", session=True):
         if cwd:
             new.append(f"export LEAN_SESSION_CWD={shlex.quote(cwd)}")
     new.append(path_line())
+    existed = os.path.exists(env_file)
+    if existed and not os.access(env_file, os.W_OK):
+        return False  # a read-only file is someone's choice, a rename would get around it
     try:
-        with open(env_file, encoding="utf-8") as f:
-            content = f.read()
-    except FileNotFoundError:
-        content = ""
-    except (OSError, UnicodeDecodeError):
-        return False  # never overwrite a file we could not read
-    lines = content.split("\n")
-    if lines[-1] == "":
-        lines.pop()
-    kept = [ln for ln in lines if not ours(ln) and not (session and SESSION_LINE.match(ln))]
-    text = "".join(ln + "\n" for ln in kept + new)
-    if text != content:
+        lock = _locked(env_file)
+    except OSError:
+        return False
+    try:
         try:
-            with open(env_file, "w", encoding="utf-8") as f:
-                f.write(text)
-        except OSError:
-            return False
+            with open(env_file, encoding="utf-8", newline="") as f:
+                content = f.read()
+            st_mode = os.stat(env_file).st_mode & 0o7777
+        except FileNotFoundError:  # no flock here, so nothing created it
+            umask = os.umask(0)
+            os.umask(umask)
+            content, st_mode = "", 0o666 & ~umask
+        except (OSError, UnicodeDecodeError):
+            return False  # never overwrite a file we could not read
+        nl = "\r\n" if "\r\n" in content else "\n"
+        lines = content.split(nl)
+        if lines[-1] == "":
+            lines.pop()
+        kept = [ln for ln in lines if not ours(ln) and not (session and SESSION_LINE.match(ln))]
+        text = "".join(ln + nl for ln in kept + new)
+        if text != content:
+            try:
+                _replace(env_file, text, st_mode)
+            except OSError:
+                return False
+    finally:
+        if lock is not None:
+            os.close(lock)
     marker = hookkit.marker_file(sid)
     if marker:
         try:
@@ -214,7 +266,7 @@ def self_test():
                              capture_output=True, text=True).stdout
         if got != "1|glue-1":
             fails.append(f"a file with no final newline must keep its last line apart from ours: {got!r}")
-        cache = os.path.join(d, "cache", "lean-agent")
+        cache = os.path.join(d, "plugins", "cache", "mkt", "lean-agent")
         old_tools = os.path.join(cache, "1.16.0", "tools")
         os.makedirs(old_tools)
         with open(os.path.join(old_tools, "brain"), "w") as fh:
@@ -230,6 +282,51 @@ def self_test():
         if wins != os.path.join(hookkit.TOOLS, "brain"):
             fails.append(f"after an upgrade bare brain must run the current version, not {wins!r}: "
                          f"{open(upgraded).read()!r}")
+        others = [os.path.join(d, "repos", "lean-agent", "tools"), os.path.join(d, "lean-agent", "foo", "tools"),
+                  os.path.join(d, "dev", "tools"), os.path.join(d, "plugins", "cache", "lean-agent", "tools")]
+        os.makedirs(os.path.join(d, "dev", "hooks"))
+        open(os.path.join(d, "dev", "hooks", "session-env.py"), "w").close()
+        mixed = os.path.join(d, "mixed-env")
+        with open(mixed, "w") as fh:
+            fh.write("".join(f'export PATH="$PATH":{shlex.quote(o)}\n' for o in others + [old_tools]))
+        write_env(mixed)
+        if open(mixed).read() != "".join(f'export PATH="$PATH":{shlex.quote(o)}\n' for o in others) + want + "\n":
+            fails.append(f"only the old plugin-cache tools line may go; a dev checkout, an arbitrary tools folder and "
+                         f"one with hooks/session-env.py beside it stay: {open(mixed).read()!r}")
+        atomic = os.path.join(d, "atomic-env")
+        with open(atomic, "w") as fh:
+            fh.write("export FOREIGN=1\r\nexport B=2\r\n")
+        os.chmod(atomic, 0o640)
+        inode = os.stat(atomic).st_ino
+        write_env(atomic)
+        if os.stat(atomic).st_ino == inode:
+            fails.append("the env file must be written to a temp file and renamed over, never truncated in place")
+        if open(atomic, newline="").read() != f"export FOREIGN=1\r\nexport B=2\r\n{want}\r\n":
+            fails.append(f"foreign lines must survive and CRLF must stay CRLF: {open(atomic, newline='').read()!r}")
+        if os.stat(atomic).st_mode & 0o777 != 0o640:
+            fails.append(f"the env file must keep its mode: {oct(os.stat(atomic).st_mode & 0o777)}")
+        if [n for n in os.listdir(d) if n.endswith(".tmp")]:
+            fails.append("no temp file may be left beside the env file")
+        import fcntl
+        raced = os.path.join(d, "raced-env")
+        with open(raced, "w") as fh:
+            fh.write("export A=1\n")
+        env["CLAUDE_ENV_FILE"] = raced
+        held = os.open(raced, os.O_RDONLY)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        child = subprocess.Popen([sys.executable, me], stdin=subprocess.PIPE, env=env, text=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child.stdin.write('{"hook_event_name": "SessionStart", "session_id": "race-1", "cwd": "/w"}')
+        child.stdin.close()
+        time.sleep(0.5)
+        waited = open(raced).read() == "export A=1\n"
+        with open(raced, "a") as fh:
+            fh.write("export OTHER=1\n")  # another hook appends while we hold the lock
+        os.close(held)
+        child.wait()
+        if not waited or "export OTHER=1\n" not in open(raced).read():
+            fails.append(f"a second writer must wait for the lock and keep the line added meanwhile: "
+                         f"{open(raced).read()!r}")
         for label, bad in (("a missing folder", os.path.join(d, "no-such-dir", "env")),
                            ("a read-only file", os.path.join(d, "ro-env"))):
             if label == "a read-only file":
