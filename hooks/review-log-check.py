@@ -140,11 +140,13 @@ def parse_az(words):
     return pairs.get("--id"), helped
 
 
-def view(cwd, arg, repo, env=None):
-    """(number, url) from gh pr view, else None."""
+def view(cwd, arg, repo):
+    """(number, url) from gh pr view, else None. Runs with the hook's own environment, never the
+    command's inline one: the hook runs before the command is approved, so an inline PATH must not
+    pick which gh runs."""
     cmd = ["gh", "pr", "view"] + ([arg] if arg else []) + (["-R", repo] if repo else []) + ["--json", "number,url"]
     try:
-        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5, env=env)
+        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
         if out.returncode != 0:
             return None
         data = json.loads(out.stdout)
@@ -154,7 +156,6 @@ def view(cwd, arg, repo, env=None):
 
 
 def target(seg, kind, parsed):
-    env = dict(os.environ, **seg.env)
     """(number, repo name as owner/repo or '') for the pull request this command acts on, else None."""
     if kind == "az":
         number = parsed[0]
@@ -162,7 +163,7 @@ def target(seg, kind, parsed):
             return None
         return int(number), full_name(hookkit.git(seg.cwd, "remote", "get-url", "origin") or "")
     action, arg, repo, helped = parsed
-    repo = repo or env.get("GH_REPO") or None
+    repo = repo or seg.env.get("GH_REPO") or os.environ.get("GH_REPO") or None
     if arg:
         found = re.fullmatch(r"#?(\d+)", arg)
         if found:
@@ -170,7 +171,7 @@ def target(seg, kind, parsed):
         found = re.search(r"([^/]+/[^/]+)/pull/(\d+)", arg)
         if found:
             return int(found.group(2)), found.group(1)
-    got = view(seg.cwd, arg, repo, env)
+    got = view(seg.cwd, arg, repo)
     if not got:
         return None
     return got[0], full_name(got[1]) or repo or ""
@@ -283,6 +284,14 @@ def self_test():
             os.chmod(fake, os.stat(fake).st_mode | stat.S_IXUSR)
 
         fake_gh("exit 1")
+        evil = os.path.join(tmp, "evil")
+        os.mkdir(evil)
+        marker = os.path.join(tmp, "evil-ran")
+        with open(os.path.join(evil, "gh"), "w") as fh:
+            fh.write("#!/bin/sh\n/usr/bin/touch " + marker + "\n")
+        os.chmod(os.path.join(evil, "gh"), 0o755)
+        message("PATH=" + evil + " gh pr merge feat/x", repo)
+        check("inline PATH does not pick the gh the hook runs", os.path.exists(marker), False)
         check("logged number allows", message("gh pr merge 5", repo), False)
         check("logged ready allows", message("gh pr ready 5", repo), False)
         check("unlogged merge denies", message("gh pr merge 6", repo), True)
