@@ -45,8 +45,8 @@ CAUSES = [
     ("playwright browsers missing", "run `npx playwright install` in the project, or use an image that has the browsers",
      re.compile(r"Executable doesn't exist at|npx playwright install")),
     ("npm registry login", "the npm registry needs credentials this lane does not have; run it on the local lane",
-     re.compile(r"npm (?:error|ERR!) (?:code )?(?:E401|ENEEDAUTH)\b|Unable to authenticate"
-                r"|npm (?:error|ERR!)[^\n]*\b403\b[^\n]*(?:Forbidden|install)")),
+     re.compile(r"npm (?:error|ERR!)[^\n]*(?:\bE401\b|\bENEEDAUTH\b|Unable to authenticate)"
+                r"|npm (?:error|ERR!) 403\b")),
 ]
 MIN_SHARED = 3  # fewer than this is a test problem, not a machine problem
 
@@ -195,6 +195,14 @@ def environmental(failing):
     top = max(by, key=lambda k: len(by[k][1]))
     hint = by[top][0] if len(by) == 1 else "; ".join(h for h, _ in by.values())
     return top, hint, names, {k: len(v[1]) for k, v in by.items()}
+
+
+LOCAL_NPM_HINT = "check the login in ~/.npmrc or run npm login"
+
+
+def lane_hint(label, hint, remote):
+    """The npm login hint depends on the lane: a remote lane cannot be logged in, the local one can."""
+    return hint if remote or label != "npm registry login" else LOCAL_NPM_HINT
 
 
 def log_cause(text):
@@ -366,6 +374,11 @@ def self_test():
         got = log_cause(sample)
         if not got or got[0] != "npm registry login" or "local lane" not in got[1]:
             fails.append(f"an npm auth failure must be an environmental cause: {sample!r} {got}")
+    if log_cause("FAIL auth.test.ts > shows Unable to authenticate message\n  AssertionError: E401 not shown"):
+        fails.append("a test that merely mentions E401 or Unable to authenticate is not an npm login cause")
+    if lane_hint("npm registry login", "x", False) != LOCAL_NPM_HINT or lane_hint("npm registry login", "x", True) != "x" \
+            or lane_hint("database unreachable", "y", False) != "y":
+        fails.append("lane_hint must change only the npm login hint, and only on the local lane")
     if log_cause("npm error code E404\nnpm error 404 Not Found") or log_cause("exit 1: Assert.Equal failed"):
         fails.append("a missing package or an ordinary failure is not an npm login cause")
     npm = {f"a.test.ts > t{i}": "npm error code E401\nUnable to authenticate" for i in range(3)}

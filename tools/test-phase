@@ -107,7 +107,7 @@ Runner support is a class with mode, command, failures, counts and class_of; ano
 class in RUNNERS. Dotnet runs a test project. Vitest runs a job whose test path ends in package.json (for
 example web/package.json): in that folder it installs with the nearest lockfile, looked up from that folder
 to the repo root (pnpm-lock.yaml: pnpm install --frozen-lockfile; package-lock.json: npm ci in the lockfile's
-folder; yarn.lock is refused, and with no lockfile pnpm install runs), then runs `vitest run --reporter=verbose` (or `npm test -- --reporter=verbose`, `pnpm run test`, when the package.json has a "test" script)
+folder; yarn.lock is refused, and with no lockfile pnpm install runs), then runs `vitest run --reporter=verbose` (or `npm test -- --reporter=verbose`, `pnpm run test`, when the package.json "test" script runs vitest or one node file, with no &&, ; or |)
 (pnpm exec, or npx for npm), the fast filter pieces as file filters. A failed test file is the class, so the
 rerun is per file. Playwright runs a job whose test path ends in playwright.config.ts, .js, .mjs or .cjs: the
 same install in the config's folder, then `playwright test --reporter=list` with the filter pieces as file
@@ -408,10 +408,11 @@ while :; do
   [ "$d" = "$R" ] || [ "$d" = / ] && break
   d=$(dirname "$d")
 done
-# A package.json with a "test" script runs that script: it may set --root, the time zone or other flags that a bare
-# vitest run from this folder would miss. Extra arguments (the reporter, file filters) go after it.
+# A "test" script that runs vitest, or one node file that does (it may set --root or the time zone, which a bare
+# vitest run from this folder would miss), is run instead, with the extra arguments after it. A chained script
+# (&&, ; or |), the npm init placeholder, jest and the like keep the bare vitest run.
 S=
-if [ "$T" = vitest ] && [ -n "$(node -p "(require('./package.json').scripts||{}).test?1:''" 2>/dev/null)" ]; then S=1; fi
+if [ "$T" = vitest ] && [ -n "$(node -p "s=(require('./package.json').scripts||{}).test||'';(/\\bvitest\\b|^\\s*node\\s/.test(s)&&!/&&|;|\\||no test specified/.test(s))?1:''" 2>/dev/null)" ]; then S=1; fi
 case "$T" in
   vitest) if [ -n "$S" ]; then set -- --reporter=verbose "$@"; else set -- vitest run --reporter=verbose "$@"; fi ;;
   playwright) set -- playwright test --reporter=list "$@" ;;
@@ -1190,6 +1191,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     cause = tn.environmental(failing) if tn else None
     if cause:  # the machine failed, not the tests: one blocker, and none of these is rerun or counted as flaky
         label, hint, names, counts = cause
+        hint = tn.lane_hint(label, hint, remote)
         total = len(failing)
         for n in names:
             del failing[n]
@@ -1229,7 +1231,8 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
                  f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
     elif rc != 0 and not failing and not row.get("env") and tn and tn.log_cause(text):
-        label, hint = tn.log_cause(text)  # the install or build never reached a test: say why, not "build error?"
+        label, hint = tn.log_cause(text)
+        hint = tn.lane_hint(label, hint, remote)  # the install or build never reached a test: say why, not "build error?"
         row["env"], row["env_label"] = 1, label
         row["notes"].append(f"exit {rc}, environment: {label}")
         add_item(row, "blocker", f"environment: {label}: {project}", "important",
@@ -1827,6 +1830,14 @@ def node_checks(fails, fixture):
         rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest", "test/a.test.ts|test/b.test.ts")
         if rc != 0 or calls[1:] != ["npm test -- --reporter=verbose test/a.test.ts test/b.test.ts in dopa"]:
             fails.append(f"a package.json with a test script must run npm test with the args after --: {rc} {calls} {err}")
+    for script in ('echo \\"Error: no test specified\\" && exit 1', "jest", "vitest run && tsc", "node a.js; node b.js"):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "package-lock.json", ())
+            with open(os.path.join(d, "packages", "dopa", "package.json"), "w") as fh:
+                fh.write(json.dumps({"scripts": {"test": script}}) + "\n")
+            rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+            if rc != 0 or calls[1:] != ["npx --no-install vitest run --reporter=verbose in dopa"]:
+                fails.append(f"a test script {script!r} that is a placeholder, jest or chained must keep the bare vitest run: {rc} {calls} {err}")
     with tempfile.TemporaryDirectory() as d:
         tree(d, "pnpm-lock.yaml", ())
         with open(os.path.join(d, "packages", "dopa", "package.json"), "w") as fh:
