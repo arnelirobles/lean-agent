@@ -1,10 +1,14 @@
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 from urllib.parse import urlparse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+import gradle_args  # noqa: E402
 
 from .items import infer_session, session_ok
 from .store import connect, now
@@ -118,14 +122,36 @@ def private_npm_feed(repo, test_project):
         folder = os.path.dirname(folder)
 
 
-def detect_platform(repo, test_project):
-    """'apple' when the job may need an Apple platform, 'private' when an npm job needs a private feed, else ''.
+GRADLE_SETTINGS = ("settings.gradle.kts", "settings.gradle")
+
+
+def is_gradle(repo, test_project):
+    """True when the test path is a Gradle settings file or a folder that holds one."""
+    if os.path.basename(test_project) in GRADLE_SETTINGS:
+        return True
+    folder = os.path.join(repo, test_project)
+    return os.path.isdir(folder) and any(os.path.isfile(os.path.join(folder, n)) for n in GRADLE_SETTINGS)
+
+
+def gradle_ios(args):
+    """True when the job's args name an iOS test task (gradle_args.ios_test_tasks), which needs a Mac."""
+    try:
+        return bool(gradle_args.ios_test_tasks(shlex.split(args or "")))
+    except ValueError:
+        return False
+
+
+def detect_platform(repo, test_project, args=None):
+    """'apple' when the job may need an Apple platform, 'private' when an npm job needs a private feed or the job is
+    a Gradle build (local only, its publishing credentials never leave this machine), else ''.
 
     Conservative: the project file, Directory.Build.props from its folder up to the repo root, and every
     project it references (transitively) are checked. A project that cannot be found or read, or a folder
     with more than one csproj, gives 'apple' too: unknown means local only."""
     path = os.path.join(repo, test_project)
     base = os.path.basename(test_project)
+    if is_gradle(repo, test_project):
+        return "apple" if gradle_ios(args) else "private"
     if base == "package.json" or base.startswith("playwright.config"):
         return "private" if private_npm_feed(repo, test_project) else ""
     try:
@@ -218,7 +244,9 @@ def cmd_queue(a):
         commit = git_out(repo, "rev-parse", "HEAD") or ""
         # Everything that runs git or reads files happens before the write lock is taken.
         project = a.project or project_of(repo)
-        platform = detect_platform(repo, a.test_project) if a.platform == "auto" else ("apple" if a.platform == "apple" else "")
+        if a.platform == "none" and is_gradle(repo, a.test_project):
+            sys.exit("brain: a Gradle job runs on the local lane only, so --platform none is refused")
+        platform = detect_platform(repo, a.test_project, a.args) if a.platform == "auto" else ("apple" if a.platform == "apple" else "")
         st = subprocess.run(["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True) \
             if a.tier == "full" and commit and not again else None
         session, session_cwd = a.session, a.session_cwd if a.session else ""
@@ -372,18 +400,22 @@ def cmd_queue(a):
                 sys.exit(f"brain: no job #{a.id}")
             if r["status"] != "queued":
                 sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be routed")
+            # A Gradle job never goes to a remote lane, with or without --force: any would let one claim it.
+            if is_gradle(r["repo_dir"], r["test_project"]) and a.to in ("remote", "any"):
+                sys.exit(f"brain: job #{a.id} is a Gradle build and runs on this machine only: a remote lane never "
+                         "receives its Gradle or Maven credentials, so only --to local is allowed")
             # Refuse only a job marked apple: detect_platform also says apple for a project it cannot read.
-            if a.to == "remote" and r["platform"] == "private" and not a.force:
-                sys.exit(f"brain: job #{a.id} uses a private npm feed whose login only this machine has, so npm ci "
-                         "would fail with E401 on a remote host; pass --force to send it anyway")
-            if a.to == "any" and r["platform"] == "private" and not a.force:
-                sys.exit(f"brain: job #{a.id} uses a private npm feed whose login only this machine has, so a remote "
-                         "lane would fail it with E401; pass --force to let any lane take it")
+            why = "uses a private npm feed whose login only this machine has, so npm ci would fail with E401 on a remote host"
+            if a.to in ("remote", "any") and r["platform"] == "private" and not a.force:
+                sys.exit(f"brain: job #{a.id} {why}; pass --force to "
+                         + ("send it anyway" if a.to == "remote" else "let any lane take it"))
             if a.to == "remote" and r["platform"] == "apple" and not a.force:
                 sys.exit(f"brain: job #{a.id} is marked Apple, this machine only, and would likely fail to build on a remote host; "
                          "pass --force to send it anyway")
             con.execute("UPDATE jobs SET platform=? WHERE id=?",
-                        ({"remote": "remote", "local": "apple", "any": ""}[a.to], a.id))
+                        (detect_platform(r["repo_dir"], r["test_project"], r["args"]) if a.to == "local"
+                         and is_gradle(r["repo_dir"], r["test_project"]) else
+                         {"remote": "remote", "local": "apple", "any": ""}[a.to], a.id))
         if a.to == "remote" and detect_platform(r["repo_dir"], r["test_project"]) == "private":
             print(f"brain: job #{a.id} uses a private npm feed; npm ci can fail with E401 on a remote host",
                   file=sys.stderr)
@@ -401,6 +433,10 @@ def cmd_queue(a):
                 sys.exit(f"brain: job #{a.id} is {r['status']}, only a running job can be requeued")
             con.execute("UPDATE jobs SET status='queued', host='', started_at=NULL, reason=? WHERE id=?",
                         (a.reason, a.id))
+            if is_gradle(r["repo_dir"], r["test_project"]) and r["platform"] not in ("apple", "private"):
+                # A remote lane got a Gradle job (it was routed or added by hand): keep it local from now on.
+                con.execute("UPDATE jobs SET platform=? WHERE id=?",
+                            (detect_platform(r["repo_dir"], r["test_project"], r["args"]), a.id))
         print(job_line(con.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()))
         return 0
     if a.qcmd == "finish":

@@ -77,6 +77,8 @@ The lockfile is looked up from the package folder to the repo root, so a pnpm wo
 
 A job whose test path is a `playwright.config.ts` (or `.js`, `.mjs`, `.cjs`) runs Playwright from that folder: the same install, then `playwright test --reporter=list`. The fast filter pieces are file filters, and a failed test is named `file > title`, so a rerun is per spec file. The default `node_image` has no Playwright browsers, so on a host set `node_image` to an image that has them (for example `mcr.microsoft.com/playwright`) or run the job on the local lane.
 
+A job whose test path is a `settings.gradle.kts` or `settings.gradle` (or the folder holding one) is a Gradle job. It never runs on a remote lane: a Gradle build can read `~/.gradle/gradle.properties`, `~/.gradle/init.d`, `~/.m2/settings.xml` and signing keys, and the local lane is the only place that has been checked for that. The job is marked `platform=private`, so only the local lane takes it. `brain queue route ID --to remote` and `--to any` refuse it, with or without `--force`, `brain queue add --platform none` is refused, and a remote lane that still receives one hands it back (brain pins it local again). `run_script` refuses `kind=gradle`. `lean_remote` does not add Gradle files to its never-copy list, because a Gradle job never reaches the copy.
+
 Three things to know:
 
 - A drainer from before the Vitest runner does not know `package.json` jobs. It runs one as `dotnet test` and fails it with a `run-failed` item. Replace every copy of `test-phase` before queueing one.
@@ -99,7 +101,7 @@ Each claim prunes: the newest `build_keep` folders of the repository stay (newes
 
 ## Which jobs go where
 
-A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. An npm job (a `package.json` or Playwright config) whose `.npmrc`, in its folder or any folder up to the repo root, names a registry other than registry.npmjs.org is marked `platform=private` and also runs on the local lane only: its login lives in `~/.npmrc` on this machine, and the copy to a remote host never sends secrets. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
+A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. An npm job (a `package.json` or Playwright config) whose `.npmrc`, in its folder or any folder up to the repo root, names a registry other than registry.npmjs.org is marked `platform=private` and also runs on the local lane only: its login lives in `~/.npmrc` on this machine, and the copy to a remote host never sends secrets. A Gradle job is `platform=private` too (see above), and `platform=apple` when its `--args` name an iOS test task (a test task whose name contains `ios`, in any case; option values do not count). Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
 
 To choose for a job already queued, use `brain queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs queued before the upgrade to schema 7 are all marked `platform=apple`, so route the ones you want on a remote host. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
 

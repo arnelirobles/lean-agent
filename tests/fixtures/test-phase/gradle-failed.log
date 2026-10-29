@@ -1,0 +1,23 @@
+> Task :shared:compileKotlinJvm UP-TO-DATE
+> Task :shared:jvmTest FAILED
+
+CartTest > addsItem() FAILED
+    org.opentest4j.AssertionFailedError at CartTest.kt:12
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':shared:jvmTest'.
+> There were failing tests. See the report at: file:///repo/shared/build/reports/tests/jvmTest/index.html
+
+* Try:
+> Run with --scan to get full insights.
+
+BUILD FAILED in 40s
+lean-gradle: passed 10 failed 2 skipped 0 files 3
+lean-gradle-failed: com.acme.CartTest > addsItem
+lean-gradle-detail: expected:<2> but was:<1> org.opentest4j.AssertionFailedError: expected:<2> but was:<1>
+lean-gradle-failed: com.acme.CartTest > removesItem
+lean-gradle-detail: expected:<0> but was:<1>
+lean-gradle-failed: com.acme.PriceTest > rounds
+lean-gradle-detail: boom

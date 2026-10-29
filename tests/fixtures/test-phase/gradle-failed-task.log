@@ -1,0 +1,16 @@
+> Task :shared:compileKotlinJvm UP-TO-DATE
+> Task :shared:jvmTest
+> Task :shared:verifyFixtures FAILED
+> Task :shared:check SKIPPED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':shared:verifyFixtures'.
+> fixture drift: schema/cart.json differs from the generated copy
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+
+BUILD FAILED in 12s
+lean-gradle: passed 12 failed 0 skipped 0 files 3

@@ -44,6 +44,8 @@ CAUSES = [
      re.compile(r"NpgsqlException[^\n]*Failed to connect to")),
     ("playwright browsers missing", "run `npx playwright install` in the project, or use an image that has the browsers",
      re.compile(r"Executable doesn't exist at|npx playwright install")),
+    ("gradle toolchain missing", "install a JDK (or let Gradle download the toolchain), or point sdk.dir at the Android SDK; run it where the build tools exist",
+     re.compile(r"Unable to locate a Java Runtime|JAVA_HOME is not set|SDK location not found|No matching toolchains found|Could not (?:install|download) Gradle distribution")),
     ("npm registry login", "the npm registry needs credentials this lane does not have; run it on the local lane",
      re.compile(r"npm (?:error|ERR!)[^\n]*(?:\bE401\b|\bENEEDAUTH\b|Unable to authenticate)"
                 r"|npm (?:error|ERR!) 403\b")),
@@ -376,6 +378,13 @@ def self_test():
             fails.append(f"an npm auth failure must be an environmental cause: {sample!r} {got}")
     if log_cause("FAIL auth.test.ts > shows Unable to authenticate message\n  AssertionError: E401 not shown"):
         fails.append("a test that merely mentions E401 or Unable to authenticate is not an npm login cause")
+    for sample in ("Unable to locate a Java Runtime.", "SDK location not found. Define a valid SDK location",
+                   "No matching toolchains found for requested specification"):
+        got = log_cause(sample)
+        if not got or got[0] != "gradle toolchain missing":
+            fails.append(f"a missing JDK or SDK must be an environmental cause: {sample!r} {got}")
+    if log_cause("e: file.kt: Unresolved reference: sdk"):
+        fails.append("a compile error is not a Gradle toolchain cause")
     if lane_hint("npm registry login", "x", False) != LOCAL_NPM_HINT or lane_hint("npm registry login", "x", True) != "x" \
             or lane_hint("database unreachable", "y", False) != "y":
         fails.append("lane_hint must change only the npm login hint, and only on the local lane")

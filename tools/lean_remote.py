@@ -384,7 +384,11 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None, kind="dotn
     dest is a kept build folder. build is the build command to run first in it, and the folder's lock is
     released after it, with mark written only when the build succeeded.
     kind vitest or playwright runs in node_image with a pnpm store volume (corepack and the store live in <workdir>/.node-cache);
-    the container is on the job's bridge network, so it has outbound network for the install."""
+    the container is on the job's bridge network, so it has outbound network for the install.
+    kind gradle is refused: a Gradle build can reach publishing credentials and signing keys, and the remote lane
+    never receives them."""
+    if kind == "gradle":
+        raise ValueError("a Gradle job does not run on a remote lane: it could reach the Gradle or Maven credentials of this machine")
     jd = sh_path(dest or job_dir(r, job_id))
     node = kind in ("vitest", "playwright")
     nuget = sh_path(r.workdir.rstrip("/") + ("/.node-cache" if node else "/.nuget"))
@@ -627,6 +631,12 @@ docker = yes
             fails.append(f"file_list must never copy a package manager config, even with an empty exclude: {left}")
         for rc_name in (".npmrc", "web/.npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"):
             os.remove(os.path.join(repo, rc_name))
+        try:
+            run_script(Remote(name="dev", host="h", workdir="~/w"), None, 1, "./gradlew check", kind="gradle")
+            fails.append("run_script must refuse a Gradle job")
+        except ValueError as e:
+            if "remote lane" not in str(e):
+                fails.append(f"the Gradle refusal must say why: {e}")
         os.symlink("/etc/hosts", os.path.join(repo, ".lean.env"))
         if ".lean.env" in file_list(repo, [], []):
             fails.append("a repo file named .lean.env must never be copied over the env file")
