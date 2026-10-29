@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.acme.CartTest" tests="3" skipped="1" failures="0" errors="0" timestamp="2026-10-29T10:00:00" hostname="h" time="0.1">
+  <testcase name="addsItem" classname="com.acme.CartTest" time="0.01"/>
+  <testcase name="removesItem" classname="com.acme.CartTest" time="0.01"/>
+  <testcase name="later" classname="com.acme.CartTest" time="0.0"><skipped/></testcase>
+</testsuite>

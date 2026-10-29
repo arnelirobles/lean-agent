@@ -115,6 +115,16 @@ filters. A failed test is named file > title, and the spec file is the class. Th
 from the test path (runner_for). TEST_PHASE_DOTNET_ARGS does not reach a Vitest or Playwright job; `args=` on
 the job does. A remote lane runs them in the node_image container, which has no Playwright browsers; see
 docs/remote-lane.md.
+
+Gradle runs a job whose test path is a settings.gradle(.kts) or the folder holding one. It runs only the repo's
+./gradlew (`--console=plain --continue --no-daemon`; heavy.sh stops only its own process group, so a daemon
+would outlive a stall kill), by default the `check` task, or the tasks in `args=` (for example
+`jvmTest iosSimulatorArm64Test`). Filter pieces become `--tests <piece>` on each test task, so a filter needs a
+test task in `args=`. The environment loses ORG_GRADLE_PROJECT_*, and any name with SIGNING, MAVEN_CENTRAL or
+GPG; -P, -Dorg.gradle.project.*, -I and -g are refused. Results come from the TEST-*.xml files under
+build/test-results that this run wrote (older files are ignored). A green exit with no test is ran-no-tests. A
+failed task that is not a test task is a run-failed item that names it. An iOS test task needs a Mac and
+the job is marked apple; a Gradle job never runs on a remote lane. With no ./gradlew the job fails at once.
 """
 import argparse
 import fcntl
@@ -130,7 +140,8 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 
-HERE = os.path.dirname(os.path.realpath(__file__))
+SELF = os.path.realpath(__file__)
+HERE = os.path.dirname(SELF)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
 try:
@@ -591,7 +602,229 @@ class Playwright:
         return test.split(" \u203a ", 1)[0]
 
 
-RUNNERS = [Dotnet, Vitest, Playwright]
+GRADLE_SETTINGS = ("settings.gradle.kts", "settings.gradle")
+GRADLE_VALUE_OPTS = {"-x", "--exclude-task", "--max-workers", "-p", "--project-dir", "-b", "--build-file", "-c",
+                     "--settings-file", "--console", "--warning-mode", "--tests", "--priority", "--configuration-cache-problems"}
+GRADLE_SECRET_NAME = re.compile(r"SIGNING|MAVEN_CENTRAL|GPG", re.I)
+GRADLE_PROJECT_PROP = re.compile(r"\s*-D\s*org\.gradle\.project\.\S*")
+
+
+def gradle_folder(project):
+    """The folder a Gradle job runs in: the one holding the settings file, or the path itself when it is a folder."""
+    if os.path.basename(project) in GRADLE_SETTINGS:
+        return os.path.dirname(project) or "."
+    return project or "."
+
+
+def gradle_env(environ):
+    """The environment a Gradle test run gets: no publishing credentials. Drops ORG_GRADLE_PROJECT_*, any name
+    containing SIGNING, MAVEN_CENTRAL or GPG (any case), and -Dorg.gradle.project.* from the JVM option variables."""
+    out = {}
+    for k, v in environ.items():
+        if k.startswith("ORG_GRADLE_PROJECT_") or GRADLE_SECRET_NAME.search(k):
+            continue
+        if k in ("GRADLE_OPTS", "JAVA_OPTS", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS"):
+            v = GRADLE_PROJECT_PROP.sub("", v)
+        out[k] = v
+    return out
+
+
+def gradle_wrapper(folder):
+    """The repo's own ./gradlew, looked for from the build folder up to the working directory (the repo)."""
+    top = os.path.realpath(os.getcwd())
+    d = os.path.realpath(folder if os.path.isabs(folder) else os.path.join(top, folder))
+    while True:
+        w = os.path.join(d, "gradlew")
+        if os.path.isfile(w) and os.access(w, os.X_OK):
+            return w
+        if d == top or d == os.path.dirname(d) or not d.startswith(top):
+            return None
+        d = os.path.dirname(d)
+
+
+def gradle_results(folder, since):
+    """JUnit XML written at or after `since` under any build/test-results folder: (passed, failed, skipped,
+    files, [(class, test, detail)]). Older files are leftovers of an earlier run and are ignored."""
+    p = f = s = n = 0
+    bad = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", ".gradle")]
+        if f"{os.sep}build{os.sep}test-results" not in root + os.sep:
+            continue
+        for fn in sorted(files):
+            if not (fn.startswith("TEST-") and fn.endswith(".xml")):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                if os.path.getmtime(path) < since:
+                    continue
+                tree = ET.parse(path).getroot()
+            except (OSError, ET.ParseError):
+                continue
+            n += 1
+            for case in tree.iter("testcase"):
+                kinds = {c.tag for c in case}
+                if kinds & {"failure", "error"}:
+                    f += 1
+                    el = next(c for c in case if c.tag in ("failure", "error"))
+                    detail = " ".join(((el.get("message") or "") + " " + (el.text or "")).split())
+                    bad.append((case.get("classname") or tree.get("name") or "?", case.get("name") or "?", detail[:600]))
+                elif "skipped" in kinds:
+                    s += 1
+                else:
+                    p += 1
+    return p, f, s, n, bad
+
+
+def gradle_run(argv):
+    """`test-phase --gradle-run <folder> <gradle args>`: the command a Gradle job runs. Runs the repo's ./gradlew
+    with a clean environment, then prints the JUnit result of this run as lean-gradle lines for the runner."""
+    folder, args = argv[0], argv[1:]
+    wrapper = gradle_wrapper(folder)
+    if not wrapper:
+        print(f"run-failed: no ./gradlew in {folder} or above; the Gradle runner runs only the repo's own wrapper")
+        return 2
+    start = time.time() - 1  # file times can be coarser than the clock
+    # --no-daemon: heavy.sh stops only its own process group on a stall, so a daemon left behind would survive it.
+    cmd = [wrapper, "--console=plain", "--continue", "--no-daemon"] + args
+    p = subprocess.Popen(cmd, cwd=folder, env=gradle_env(os.environ), start_new_session=True)
+
+    def forward(signum, _frame):
+        try:
+            os.killpg(p.pid, signum)
+        except OSError:
+            pass
+    import signal
+    for sg in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sg, forward)
+    rc = p.wait()
+    rc = 128 - rc if rc < 0 else rc
+    passed, failed, skipped, files, bad = gradle_results(folder, start)
+    print(f"lean-gradle: passed {passed} failed {failed} skipped {skipped} files {files}")
+    for cls, name, detail in bad:
+        print(f"lean-gradle-failed: {cls} > {name}".replace("\n", " "))
+        print(f"lean-gradle-detail: {detail}")
+    sys.stdout.flush()
+    return rc
+
+
+class Gradle:
+    """A Gradle build (Kotlin Multiplatform included). The test path is a settings.gradle(.kts) or its folder. The
+    job runs `test-phase --gradle-run`, which runs the repo's ./gradlew and reports the JUnit XML of this run."""
+    name = "gradle"
+    progress = r"^> Task .*"
+
+    @staticmethod
+    def mode(_repo):
+        return "gradle"
+
+    @staticmethod
+    def is_test_task(task):
+        return task.rsplit(":", 1)[-1].lower().endswith("test")
+
+    @staticmethod
+    def split(extra):
+        """(tasks, other arguments). Refuses anything that would hand a credential or a script to the build."""
+        tasks, opts, i = [], [], 0
+        while i < len(extra):
+            t = extra[i]
+            if t.startswith("-P") or t.startswith("--project-prop") or t.startswith("-Dorg.gradle.project.") \
+                    or t in ("-I", "--init-script") or t.startswith("--init-script=") or t.startswith("-I") \
+                    or t == "-g" or t.startswith("--gradle-user-home") or t.startswith("-g"):
+                raise ValueError(f"{t} is not allowed in a Gradle test run (no properties, init scripts or Gradle home)")
+            if t.startswith("-"):
+                opts.append(t)
+                if t in GRADLE_VALUE_OPTS and i + 1 < len(extra):
+                    i += 1
+                    opts.append(extra[i])
+            else:
+                tasks.append(t)
+            i += 1
+        return tasks, opts
+
+    @classmethod
+    def command(cls, mode, project, cls_filter, fast, extra, probe=False, **_):
+        tasks, opts = cls.split(extra)
+        tasks = tasks or ["check"]
+        pieces = [p for p in (cls_filter or "").split("|") if p]
+        for p in pieces:
+            if p.startswith("-"):
+                raise ValueError("a filter piece starts with -")
+        argv = []
+        if pieces:
+            if not any(cls.is_test_task(t) for t in tasks):
+                raise ValueError("a filter needs a test task: pass one with args=, for example args=\"jvmTest\"")
+            for t in tasks:
+                argv.append(t)
+                if cls.is_test_task(t):
+                    for p in pieces:
+                        argv += ["--tests", p]
+        else:
+            argv = list(tasks)
+        return [sys.executable, SELF, "--gradle-run", gradle_folder(project)] + opts + argv
+
+    @classmethod
+    def needs_mac(cls, extra):
+        """An iOS test task runs only on a Mac."""
+        try:
+            tasks, _ = cls.split(extra)
+        except ValueError:
+            return False
+        return any(cls.is_test_task(t) and "ios" in t.lower() for t in tasks)
+
+    @staticmethod
+    def failures(text):
+        out, cur = [], None
+        for line in text.splitlines():
+            if line.startswith("lean-gradle-failed: "):
+                cur = [line[len("lean-gradle-failed: "):].strip(), ""]
+                out.append(cur)
+            elif line.startswith("lean-gradle-detail: ") and cur is not None:
+                cur[1] = line[len("lean-gradle-detail: "):]
+                cur = None
+        seen, res = set(), []
+        for n, d in out:
+            if n not in seen:
+                seen.add(n)
+                res.append((n, d))
+        return res
+
+    @staticmethod
+    def counts(text):
+        m = re.findall(r"^lean-gradle: passed (\d+) failed (\d+) skipped (\d+)", text, re.M)
+        return tuple(int(x) for x in m[-1]) if m else (0, 0, 0)
+
+    @staticmethod
+    def class_of(test):
+        return test.split(" > ", 1)[0]
+
+    @classmethod
+    def task_failures(cls, text, include_tests=False):
+        """[(task, why)] for each `> Task :x:y FAILED` line, test tasks left out unless asked for, with the
+        `What went wrong` block of Gradle's summary. A build that fails before any task names none: ("configuration", why)."""
+        lines = text.splitlines()
+        why, i = [], 0
+        while i < len(lines):
+            if lines[i].startswith("* What went wrong"):
+                j = i + 1
+                while j < len(lines) and not re.match(r"^(\* Try:|\* Exception is:|BUILD )", lines[j]) and len(why) < 8:
+                    if lines[j].strip():
+                        why.append(lines[j].strip())
+                    j += 1
+                break
+            i += 1
+        out, seen = [], set()
+        for line in lines:
+            m = re.match(r"^> Task (\S+) FAILED\s*$", line)
+            if m and m.group(1) not in seen and (include_tests or not cls.is_test_task(m.group(1))):
+                seen.add(m.group(1))
+                out.append((m.group(1), "\n".join(why)))
+        if not out and why and not re.search(r"^> Task \S+ FAILED", text, re.M):
+            out.append(("configuration", "\n".join(why)))
+        return out
+
+
+RUNNERS = [Dotnet, Vitest, Playwright, Gradle]
 
 
 def skips_node_modules(runner):
@@ -607,12 +840,18 @@ def tp_name(path):
     config its folder too."""
     base = os.path.basename(path)
     return os.path.join(os.path.basename(os.path.dirname(path)), base) if (base == "package.json"
-        or PLAYWRIGHT_CONFIG.match(base)) and os.path.dirname(path) else base
+        or base in GRADLE_SETTINGS or PLAYWRIGHT_CONFIG.match(base)) and os.path.dirname(path) else base
 
 
-def runner_for(test_project):
-    """Vitest for a package.json, Playwright for a playwright.config file, Dotnet for everything else."""
+def runner_for(test_project, repo=None):
+    """Gradle for a settings.gradle(.kts) or a folder holding one, Vitest for a package.json, Playwright for a
+    playwright.config file, Dotnet for everything else."""
     base = os.path.basename(test_project)
+    if base in GRADLE_SETTINGS:
+        return Gradle
+    if repo and os.path.isdir(os.path.join(repo, test_project)) \
+            and any(os.path.isfile(os.path.join(repo, test_project, f)) for f in GRADLE_SETTINGS):
+        return Gradle
     if PLAYWRIGHT_CONFIG.match(base):
         return Playwright
     return Vitest if base == "package.json" else Dotnet
@@ -1049,6 +1288,15 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         row["result"] = "error"
         row["notes"].append(f"bad filter: {e}")
         return row
+    if runner is Gradle:
+        if remote:  # no Gradle or Maven credential file may leave this machine, so a Gradle job never runs remote
+            row["result"] = "error"
+            row["notes"].append("Gradle jobs run on the local lane only (a remote host never gets this machine's Gradle or Maven credentials)")
+            return row
+        if Gradle.needs_mac(extra) and sys.platform != "darwin":
+            row["result"] = "error"
+            row["notes"].append("an iOS test task needs a Mac; route the job to an Apple host (--platform apple)")
+            return row
 
     if tn and not remote:
         try:
@@ -1204,6 +1452,9 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                  + "\n".join(names[:5]), run_id, ctx)
         if remote:  # the host is the problem, so this lane should not take the next job at once
             row["lane_rest"] = f"environment: {label}"
+    tfail = []
+    if runner is Gradle and not hung and rc not in (75, 76, 78) and rc != 0:
+        tfail = Gradle.task_failures(text, include_tests=not failing)
     facts = stall_facts(text) if rc in (76, 78) else None
     seen = f"passed {facts[0]}, failed {facts[1]}, last test: {facts[2]}" if facts else "no counts in the log"
     if hung:
@@ -1230,7 +1481,13 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         row["notes"].append("filter matched no test")
         add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
                  f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
-    elif rc != 0 and not failing and not row.get("env") and tn and tn.log_cause(text):
+    elif runner is Gradle and rc == 0 and not failing and not sum(Gradle.counts(text)):
+        row["result"] = "fail"
+        row["notes"].append("ran no tests")
+        add_item(row, "test-fail", f"ran-no-tests: {project}", "important",
+                 f"Gradle exited 0 but no JUnit XML with a test was written by this run. Tasks: "
+                 f"{' '.join(Gradle.split(extra)[0]) or 'check'}. Log: {stem}.log", run_id, ctx)
+    elif rc != 0 and not failing and not row.get("env") and not tfail and tn and tn.log_cause(text):
         label, hint = tn.log_cause(text)
         hint = tn.lane_hint(label, hint, remote)  # the install or build never reached a test: say why, not "build error?"
         row["env"], row["env_label"] = 1, label
@@ -1240,6 +1497,11 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                  + "\n".join(text.splitlines()[-15:]), run_id, ctx)
         if remote:
             row["lane_rest"] = f"environment: {label}"
+    elif tfail and not row.get("env"):
+        for task, why in tfail[:5]:
+            add_item(row, "test-fail", f"run-failed: {project}: {task}", "important",
+                     f"Gradle task {task} failed (exit {rc}). Log: {stem}.log\n{why}", run_id, ctx)
+        row["notes"].append(f"exit {rc}, failed task: " + ", ".join(t for t, _ in tfail[:5]))
     elif rc != 0 and not failing and not row.get("env"):
         tail = "\n".join(text.splitlines()[-15:])
         add_item(row, "test-fail", f"run-failed: {project}", "important",
@@ -1477,7 +1739,7 @@ def drain(a, run_dir, lanes=None):
                 job = json.loads(out)
                 say(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})"
                     + (f" on {lane.remote.name}" if lane.remote else ""))
-                row = run_job(job, a, run_dir, runner_for(job["test_project"]), lane)
+                row = run_job(job, a, run_dir, runner_for(job["test_project"], job.get("repo_dir")), lane)
                 problem = row.get("lane_problem")
                 if problem:
                     if requeue_job(job["id"], problem, say):
@@ -1556,6 +1818,8 @@ def is_bad(r):
 
 
 def main(argv):
+    if argv[:1] == ["--gradle-run"] and len(argv) > 1:
+        return gradle_run(argv[1:])
     p = argparse.ArgumentParser(prog="test-phase", description="Drain the test queue.")
     p.add_argument("plan", nargs="?")
     p.add_argument("--lane", default="dotnet")
@@ -1772,6 +2036,153 @@ def vitest_checks(fails, fixture):
         got = lr.file_list(d, [], [], skip_node_modules=True)
         if got != ["web/a.test.ts", "web/package.json"]:
             fails.append(f"a vitest copy must leave node_modules behind: {got}")
+
+
+def gradle_checks(fails, fixture):
+    """Gradle: counts, failed classes, failed non-test tasks, the XML of this run only, the missing wrapper, the
+    credential-free environment, the command, the Mac rule and the runner by path. Looked up by name."""
+    import contextlib
+    import io
+    G = globals().get("Gradle")
+    if G is None:
+        fails.append("no Gradle runner class")
+        return
+    if G.counts(fixture("gradle-passed.log")) != (12, 0, 1):
+        fails.append(f"Gradle counts on a pass: {G.counts(fixture('gradle-passed.log'))}")
+    if G.counts("nothing here") != (0, 0, 0):
+        fails.append("Gradle counts on a log with no result line must be zeros")
+    got = G.failures(fixture("gradle-failed.log"))
+    names = [n for n, _ in got]
+    if names != ["com.acme.CartTest > addsItem", "com.acme.CartTest > removesItem", "com.acme.PriceTest > rounds"]:
+        fails.append(f"Gradle failures: {names}")
+    elif "expected:<2>" not in got[0][1] or got[2][1] != "boom":
+        fails.append(f"Gradle failure details: {got}")
+    if sorted({G.class_of(n) for n in names}) != ["com.acme.CartTest", "com.acme.PriceTest"]:
+        fails.append("Gradle class_of must give the class before ' > '")
+    if G.failures(fixture("gradle-passed.log")):
+        fails.append("Gradle failures on a pass must be empty")
+    # A failed non-test task is named, with Gradle's reason; a failed test task is not one.
+    tf = G.task_failures(fixture("gradle-failed-task.log"))
+    if [t for t, _ in tf] != [":shared:verifyFixtures"] or "fixture drift" not in tf[0][1]:
+        fails.append(f"Gradle task_failures on a failed check task: {tf}")
+    tf = G.task_failures(fixture("gradle-compile-failed.log"))
+    if [t for t, _ in tf] != [":shared:compileKotlinJvm"] or "Compilation error" not in tf[0][1]:
+        fails.append(f"Gradle task_failures on a compile failure: {tf}")
+    if G.task_failures(fixture("gradle-failed.log")):
+        fails.append("Gradle task_failures must leave a failed test task out")
+    if [t for t, _ in G.task_failures(fixture("gradle-failed.log"), include_tests=True)] != [":shared:jvmTest"]:
+        fails.append("Gradle task_failures(include_tests) must name the failed test task")
+    cfg = "FAILURE: Build failed with an exception.\n\n* What went wrong:\nSettings file not found\n\n* Try:\n"
+    if [t for t, _ in G.task_failures(cfg)] != ["configuration"]:
+        fails.append("Gradle task_failures with no task line must say configuration")
+    # The XML of this run only.
+    with tempfile.TemporaryDirectory() as d:
+        res = os.path.join(d, "shared", "build", "test-results", "jvmTest")
+        os.makedirs(res)
+        os.makedirs(os.path.join(d, "shared", "src", "TEST-not-results.xml"))
+        for src, dst in (("gradle-junit-pass.xml", "TEST-com.acme.CartTest.xml"),
+                         ("gradle-junit-fail.xml", "TEST-com.acme.PriceTest.xml")):
+            with open(os.path.join(res, dst), "w") as fh:
+                fh.write(fixture(src))
+        old = os.path.join(res, "TEST-com.acme.CartTest.xml")
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        p, f, s, n, bad = gradle_results(d, time.time() - 60)
+        if (p, f, s, n) != (1, 1, 0, 1) or bad[0][:2] != ("com.acme.PriceTest", "rounds") \
+                or "expected:<2>" not in bad[0][2]:
+            fails.append(f"gradle_results must ignore XML older than the run start: {(p, f, s, n, bad)}")
+        p, f, s, n, bad = gradle_results(d, time.time() - 7200)
+        if (p, f, s, n) != (3, 1, 1, 2):
+            fails.append(f"gradle_results counts over fresh XML: {(p, f, s, n)}")
+        # Without a wrapper the run refuses and says why; with one, it runs it with the clean environment.
+        cwd = os.getcwd()
+        try:
+            os.chdir(d)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = gradle_run(["shared", "check"])
+            if rc != 2 or "no ./gradlew" not in buf.getvalue() or not buf.getvalue().startswith("run-failed:"):
+                fails.append(f"gradle_run without a wrapper must refuse with run-failed: rc={rc} {buf.getvalue()!r}")
+            wrap = os.path.join(d, "gradlew")
+            with open(wrap, "w") as fh:
+                fh.write('#!/bin/sh\necho "args: $*"\nenv | grep -iE "SIGNING|GPG|MAVEN_CENTRAL|ORG_GRADLE|KEEP_ME" | sort\n'
+                         'exit 0\n')
+            os.chmod(wrap, 0o755)
+            keep = {"ORG_GRADLE_PROJECT_signingKey": "x", "mySigning_pass": "x", "gpg_pass": "x", "MAVEN_CENTRAL_TOKEN": "x",
+                    "KEEP_ME": "ok"}
+            old_env = {k: os.environ.get(k) for k in keep}
+            os.environ.update(keep)
+            try:
+                out = subprocess.run([sys.executable, SELF, "--gradle-run", ".", "jvmTest"],
+                                     capture_output=True, text=True, cwd=d).stdout
+            finally:
+                for k, v in old_env.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            if "--console=plain --continue --no-daemon jvmTest" not in out:
+                fails.append(f"gradle_run must pass --console=plain --continue --no-daemon and the tasks: {out!r}")
+            if any(x in out for x in ("ORG_GRADLE", "Signing", "gpg_pass", "MAVEN_CENTRAL")) or "KEEP_ME=ok" not in out:
+                fails.append(f"gradle_run must not hand credentials to the build: {out!r}")
+            if "lean-gradle: passed 1 failed 1 skipped 0 files 1" not in out:
+                fails.append(f"gradle_run must print the lean-gradle result line: {out!r}")
+        finally:
+            os.chdir(cwd)
+    # gradle_env itself.
+    env = gradle_env({"PATH": "/bin", "ORG_GRADLE_PROJECT_x": "1", "org_gradle_project_y": "1", "my_signing_key": "1",
+                      "MavenCentralPass": "keep", "MAVEN_CENTRAL_USER": "1", "GPG_TTY": "1", "gnupg_home": "keep",
+                      "GRADLE_OPTS": "-Xmx2g -Dorg.gradle.project.token=abc -Dfoo=1", "HOME": "/h"})
+    if sorted(env) != ["GRADLE_OPTS", "HOME", "MavenCentralPass", "PATH", "gnupg_home", "org_gradle_project_y"]:
+        fails.append(f"gradle_env kept the wrong names: {sorted(env)}")
+    if env.get("GRADLE_OPTS") != "-Xmx2g -Dfoo=1":
+        fails.append(f"gradle_env must strip -Dorg.gradle.project. from GRADLE_OPTS: {env.get('GRADLE_OPTS')!r}")
+    # The command.
+    base = [sys.executable, SELF, "--gradle-run"]
+    if G.command("gradle", "app/settings.gradle.kts", None, False, []) != base + ["app", "check"]:
+        fails.append(f"Gradle default command: {G.command('gradle', 'app/settings.gradle.kts', None, False, [])}")
+    if G.command("gradle", ".", None, False, ["jvmTest", "--info"]) != base + [".", "--info", "jvmTest"]:
+        fails.append("Gradle command must keep args= tasks and options")
+    got = G.command("gradle", "app", "CartTest|PriceTest", True, ["jvmTest", "iosSimulatorArm64Test", "lint"])
+    want = base + ["app", "jvmTest", "--tests", "CartTest", "--tests", "PriceTest", "iosSimulatorArm64Test",
+                   "--tests", "CartTest", "--tests", "PriceTest", "lint"]
+    if got != want:
+        fails.append(f"Gradle filter must add --tests per piece on each test task only: {got}")
+    for bad_args, why in ((["-PsigningKey=x"], "-P"), (["-Dorg.gradle.project.a=b"], "-Dorg.gradle.project"),
+                          (["-I", "x.gradle"], "-I"), (["--init-script", "x"], "--init-script"),
+                          (["-g", "/tmp"], "-g"), (["--project-prop", "a=b"], "--project-prop")):
+        try:
+            G.command("gradle", ".", None, False, bad_args)
+            fails.append(f"Gradle must refuse {why}")
+        except ValueError:
+            pass
+    try:
+        G.command("gradle", ".", "CartTest", True, [])
+        fails.append("Gradle must refuse a filter when args= names no test task")
+    except ValueError:
+        pass
+    try:
+        G.command("gradle", ".", "-x", True, ["jvmTest"])
+        fails.append("Gradle must refuse a filter piece starting with -")
+    except ValueError:
+        pass
+    # The Mac rule, the runner by path, the name.
+    if not G.needs_mac(["iosSimulatorArm64Test"]) or not G.needs_mac([":shared:iosX64Test"]):
+        fails.append("Gradle needs_mac must be true for an iOS test task")
+    if G.needs_mac(["jvmTest", "check"]) or G.needs_mac(["compileKotlinIosArm64"]) or G.needs_mac([]):
+        fails.append("Gradle needs_mac must be false for tasks that are not iOS tests")
+    if runner_for("app/settings.gradle.kts") is not G or runner_for("settings.gradle") is not G:
+        fails.append("runner_for must pick Gradle for a settings file")
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "kmp"))
+        open(os.path.join(d, "kmp", "settings.gradle.kts"), "w").close()
+        if runner_for("kmp", d) is not G:
+            fails.append("runner_for must pick Gradle for a folder holding a settings file")
+        if runner_for("other", d) is G:
+            fails.append("runner_for must not pick Gradle for a folder without one")
+    if tp_name("app/settings.gradle.kts") != "app/settings.gradle.kts":
+        fails.append(f"tp_name for a settings file: {tp_name('app/settings.gradle.kts')}")
+    if "no ./gradlew" not in fixture("gradle-missing-wrapper.log") or G.counts(fixture("gradle-missing-wrapper.log")) != (0, 0, 0):
+        fails.append("the missing-wrapper fixture must read as a run with no result")
 
 
 def node_checks(fails, fixture):
@@ -2287,6 +2698,7 @@ def self_test():
 
     vitest_checks(fails, fixture)
     node_checks(fails, fixture)
+    gradle_checks(fails, fixture)
 
     # Secrets in test output are masked, and the body travels by stdin.
     jwt = ".".join(("eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxIn0", "sig_nature"))

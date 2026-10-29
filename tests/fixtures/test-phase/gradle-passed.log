@@ -1,0 +1,6 @@
+> Task :shared:compileKotlinJvm UP-TO-DATE
+> Task :shared:jvmTest
+> Task :shared:check
+
+BUILD SUCCESSFUL in 41s
+lean-gradle: passed 12 failed 0 skipped 1 files 3

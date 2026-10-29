@@ -1,0 +1,15 @@
+> Task :shared:compileKotlinJvm FAILED
+e: file:///repo/shared/src/commonMain/Cart.kt:4:1 Unresolved reference: Foo
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':shared:compileKotlinJvm'.
+> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
+   > Compilation error. See log for more details
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+
+BUILD FAILED in 9s
+lean-gradle: passed 0 failed 0 skipped 0 files 0
