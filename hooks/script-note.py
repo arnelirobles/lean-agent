@@ -7,6 +7,10 @@ PreToolUse hook on Bash. It adds a note, never a deny, in two cases:
   - the command calls a lean-agent script by its .../plugins/cache/lean-agent/lean-agent/
     <version>/tools/ path (or the older bin/ one): the versioned path breaks after an upgrade, use
     the absolute tools path. Once per session.
+It also blocks (exit 2) a command that runs dotnet test, npx vitest, vitest run or npm test
+directly: tests run through `brain queue add` and test-phase. A command that only mentions the
+words (quoted, a heredoc body) passes, and so does one that names test-phase, heavy.sh or
+brain queue.
 A family whose covering script is a hook (wait-loop, pgrep) gets no note here, nor does
 direct-test-run (wait-loop.py notes that one), nor does a command that already names the
 covering script.
@@ -21,7 +25,8 @@ calls cannot drop each other's entry. State files older than 14 days are deleted
 written. A session id outside [A-Za-z0-9-]{1,100} or a
 folder that cannot be trusted means no note. A hook error never fails the session.
 
-  LEAN_SCRIPT_NOTE=off   turn it off (environment or settings env)
+  LEAN_SCRIPT_NOTE=off   turn the notes off (environment or settings env)
+  LEAN_DIRECT_TEST=allow turn the direct test run block off (environment, settings env or inline)
   script-note.py --self-test
 """
 import importlib.machinery
@@ -35,6 +40,7 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import direct_test as direct  # noqa: E402
 import hookkit  # noqa: E402
 
 REPEATS = os.path.join(HERE, "..", "tools", "script-repeats")
@@ -104,6 +110,19 @@ def candidates(command):
     return out
 
 
+def direct_test(command, cwd):
+    """True when a segment of the command starts a test run that test-phase can take."""
+    module = repeats()
+    return direct.blocks(module.SEGMENT.split(module.strip_prose(command[:module.CAP])), cwd)
+
+
+def block_message(cwd):
+    return ("Do not run tests directly. Queue them: `%s queue add %s <test project> --filter ...`, then end "
+            "the turn; the orchestrator runs `%s`. If it cannot run here, `%s --doctor` shows what is missing. "
+            "LEAN_DIRECT_TEST=allow turns this block off." % (
+                hookkit.tool_path("brain"), cwd, hookkit.tool_path("test-phase"), hookkit.tool_path("test-phase")))
+
+
 def state_dir():
     return os.path.abspath(os.path.join(os.path.expanduser("~"), ".local", "share", "lean", "script-note"))
 
@@ -171,11 +190,15 @@ def fresh(session, found):
 
 
 def main():
-    if os.environ.get("LEAN_SCRIPT_NOTE", "").lower() == "off":
-        return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command")
     if not isinstance(command, str) or not command.strip():
+        return 0
+    cwd = event.get("cwd") or os.getcwd()
+    if direct_test(command, cwd):
+        print(block_message(cwd), file=sys.stderr)
+        return 2
+    if os.environ.get("LEAN_SCRIPT_NOTE", "").lower() == "off":
         return 0
     found = candidates(command)
     if not found:
@@ -199,6 +222,7 @@ def self_test():
     if os.environ.get("HOME", "") == pwd.getpwuid(os.getuid()).pw_dir:  # the seen file must not land in the real home
         os.environ["HOME"] = tempfile.mkdtemp(prefix="script-note-home-")
     os.environ.pop("LEAN_SCRIPT_NOTE", None)
+    os.environ.pop("LEAN_DIRECT_TEST", None)
 
     def check(label, ok, detail=""):
         nonlocal failures
@@ -206,9 +230,15 @@ def self_test():
             print("FAIL %s %s" % (label, detail))
             failures += 1
 
-    def fire(command, session="sess-1"):
+    lanes = tempfile.mkdtemp()
+    for f in ("App.sln", "pnpm-lock.yaml"):
+        open(os.path.join(lanes, f), "w").close()
+    bare = tempfile.mkdtemp()
+
+    def fire(command, session="sess-1", cwd=None):
         old = sys.stdin
-        sys.stdin = io.StringIO(json.dumps({"tool_input": {"command": command}, "session_id": session}))
+        sys.stdin = io.StringIO(json.dumps({"tool_input": {"command": command}, "session_id": session,
+                                            "cwd": cwd or lanes}))
         out, err = io.StringIO(), io.StringIO()
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -285,6 +315,54 @@ def self_test():
           fire("python3 ~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/hooks/wait-loop.py --self-test", "vh")[1] == "")
     rc, text, _ = fire("pytest -q; npm view left-pad version; curl -s https://example.com/h", "two")
     check("two families, one note each, test runs left to wait-loop", text.count("does this:") == 2 and "test-phase" not in text, repr(text))
+
+    # direct test runs are blocked
+    for label, command in (("dotnet test", "dotnet test X.sln --filter A"), ("npx vitest", "npx vitest run src/a.test.ts"),
+                           ("vitest run", "vitest run"), ("npm test", "npm test -- --watch=false"),
+                           ("after cd", "cd app && dotnet test | tail -5"),
+                           ("env prefix", "CI=1 npm test"), ("after a note", "echo hi; npx vitest")):
+        rc, text, err = fire(command, "dt-" + label.replace(" ", "-"))
+        check("block " + label, rc == 2 and text == "" and "brain" in err and "queue add" in err
+              and "test-phase --doctor" in err and "LEAN_DIRECT_TEST=allow" in err, repr((rc, err)))
+    rc, _, _ = fire("dotnet test X", "dt-again")
+    rc2, _, _ = fire("dotnet test X", "dt-again")
+    check("block is not once per session", rc == 2 and rc2 == 2)
+    for label, command in (("test-phase", "tools/test-phase run -- dotnet test X"),
+                           ("heavy.sh lane", "bash tools/heavy.sh dotnet dotnet test X.sln"),
+                           ("heavy.sh node", "HEAVY_WAIT=60 bash /p/tools/heavy.sh node npm test"),
+                           ("queue add", "brain queue add r p --filter A"),
+                           ("commit message", 'git commit -m "wire dotnet test into npm test"'),
+                           ("grep", "grep 'dotnet test' README.md"),
+                           ("heredoc body", "cat > notes.md <<'EOF'\nrun npx vitest\ndotnet test X\nEOF"),
+                           ("other npm", "npm run build && npm install"), ("test file", "cat tests/npm-test.txt")):
+        rc, text, err = fire(command, "dtok-" + label.replace(" ", "-"))
+        check("no block " + label, rc == 0 and not err, repr((rc, err)))
+    for label, command in (("two spaces", "dotnet  test X.sln"), ("npm run test", "npm run test"),
+                           ("pnpm test", "pnpm test"), ("yarn test", "yarn test")):
+        check("block " + label, fire(command, "dt2-" + label.replace(" ", "-"))[0] == 2)
+    check("list-tests runs nothing", fire("dotnet test X.sln --list-tests", "dt-list")[0] == 0)
+    check("redirect to a lane name is still blocked", fire("npm test > test-phase.log", "dt-redir")[0] == 2)
+    check("lane name as an argument is still blocked", fire("dotnet test X --logger heavy.sh", "dt-arg")[0] == 2)
+    rc, _, err = fire("npm test", "dt-msg")
+    check("message names the repo and leaves the run to the orchestrator", lanes in err and "orchestrator" in err, repr(err))
+    for label, command in (("npm test", "npm test"), ("npx vitest run", "npx vitest run"), ("vitest run", "vitest run")):
+        rc, _, err = fire(command, "dtn-" + label.replace(" ", "-"), bare)
+        check("no lane, no block " + label, rc == 0 and not err, repr((rc, err)))
+    check("dotnet without a project is not blocked", fire("dotnet test X", "dtn-dn", bare)[0] == 0)
+    lock_only = tempfile.mkdtemp()
+    open(os.path.join(lock_only, "package-lock.json"), "w").close()
+    check("npm lockfile has no lane", fire("npm test", "dtn-npm", lock_only)[0] == 0)
+    check("dotnet with a project is blocked", fire("dotnet test", "dtn-sln", lanes)[0] == 2)
+    rc, _, err = fire("LEAN_DIRECT_TEST=allow dotnet test X", "dt-inline")
+    check("allow inline", rc == 0 and not err, repr(err))
+    os.environ["LEAN_DIRECT_TEST"] = "allow"
+    check("allow from the environment", fire("npm test", "dt-env")[0] == 0)
+    os.environ["LEAN_DIRECT_TEST"] = "ALLOW"
+    check("allow, any case", fire("npx vitest", "dt-env")[0] == 0)
+    del os.environ["LEAN_DIRECT_TEST"]
+    os.environ["LEAN_SCRIPT_NOTE"] = "off"
+    check("note switch leaves the block on", fire("dotnet test X", "dt-note")[0] == 2)
+    del os.environ["LEAN_SCRIPT_NOTE"]
 
     os.environ["LEAN_SCRIPT_NOTE"] = "off"
     check("off switch", fire(TRIGGER, "offsw") == (0, "", ""))

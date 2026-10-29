@@ -17,9 +17,11 @@ run_in_background command is checked the same way. A hook error never fails the 
   wait-loop.py --self-test
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import direct_test  # noqa: E402
 import hookkit  # noqa: E402
 
 BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")
@@ -141,7 +143,8 @@ def verdict(command, cwd="."):
         if name(words) == "sleep" and name(cmds[i + 1]) in SLEEP_READERS:
             return "deny", DENY_SLEEP_READ + TURN_OFF
     if os.path.exists(BRAIN) and any(is_test_run(w) for w in cmds) \
-            and not any(name(w) in LANES for w in cmds):
+            and not any(name(w) in LANES for w in cmds) \
+            and not direct_test.blocks(re.split(r"\|\||&&|;|\||\n", command), cwd):
         return "note", NOTE_TEST
     return None
 
@@ -261,6 +264,20 @@ def self_test():
     check("test inside heavy.sh passes", "heavy.sh run lane dotnet test X", None)
     check("queued test passes", "brain queue add repo proj --filter 'dotnet test'", None)
     check("dotnet build is quiet", "dotnet build X", None)
+    lane_tmp = tempfile.TemporaryDirectory()
+    lane_dir = lane_tmp.name
+    open(os.path.join(lane_dir, "App.sln"), "w").close()
+    open(os.path.join(lane_dir, "pnpm-lock.yaml"), "w").close()
+    for label, command in (("dotnet test", "dotnet test X"), ("npx vitest", "npx vitest run")):
+        if verdict(command, lane_dir) is not None:
+            print(f"FAIL {label} where script-note blocks gets no second note")
+            failures += 1
+    if (verdict("go test ./...", lane_dir) or ("", ""))[0] != "note":
+        print("FAIL go test still notes where a lane exists")
+        failures += 1
+    if (verdict("timeout 60 dotnet test X", lane_dir) or ("", ""))[0] != "note":
+        print("FAIL wrapped dotnet test keeps its note")
+        failures += 1
     BRAIN = os.path.join(tmp.name, "missing")
     check("no note without the brain script", "dotnet test X", None)
     BRAIN = fake
@@ -287,6 +304,7 @@ def self_test():
 
     BRAIN = real_brain
     tmp.cleanup()
+    lane_tmp.cleanup()
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

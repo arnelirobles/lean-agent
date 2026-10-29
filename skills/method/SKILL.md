@@ -46,7 +46,7 @@ The scripts are not on PATH. They live in `${CLAUDE_PLUGIN_ROOT}/tools/`, so run
 - `pr-wait <pr>`: waits for a pull request's checks (or `--provider azure` for a pipeline run) and prints only the failed checks and the tail of their logs.
 - `orient [--all]`: repo, branch, dirty count, ahead and behind, open PR with its checks, and with `--all` one line per worktree. Use it instead of a status loop over worktrees.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what each project in the repo pins. Use it instead of a curl to a registry.
-- `script-note` hook (`hooks/script-note.py`): when a command matches a family in `lib/script_families.json` that a script covers, or calls a script by its plugin cache path, it adds a one line note naming the script. Once per family per session, never a deny. `LEAN_SCRIPT_NOTE=off` turns it off.
+- `script-note` hook (`hooks/script-note.py`): when a command matches a family in `lib/script_families.json` that a script covers, or calls a script by its plugin cache path, it adds a one line note naming the script. Once per family per session. `LEAN_SCRIPT_NOTE=off` turns it off. The same hook blocks (exit 2) a direct `dotnet test` (a .sln or .csproj in reach) or `npm test`, `npx vitest`, `vitest run` (a pnpm-lock.yaml in reach) and names the `brain queue add` line to use; `LEAN_DIRECT_TEST=allow` turns that off.
 - `pr-blockers.sh <pr>`: every reason a pull request cannot merge, in one read-only call.
 - `why-red.sh <log>`: names environmental causes (no Docker, a busy port, a full disk) in a failed log before you debug code.
 - `assert-ran.sh <report>`: fails when a test report shows zero tests ran.
@@ -59,6 +59,14 @@ The scripts are not on PATH. They live in `${CLAUDE_PLUGIN_ROOT}/tools/`, so run
 - `check-conflict-markers.sh`, `check-top-level-md.sh`, `check-workflow-keys.py`, `check-runtime.sh`: cheap repository checks, run them in the preflight.
 - `script-repeats [--days N]`: counts the commands agents wrote by hand in recent transcripts, per family, with the script that covers each. The retro runs it.
 - `retro-signals.sh`, `lean-stats`, `workflow-cost.py`: the retro's facts and what a run cost.
+
+### Drafter brief (`lean:draft`)
+Coding agents call these instead of writing the command again:
+- `replace FILE < blocks`: exact text edit that fails unless the old text is there once. Use it instead of inline python that calls `.replace`.
+- `brain queue add ...`: queue the tests, end the turn, and the orchestrator runs `test-phase`. Never run `dotnet test`, `npx vitest`, `vitest run` or `npm test` yourself; the script-note hook blocks it where test-phase can take the job.
+- `check-deployed-sha.sh <url> <sha>`: proves a deploy by the commit sha it reports. Use it instead of a curl smoke check.
+- `style-scan`: checks added lines for dashes, arrows, slop and attribution. Use it instead of a grep, before every commit.
+- `pkg-version <name> [--nuget|--npm]`: the latest stable version and what the repo pins. Use it instead of a curl to a registry.
 
 ## Tests and brain
 - Code first, build only. Run the tests once, as one phase: add each test project with `${CLAUDE_PLUGIN_ROOT}/tools/brain queue add <repo-dir> <test project> [--after ID]`, then the orchestrator starts one `${CLAUDE_PLUGIN_ROOT}/tools/test-phase` as a background task. Queue one job per worktree: put every class you need in one `--filter 'ATests|BTests'` rather than one job per class, run `${CLAUDE_PLUGIN_ROOT}/tools/brain queue list` first, and when an earlier job of yours for the same worktree is still queued, cancel it and add the merged one. Adding a job that is already queued returns its id, so wait on that. Failures land in `${CLAUDE_PLUGIN_ROOT}/tools/brain`. The fix round reads `${CLAUDE_PLUGIN_ROOT}/tools/brain list --open`, closes entries with a resolution and the fix commit, and the phase runs again.
