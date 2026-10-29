@@ -16,7 +16,7 @@ import sys
 SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")", ";;", "|&"}
 PIPES = {"|", "|&"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
-HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([^\s;&|()<>]+))")
+HEREDOC = re.compile(r"<<(-?)[ \t]*((?:'[^'\n]*'|\"[^\"\n]*\"|\\.|[^\s;&|()<>'\"\\])+)")
 HEREDOC_MARK = re.compile(r"__lean_heredoc_(\d+)__")
 GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 _EVENT = {}  # the last event read, for the session id and cwd of a recorded fire
@@ -167,6 +167,14 @@ def test_marker(cwd):
     return os.path.join(git_dir, "lean-last-test-run") if git_dir else None
 
 
+def _end_word(word):
+    """The heredoc end word as bash reads it: quotes and backslashes removed, so <<E"O"F ends at EOF."""
+    try:
+        return "".join(shlex.split(word))
+    except ValueError:
+        return word
+
+
 def prepare(command):
     """Drop shell comments and cut heredoc bodies out of a command.
 
@@ -204,7 +212,7 @@ def prepare(command):
         if command.startswith("<<", i) and not command.startswith("<<<", i):
             match = HEREDOC.match(command, i)
             if match:
-                delim = next(g for g in match.groups()[1:] if g is not None)
+                delim = _end_word(match.group(2))
                 out.append(f" __lean_heredoc_{len(bodies) + len(pending)}__ ")
                 pending.append((delim, bool(match.group(1))))
                 i = match.end()
