@@ -699,7 +699,8 @@ def run(brain_cli):
         for rel, args, want in (("kmp/settings.gradle.kts", None, "private"), ("kmp", None, "private"),
                                 ("groovy/settings.gradle", None, "private"), ("groovy", "jvmTest", "private"),
                                 ("kmp", "jvmTest iosSimulatorArm64Test", "apple"), ("kmp", "iosX64Test", "apple"),
-                                ("kmp", "jvmTest --tests Fooios", "private"), ("kmp", "compileKotlinIosArm64", "private")):
+                                ("kmp", "jvmTest --tests Fooios", "private"), ("kmp", "IOSArm64Test", "apple"),
+                                ("kmp", "jvmTest -x iosX64Test", "private"), ("kmp", "compileKotlinIosArm64", "private")):
             if detect_platform(rp, rel, args) != want:
                 fails.append(f"detect_platform({rel}, {args!r}) must be {want!r}")
         gj = run("queue", "add", rp, "kmp")[1]
@@ -708,12 +709,29 @@ def run(brain_cli):
             fails.append("a Gradle job must queue as platform=private")
         if nxt("--where", "remote", "--peek") is not None and nxt("--where", "remote", "--peek")["id"] == int(gj):
             fails.append("a remote lane claimed a Gradle job")
-        rc, out, err = run("queue", "route", gj, "--to", "remote")
-        if rc == 0 or "Gradle" not in err or "--force" not in err:
-            fails.append(f"route --to remote on a Gradle job must be refused without --force: {rc} {out!r} {err!r}")
-        rc, out, err = run("queue", "route", gj, "--to", "any")
-        if rc == 0 or "Gradle" not in err or "--force" not in err:
-            fails.append(f"route --to any on a Gradle job must be refused without --force: {rc} {out!r} {err!r}")
+        for to in ("remote", "any"):
+            for force in ([], ["--force"]):
+                rc, out, err = run("queue", "route", gj, "--to", to, *force)
+                if rc == 0 or "Gradle" not in err or "--to local" not in err or "pass --force" in err:
+                    fails.append(f"route --to {to} {force} on a Gradle job must be refused and name --to local: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "add", rp, "kmp", "--platform", "none")
+        if rc == 0 or "Gradle" not in err:
+            fails.append(f"queue add --platform none on a Gradle job must be refused: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "route", gj, "--to", "local")
+        if rc != 0 or "platform=private" not in out:
+            fails.append(f"route --to local must keep a Gradle job private: {rc} {out!r} {err!r}")
+        # A remote lane that still got a Gradle job (a platform cleared by hand) hands it back: requeue pins it again.
+        import sqlite3 as sq1
+        c1 = sq1.connect(env["LEAN_BRAIN_DB"])
+        c1.execute("UPDATE jobs SET platform='' WHERE id=?", (gj,))
+        c1.commit()
+        c1.close()
+        if nxt("--where", "remote", "--peek") is None or nxt("--where", "remote", "--peek")["id"] != int(gj):
+            fails.append("setup: a job with no platform must be open to a remote lane")
+        run("queue", "next", "--where", "remote", "--host", "dev")
+        run("queue", "requeue", gj, "--reason", "a Gradle job reached a remote lane")
+        if nxt("--where", "remote", "--peek") is not None and nxt("--where", "remote", "--peek")["id"] == int(gj):
+            fails.append("requeue must pin a Gradle job to the local lane")
         run("queue", "cancel", gj)
         gi = run("queue", "add", rp, "kmp", "--args=iosSimulatorArm64Test")[1]
         if "platform=apple" not in [x for x in run("queue", "list", "--status", "queued")[1].splitlines()
