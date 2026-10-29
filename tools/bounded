@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Run a command so it cannot outlive its shell or run for hours unnoticed.
+
+  bounded [--minutes N] -- command [args...]
+
+The command runs in its own process group. That whole group is stopped when:
+  - N minutes pass (default 60, 0 means no limit); exit 124 with a line on stderr
+  - this process gets SIGTERM, SIGHUP or SIGINT (a stopped background task)
+  - the shell that started this process goes away, so nothing is left reparented to
+    init and spinning on a CPU with no task to show for it
+Stopping sends SIGTERM, waits 5 seconds, then SIGKILL. bash defers SIGTERM until a
+builtin finishes, and a slow builtin can take hours, so SIGTERM alone is not enough.
+Otherwise it exits with the command's own code. Standard library only.
+
+  bounded --self-test
+"""
+import os
+import signal
+import subprocess
+import sys
+import time
+
+GRACE = 5.0
+
+
+def stop(proc):
+    """SIGTERM the group, then SIGKILL whatever is left after the grace period."""
+    for sig, wait in ((signal.SIGTERM, GRACE), (signal.SIGKILL, 0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            if proc.poll() is not None and not group_alive(proc.pid):
+                return
+            time.sleep(0.1)
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def run(minutes, argv, poll=1.0):
+    parent = os.getppid()
+    proc = subprocess.Popen(argv, start_new_session=True)
+    reason = []
+
+    def on_signal(signum, _frame):
+        reason.append(f"got {signal.Signals(signum).name}")
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, on_signal)
+
+    deadline = time.monotonic() + minutes * 60 if minutes > 0 else None
+    while True:
+        try:
+            code = proc.wait(timeout=poll)
+            return code if code >= 0 else 128 - code
+        except subprocess.TimeoutExpired:
+            pass
+        if reason:
+            stop(proc)
+            return 143
+        if os.getppid() != parent:
+            stop(proc)
+            return 129
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f"bounded: stopped after {minutes:g} minutes: {' '.join(argv)[:200]}. "
+                  "Raise --minutes (or LEAN_BG_MINUTES) if it needs longer, or find what hangs.",
+                  file=sys.stderr)
+            stop(proc)
+            return 124
+
+
+def parse(args):
+    minutes = float(os.environ.get("LEAN_BG_MINUTES") or 60)
+    if args[:1] == ["--minutes"] and len(args) > 1:
+        minutes = float(args[1])
+        args = args[2:]
+    if args[:1] == ["--"]:
+        args = args[1:]
+    if not args:
+        sys.exit("usage: bounded [--minutes N] -- command [args...]")
+    return minutes, args
+
+
+def self_test():
+    fails = []
+    if run(0, ["sh", "-c", "exit 3"]) != 3:
+        fails.append("exit code not passed through")
+    t0 = time.monotonic()
+    code = run(0.02, ["sh", "-c", "sleep 30"], poll=0.1)
+    if code != 124 or time.monotonic() - t0 > 10:
+        fails.append(f"deadline not enforced: {code}")
+    # A child that ignores SIGTERM, the way bash does inside a slow builtin, still stops.
+    t0 = time.monotonic()
+    code = run(0.01, ["sh", "-c", "trap '' TERM; while :; do :; done"], poll=0.1)
+    if code != 124 or time.monotonic() - t0 > 15:
+        fails.append(f"TERM-ignoring child not killed: {code}")
+    # The whole group stops, grandchildren included.
+    marker = f"/tmp/bounded-selftest-{os.getpid()}"
+    run(0.01, ["sh", "-c", f"(sleep 3; touch {marker}) & wait"], poll=0.1)
+    time.sleep(4)
+    if os.path.exists(marker):
+        os.remove(marker)
+        fails.append("grandchild survived")
+    # The shell that started it dies: the command stops instead of being orphaned.
+    script = os.path.realpath(__file__)
+    shell = subprocess.Popen(["sh", "-c", f"python3 '{script}' --minutes 0 -- sleep 60 & echo $!; wait"],
+                             stdout=subprocess.PIPE, text=True)
+    pid = int(shell.stdout.readline())
+    time.sleep(1)
+    shell.kill()
+    shell.wait()
+    end = time.monotonic() + 10
+    while time.monotonic() < end and pid_alive(pid):
+        time.sleep(0.2)
+    if pid_alive(pid):
+        os.kill(pid, signal.SIGKILL)
+        fails.append("orphaned runner kept going after its shell died")
+    for f in fails:
+        print("self-test failed:", f)
+    if fails:
+        return 1
+    print("self-test passed")
+    return 0
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return bool(out.strip()) and not out.strip().startswith("Z")
+    except OSError:
+        return True
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    m, a = parse(sys.argv[1:])
+    sys.exit(run(m, a))
