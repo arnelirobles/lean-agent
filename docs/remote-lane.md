@@ -80,7 +80,7 @@ A job whose test path is a `playwright.config.ts` (or `.js`, `.mjs`, `.cjs`) run
 Three things to know:
 
 - A drainer from before the Vitest runner does not know `package.json` jobs. It runs one as `dotnet test` and fails it with a `run-failed` item. Replace every copy of `test-phase` before queueing one.
-- A tracked `.npmrc` is copied to the host like any tracked file, token included. Add `.npmrc` to `exclude` if it holds one (and send the token through `env_file`).
+- The copy never sends `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `.pnpmrc` (a token may be in them), and `exclude =` cannot bring them back. The host installs from the public registry only; a job that needs a private feed stays on the local lane.
 - A cold first run downloads pnpm and installs with little output. If it trips `--stall` (default 600 seconds), raise `--stall` for that run.
 
 ## Build reuse

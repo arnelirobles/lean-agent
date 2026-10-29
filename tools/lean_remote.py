@@ -42,6 +42,8 @@ import time
 from dataclasses import dataclass, field
 
 DEFAULT_EXCLUDE = [".env*", "*.key", "*.pem", "*license-key*", "secrets*"]
+# Package manager config can hold a login token. It is never copied, whatever `exclude =` says.
+NEVER_COPY = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"]
 DEFAULT_IMAGE = "mcr.microsoft.com/dotnet/sdk:10.0"
 DEFAULT_NODE_IMAGE = "node:22-bookworm-slim"
 MARKER = "lean-remote: started"
@@ -256,6 +258,7 @@ def file_list(repo, extra_paths, exclude, skip_node_modules=False):
         elif os.path.lexists(top):
             found.add(os.path.normpath(extra))
     # .lean.env is where send_env writes; a repo file of that name must not be copied over it.
+    exclude = list(exclude) + NEVER_COPY
     if skip_node_modules:
         exclude = list(exclude) + ["node_modules"]
     return sorted(f for f in found if os.path.lexists(os.path.join(repo, f)) and not excluded(f, exclude)
@@ -615,6 +618,15 @@ docker = yes
             fails.append(f"file_list must drop excluded files, extra paths included, and keep ignored extra paths: {got}")
         if file_list(repo, [], ["a.*"]) != [".env.local", ".gitignore", "secrets.json"]:
             fails.append("exclude must apply to a custom list")
+        for rc_name in (".npmrc", "web/.npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"):
+            os.makedirs(os.path.dirname(os.path.join(repo, rc_name)) or repo, exist_ok=True)
+            with open(os.path.join(repo, rc_name), "w") as fh:
+                fh.write("//registry.npmjs.org/:_authToken=npm_abc\n")
+        left = [f for f in file_list(repo, [], []) if "rc" in os.path.basename(f)]
+        if left:
+            fails.append(f"file_list must never copy a package manager config, even with an empty exclude: {left}")
+        for rc_name in (".npmrc", "web/.npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"):
+            os.remove(os.path.join(repo, rc_name))
         os.symlink("/etc/hosts", os.path.join(repo, ".lean.env"))
         if ".lean.env" in file_list(repo, [], []):
             fails.append("a repo file named .lean.env must never be copied over the env file")
