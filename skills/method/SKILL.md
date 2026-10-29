@@ -22,6 +22,7 @@ Label every agent you start, so lean-stats can count it by role. The Agent descr
 - Write tickets in the agent-ready shape with the `shape-ticket` skill: Goal, Where, Covers, Done when, Risks, Constraints, Out of scope.
 - Bigger tickets get a cheap spec review (read the ticket and the code, list what could go wrong) before anyone builds.
 - Plan the steps that need a person up front: merges without a standing authorisation, production, writes to outside services, destructive git. Record any standing authorisation with its scope (which changes, until when, what it excludes). End a run with one block of exact commands for the person.
+- Do not stack pull requests on Azure DevOps: `az` cannot change a target branch, so each retarget is a person in the web UI. Open each pull request against the default branch. Either open the next one after the one before merges, or open it against the default branch now and name in its body which commits belong to the earlier pull request.
 
 ## While working
 - Scripts, not instructions: run the repository's full gate script, not the one gate that seems relevant.
@@ -34,7 +35,7 @@ Label every agent you start, so lean-stats can count it by role. The Agent descr
 - A worktree-isolated agent runs git as plain single commands from the worktree root: no `cd x &&`, no pipes. The harness refuses what it cannot verify.
 - Parallel changes never append to one shared file such as a changelog: one fragment file per change.
 - Verify content and identity, not status codes or ratios: a page baked empty still answers 200, a small pixel ratio can hide wrong dates, and the deployed commit sha proves a deploy where a version string does not.
-- Before opening a pull request, run `${CLAUDE_PLUGIN_ROOT}/tools/style-scan` on the branch and on the body file, and `${CLAUDE_PLUGIN_ROOT}/tools/holdout.sh` for the mutation check. Do not write your own dash grep or revert loop.
+- Before opening a pull request, run `${CLAUDE_PLUGIN_ROOT}/tools/style-scan` on the branch and on the body file, and `${CLAUDE_PLUGIN_ROOT}/tools/holdout.sh` for the mutation check. Holdout runs in the draft, before the adversarial review starts, not after it. Do not write your own dash grep or revert loop.
 - A task is not done until the pull request URL exists.
 
 ## Scripts
@@ -43,6 +44,7 @@ The scripts live in `${CLAUDE_PLUGIN_ROOT}/tools/`. They are on PATH when the se
 - `holdout.sh --spec <file>`: holds a change's production hunk out and requires its named test to fail. Use it for the mutation check, not a hand revert.
 - `replace`: exact text edit that fails unless the old text is there exactly once.
 - `wait-loop` hook (`hooks/wait-loop.py`): denies `sleep` and `pgrep` wait loops. Enqueue and end the turn instead, or start `brain queue wait ID...` or `pr-wait` in the background.
+- `review-log-check` hook (`hooks/review-log-check.py`): denies `gh pr ready`, `gh pr merge` and `az repos pr update --draft false` (or `--status completed`) when `lean.db` has no review row for that pull request, once the repo has a logged review. Log it with `log-review.sh <repo> <pr> ...` first, or set `LEAN_SKIP_REVIEW_LOG_CHECK=1` for a change that was not reviewed.
 - `pr-wait <pr>`: waits for a pull request's checks (or `--provider azure` for a pipeline run) and prints only the failed checks and the tail of their logs.
 - `orient [--all]`: repo, branch, dirty count, ahead and behind, open PR with its checks, and with `--all` one line per worktree. Use it instead of a status loop over worktrees.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what each project in the repo pins. Use it instead of a curl to a registry.
@@ -67,6 +69,7 @@ Coding agents call these instead of writing the command again:
 - `brain queue add ...`: queue the tests, end the turn, and the orchestrator runs `test-phase`. Never run `dotnet test`, `npx vitest`, `vitest run` or `npm test` yourself; the script-note hook blocks it where test-phase can take the job.
 - `check-deployed-sha.sh <url> <sha>`: proves a deploy by the commit sha it reports. Use it instead of a curl smoke check.
 - `style-scan`: checks added lines for dashes, arrows, slop and attribution. Use it instead of a grep, before every commit.
+- `holdout.sh --spec <file>`: holds each production hunk out and requires its named test to fail. The draft is not done until it passes; run it before handing the branch to the hunt, so the hunter does not spend its pass on tests that pass for the wrong reason. On a repository whose default branch is not `master`, set `HOLDOUT_BASE=origin/<default>`.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what the repo pins. Use it instead of a curl to a registry.
 
 ## Tests and brain
