@@ -89,6 +89,7 @@ def _apple_text(text):
 
 
 NPM_REGISTRY = re.compile(r"^\s*(?:@[^:=\s]+:)?registry\s*=\s*(\S+)", re.I)
+NPM_AUTH = re.compile(r"^\s*(?://\S*:)?_?(?:authToken|auth|password|username)\s*=", re.I)
 
 
 def private_npm_feed(repo, test_project):
@@ -98,10 +99,12 @@ def private_npm_feed(repo, test_project):
     root = os.path.abspath(repo)
     while True:
         try:
-            lines = open(os.path.join(folder, ".npmrc"), encoding="utf-8", errors="replace").read().splitlines()
+            lines = open(os.path.join(folder, ".npmrc"), encoding="utf-8-sig", errors="replace").read().splitlines()
         except OSError:
             lines = []
         for line in lines:
+            if NPM_AUTH.match(line) or "${" in line:  # a login or an env placeholder: the value lives on this machine
+                return True
             m = NPM_REGISTRY.match(line)
             if m:
                 try:
@@ -373,6 +376,9 @@ def cmd_queue(a):
             if a.to == "remote" and r["platform"] == "private" and not a.force:
                 sys.exit(f"brain: job #{a.id} uses a private npm feed whose login only this machine has, so npm ci "
                          "would fail with E401 on a remote host; pass --force to send it anyway")
+            if a.to == "any" and r["platform"] == "private" and not a.force:
+                sys.exit(f"brain: job #{a.id} uses a private npm feed whose login only this machine has, so a remote "
+                         "lane would fail it with E401; pass --force to let any lane take it")
             if a.to == "remote" and r["platform"] == "apple" and not a.force:
                 sys.exit(f"brain: job #{a.id} is marked Apple, this machine only, and would likely fail to build on a remote host; "
                          "pass --force to send it anyway")

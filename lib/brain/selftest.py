@@ -653,8 +653,24 @@ def run(brain_cli):
         mk("Up/Deep/package.json", "{}")
         mk("Up/.npmrc", "registry=https://pkgs.example.com/npm/\n")
         mk("Bare/package.json", "{}")
+        mk("Tok/package.json", "{}")
+        mk("Tok/.npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n")
+        mk("Lit/package.json", "{}")
+        mk("Lit/.npmrc", "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=npm_abc\n")
+        mk("Basic/package.json", "{}")
+        mk("Basic/.npmrc", "_auth=abc\n")
+        mk("Pw/package.json", "{}")
+        mk("Pw/.npmrc", "//registry.npmjs.org/:_password=abc\n")
+        mk("Usr/package.json", "{}")
+        mk("Usr/.npmrc", "//registry.npmjs.org/:username=me\n")
+        mk("Bom/package.json", "{}")
+        with open(os.path.join(rp, "Bom", ".npmrc"), "w", encoding="utf-8-sig") as fh:
+            fh.write("registry=https://pkgs.example.com/npm/\n")
         for rel, want in (("Web/package.json", "private"), ("Pub/package.json", ""), ("Env/package.json", "private"),
-                          ("Up/Deep/package.json", "private"), ("Bare/package.json", "")):
+                          ("Up/Deep/package.json", "private"), ("Bare/package.json", ""),
+                          ("Tok/package.json", "private"), ("Lit/package.json", "private"),
+                          ("Basic/package.json", "private"), ("Pw/package.json", "private"),
+                          ("Usr/package.json", "private"), ("Bom/package.json", "private")):
             if detect_platform(rp, rel) != want:
                 fails.append(f"detect_platform({rel}) must be {want!r}")
         pn = run("queue", "add", rp, "Web/package.json")[1]
@@ -666,6 +682,16 @@ def run(brain_cli):
         rc, out, err = run("queue", "route", pn, "--to", "remote")
         if rc == 0 or "private npm feed" not in err or "--force" not in err:
             fails.append(f"route --to remote on a private feed job must be refused without --force: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "route", pn, "--to", "any")
+        if rc == 0 or "private npm feed" not in err or "--force" not in err:
+            fails.append(f"route --to any on a private feed job must be refused without --force: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "route", pn, "--to", "remote", "--force")
+        if rc != 0 or "platform=remote" not in out or "private npm feed" not in err:
+            fails.append(f"route --to remote --force must send a private job and warn: {rc} {out!r} {err!r}")
+        run("queue", "route", pn, "--to", "local")
+        rc, out, err = run("queue", "route", pn, "--to", "any", "--force")
+        if rc != 0:
+            fails.append(f"route --to any --force must be allowed on a private job: {rc} {out!r} {err!r}")
         run("queue", "cancel", pn)
         # route: send a queued job to a remote lane, back to the Mac, or to whichever lane is free.
         ra = run("queue", "add", rp, "Apple.Tests")[1]
