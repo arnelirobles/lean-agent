@@ -40,6 +40,7 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import direct_test as direct  # noqa: E402
 import hookkit  # noqa: E402
 
 REPEATS = os.path.join(HERE, "..", "tools", "script-repeats")
@@ -50,9 +51,6 @@ MAX_AGE = 14 * 86400
 SKIP_FAMILIES = {"direct-test-run"}
 SUFFIX = ".seen"
 _REPEATS = None
-DIRECT_TEST = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:time\s+)?(?:dotnet test|npx vitest|vitest run|npm test)\b")
-LANE = re.compile(r"test-phase|heavy\.sh|brain queue")
-INLINE_ALLOW = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*LEAN_DIRECT_TEST=allow\b", re.I)
 
 
 def repeats():
@@ -112,22 +110,17 @@ def candidates(command):
     return out
 
 
-def direct_test(command):
-    """True when a segment of the command starts a test run outside test-phase and heavy.sh."""
+def direct_test(command, cwd):
+    """True when a segment of the command starts a test run that test-phase can take."""
     module = repeats()
-    if os.environ.get("LEAN_DIRECT_TEST", "").lower() == "allow":
-        return False
-    for seg in module.SEGMENT.split(module.strip_prose(command[:module.CAP])):
-        if DIRECT_TEST.search(seg) and not LANE.search(seg) and not INLINE_ALLOW.search(seg):
-            return True
-    return False
+    return direct.blocks(module.SEGMENT.split(module.strip_prose(command[:module.CAP])), cwd)
 
 
-def block_message():
-    return ("Do not run tests directly. Queue them: `%s queue add <repo> <project> --filter ...`, then run "
-            "`%s` as one background task. If it cannot run here, `%s --doctor` shows what is missing. "
+def block_message(cwd):
+    return ("Do not run tests directly. Queue them: `%s queue add %s <test project> --filter ...`, then end "
+            "the turn; the orchestrator runs `%s`. If it cannot run here, `%s --doctor` shows what is missing. "
             "LEAN_DIRECT_TEST=allow turns this block off." % (
-                hookkit.tool_path("brain"), hookkit.tool_path("test-phase"), hookkit.tool_path("test-phase")))
+                hookkit.tool_path("brain"), cwd, hookkit.tool_path("test-phase"), hookkit.tool_path("test-phase")))
 
 
 def state_dir():
@@ -201,8 +194,9 @@ def main():
     command = hookkit.tool_input(event).get("command")
     if not isinstance(command, str) or not command.strip():
         return 0
-    if direct_test(command):
-        print(block_message(), file=sys.stderr)
+    cwd = event.get("cwd") or os.getcwd()
+    if direct_test(command, cwd):
+        print(block_message(cwd), file=sys.stderr)
         return 2
     if os.environ.get("LEAN_SCRIPT_NOTE", "").lower() == "off":
         return 0
@@ -236,9 +230,15 @@ def self_test():
             print("FAIL %s %s" % (label, detail))
             failures += 1
 
-    def fire(command, session="sess-1"):
+    lanes = tempfile.mkdtemp()
+    for f in ("App.sln", "pnpm-lock.yaml"):
+        open(os.path.join(lanes, f), "w").close()
+    bare = tempfile.mkdtemp()
+
+    def fire(command, session="sess-1", cwd=None):
         old = sys.stdin
-        sys.stdin = io.StringIO(json.dumps({"tool_input": {"command": command}, "session_id": session}))
+        sys.stdin = io.StringIO(json.dumps({"tool_input": {"command": command}, "session_id": session,
+                                            "cwd": cwd or lanes}))
         out, err = io.StringIO(), io.StringIO()
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -337,6 +337,22 @@ def self_test():
                            ("other npm", "npm run build && npm install"), ("test file", "cat tests/npm-test.txt")):
         rc, text, err = fire(command, "dtok-" + label.replace(" ", "-"))
         check("no block " + label, rc == 0 and not err, repr((rc, err)))
+    for label, command in (("two spaces", "dotnet  test X.sln"), ("npm run test", "npm run test"),
+                           ("pnpm test", "pnpm test"), ("yarn test", "yarn test")):
+        check("block " + label, fire(command, "dt2-" + label.replace(" ", "-"))[0] == 2)
+    check("list-tests runs nothing", fire("dotnet test X.sln --list-tests", "dt-list")[0] == 0)
+    check("redirect to a lane name is still blocked", fire("npm test > test-phase.log", "dt-redir")[0] == 2)
+    check("lane name as an argument is still blocked", fire("dotnet test X --logger heavy.sh", "dt-arg")[0] == 2)
+    rc, _, err = fire("npm test", "dt-msg")
+    check("message names the repo and leaves the run to the orchestrator", lanes in err and "orchestrator" in err, repr(err))
+    for label, command in (("npm test", "npm test"), ("npx vitest run", "npx vitest run"), ("vitest run", "vitest run")):
+        rc, _, err = fire(command, "dtn-" + label.replace(" ", "-"), bare)
+        check("no lane, no block " + label, rc == 0 and not err, repr((rc, err)))
+    check("dotnet without a project is not blocked", fire("dotnet test X", "dtn-dn", bare)[0] == 0)
+    lock_only = tempfile.mkdtemp()
+    open(os.path.join(lock_only, "package-lock.json"), "w").close()
+    check("npm lockfile has no lane", fire("npm test", "dtn-npm", lock_only)[0] == 0)
+    check("dotnet with a project is blocked", fire("dotnet test", "dtn-sln", lanes)[0] == 2)
     rc, _, err = fire("LEAN_DIRECT_TEST=allow dotnet test X", "dt-inline")
     check("allow inline", rc == 0 and not err, repr(err))
     os.environ["LEAN_DIRECT_TEST"] = "allow"

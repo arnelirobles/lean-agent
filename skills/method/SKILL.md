@@ -46,7 +46,7 @@ The scripts are not on PATH. They live in `${CLAUDE_PLUGIN_ROOT}/tools/`, so run
 - `pr-wait <pr>`: waits for a pull request's checks (or `--provider azure` for a pipeline run) and prints only the failed checks and the tail of their logs.
 - `orient [--all]`: repo, branch, dirty count, ahead and behind, open PR with its checks, and with `--all` one line per worktree. Use it instead of a status loop over worktrees.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what each project in the repo pins. Use it instead of a curl to a registry.
-- `script-note` hook (`hooks/script-note.py`): when a command matches a family in `lib/script_families.json` that a script covers, or calls a script by its plugin cache path, it adds a one line note naming the script. Once per family per session. `LEAN_SCRIPT_NOTE=off` turns it off. The same hook blocks (exit 2) a direct `dotnet test`, `npx vitest`, `vitest run` or `npm test` and names the `brain queue add` line to use; `LEAN_DIRECT_TEST=allow` turns that off.
+- `script-note` hook (`hooks/script-note.py`): when a command matches a family in `lib/script_families.json` that a script covers, or calls a script by its plugin cache path, it adds a one line note naming the script. Once per family per session. `LEAN_SCRIPT_NOTE=off` turns it off. The same hook blocks (exit 2) a direct `dotnet test` (a .sln or .csproj in reach) or `npm test`, `npx vitest`, `vitest run` (a pnpm-lock.yaml in reach) and names the `brain queue add` line to use; `LEAN_DIRECT_TEST=allow` turns that off.
 - `pr-blockers.sh <pr>`: every reason a pull request cannot merge, in one read-only call.
 - `why-red.sh <log>`: names environmental causes (no Docker, a busy port, a full disk) in a failed log before you debug code.
 - `assert-ran.sh <report>`: fails when a test report shows zero tests ran.
@@ -63,7 +63,7 @@ The scripts are not on PATH. They live in `${CLAUDE_PLUGIN_ROOT}/tools/`, so run
 ### Drafter brief (`lean:draft`)
 Coding agents call these instead of writing the command again:
 - `replace FILE < blocks`: exact text edit that fails unless the old text is there once. Use it instead of inline python that calls `.replace`.
-- `brain queue add`, then `test-phase`: the only way to run tests. Never run `dotnet test`, `npx vitest`, `vitest run` or `npm test` yourself; the script-note hook blocks it.
+- `brain queue add ...`: queue the tests, end the turn, and the orchestrator runs `test-phase`. Never run `dotnet test`, `npx vitest`, `vitest run` or `npm test` yourself; the script-note hook blocks it where test-phase can take the job.
 - `check-deployed-sha.sh <url> <sha>`: proves a deploy by the commit sha it reports. Use it instead of a curl smoke check.
 - `style-scan`: checks added lines for dashes, arrows, slop and attribution. Use it instead of a grep, before every commit.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what the repo pins. Use it instead of a curl to a registry.
