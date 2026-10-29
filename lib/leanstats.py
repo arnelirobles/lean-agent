@@ -103,6 +103,7 @@ MIGRATIONS = [  # one entry per schema version, applied in order; never edit an 
 CONTEXT_LIMIT = 80000
 LOOKUP_TOOLS = {"Grep", "Glob", "Read"}
 LOOKUP_WORDS = {"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "ls"}
+SEARCH_WORDS = {"grep", "egrep", "fgrep", "rg", "find", "cat"}
 LOOKUP_GIT = {"status", "log", "diff", "show", "fetch"}
 LOOKUP_GH = {"view", "list", "checks"}
 LOOKUP_GH_AREAS = {"pr", "issue", "run"}
@@ -302,6 +303,20 @@ def is_lookup(command):
         return False
 
 
+def is_search(name, tool_input):
+    """True for Grep, Glob, or a read-only Bash command with a grep, rg, find or cat in it. git and gh state
+    checks and ls are lookups but not searches."""
+    if name in ("Grep", "Glob"):
+        return True
+    if name != "Bash" or not isinstance(tool_input, dict) or not is_lookup(tool_input.get("command")):
+        return False
+    try:
+        return any(seg.words and os.path.basename(seg.words[0]) in SEARCH_WORDS
+                   for seg in _hookkit().segments(tool_input["command"]))
+    except Exception:
+        return False
+
+
 def is_wait_loop(command):
     """True when wait-loop.py would deny the command: a sleep and read poll, or pgrep."""
     if not isinstance(command, str) or len(command) > MAX_WAIT_COMMAND \
@@ -328,12 +343,30 @@ def tool_kind(name, tool_input):
     return "other"
 
 
+IMAGE_READ_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+IMAGE_TOOL_WORDS = ("screenshot", "thumbnail")  # matches browser_take_screenshot, get_screenshot, read_slide_page_thumbnail
+
+
+def is_image_call(name, tool_input):
+    """True when the tool call returns an image: Read of an image file or of a pdf with pages, or a screenshot or thumbnail tool."""
+    if not isinstance(name, str):
+        return False
+    if name == "Read" and isinstance(tool_input, dict):
+        path = tool_input.get("file_path")
+        if not isinstance(path, str):
+            return False
+        path = path.lower()
+        return path.endswith(IMAGE_READ_EXTENSIONS) or (path.endswith(".pdf") and bool(tool_input.get("pages")))
+    return any(word in name.lower() for word in IMAGE_TOOL_WORDS)
+
+
 def usage_of(row, message):
     usage = message["usage"]
     split = usage.get("cache_creation")
     split = split if isinstance(split, dict) else {}
     written = int(usage.get("cache_creation_input_tokens") or 0)
     return {
+        "id": message.get("id") or "",
         "model": message.get("model") or "",
         "cwd": row.get("cwd") or "",
         "ts": row.get("timestamp") or "",
@@ -510,6 +543,23 @@ def self_test():
         return json.dumps({"message": message, "cwd": cwd, "sessionId": "s1",
                            "timestamp": "2026-10-02T01:00:00.000Z"}) + "\n"
 
+    for label, name, tool_input, want in (
+            ("a png read", "Read", {"file_path": "/a/shot.PNG"}, True),
+            ("a webp read", "Read", {"file_path": "x.webp"}, True),
+            ("a jpeg read", "Read", {"file_path": "x.jpeg"}, True),
+            ("a text read", "Read", {"file_path": "x.py"}, False),
+            ("a read with no path", "Read", {}, False),
+            ("a browser screenshot", "mcp__plugin_playwright_playwright__browser_take_screenshot", {}, True),
+            ("a devtools screenshot", "mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_screenshot", {}, True),
+            ("a figma screenshot", "mcp__plugin_figma_figma__get_screenshot", {}, True),
+            ("a slide thumbnail", "mcp__claude_ai_Google_Slides__read_slide_page_thumbnail", {}, True),
+            ("a computer-use screenshot", "screenshot", {}, True),
+            ("a pdf read with pages", "Read", {"file_path": "/a/b.PDF", "pages": "1-3"}, True),
+            ("a pdf read without pages", "Read", {"file_path": "/a/b.pdf"}, False),
+            ("a snapshot is text", "mcp__plugin_playwright_playwright__browser_snapshot", {}, False),
+            ("a png path in Bash", "Bash", {"file_path": "x.png"}, False),
+            ("no name", None, {}, False)):
+        check("image call: " + label, is_image_call(name, tool_input), want)
     check("family by name", family("claude-haiku-4-5"), "haiku")
     check("unknown family is opus", family("something-new"), "opus")
     check("family of a versioned id", family("claude-fable-5-1"), "fable")
