@@ -171,7 +171,10 @@ def _end_word(word):
     """The heredoc end word as bash reads it: quotes and backslashes removed, so <<E"O"F ends at EOF.
 
     None when the word will not parse; the caller then leaves the text in place for the strict parse to refuse.
+    Also None for $ or a backtick: bash drops a backslash before them inside double quotes and shlex does not.
     """
+    if "$" in word or "`" in word:
+        return None
     try:
         return "".join(shlex.split(word))
     except ValueError:

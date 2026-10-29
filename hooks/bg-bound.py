@@ -119,6 +119,7 @@ def self_test():
     check("separator inside a heredoc body passes", bg(f"{BOUNDED} -- cat <<EOF\nfoo && bar\nEOF"), False)
     check("quoted heredoc end word cannot hide a command", bg(f"{BOUNDED} -- cat <<E\"O\"F\nx\nEOF\nsleep 999"), True)
     check("escaped quote in a heredoc end word cannot hide a command", bg(f"{BOUNDED} -- cat <<\"E\\\"F\"\nx\nE\"F\nsleep 999"), True)
+    check("escaped dollar in a heredoc end word cannot hide a command", bg(f"{BOUNDED} -- cat <<\"E\\$F\"\nx\nE$F\nsleep 999"), True)
     check("two env assignments then bounded", bg(f"A=1 B=2 {BOUNDED} -- true"), False)
     check("three env assignments then bounded is denied", bg(f"A=1 B=2 C=3 {BOUNDED} -- true"), True)
     check("background false passes", {"command": "make", "run_in_background": False}, False)
