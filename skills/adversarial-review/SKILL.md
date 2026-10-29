@@ -165,10 +165,11 @@ The same row goes into the lean-stats database (`~/.lean/lean.db`), where `${CLA
 it to the agents that worked on the change. Logging the same pull request again replaces its row
 there, which is how `escaped` gets filled in later.
 
-The log row is the last step of every review. Write it and commit it before the push. The
-`review-log-check` hook refuses a `git push`, `gh pr create` or `az repos pr create` on a branch with no
-row in the `pr` column (the branch name, or the branch name with `/` as `-`). If the change was
-deliberately not reviewed, set `LEAN_REVIEW_LOG_CHECK=off` for that command.
+The log row is the last step of every review. Log it by pull request number before marking the
+pull request ready or merging it. The `review-log-check` hook refuses `gh pr ready`, `gh pr merge`
+and `az repos pr update --draft false` (or `--status completed`) when `lean.db` has no row in
+`reviews` for that pull request. If the change was deliberately not reviewed, set
+`LEAN_SKIP_REVIEW_LOG_CHECK=1` for that command.
 
 When a category keeps surviving refutation, turn it into a scripted check. When a tier has
 produced nothing for three batches, stop running the full review on it.
