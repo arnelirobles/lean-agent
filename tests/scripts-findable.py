@@ -4,7 +4,7 @@
 Two rules, both from issue 68:
 
 1. No skill, full-text.md or the README names a script by the old ${CLAUDE_PLUGIN_ROOT}/bin/ or by a
-   versioned plugin path. Scripts live in tools/ and are not on PATH; the path to use is
+   versioned plugin path. Scripts live in tools/ and are on PATH when session-env ran; otherwise the path to use is
    ${CLAUDE_PLUGIN_ROOT}/tools/<name>, and a versioned path breaks after an upgrade.
 2. Every script in tools/ that has a --self-test is named in the "Scripts" block of
    skills/method/SKILL.md. Only scripts that exist in tools/ are checked.
