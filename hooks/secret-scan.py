@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
-"""Block a key or token from reaching git: a commit, a push, or a file write.
+"""Keep keys and tokens out of git.
 
-PreToolUse hook. It uses the scanner in tools/secret-scan (gitleaks when it is
-installed, plus the plugin's own patterns) and checks:
+PreToolUse hook. The scan itself runs in git's own pre-commit and pre-push
+hooks, which tools/secret-scan installs (secret-scan install REPO), so a commit
+or push made any way at all is checked. This hook makes sure they run:
 
-  Bash   git commit   the staged diff; with -a the work tree against HEAD; with
-                      paths (git commit a.txt, -o, -i, --) those paths in the
-                      work tree; plus untracked files when git add runs first
-  Bash   git push     the commits the push sends that the target remote does
-                      not have, by remote and refspec (all of --all, --tags)
+  Bash   a command that commits or pushes (git commit, git push, an alias of
+         either, a git command it does not know, or a git call it cannot place)
+         is blocked when the repository has no working secret-scan pre-commit
+         and pre-push hooks, with the command that installs them. It is also
+         blocked when it skips them: --no-verify, commit -n, core.hooksPath set
+         with -c, --config-env or git config, or GIT_CONFIG_*, HOME or
+         XDG_CONFIG_HOME set in the command. git send-pack and git http-push
+         never run pre-push and are blocked too.
   Write, Edit, MultiEdit, NotebookEdit
-                      the text being written, when the file is tracked or would
-                      be tracked. A gitignored file such as .env.local is fine.
+         the text being written, when the file is tracked or would be tracked.
+         A gitignored file such as .env.local is fine, and so is a file inside
+         the git dir.
 
 It looks inside bash -c, sh -c, eval, braces, if/then and xargs, and follows
--C, --git-dir, --work-tree, GIT_DIR and GIT_WORK_TREE. A path it cannot work out
-(cd $(...)) scans the starting repository, or blocks when that is not one.
-If the scanner is missing or fails, the call is blocked with the reason: a
-check that cannot run is not a pass.
+cd, pushd, -C, --git-dir, --work-tree, GIT_DIR and GIT_WORK_TREE. When a path is
+a variable or a command (cd $(...)), or a cd target does not exist yet, it
+checks the starting repository, and blocks when that is not one. If the
+scanner cannot be loaded the call is blocked with the reason.
 
 The message names the file, the line and the pattern, never the value. A line
 with `allow-secret` on it is skipped. Each block is recorded as a hook fire in
 lean.db, so a weekly count is possible.
 
-  LEAN_SKIP_SECRET_SCAN=1   turn it off, in the environment, in the env block
-                            of Claude Code settings, or inline in front of the
-                            command
+  LEAN_SKIP_SECRET_SCAN=1   turn it off, here and in the git hooks: in the
+                            environment, in the env block of Claude Code
+                            settings, or inline in front of the command
   secret-scan.py --self-test
 """
 import importlib.machinery
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
@@ -52,23 +58,36 @@ def scanner():
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 KEYWORDS = {"{", "}", "!", "if", "then", "else", "elif", "do", "while", "until", "fi", "done"}
 QUIET = {"echo", "printf", "grep", "rg", "cat", "man", "which", "head", "tail", "less", "type", "jq"}
-COMMIT_VALUE_SHORT = set("mFCct")
-COMMIT_VALUE_LONG = {"--author", "--date", "--cleanup", "--fixup", "--squash", "--trailer", "--message",
-                     "--file", "--reuse-message", "--reedit-message", "--template"}
+EXPORTS = {"export", "declare", "typeset", "local", "readonly"}
+# git commands that neither commit through pre-commit nor push. Anything else that is not an
+# alias (git-foo on PATH, a typo) counts as a commit or push, since it might be one.
+BUILTINS = set("""add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file
+check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick clean
+clone column commit-graph commit-tree config count-objects credential describe diagnose diff diff-files
+diff-index diff-pairs diff-tree difftool fetch fetch-pack filter-branch fmt-merge-msg for-each-ref
+for-each-repo format-patch fsck gc grep hash-object help hook index-pack init init-db interpret-trailers
+log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-tree
+mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects pack-refs patch-id prune pull
+range-diff read-tree rebase reflog refs remote repack replace replay repo rerere reset restore rev-list
+rev-parse revert rm shortlog show show-branch show-index show-ref sparse-checkout stage stash status
+stripspace submodule switch symbolic-ref tag unpack-file unpack-objects update-index update-ref var
+verify-commit verify-pack verify-tag version whatchanged worktree""".split())
+NO_HOOK_PUSH = {"send-pack", "http-push"}
+COMMIT_VALUE_SHORT = set("mFCctSu")
+VALUE_LONG = {"--author", "--date", "--cleanup", "--fixup", "--squash", "--trailer", "--message", "--file",
+              "--reuse-message", "--reedit-message", "--template", "--repo", "--receive-pack", "--exec",
+              "--push-option", "--pathspec-from-file"}
+BYPASS_ENV = re.compile(r"GIT_CONFIG\w*|HOME|XDG_CONFIG_HOME")
 ENV_PATH = re.compile(r"""\b(GIT_DIR|GIT_WORK_TREE)=(?:'([^']*)'|"([^"]*)"|([^\s;&|()]+))""")
 
 
 class Call:
-    """One git invocation found in a command."""
+    """One git invocation found in a command. dynamic: its folder could not be worked out."""
 
-    def __init__(self, sub, args, cwd, base, git_dir, work_tree, env, dynamic):
+    def __init__(self, sub, args, cwd, base, git_dir, work_tree, env, dynamic, config):
         self.sub, self.args, self.cwd, self.base = sub, args, cwd, base
         self.git_dir, self.work_tree, self.env, self.dynamic = git_dir, work_tree, env, dynamic
-
-
-class Env:
-    def __init__(self, env):
-        self.env = env
+        self.config = config  # [(key, value)] from -c and --config-env
 
 
 def is_dynamic(text):
@@ -88,27 +107,35 @@ def shell_string(words):
     return None
 
 
-def parse_git(words, seg_cwd, base, env, dynamic_cd, env_dirs):
-    cwd, git_dir, work_tree, dynamic, i = seg_cwd, None, None, dynamic_cd, 1
+def parse_git(words, seg_cwd, base, env, dynamic, env_dirs):
+    cwd, git_dir, work_tree, config, i = seg_cwd, None, None, [], 1
     while i < len(words) and words[i].startswith("-"):
         w = words[i]
         name, eq, val = w.partition("=") if w.startswith("--") else (w, "", "")
         if w == "-C" and i + 1 < len(words):
-            dynamic = dynamic or is_dynamic(words[i + 1])
+            dynamic = dynamic or is_dynamic(words[i + 1]) or not os.path.isdir(hookkit.resolve(words[i + 1], cwd))
             cwd = hookkit.safe_dir(words[i + 1], cwd, base)
             i += 2
-        elif name in ("--git-dir", "--work-tree"):
+        elif name in ("--git-dir", "--work-tree", "--config-env"):
             if not eq:
                 if i + 1 >= len(words):
                     break
                 val, i = words[i + 1], i + 1
             i += 1
+            if name == "--config-env":
+                key, _eq, var = val.partition("=")
+                config.append((key, "$" + var))
+                continue
             dynamic = dynamic or is_dynamic(val)
             if name == "--git-dir":
                 git_dir = hookkit.resolve(val, cwd)
             else:
                 work_tree = hookkit.resolve(val, cwd)
-        elif w in ("-c", "--namespace", "--exec-path"):
+        elif w == "-c" and i + 1 < len(words):
+            key, _eq, value = words[i + 1].partition("=")
+            config.append((key, value))
+            i += 2
+        elif w in ("--namespace", "--exec-path"):
             i += 2
         else:
             i += 1
@@ -124,21 +151,60 @@ def parse_git(words, seg_cwd, base, env, dynamic_cd, env_dirs):
         if value:
             dynamic = dynamic or is_dynamic(value)
             work_tree = hookkit.resolve(value, cwd)
-    return Call(words[i], words[i + 1:], cwd, base, git_dir, work_tree, env, dynamic)
+    return Call(words[i], words[i + 1:], cwd, base, git_dir, work_tree, env, dynamic, config)
+
+
+def split(text, cwd, base):
+    """Simple commands of a shell line as (segment, dynamic, assigned names). Like hookkit.segments,
+    and it follows pushd too. After a cd it cannot follow (a variable, a command, a folder that does
+    not exist yet, cd -, popd) every later segment is dynamic and runs, as far as we know, in base."""
+    text, bodies = hookkit.prepare(text)
+    out, current, dyn = [], [], False
+    for tok in hookkit.tokens(text) + [";"]:
+        if not hookkit.is_separator(tok):
+            current.append(tok)
+            continue
+        env, heredocs, words = {}, [], []
+        for word in current:
+            mark = hookkit.HEREDOC_MARK.fullmatch(word)
+            if mark:
+                n = int(mark.group(1))
+                heredocs.append(bodies[n] if n < len(bodies) else "")
+            else:
+                words.append(word)
+        current = []
+        while words and hookkit.ASSIGNMENT.fullmatch(words[0]):
+            key, value = words.pop(0).split("=", 1)
+            env[key] = value
+        words = hookkit.strip_wrappers(words, env)
+        assigned = set(env)
+        if words and words[0] in EXPORTS:
+            assigned |= {w.split("=", 1)[0] for w in words[1:] if hookkit.ASSIGNMENT.fullmatch(w)}
+        if words and words[0] in ("cd", "pushd", "popd"):
+            args = [w for w in words[1:] if w == "-" or not w.startswith("-")]
+            target = args[0] if args else "~"
+            path = hookkit.resolve(target, cwd)
+            if words[0] == "popd" or target == "-" or is_dynamic(target) or not os.path.isdir(path):
+                dyn, cwd = True, base
+            else:
+                cwd = path
+            words = []
+        out.append((hookkit.Segment(env, words, cwd, base, heredocs, tok in hookkit.PIPES), dyn, assigned))
+    return out
 
 
 def find_calls(command, cwd):
-    """(calls, unplaced): the git invocations in a command, looking inside sh -c, eval,
-    braces, if/then and xargs. unplaced is True when git and commit or push appear but no
-    git call could be placed."""
-    calls, mentions = [], []
-    dynamic_cd = bool(re.search(r"\bcd\b[^;&|\n]*[$`]", command))
+    """(calls, odd, assigned): the git invocations in a command, looking inside sh -c, eval, braces,
+    if/then and xargs; odd is True when some command word is itself a variable or a command
+    substitution, so a git call may hide there; assigned is every variable the command sets."""
+    calls, odd, assigned = [], [False], set()
     env_dirs = {}
     for m in ENV_PATH.finditer(command):
         env_dirs[m.group(1)] = m.group(2) or m.group(3) or m.group(4) or ""
 
-    def walk(text, where, env, depth):
-        for seg in hookkit.segments(text, where):
+    def walk(text, where, env, depth, dyn0):
+        for seg, dyn, names in split(text, where, cwd):
+            assigned.update(names)
             words, senv = list(seg.words), dict(env)
             senv.update(seg.env)
             while True:
@@ -148,103 +214,165 @@ def find_calls(command, cwd):
                 while words and hookkit.ASSIGNMENT.fullmatch(words[0]):
                     key, value = words.pop(0).split("=", 1)
                     senv[key] = value
+                    assigned.add(key)
                 words = hookkit.strip_wrappers(words, senv)
+                assigned.update(senv)
                 if len(words) == size:
                     break
             if not words:
                 continue
             first = os.path.basename(words[0])
+            if is_dynamic(words[0]) or words[0] == "$":
+                odd[0] = True
             if first in SHELLS or first == "eval":
                 inner = shell_string(words)
                 if inner is not None and depth < 4:
-                    walk(inner, seg.cwd, senv, depth + 1)
+                    walk(inner, seg.cwd, senv, depth + 1, dyn0 or dyn)
                     continue
             idx = next((j for j, w in enumerate(words) if os.path.basename(w) == "git"
                         and (j == 0 or first not in QUIET)), None)
             if idx is None:
-                if first not in QUIET:
-                    mentions.append(seg)
                 continue
-            call = parse_git(words[idx:], seg.cwd, seg.base, senv, dynamic_cd, env_dirs)
+            call = parse_git(words[idx:], seg.cwd, cwd, senv, dyn0 or dyn, env_dirs)
             if call:
                 calls.append(call)
 
-    walk(command, cwd, {}, 0)
-    return calls, bool(mentions) and not calls and bool(re.search(r"\bgit\b", command))
+    walk(command, cwd, {}, 0, False)
+    return calls, odd[0], assigned
 
 
-def commit_plan(args):
-    """What `git commit ARGS` takes: flags all, only, include, dry, and the pathspecs."""
-    plan = {"all": False, "include": False, "dry": False, "paths": [], "dynamic": False}
-    i, rest = 0, False
-    while i < len(args):
-        a = args[i]
-        if rest or not a.startswith("-") or a == "-":
-            plan["paths"].append(a)
-        elif a == "--":
-            rest = True
-        elif a.startswith("--"):
-            name = a.split("=", 1)[0]
-            if name == "--all":
-                plan["all"] = True
-            elif name == "--include":
-                plan["include"] = True
-            elif name == "--dry-run":
-                plan["dry"] = True
-            elif name in COMMIT_VALUE_LONG and "=" not in a:
-                i += 1
-        else:
+def alias_value(call):
+    """The alias call.sub stands for: from -c alias.X=... on the command, else from git config."""
+    want = "alias." + call.sub.lower()
+    for key, value in reversed(call.config):
+        if key.lower() == want:
+            return value
+    argv = ["git"] + (["--git-dir", call.git_dir] if call.git_dir else []) + ["config", "--get", want]
+    try:
+        p = subprocess.run(argv, cwd=call.cwd if os.path.isdir(call.cwd or "") else None,
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else None
+
+
+def effective(call, depth=0):
+    """The calls that commit or push, once aliases are expanded: [] for a git command that does
+    neither. A shell alias (!...) counts as one, and the git calls in its text are added."""
+    sub = call.sub
+    if sub in ("commit", "push") or sub in NO_HOOK_PUSH or is_dynamic(sub):
+        return [call]
+    if sub in BUILTINS:
+        return []
+    alias = alias_value(call) if depth < 5 else None
+    if alias is None:
+        return [call]
+    if alias.startswith("!"):
+        inner, _odd, _names = find_calls(alias[1:], call.cwd)
+        out = [call]
+        for c in inner:
+            c.dynamic = c.dynamic or call.dynamic
+            out += effective(c, depth + 1)
+        return out
+    new = parse_git(["git"] + hookkit.tokens(alias) + list(call.args), call.cwd, call.base, call.env,
+                    call.dynamic, {})
+    if new is None:
+        return []
+    new.git_dir = new.git_dir or call.git_dir
+    new.work_tree = new.work_tree or call.work_tree
+    new.config = call.config + new.config
+    return effective(new, depth + 1)
+
+
+def skips_hooks(call):
+    """Why this commit or push would not run its git hook, or None."""
+    if call.sub in NO_HOOK_PUSH:
+        return f"git {call.sub} never runs the pre-push hook"
+    i = 0
+    while i < len(call.args):
+        a = call.args[i]
+        name = a.split("=", 1)[0]
+        if a == "--":
+            break
+        if len(name) >= 7 and "--no-verify".startswith(name):
+            return a
+        if a.startswith("--"):
+            i += 2 if name in VALUE_LONG and "=" not in a else 1
+            continue
+        if call.sub == "commit" and a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:], 1):
-                if ch == "a":
-                    plan["all"] = True
-                elif ch == "i":
-                    plan["include"] = True
-                elif ch in COMMIT_VALUE_SHORT:
-                    if k == len(a) - 1:
+                if ch == "n":
+                    return "commit -n"
+                if ch in COMMIT_VALUE_SHORT:
+                    if k == len(a) - 1 and ch not in "Su":
                         i += 1
                     break
         i += 1
-    plan["dynamic"] = any(is_dynamic(p) for p in plan["paths"])
-    return plan
+    return None
 
 
-def bash_findings(command, cwd, tool):
-    """Findings for every git commit and git push in a command, scanned in one pass."""
-    calls, unplaced = find_calls(command, cwd)
-    col = tool.Collector()
-    adds = any(c.sub in ("add", "stage") for c in calls)
+def bypasses(calls, touching, assigned):
+    """Ways this command turns the git hooks off."""
+    found = []
+    for name in sorted(assigned):
+        if BYPASS_ENV.fullmatch(name):
+            found.append(f"{name}= in the command")
+    for c in calls + touching:
+        for key, _value in c.config:
+            if key.lower() == "core.hookspath":
+                found.append("core.hooksPath on the command line")
+        if c.sub == "config" and any("core.hookspath" in a.lower() for a in c.args):
+            found.append("git config core.hooksPath")
+    for c in touching:
+        why = skips_hooks(c)
+        if why:
+            found.append(why)
+    return sorted(set(found))
+
+
+def bash_check(command, cwd):
+    """None when the command may run, else the message that blocks it."""
+    calls, odd, assigned = find_calls(command, cwd)
+    touching = []
     for c in calls:
-        if c.sub not in ("commit", "push") or hookkit.disabled(SKIP, Env(c.env)):
+        if not hookkit.disabled(SKIP, c):
+            touching += effective(c)
+    unplaced = odd and re.search(r"\b(commit|push)\b", hookkit.prepare(command)[0])
+    if unplaced and SKIP + "=1" not in command:
+        touching.append(Call("commit", [], cwd, cwd, None, None, {}, True, []))
+    touching = [c for c in touching if not hookkit.disabled(SKIP, c)]
+    if not touching:
+        return None
+    skip_note = f"Put {SKIP}=1 in front of the command to skip the scan on purpose."
+    found = bypasses(calls, touching, assigned)
+    if found:
+        return ("Blocked by lean-agent: this command commits or pushes without the git hooks that scan "
+                f"for keys ({', '.join(found)}). Run it without that. " + skip_note)
+    scan = os.path.join(hookkit.TOOLS, "secret-scan")
+    if any(c.sub in ("init", "clone") for c in calls):
+        return ("Blocked by lean-agent: this command makes a repository and commits or pushes in it in one go, "
+                "before the secret-scan git hooks can be installed. Run git init or git clone on its own, then "
+                f"python3 '{scan}' install DIR, then the rest. " + skip_note)
+    tool = scanner()
+    seen = set()
+    for c in touching:
+        repo = tool.Repo(c.base) if c.dynamic else tool.Repo(c.cwd, c.git_dir, c.work_tree)
+        if not tool.is_repo(repo):
+            if c.dynamic:
+                return ("Blocked by lean-agent: cannot tell which repository this command commits or pushes in "
+                        "(a path is a variable or a command, or a cd target does not exist yet), and "
+                        f"{c.base} is not a git repository. Use a literal path that exists. " + skip_note)
             continue
-        repo = tool.Repo(c.cwd, c.git_dir, c.work_tree)
-        if c.dynamic:
-            repo = tool.Repo(c.base)
-            if not tool.is_repo(repo):
-                raise tool.ScanError("cannot tell which repository the command works in "
-                                     "(a variable or command in a path), so it was not scanned")
-        elif not tool.is_repo(repo):
+        key = (repo.cwd, repo.git_dir, repo.work_tree)
+        if key in seen:
             continue
-        if c.sub == "push":
-            tool.scan_push(repo, c.args, col=col)
-            continue
-        plan = commit_plan(c.args)
-        if plan["dry"]:
-            continue
-        if plan["all"]:
-            tool.scan_worktree(repo, untracked=adds, col=col)
-        elif plan["dynamic"]:
-            tool.scan_worktree(repo, untracked=True, staged=True, col=col)
-        elif plan["paths"]:
-            tool.scan_worktree(repo, paths=plan["paths"], staged=plan["include"], untracked=adds, col=col)
-        elif adds:
-            tool.scan_worktree(repo, untracked=True, col=col)
-        else:
-            tool.scan_staged(repo, col=col)
-    if unplaced:
-        repo = tool.Repo(cwd)
-        if tool.is_repo(repo):
-            tool.scan_worktree(repo, staged=True, col=col)
-    return col.finish()
+        seen.add(key)
+        ok, why = tool.hooks_installed(repo)
+        if not ok:
+            return (f"Blocked by lean-agent: {tool.toplevel(repo)} cannot scan this commit or push for keys: {why}. "
+                    f"Install the git hooks, then run the command again:\n  {tool.install_command(repo)}\n"
+                    + skip_note)
+    return None
 
 
 def as_text(value):
@@ -283,18 +411,27 @@ def write_findings(name, data, cwd, tool):
     repo = tool.Repo(folder)
     if not tool.is_repo(repo):
         return []
+    real = os.path.realpath(path)
+    for flag in ("--absolute-git-dir", "--git-common-dir"):
+        gd = (tool.git(repo, "rev-parse", flag, check=False) or "").strip()
+        if gd:
+            gd = os.path.realpath(hookkit.resolve(gd, folder))
+            if real == gd or real.startswith(gd + os.sep):
+                return []  # git's own files (config, hooks) are never committed
     top = os.path.realpath(tool.toplevel(repo))
-    rel = os.path.relpath(os.path.realpath(path), top)
+    rel = os.path.relpath(real, top)
     if rel.startswith(".."):
         return []
-    tracked = tool.git(repo, "--literal-pathspecs", "ls-files", "--error-unmatch", "--", rel, check=False)
-    if tracked is None and tool.git(repo, "check-ignore", "-q", "--", rel, check=False) is not None:
+    # rel is relative to the top, so ask git from the top, not from the folder the file is in
+    at_top = tool.Repo(top)
+    tracked = tool.git(at_top, "--literal-pathspecs", "ls-files", "--error-unmatch", "--", rel, check=False)
+    if tracked is None and tool.git(at_top, "check-ignore", "-q", "--", rel, check=False) is not None:
         return []
     return tool.scan_text(written_text(name, data), rel)
 
 
 def blocked(reason):
-    print(f"Blocked by lean-agent: the secret scan could not run ({reason}), so nothing was checked. "
+    print(f"Blocked by lean-agent: the secret scan check could not run ({reason}), so nothing was checked. "
           f"Fix that, or set {SKIP}=1 in front of the command or in the env block of Claude Code settings.",
           file=sys.stderr)
     return 2
@@ -309,16 +446,22 @@ def main():
     cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else os.getcwd()
     if name == "Bash":
         command = data.get("command")
-        if not isinstance(command, str) or "git" not in command or not re.search(r"\b(commit|push)\b", command):
+        if not isinstance(command, str) or "git" not in command:
             return 0
-        what = "this command"
-    elif name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
-        what = "this " + name.lower()
-    else:
+        try:
+            text = bash_check(command, cwd)
+        except Exception as exc:
+            return blocked(f"{type(exc).__name__}: {exc}")
+        if text:
+            print(text, file=sys.stderr)
+            return 2
         return 0
+    if name not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        return 0
+    what = "this " + name.lower()
     try:
         tool = scanner()
-        found = bash_findings(command, cwd, tool) if name == "Bash" else write_findings(name, data, cwd, tool)
+        found = write_findings(name, data, cwd, tool)
     except Exception as exc:
         return blocked(f"{type(exc).__name__}: {exc}")
     if found:
@@ -333,7 +476,6 @@ def self_test():
     import json
     import shutil
     import sqlite3
-    import subprocess
     import tempfile
 
     failures = 0
@@ -348,22 +490,24 @@ def self_test():
     keys = tool.fake_keys()
     google = keys["google-api-key (AIza)"]
     npm = keys["npm-token (npm_)"]
-    tmp = tempfile.mkdtemp(prefix="secret-hook-")
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix="secret-hook-"))
     try:
         nogl = os.path.join(tmp, "nogl")
         os.makedirs(nogl)
-        for name in ("git", "sh", "cat", "touch", "sleep", "printf", "xargs", "echo", "bash"):
+        for name in ("git", "sh", "cat", "touch", "sleep", "printf", "xargs", "echo", "bash", "python3"):
             real = shutil.which(name)
             if real:
                 os.symlink(real, os.path.join(nogl, name))
         env = dict(os.environ, HOME=tmp, LEAN_DB=os.path.join(tmp, "lean.db"), GIT_CONFIG_NOSYSTEM="1",
                    LEAN_SECRET_SCAN_HOME=os.path.join(tmp, "home"), PATH=nogl)
-        for var in (SKIP, "LEAN_STATS", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        for var in (SKIP, "LEAN_STATS", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT",
+                    "GIT_CONFIG_PARAMETERS"):
             env.pop(var, None)
         here = os.path.realpath(__file__)
+        scan = os.path.join(hookkit.TOOLS, "secret-scan")
 
-        def sh(*argv, cwd=None):
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=env)
+        def sh(*argv, cwd=None, extra=None):
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=dict(env, **(extra or {})))
 
         def hook(tool_name, tool_input, cwd, extra=None, script=None):
             e = dict(env, **(extra or {}))
@@ -376,7 +520,7 @@ def self_test():
 
         def make(name):
             r = os.path.join(tmp, name)
-            sh("git", "init", "-q", r)
+            sh("git", "init", "-q", "-b", "main", r)
             sh("git", "-C", r, "config", "user.email", "t@example.org")
             sh("git", "-C", r, "config", "user.name", "t")
             return r
@@ -391,141 +535,138 @@ def self_test():
             sh("git", "-C", r, "add", "-A")
             sh("git", "-C", r, "commit", "-qm", msg, "--no-verify")
 
-        repo = make("repo")
-        write = lambda rel, text: put(repo, rel, text)  # noqa: E731
-        write(".gitignore", ".env.local\n")
-        write("ok.txt", "fine\n")
-        sh("git", "-C", repo, "add", ".")
-        check("clean commit passes", bash("git commit -m x", repo).returncode, 0)
-        sh("git", "-C", repo, "commit", "-qm", "base")
+        def install(r):
+            return sh("python3", scan, "install", r)
 
-        write("app.js", "const k = '" + google + "';\n")
-        sh("git", "-C", repo, "add", "app.js")
-        p = bash("git commit -m x", repo)
-        check("staged key blocks the commit", p.returncode, 2)
-        check("message names file, line, pattern", "app.js:1  google-api-key (AIza)" in p.stderr, True)
-        check("message never prints the value", google in p.stderr + p.stdout, False)
-        check("unrelated command passes", bash("git status", repo).returncode, 0)
-        check("--dry-run passes", bash("git commit --dry-run", repo).returncode, 0)
-        check("skip variable inline", bash("LEAN_SKIP_SECRET_SCAN=1 git commit -m x", repo).returncode, 0)
-        check("skip variable in env", bash("git commit -m x", repo, {SKIP: "1"}).returncode, 0)
-        check("cd into the repo is followed", bash(f"cd {repo} && git commit -m x", tmp).returncode, 2)
-        check("git -C is followed", bash(f"git -C {repo} commit -m x", tmp).returncode, 2)
-        check("outside a repository passes", bash("git commit -m x", tmp).returncode, 0)
-        # 14 on the hook side: the pre-commit framework's SKIP is not ours
-        check("SKIP=flake8 does not skip", bash("SKIP=flake8 git commit -m x", repo).returncode, 2)
-
-        # the same key staged, then held back: -a and git add chains
-        sh("git", "-C", repo, "reset", "-q")
-        check("unstaged key, plain commit passes", bash("git commit -m x", repo).returncode, 0)
-        sh("git", "-C", repo, "add", "-N", "app.js")
-        check("unstaged key, commit -a blocks", bash("git commit -am x", repo).returncode, 2)
-        check("unstaged key, --all blocks", bash("git commit --all -m x", repo).returncode, 2)
-        check("git add && git commit blocks", bash("git add -A && git commit -m x", repo).returncode, 2)
-        # 1: pathspec commits take the work tree content of those paths
-        check("intent-to-add file named in the commit blocks", bash("git commit -m x app.js", repo).returncode, 2)
-        check("-o blocks", bash("git commit -o -m x app.js", repo).returncode, 2)
-        check("-- blocks", bash("git commit -m x -- app.js", repo).returncode, 2)
-        check("-m value is not taken as a path", bash("git commit -m app.js", repo).returncode, 0)
-        sh("git", "-C", repo, "rm", "-q", "--cached", "app.js")
-        os.remove(os.path.join(repo, "app.js"))
-        write("t.js", "ok\n")
-        write("other.js", "ok\n")
-        commit(repo, "t")
-        write("t.js", "ok\nk = '" + google + "'\n")
-        check("modified tracked file named in the commit blocks", bash("git commit -m x t.js", repo).returncode, 2)
-        check("--only blocks", bash("git commit --only -m x t.js", repo).returncode, 2)
-        check("another path is not scanned", bash("git commit -m x other.js", repo).returncode, 0)
-        write("other.js", "ok\nk = '" + npm + "'\n")
-        sh("git", "-C", repo, "add", "other.js")
-        write("t.js", "ok\n")
-        check("only: a staged key outside the paths is not committed", bash("git commit -m x t.js", repo).returncode, 0)
-        check("-i includes the index", bash("git commit -i -m x t.js", repo).returncode, 2)
-        sh("git", "-C", repo, "reset", "-q")
-        write("other.js", "ok\n")
-
-        write("new.js", google)
-        check("untracked key, git add && commit blocks", bash("git add . && git commit -m x", repo).returncode, 2)
-        os.remove(os.path.join(repo, "new.js"))
-
-        # 3: commands that wrap the commit
-        write("w.js", "x = '" + google + "'\n")
-        sh("git", "-C", repo, "add", "w.js")
+        # a repository without the git hooks: anything that commits or pushes is stopped
+        bare = make("bare")
+        put(bare, "a.txt", "a\n")
+        commit(bare, "base")
+        p = bash("git commit -m x", bare)
+        check("no hooks: commit blocks", p.returncode, 2)
+        check("and says how to install them", "install" in p.stderr and scan in p.stderr and bare in p.stderr, True)
+        check("and why", "no secret-scan pre-commit hook" in p.stderr, True)
+        check("no hooks: push blocks", bash("git push origin main", bare).returncode, 2)
+        check("no hooks: status passes", bash("git status", bare).returncode, 0)
+        check("no hooks: log --grep commit passes", bash("git log --grep commit", bare).returncode, 0)
+        check("no hooks: echo git commit passes", bash("echo git commit", bare).returncode, 0)
+        check("no hooks: gh pr create text that says git commit passes",
+              bash('gh pr create --title "x" --body "run git commit, then git push; cd $HOME"', bare).returncode, 0)
+        check("no hooks: skip inline", bash("LEAN_SKIP_SECRET_SCAN=1 git commit -m x", bare).returncode, 0)
+        check("no hooks: skip in env", bash("git commit -m x", bare, {SKIP: "1"}).returncode, 0)
+        check("no hooks: skip inside bash -c", bash("bash -c 'LEAN_SKIP_SECRET_SCAN=1 git commit -m x'", bare).returncode, 0)
+        check("outside a repository a literal commit passes", bash("git commit -m x", tmp).returncode, 0)
+        sh("git", "-C", bare, "config", "alias.ci", "commit")
+        sh("git", "-C", bare, "config", "alias.st", "status")
+        sh("git", "-C", bare, "config", "alias.sci", "!git commit")
+        sh("git", "-C", bare, "config", "alias.deep", "ci -q")
         for label, cmd in (("bash -c", "bash -c 'git commit -m x'"), ("sh -c", 'sh -c "git commit -m x"'),
                            ("bash -lc", "bash -lc 'git commit -m x'"), ("eval", "eval 'git commit -m x'"),
                            ("braces", "{ git commit -m x; }"), ("if/then", "if true; then git commit -m x; fi"),
                            ("negation", "! git commit -m x"), ("xargs", "echo m | xargs git commit -m"),
                            ("nested", "bash -c \"sh -c 'git commit -m x'\""),
-                           ("cd inside", f"bash -c 'cd {repo} && git commit -m x'"),
-                           ("env wrapper", "env FOO=1 git commit -m x"), ("while", "while true; do git commit -m x; done")):
-            check(f"wrapped: {label}", bash(cmd, repo).returncode, 2)
-        check("wrapped, skip variable inside the string", bash("bash -c 'LEAN_SKIP_SECRET_SCAN=1 git commit -m x'", repo).returncode, 0)
-        check("echo of a commit command does not scan", bash("echo git commit", repo).returncode, 0)
-        check("git log --grep commit passes", bash("git log --grep commit", repo).returncode, 0)
-        check("an unplaced git commit scans conservatively", bash("$(printf git) commit -m x", repo).returncode, 2)
+                           ("env wrapper", "env FOO=1 git commit -m x"), ("while", "while true; do git commit -m x; done"),
+                           ("alias git ci", "git ci -m x"), ("alias of an alias", "git deep -m x"),
+                           ("shell alias", "git sci -m x"), ("-c alias", "git -c alias.c=commit c -m x"),
+                           ("an unknown git command", "git frobnicate"), ("a git subcommand in a variable", "git $SUB -m x"),
+                           ("-C into it", f"git -C {bare} commit -m x"), ("cd into it", f"cd {bare} && git commit -m x"),
+                           ("pushd into it", f"pushd {bare} && git commit -m x"),
+                           ("commit -a", "git commit -am x"), ("--pathspec-from-file", "git commit -m x --pathspec-from-file=l"),
+                           ("GIT_INDEX_FILE", "GIT_INDEX_FILE=/tmp/i git commit -m x")):
+            check(f"no hooks, {label}: blocks", bash(cmd, bare if not label.endswith("into it") else tmp).returncode, 2)
+        check("an alias for status passes", bash("git st", bare).returncode, 0)
 
-        # 4: other repositories by option or variable
+        # once installed, commits and pushes go through to git, which scans them
+        p = install(bare)
+        check("install", p.returncode, 0)
+        put(bare, "k.txt", "k = " + google + "\n")
+        sh("git", "-C", bare, "add", "k.txt")
+        check("installed: a commit with a staged key is left to the git hook", bash("git commit -m x", bare).returncode, 0)
+        p = sh("git", "-C", bare, "commit", "-qm", "x")
+        check("and the git hook blocks it", p.returncode != 0 and "k.txt:1" in p.stderr, True)
+        sh("git", "-C", bare, "reset", "-q")
+        os.remove(os.path.join(bare, "k.txt"))
+        for label, cmd in (("alias git ci", "git ci -m x"), ("shell alias", "git sci -m x"),
+                           ("bash -c", "bash -c 'git commit -m x'"), ("cd $(...) from inside", "cd $(echo /) && git commit -m x"),
+                           ("$(printf git) commit", "$(printf git) commit -m x"), ("git -C $DIR", "git -C $DIR commit -m x"),
+                           ("cd to a folder that does not exist yet", "cd nosuch && git commit -m x")):
+            check(f"installed, {label}: passes", bash(cmd, bare).returncode, 0)
+
+        # the regression set: ordinary work in a repository with the hooks passes
+        origin = os.path.join(tmp, "origin.git")
+        sh("git", "init", "-q", "--bare", "-b", "main", origin)
+        sh("git", "-C", bare, "remote", "add", "origin", origin)
+        for label, cmd in (("plain commit", "git commit -m x"), ("first push -u", "git push -u origin main"),
+                           ("push with upstream", "git push"), ("detached HEAD push", "git push origin HEAD:refs/heads/d"),
+                           ("push --delete", "git push origin --delete d"),
+                           ("heredoc message with cd $HOME", "git commit -F - <<'EOF'\nfix\ncd $HOME\nEOF"),
+                           ("$(cat <<EOF) message with cd $HOME", "git commit -m \"$(cat <<'EOF'\nfix\ncd $HOME\nEOF\n)\""),
+                           ("add then commit", "git add c.txt && git commit -m c"),
+                           ("commit -m -n is a message", "git commit -m -n"),
+                           ("gh pr create", 'gh pr create --body "git commit -n and git push --no-verify"')):
+            check(f"regression: {label}", bash(cmd, bare).returncode, 0)
+
+        # skipping the hooks is blocked, even where they are installed
+        for label, cmd in (("--no-verify", "git commit --no-verify -m x"), ("--no-verif", "git commit --no-verif -m x"),
+                           ("-n", "git commit -n -m x"), ("-anm", "git commit -anm x"), ("push --no-verify", "git push --no-verify"),
+                           ("-c core.hooksPath", "git -c core.hooksPath=/dev/null commit -m x"),
+                           ("-c CORE.HOOKSPATH", "git -c CORE.HOOKSPATH=/x commit -m x"),
+                           ("--config-env", "git --config-env=core.hooksPath=HP commit -m x"),
+                           ("GIT_CONFIG_COUNT", "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/x git commit -m x"),
+                           ("export GIT_CONFIG_PARAMETERS", "export GIT_CONFIG_PARAMETERS=\"'core.hooksPath'='/x'\"; git commit -m x"),
+                           ("env GIT_CONFIG_GLOBAL", "env GIT_CONFIG_GLOBAL=/tmp/g git push"),
+                           ("HOME", "HOME=/tmp/h git commit -m x"),
+                           ("git config core.hooksPath", "git config core.hooksPath /x && git commit -m x"),
+                           ("an alias that adds --no-verify", "git -c alias.c='commit --no-verify' c -m x"),
+                           ("an alias that sets hooksPath", "git -c 'alias.c=-c core.hooksPath=/x commit' c -m x"),
+                           ("a shell alias that skips", "git -c 'alias.c=!git commit -n' c"),
+                           ("send-pack", f"git send-pack {origin} main"), ("wrapped", "bash -c 'git commit --no-verify -m x'")):
+            p = bash(cmd, bare)
+            check(f"bypass, {label}: blocks", p.returncode, 2)
+            check(f"bypass, {label}: says why", "without the git hooks" in p.stderr, True)
+        check("bypass with skip set is allowed", bash("LEAN_SKIP_SECRET_SCAN=1 git commit --no-verify -m x", bare).returncode, 0)
+
+        # where the repository cannot be worked out
         outer = os.path.join(tmp, "elsewhere")
         os.makedirs(outer)
-        gd = os.path.join(repo, ".git")
-        check("--git-dir with --work-tree", bash(f"git --git-dir={gd} --work-tree={repo} commit -m x", outer).returncode, 2)
-        check("--git-dir and --work-tree as two words", bash(f"git --git-dir {gd} --work-tree {repo} commit -m x", outer).returncode, 2)
-        check("GIT_DIR inline", bash(f"GIT_DIR={gd} GIT_WORK_TREE={repo} git commit -m x", outer).returncode, 2)
-        check("GIT_DIR exported earlier", bash(f"export GIT_DIR={gd}; export GIT_WORK_TREE={repo}; git commit -m x", outer).returncode, 2)
-        check("GIT_DIR in the environment", bash("git commit -m x", outer, {"GIT_DIR": gd, "GIT_WORK_TREE": repo}).returncode, 2)
-        check("cd $(...) from inside the repo scans it", bash("cd $(echo /) && git commit -m x", repo).returncode, 2)
-        p = bash("cd $(echo /) && git commit -m x", outer)
-        check("cd $(...) from a non-repo fails closed", p.returncode, 2)
-        check("and says it could not tell", "could not run" in p.stderr, True)
-        check("-C with a variable fails closed", bash("git -C $DIR commit -m x", outer).returncode, 2)
-        check("-C with a variable in the repo scans it", bash("git -C $DIR commit -m x", repo).returncode, 2)
+        for label, cmd in (("cd $(...)", "cd $(echo /) && git commit -m x"), ("pushd $X", "pushd $X && git commit -m x"),
+                           ("git -C $DIR", "git -C $DIR commit -m x"), ("$(printf git) commit", "$(printf git) commit -m x"),
+                           ("cd to a missing folder", "cd nosuch && git push")):
+            p = bash(cmd, outer)
+            check(f"from a non-repo, {label}: blocks", p.returncode, 2)
+            check(f"from a non-repo, {label}: says it cannot tell", "cannot tell which repository" in p.stderr, True)
+        p = bash("git init x && cd x && git commit -m x", outer)
+        check("init and commit in one command blocks", p.returncode == 2 and "git init" in p.stderr, True)
+        check("clone and push in one command blocks", bash(f"git clone {origin} y && cd y && git push", outer).returncode, 2)
 
-        sh("git", "-C", repo, "rm", "-q", "-f", "--cached", "w.js")
-        os.remove(os.path.join(repo, "w.js"))
-
-        # allow-secret is per line
-        write("t.js", "a = '" + npm + "' // allow-secret\n")
-        sh("git", "-C", repo, "add", "t.js")
-        check("allow-secret line passes", bash("git commit -m x", repo).returncode, 0)
-        write("t.js", "a = '" + npm + "' // allow-secret\nb = '" + npm + "'\n")
-        sh("git", "-C", repo, "add", "t.js")
-        p = bash("git commit -m x", repo)
-        check("the next line without the marker blocks", p.returncode, 2)
-        check("and is line 2", "t.js:2" in p.stderr and "t.js:1" not in p.stderr, True)
-        sh("git", "-C", repo, "reset", "-q", "--hard")
-        sh("git", "-C", repo, "clean", "-qfd")
-
-        # 2: push scope. The key sits on priv already; pub must still be checked.
-        write("k.js", "x = '" + npm + "'\n")
-        sh("git", "-C", repo, "add", "k.js")
-        sh("git", "-C", repo, "commit", "-qm", "key", "--no-verify")
-        priv, pub = os.path.join(tmp, "priv.git"), os.path.join(tmp, "pub.git")
-        sh("git", "init", "-q", "--bare", priv)
-        sh("git", "init", "-q", "--bare", pub)
-        sh("git", "-C", repo, "remote", "add", "priv", priv)
-        sh("git", "-C", repo, "remote", "add", "pub", pub)
-        p = bash("git push pub HEAD", repo)
-        check("push of a commit with a key blocks", p.returncode, 2)
-        check("push message names the file", "k.js:1  npm-token (npm_)" in p.stderr, True)
-        check("push skip variable", bash("git push pub HEAD", repo, {SKIP: "1"}).returncode, 0)
-        sh("git", "-C", repo, "branch", "other")
-        sh("git", "-C", repo, "tag", "v1")
-        sh("git", "-C", repo, "push", "-q", "priv", "HEAD:refs/heads/master")
-        sh("git", "-C", repo, "fetch", "-q", "priv")
-        check("pushing to priv, which has it, passes", bash("git push priv HEAD:master", repo).returncode, 0)
-        for label, cmd in (("a branch by name", "git push pub other"), ("a full ref", "git push pub refs/heads/other"),
-                           ("--all", "git push --all pub"), ("--tags", "git push --tags pub"),
-                           ("a tag", "git push pub v1"), ("src:dst", "git push pub other:x"),
-                           ("the same key on another remote", "git push pub HEAD"),
-                           ("a wrapped push", "bash -c 'git push pub other'")):
-            check(f"push scope: {label}", bash(cmd, repo).returncode, 2)
-        check("push --dry-run passes", bash("git push --dry-run pub other", repo).returncode, 0)
-        check("push --delete passes", bash("git push pub --delete other", repo).returncode, 0)
-        p = bash("git push pub nosuchbranch", repo)
-        check("an unresolvable ref fails closed", p.returncode, 2)
-        check("and says nothing was checked", "could not run" in p.stderr, True)
+        # another repository by option or variable, from a repository that has the hooks
+        other = make("other")
+        gd = os.path.join(other, ".git")
+        for label, cmd in (("--git-dir", f"git --git-dir={gd} --work-tree={other} commit -m x"),
+                           ("GIT_DIR inline", f"GIT_DIR={gd} GIT_WORK_TREE={other} git commit -m x"),
+                           ("GIT_DIR exported", f"export GIT_DIR={gd}; git commit -m x"),
+                           ("-C", f"git -C {other} push"), ("cd", f"cd {other} && git commit -m x"),
+                           ("bash -c cd", f"bash -c 'cd {other} && git commit -m x'")):
+            check(f"another repo without hooks, {label}: blocks", bash(cmd, bare).returncode, 2)
+        check("GIT_DIR in the environment", bash("git commit -m x", outer, {"GIT_DIR": gd, "GIT_WORK_TREE": other}).returncode, 2)
+        # a hooks path of the repo's own is followed
+        hp = make("hp")
+        sh("git", "-C", hp, "config", "core.hooksPath", os.path.join(tmp, "hp-hooks"))
+        check("a repo-level hooksPath without hooks blocks", bash("git commit -m x", hp).returncode, 2)
+        install(hp)
+        check("and passes once installed there", bash("git commit -m x", hp).returncode, 0)
+        # the scanner copy the hooks run is gone
+        gone = make("gone")
+        sh("python3", scan, "install", gone, extra={"LEAN_SECRET_SCAN_HOME": os.path.join(tmp, "home2")})
+        os.remove(os.path.join(tmp, "home2", "secret-scan"))
+        p = bash("git commit -m x", gone)
+        check("a missing scanner copy blocks", p.returncode == 2 and "missing" in p.stderr, True)
 
         # Write / Edit / MultiEdit / NotebookEdit
+        repo = bare
+        write = lambda rel, text: put(repo, rel, text)  # noqa: E731
+        write(".gitignore", ".env.local\n")
+        commit(repo, "ignore")
         check("Write of a key into a tracked path blocks",
               hook("Write", {"file_path": os.path.join(repo, "src.js"), "content": "k=" + google}, repo).returncode, 2)
         p = hook("Write", {"file_path": os.path.join(repo, "src.js"), "content": "a\nk=" + google}, repo)
@@ -536,8 +677,8 @@ def self_test():
         check("Write of clean text passes",
               hook("Write", {"file_path": os.path.join(repo, "src.js"), "content": "hello"}, repo).returncode, 0)
         check("Edit blocks",
-              hook("Edit", {"file_path": os.path.join(repo, "ok.txt"), "old_string": "fine", "new_string": google}, repo).returncode, 2)
-        check("MultiEdit blocks", hook("MultiEdit", {"file_path": os.path.join(repo, "ok.txt"), "edits": [
+              hook("Edit", {"file_path": os.path.join(repo, "a.txt"), "old_string": "a", "new_string": google}, repo).returncode, 2)
+        check("MultiEdit blocks", hook("MultiEdit", {"file_path": os.path.join(repo, "a.txt"), "edits": [
             {"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": google}]}, repo).returncode, 2)
         check("Write outside a repository passes",
               hook("Write", {"file_path": os.path.join(tmp, "loose", "x.txt"), "content": google}, tmp).returncode, 0)
@@ -547,10 +688,8 @@ def self_test():
               hook("Write", {"file_path": os.path.join(repo, "s.js"), "content": google + " // allow-secret"}, repo).returncode, 0)
         check("skip variable on a write",
               hook("Write", {"file_path": os.path.join(repo, "s.js"), "content": google}, repo, {SKIP: "1"}).returncode, 0)
-        # 13
         p = hook("NotebookEdit", {"notebook_path": os.path.join(repo, "n.ipynb"), "new_source": "k=" + google}, repo)
-        check("NotebookEdit blocks", p.returncode, 2)
-        check("NotebookEdit names the notebook", "n.ipynb:1" in p.stderr, True)
+        check("NotebookEdit blocks", p.returncode == 2 and "n.ipynb:1" in p.stderr, True)
         check("NotebookEdit with a list source blocks",
               hook("NotebookEdit", {"notebook_path": os.path.join(repo, "n.ipynb"), "new_source": ["a", google]}, repo).returncode, 2)
         check("a non-string content does not crash",
@@ -560,17 +699,37 @@ def self_test():
         write("ign.txt", "x\n")
         sh("git", "-C", repo, "add", "-f", "ign.txt")
         write(".gitignore", ".env.local\nign.txt\n")
-        sh("git", "-C", repo, "add", ".gitignore")
-        sh("git", "-C", repo, "commit", "-qm", "ign", "--no-verify")
+        commit(repo, "ign")
         check("a tracked file that is also gitignored is scanned",
               hook("Write", {"file_path": os.path.join(repo, "ign.txt"), "content": google}, repo).returncode, 2)
+        # C: the folder the file sits in is not the top of the repo
+        write("sub/deep/conf.js", "x\n")
+        sh("git", "-C", repo, "add", "-f", "sub/deep/conf.js")
+        write(".gitignore", ".env.local\nign.txt\nconf.js\n")
+        commit(repo, "sub")
+        check("a tracked, ignored-by-name file in a subfolder is scanned",
+              hook("Write", {"file_path": os.path.join(repo, "sub", "deep", "conf.js"), "content": google}, repo).returncode, 2)
+        check("an untracked ignored file in a subfolder passes",
+              hook("Write", {"file_path": os.path.join(repo, "sub", "deep", "x", "conf.js"), "content": google},
+                   os.path.join(repo, "sub")).returncode, 0)
+        check("a file inside .git passes",
+              hook("Write", {"file_path": os.path.join(repo, ".git", "config"), "content": "url = " + google}, repo).returncode, 0)
+        check("a file inside .git, from a subfolder, passes",
+              hook("Write", {"file_path": os.path.join(repo, ".git", "hooks", "x"), "content": google},
+                   os.path.join(repo, "sub")).returncode, 0)
+        wt = os.path.join(tmp, "wt")
+        sh("git", "-C", repo, "worktree", "add", "-q", wt)
+        check("a file in a worktree's own git dir passes",
+              hook("Write", {"file_path": os.path.join(repo, ".git", "worktrees", "wt", "x"), "content": google}, wt).returncode, 0)
+        check("a tracked file in a worktree is scanned",
+              hook("Write", {"file_path": os.path.join(wt, "a.txt"), "content": google}, wt).returncode, 2)
         link = os.path.join(tmp, "lnk")
         os.symlink(repo, link)
         p = hook("Write", {"file_path": os.path.join(link, "sub", "src.js"), "content": google}, tmp)
         check("a write through a symlinked folder blocks", p.returncode, 2)
         check("and is labelled by the path inside the repo", "sub/src.js:1" in p.stderr and ".." not in p.stderr, True)
 
-        # 5: a repo's own config must not run code during the scan
+        # a repo's own config must not run code during a write scan
         trap = make("trap")
         put(trap, "a.txt", "hi\n")
         commit(trap, "base")
@@ -580,17 +739,14 @@ def self_test():
             f.write(f"#!/bin/sh\ntouch '{mark}'\ncat \"$1\" 2>/dev/null\n")
         os.chmod(script, 0o755)
         sh("git", "-C", trap, "config", "core.fsmonitor", script)
-        sh("git", "-C", trap, "config", "diff.evil.textconv", script)
-        put(trap, ".gitattributes", "a.txt diff=evil\n")
-        put(trap, "a.txt", "hi\nk = " + google + "\n")
-        sh("git", "-C", trap, "add", "a.txt")
-        sh("git", "-C", trap, "diff", "--cached")
+        sh("git", "-C", trap, "status")
         check("the trap fires on plain git", os.path.exists(mark), True)
         os.remove(mark)
-        check("commit scan finds the key", bash("git commit -m x", trap).returncode, 2)
+        check("a write scan finds the key",
+              hook("Write", {"file_path": os.path.join(trap, "a.txt"), "content": google}, trap).returncode, 2)
         check("and ran no repo-configured command", os.path.exists(mark), False)
 
-        # 9: a scanner that is missing or crashes blocks with the reason
+        # a scanner that is missing or crashes blocks with the reason
         plug = os.path.join(tmp, "plug")
         shutil.copytree(os.path.join(os.path.dirname(here), "..", "lib"), os.path.join(plug, "lib"),
                         ignore=shutil.ignore_patterns("__pycache__"))
@@ -606,8 +762,7 @@ def self_test():
         with open(os.path.join(plug, "tools", "secret-scan"), "w") as f:
             f.write("raise RuntimeError('boom')\n")
         p = bash("git commit -m x", repo, script=copy)
-        check("a crashing scanner blocks", p.returncode, 2)
-        check("and shows the error", "boom" in p.stderr, True)
+        check("a crashing scanner blocks", p.returncode == 2 and "boom" in p.stderr, True)
         check("a write is blocked too", hook("Write", {"file_path": os.path.join(repo, "a.js"), "content": "x"},
                                              repo, script=copy).returncode, 2)
         check("skip still works without the scanner", bash("git commit -m x", repo, {SKIP: "1"}, script=copy).returncode, 0)
