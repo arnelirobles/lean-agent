@@ -881,8 +881,25 @@ def azure_test(check, root):
           (None, None))
 
     # a command never waits on stdin
-    check("run_command gives a command no stdin", run_command(["sh", "-c", "cat; echo done"]), "done\n")
-    check("capture_command gives a command no stdin", capture_command(["sh", "-c", "cat; echo done"])[1], "done\n")
+    with Deadline(15), open_stdin():
+        check("run_command gives a command no stdin", run_command(["sh", "-c", "cat; echo done"]), "done\n")
+    with Deadline(15), open_stdin():
+        check("capture_command gives a command no stdin", capture_command(["sh", "-c", "cat; echo done"])[1], "done\n")
+
+
+class open_stdin:
+    """`with open_stdin():` makes this process's stdin a pipe that never closes, so a command that
+    inherits stdin blocks (and a Deadline fails the check) instead of reading the harness's /dev/null."""
+
+    def __enter__(self):
+        self.read, self.write = os.pipe()
+        self.saved = os.dup(0)
+        os.dup2(self.read, 0)
+
+    def __exit__(self, *exc):
+        os.dup2(self.saved, 0)
+        for fd in (self.saved, self.read, self.write):
+            os.close(fd)
 
 
 class Deadline:

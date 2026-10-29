@@ -1169,6 +1169,8 @@ def test_legacy_azure(check, tmp):
     shown = [rows(t) for t in ("agent_runs", "reviews", "changes")]
     with contextlib.redirect_stdout(io.StringIO()):
         check("a second run changes nothing", fix_legacy_azure(conn, az, present, now), {})
+    with forge.Deadline(15), forge.open_stdin():
+        check("run_command gives a command no stdin", run_command(["sh", "-c", "cat; echo done"]), "done\n")
     check("a second run makes no az call", len(az.calls) - before, 0)
     check("rows after the second run", [rows(t) for t in ("agent_runs", "reviews", "changes")], shown)
     projects["Q"].append("gone")
@@ -1179,6 +1181,17 @@ def test_legacy_azure(check, tmp):
     with contextlib.redirect_stdout(io.StringIO()):
         check("after a day a name that az lists now is rewritten", fix_legacy_azure(conn, az, present, now),
               {"baryodev/Q/gone": 1})
+
+    # a failed project run is not remembered, even when the names are the same on the next run
+    add("agent_runs", "_git/pend", "r80")
+    projects["Broken"] = None
+    with contextlib.redirect_stdout(io.StringIO()):
+        fix_legacy_azure(conn, az, present, now)
+    projects["Q"].append("pend")
+    projects["Broken"] = []
+    with contextlib.redirect_stdout(io.StringIO()):
+        check("a name az lists after a failed run is found on the next run", fix_legacy_azure(conn, az, present, now),
+              {"baryodev/Q/pend": 1})
 
     add("agent_runs", "_git/new", "r90")
     projects["Q"].append("New")
