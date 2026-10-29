@@ -34,7 +34,7 @@ Label every agent you start, so lean-stats can count it by role. The Agent descr
 - A worktree-isolated agent runs git as plain single commands from the worktree root: no `cd x &&`, no pipes. The harness refuses what it cannot verify.
 - Parallel changes never append to one shared file such as a changelog: one fragment file per change.
 - Verify content and identity, not status codes or ratios: a page baked empty still answers 200, a small pixel ratio can hide wrong dates, and the deployed commit sha proves a deploy where a version string does not.
-- Before opening a pull request, run `${CLAUDE_PLUGIN_ROOT}/tools/style-scan` on the branch and on the body file, and `${CLAUDE_PLUGIN_ROOT}/tools/holdout.sh` for the mutation check. Do not write your own dash grep or revert loop.
+- Before opening a pull request, run `${CLAUDE_PLUGIN_ROOT}/tools/style-scan` on the branch and on the body file, and `${CLAUDE_PLUGIN_ROOT}/tools/holdout.sh` for the mutation check. Holdout runs in the draft, before the adversarial review starts, not after it. Do not write your own dash grep or revert loop.
 - A task is not done until the pull request URL exists.
 
 ## Scripts
@@ -67,6 +67,7 @@ Coding agents call these instead of writing the command again:
 - `brain queue add ...`: queue the tests, end the turn, and the orchestrator runs `test-phase`. Never run `dotnet test`, `npx vitest`, `vitest run` or `npm test` yourself; the script-note hook blocks it where test-phase can take the job.
 - `check-deployed-sha.sh <url> <sha>`: proves a deploy by the commit sha it reports. Use it instead of a curl smoke check.
 - `style-scan`: checks added lines for dashes, arrows, slop and attribution. Use it instead of a grep, before every commit.
+- `holdout.sh --spec <file>`: holds each production hunk out and requires its named test to fail. The draft is not done until it passes; run it before handing the branch to the hunt, so the hunter does not spend its pass on tests that pass for the wrong reason. On a repository whose default branch is not `master`, set `HOLDOUT_BASE=origin/<default>`.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what the repo pins. Use it instead of a curl to a registry.
 
 ## Tests and brain
