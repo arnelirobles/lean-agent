@@ -24,12 +24,8 @@ BOUNDED = os.path.join(hookkit.TOOLS, "bounded")
 OWN_LANES = ("bounded", "test-phase", "heavy.sh")
 
 
-def exempt(command):
-    """True when the command already runs under bounded or a lean lane runner."""
-    try:
-        words = shlex.split(command, comments=True)
-    except ValueError:
-        return False
+def lane(words):
+    """True when one simple command starts with a lane (after env assignments and an interpreter)."""
     for w in words[:3]:
         if "=" in w and not w.startswith("/") and w.split("=", 1)[0].isidentifier():
             continue
@@ -38,6 +34,20 @@ def exempt(command):
             continue
         return name in OWN_LANES
     return False
+
+
+def exempt(command):
+    """True when every command in the line runs under bounded or a lean lane runner."""
+    parts, current = [], []
+    for tok in hookkit.tokens(command):
+        if hookkit.is_separator(tok):
+            parts.append(current)
+            current = []
+        else:
+            current.append(tok)
+    parts.append(current)
+    parts = [p for p in parts if p]
+    return bool(parts) and all(lane(p) for p in parts)
 
 
 def wrapped(command):
@@ -89,6 +99,14 @@ def self_test():
     check("heavy.sh passes", bg("bash tools/heavy.sh dotnet dotnet test"), False)
     check("env prefix then bounded", bg(f"LEAN_BG_MINUTES=120 {BOUNDED} -- make"), False)
     check("bounded later in a chain is not enough", bg(f"make; {BOUNDED} -- true"), True)
+    for sep in ("&&", ";", "|", "&", "||", "\n"):
+        check(f"bounded then sleep after {sep!r}", bg(f"{BOUNDED} -- true {sep} sleep 999"), True)
+        check(f"sleep then bounded after {sep!r}", bg(f"sleep 999 {sep} {BOUNDED} -- true"), True)
+    check("heavy.sh then sleep", bg("bash heavy.sh && sleep 999"), True)
+    check("two lanes chained pass", bg(f"{BOUNDED} -- true && bash tools/heavy.sh x"), False)
+    check("quoted separator stays one argument", bg(f"{BOUNDED} -- sh -c 'a && b; c | d'"), False)
+    check("two env assignments then bounded", bg(f"A=1 B=2 {BOUNDED} -- true"), False)
+    check("three env assignments then bounded is denied", bg(f"A=1 B=2 C=3 {BOUNDED} -- true"), True)
     check("background false passes", {"command": "make", "run_in_background": False}, False)
 
     # The suggested command really runs the original under bounded.
