@@ -294,6 +294,13 @@ def run(brain_cli):
                              "--tier", tier, "--runner", "mtp", "--started", "1000", "--ended", str(1000 + dur),
                              "--lane-wait", str(wait), "--passed", "9", "--failed", "1", "--exit-code", "1")
             ids.append(out)
+        # A valid runner reaches the missing --tier error; an unknown one stops at its own choice list. No row is added.
+        rc, _, err = run("run-add", "--project", "core", "--test-project", "e2e/playwright.config.ts", "--runner", "playwright")
+        if "invalid choice" in err or "--tier" not in err:
+            fails.append(f"run-add must accept --runner playwright: {rc} {err!r}")
+        rc, _, err = run("run-add", "--project", "core", "--test-project", "T.csproj", "--runner", "nope")
+        if "invalid choice" not in err:
+            fails.append(f"run-add must refuse an unknown runner: {rc} {err!r}")
         if ids != ["1", "2", "3"]:
             fails.append(f"run ids: {ids}")
         run("add", "--project", "core", "--kind", "flaky", "--ref", "Other.Flaky", "--run-id", "2", "--cycle", "c1")

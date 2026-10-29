@@ -42,6 +42,8 @@ CAUSES = [
      re.compile(r"ResourceReaper")),
     ("database unreachable", "nothing answered on the database address; start the database or its container",
      re.compile(r"NpgsqlException[^\n]*Failed to connect to")),
+    ("playwright browsers missing", "run `npx playwright install` in the project, or use an image that has the browsers",
+     re.compile(r"Executable doesn't exist at|npx playwright install")),
 ]
 MIN_SHARED = 3  # fewer than this is a test problem, not a machine problem
 
@@ -342,6 +344,10 @@ def self_test():
     if not environmental(half):
         fails.append("4 of 7 failures is more than half")
     # Causes add up, the commonest names the blocker, and the later of two causes can be the commonest.
+    pw = {f"a.spec.ts \u203a t{i}": "Error: browserType.launch: Executable doesn't exist at /x/chrome\n  npx playwright install" for i in range(3)}
+    got = environmental(pw)
+    if not got or got[0] != "playwright browsers missing":
+        fails.append(f"missing Playwright browsers must be environmental: {got}")
     two = {f"T.D{i}": "DockerUnavailableException" for i in range(2)}
     two.update({f"T.P{i}": "NpgsqlException : Failed to connect to x" for i in range(3)})
     got = environmental(two)

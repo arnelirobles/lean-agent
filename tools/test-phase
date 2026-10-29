@@ -393,14 +393,16 @@ VITEST_SCRIPT = """R=$PWD
 cd -- "$1" || exit 2
 shift
 T=$0
-# The nearest lockfile, from the package folder up to the repo root; pnpm-lock.yaml, then package-lock.json,
-# then yarn.lock when one folder has several. pnpm and npm are run, yarn is refused.
-L=; K=; d=$PWD
+# A pnpm-lock.yaml anywhere from the package folder up to the repo root means pnpm. Otherwise the nearest
+# package-lock.json means npm, and the nearest yarn.lock is refused (package-lock.json first in one folder).
+L=; N=; NK=; d=$PWD
 while :; do
-  for f in pnpm-lock.yaml package-lock.json yarn.lock; do
-    if [ -f "$d/$f" ]; then L=$d; K=$f; break; fi
-  done
-  [ -n "$K" ] && break
+  [ -f "$d/pnpm-lock.yaml" ] && L=$d && break
+  if [ -z "$NK" ]; then
+    for f in package-lock.json yarn.lock; do
+      if [ -f "$d/$f" ]; then N=$d; NK=$f; break; fi
+    done
+  fi
   [ "$d" = "$R" ] || [ "$d" = / ] && break
   d=$(dirname "$d")
 done
@@ -408,15 +410,19 @@ case "$T" in
   vitest) set -- vitest run --reporter=verbose "$@" ;;
   playwright) set -- playwright test --reporter=list "$@" ;;
 esac
-if [ "$K" = yarn.lock ]; then
+if [ -z "$L" ] && [ "$NK" = yarn.lock ]; then
   echo "run-failed: found yarn.lock; test-phase runs package.json and Playwright jobs with pnpm or npm only" >&2
   exit 2
 fi
-if [ "$K" = package-lock.json ]; then
+if [ -z "$L" ] && [ "$NK" = package-lock.json ]; then
   W=$PWD
-  cd -- "$L" && npm ci || exit $?
-  cd -- "$W" || exit 2
-  exec npx "$@"
+  # npm ci deletes node_modules, so it runs only when they are missing or older than the lockfile.
+  M=$N/node_modules/.package-lock.json
+  if [ ! -f "$M" ] || [ -n "$(find "$N/package-lock.json" -newer "$M")" ]; then
+    cd -- "$N" && npm ci || exit $?
+    cd -- "$W" || exit 2
+  fi
+  exec npx --no-install "$@"
 fi
 # Without a packageManager field corepack takes the newest pnpm, which can refuse a lockfile an older one wrote.
 if command -v pnpm >/dev/null 2>&1; then P=pnpm
@@ -488,20 +494,20 @@ class Vitest:
 
 
 PW_FAIL = re.compile(r"^\s*[\u2718\u00d7x]\s+\d+\s+(\S.*?)\s*$")
-PW_PASS = re.compile(r"^\s*\u2713\s+\d+\s+(\S.*?)\s*$")
+PW_PASS = re.compile(r"^\s*(?:\u2713|ok)\s+\d+\s+(\S.*?)\s*$")
 PW_BLOCK = re.compile(r"^\s*\d+\)\s+(\S.*?)(?:\s+\u2500+)?\s*$")
 PW_SUMMARY = re.compile(r"^\s*\d+\s+(?:failed|flaky|passed|skipped|did not run|interrupted)\b")
 PW_TIME = re.compile(r"\s+\(\d+(?:\.\d+)?(?:ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ms|s|m|h))*\)$")
 PW_RETRY = re.compile(r"\s+\((?:retry|repeat) #\d+\)$")
 PW_PROJECT = re.compile(r"^\[[^\]]*\]\s+\u203a\s+")
-PW_WHERE = re.compile(r"^(\S+?\.[cm]?[jt]sx?):\d+:\d+(?=$| \u203a )")
+PW_WHERE = re.compile(r"^(.+?\.[cm]?[jt]sx?):\d+:\d+(?=$| \u203a )")
 
 
 class Playwright:
     """Playwright's list reporter. A test is named file \u203a title, without the project, the line and column,
     the retry suffix or the time, so the file is the class and a rerun is per spec file."""
     name = "playwright"
-    progress = r"^\s*[\u2713\u2718\u00d7x-]\s+\d+\s.*|^Progress: .*|^Packages: .*"
+    progress = r"^\s*(?:[\u2713\u2718\u00d7x-]|ok)\s+\d+\s.*|^Progress: .*|^Packages: .*"
 
     @staticmethod
     def mode(repo):
@@ -511,46 +517,55 @@ class Playwright:
     def command(mode, project, cls_filter=None, fast=False, extra=(), probe=False):
         """A shell that goes to the config folder, installs with the lockfile (pnpm or npm) and runs
         playwright test with the list reporter. Each filter piece (split on |) is a file filter."""
-        files = node_files(cls_filter)
+        # Playwright reads each file argument as a regular expression, so a path is escaped to match itself.
+        files = [re.sub(r"[.*+?^${}()|\[\]\\]", r"\\\g<0>", f) for f in node_files(cls_filter)]
         return ["sh", "-c", VITEST_SCRIPT, "playwright", os.path.dirname(project) or "."] + list(extra) + files
 
     @staticmethod
-    def test_name(raw, timed=True):
-        """file \u203a title from what follows the mark and the number, or None when it is not a test line."""
+    def parse_name(raw, timed=True):
+        """(project, file \u203a title) from what follows the mark and the number, or None when it is not a test line."""
         name = PW_RETRY.sub("", PW_TIME.sub("", raw)) if timed else raw
-        name = PW_PROJECT.sub("", name.strip())
-        m = PW_WHERE.match(name)
-        return m.group(1) + name[m.end():] if m else None
+        name = name.strip()
+        pm = PW_PROJECT.match(name)
+        project = pm.group(0) if pm else ""
+        m = PW_WHERE.match(name[len(project):])
+        return (project, m.group(1) + name[len(project) + m.end():]) if m else None
+
+    @staticmethod
+    def test_name(raw, timed=True):
+        """file \u203a title without the project, or None when it is not a test line."""
+        got = Playwright.parse_name(raw, timed)
+        return got[1] if got else None
 
     @staticmethod
     def failures(text):
         """[(test name, the lines that follow it)] in order, each name once. A test that failed and then passed on
-        a retry is flaky, not a failure. The numbered block after the run has the error, so it wins."""
+        a retry in the same project is flaky, not a failure. The numbered block after the run has the error, so it
+        wins. The project is part of the flaky check and not of the name."""
         lines = [ANSI.sub("", l).rstrip() for l in text.splitlines()]
-        first, blocks = {}, {}
+        first, blocks, last_fail, last_pass = {}, {}, {}, {}
         for i, l in enumerate(lines):
             for rx, into, timed in ((PW_FAIL, first, True), (PW_BLOCK, blocks, False)):
                 m = rx.match(l)
-                name = Playwright.test_name(m.group(1), timed) if m else None
-                if name:
+                got = Playwright.parse_name(m.group(1), timed) if m else None
+                if got:
                     end = i + 1
                     while end < min(i + 12, len(lines)) and not PW_FAIL.match(lines[end]) \
                             and not PW_BLOCK.match(lines[end]) and not PW_SUMMARY.match(lines[end]):
                         end += 1
-                    into.setdefault(name, "\n".join(lines[i:end]))
-        # a name is flaky when its last attempt passed: the pass line comes after its last fail line
-        last_fail, last_pass = {}, {}
-        for i, l in enumerate(lines):
-            m = PW_FAIL.match(l)
-            n = Playwright.test_name(m.group(1)) if m else None
-            if n:
-                last_fail[n] = i
+                    into.setdefault(got, "\n".join(lines[i:end]))
+                    if into is first:
+                        last_fail[got] = i
             m = PW_PASS.match(l)
-            n = Playwright.test_name(m.group(1)) if m else None
-            if n:
-                last_pass[n] = i
-        names = list(first) + [b for b in blocks if b not in first]
-        return [(n, blocks.get(n) or first.get(n, "")) for n in names if last_pass.get(n, -1) < last_fail.get(n, 1 << 30)]
+            got = Playwright.parse_name(m.group(1)) if m else None
+            if got:
+                last_pass[got] = i
+        out = {}
+        for key in list(first) + [b for b in blocks if b not in first]:
+            if last_pass.get(key, -1) > last_fail.get(key, 1 << 30):
+                continue
+            out.setdefault(key[1], blocks.get(key) or first.get(key, ""))
+        return list(out.items())
 
     @staticmethod
     def counts(text):
@@ -568,6 +583,11 @@ class Playwright:
 
 
 RUNNERS = [Dotnet, Vitest, Playwright]
+
+
+def skips_node_modules(runner):
+    """Whether a copy to a remote host leaves node_modules behind."""
+    return runner in (Vitest, Playwright)
 
 
 PLAYWRIGHT_CONFIG = re.compile(r"^playwright\.config\.(?:ts|js|mjs|cjs)$")
@@ -1050,7 +1070,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     def prepare():  # the copy and the env file go once per job, however many commands follow
         if synced:
             return
-        files = lr.file_list(repo, remote.extra_paths, remote.exclude, skip_node_modules=runner in (Vitest, Playwright))
+        files = lr.file_list(repo, remote.extra_paths, remote.exclude, skip_node_modules=skips_node_modules(runner))
         dest = None
         if remote.reuse_build and runner is Dotnet and build_args(extra) is not None:
             # One build folder per repository, commit, tree state, image and build arguments. A match skips the
@@ -1774,13 +1794,13 @@ def node_checks(fails, fixture):
     with tempfile.TemporaryDirectory() as d:
         tree(d, "package-lock.json", ())
         rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
-        if rc != 0 or calls != ["npm ci in " + os.path.basename(d), "npx vitest run --reporter=verbose in dopa"]:
+        if rc != 0 or calls != ["npm ci in " + os.path.basename(d), "npx --no-install vitest run --reporter=verbose in dopa"]:
             fails.append(f"a package-lock.json in a parent folder must run npm ci there, then npx vitest in the package: {rc} {calls} {err}")
         rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest", "test/a.test.ts|test/b.test.ts")
-        if calls[1:] != ["npx vitest run --reporter=verbose test/a.test.ts test/b.test.ts in dopa"]:
+        if calls[1:] != ["npx --no-install vitest run --reporter=verbose test/a.test.ts test/b.test.ts in dopa"]:
             fails.append(f"npm vitest filter pieces must become file arguments: {calls}")
         rc, err, calls = run_script_in(d, "e2e/playwright.config.ts", "playwright", "tests/e2e/online.spec.ts")
-        if calls != ["npm ci in " + os.path.basename(d), "npx playwright test --reporter=list tests/e2e/online.spec.ts in e2e"]:
+        if calls != ["npm ci in " + os.path.basename(d), "npx --no-install playwright test --reporter=list tests/e2e/online\\.spec\\.ts in e2e"]:
             fails.append(f"a playwright config must install with npm ci, then run playwright test with the list reporter: {calls}")
     with tempfile.TemporaryDirectory() as d:
         tree(d, "pnpm-lock.yaml", ())
@@ -1788,7 +1808,7 @@ def node_checks(fails, fixture):
         if rc != 0 or calls != ["pnpm install --frozen-lockfile in dopa", "pnpm exec vitest run --reporter=verbose in dopa"]:
             fails.append(f"a pnpm-lock.yaml must still pick pnpm: {rc} {calls} {err}")
         rc, err, calls = run_script_in(d, "e2e/playwright.config.ts", "playwright", "a.spec.ts|b.spec.ts")
-        if calls != ["pnpm install --frozen-lockfile in e2e", "pnpm exec playwright test --reporter=list a.spec.ts b.spec.ts in e2e"]:
+        if calls != ["pnpm install --frozen-lockfile in e2e", "pnpm exec playwright test --reporter=list a\\.spec\\.ts b\\.spec\\.ts in e2e"]:
             fails.append(f"a playwright config under a pnpm lockfile must use pnpm: {calls}")
     with tempfile.TemporaryDirectory() as d:
         tree(d, "yarn.lock", ())
@@ -1803,8 +1823,69 @@ def node_checks(fails, fixture):
         if calls[:1] != ["pnpm install --frozen-lockfile in dopa"]:
             fails.append(f"the nearest lockfile wins over one further up: {calls}")
 
+    # npm ci wipes node_modules, so it runs only when they are missing or older than the lockfile.
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "package-lock.json", ())
+        nm = os.path.join(d, "node_modules")
+        os.makedirs(nm)
+        os.utime(os.path.join(d, "package-lock.json"), (1000, 1000))
+        marker = os.path.join(nm, ".package-lock.json")
+        open(marker, "w").write("{}\n")
+        os.utime(marker, (2000, 2000))
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if calls != ["npx --no-install vitest run --reporter=verbose in dopa"]:
+            fails.append(f"npm ci must be skipped when node_modules is not older than the lockfile: {calls}")
+        os.utime(os.path.join(d, "package-lock.json"), (3000, 3000))
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if calls[:1] != ["npm ci in " + os.path.basename(d)]:
+            fails.append(f"npm ci must run when the lockfile is newer than node_modules: {calls}")
+        os.remove(marker)
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if calls[:1] != ["npm ci in " + os.path.basename(d)]:
+            fails.append(f"npm ci must run when node_modules has no install marker: {calls}")
+    # a pnpm lockfile above the package wins over a stray npm or yarn lockfile in the package folder
+    for stray in ("package-lock.json", "yarn.lock"):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "pnpm-lock.yaml", ())
+            open(os.path.join(d, "packages", "dopa", stray), "w").write("{}\n")
+            rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+            if rc != 0 or calls != ["pnpm install --frozen-lockfile in dopa", "pnpm exec vitest run --reporter=verbose in dopa"]:
+                fails.append(f"a pnpm-lock.yaml above the package must win over a {stray} in it: {rc} {calls} {err}")
+
+    # two projects, one test: a fail in chromium and a pass in firefox is still a failure; an odd path still parses
+    two = ("  \u2718  1 [chromium] \u203a a.spec.ts:3:5 \u203a t (1s)\n  \u2713  2 [firefox] \u203a a.spec.ts:3:5 \u203a t (1s)\n")
+    if [n for n, _ in P.failures(two)] != ["a.spec.ts \u203a t"]:
+        fails.append("a pass in another project must not hide a failure")
+    flaky = ("  \u2718  1 [chromium] \u203a a.spec.ts:3:5 \u203a t (1s)\n"
+             "  \u2713  2 [chromium] \u203a a.spec.ts:3:5 \u203a t (retry #1) (1s)\n")
+    if P.failures(flaky):
+        fails.append("a pass on retry in the same project is not a failure")
+    spaced = "  \u2718  4 [phone] \u203a tests/my dir/a b.spec.ts:3:1 \u203a login (1s)\n"
+    if [n for n, _ in P.failures(spaced)] != ["tests/my dir/a b.spec.ts \u203a login"]:
+        fails.append(f"a spec path with spaces must parse: {P.failures(spaced)}")
+    ok_mark = ("  x  1 [chromium] \u203a a.spec.ts:3:5 \u203a t (1s)\n  ok 2 [chromium] \u203a a.spec.ts:3:5 \u203a t (retry #1) (1s)\n")
+    if P.failures(ok_mark):
+        fails.append("the ok pass mark must count as a pass")
+    if P.counts("  2 did not run\n  1 passed (1s)\n") != (1, 0, 2):
+        fails.append("did not run counts as skipped")
+    esc = P.command("playwright", "e2e/playwright.config.ts", "tests/(auth)/login.spec.ts|tests/e2e/[id].spec.ts")[-2:]
+    if esc != ["tests/\\(auth\\)/login\\.spec\\.ts", "tests/e2e/\\[id\\]\\.spec\\.ts"] \
+            or not all(re.fullmatch(e, o) for e, o in zip(esc, ["tests/(auth)/login.spec.ts", "tests/e2e/[id].spec.ts"])):
+        fails.append(f"playwright file pieces must be regex-escaped so they match themselves: {esc}")
+    if not globals().get("skips_node_modules") or not skips_node_modules(P) or not skips_node_modules(V) \
+            or skips_node_modules(Dotnet):
+        fails.append("a remote copy for Vitest and Playwright leaves node_modules behind, Dotnet does not")
+    rr = lr.Remote(name="dev", host="devbox") if lr else None
+    if rr is not None:
+        rr.node_image = "node:20-slim"
+        pw = lr.run_script(rr, None, 5, P.command("playwright", "e2e/playwright.config.ts"), kind="playwright")
+        dn = lr.run_script(rr, None, 5, ["dotnet", "test"])
+        if "node:20-slim sh -c" not in pw or "-e CI=true" not in pw or "npm_config_cache=/cache/npm" not in pw \
+                or "npm_config_cache" in dn:
+            fails.append("a playwright job runs in the node image with a persistent npm cache, a dotnet job does not")
+
     cmd = P.command("playwright", "e2e/playwright.config.ts", "tests/a.spec.ts|tests/b.spec.ts")
-    if cmd[3:] != ["playwright", "e2e", "tests/a.spec.ts", "tests/b.spec.ts"] or "playwright test --reporter=list" not in cmd[2]:
+    if cmd[3:] != ["playwright", "e2e", "tests/a\\.spec\\.ts", "tests/b\\.spec\\.ts"] or "playwright test --reporter=list" not in cmd[2]:
         fails.append(f"playwright command: the config folder, one file argument per filter piece: {cmd}")
     if P.command("playwright", "playwright.config.ts")[3:] != ["playwright", "."]:
         fails.append("a playwright run with no filter runs everything, in the config folder")
