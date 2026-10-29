@@ -10,10 +10,15 @@ The command runs in its own process group. That whole group is stopped when:
     init and spinning on a CPU with no task to show for it
 Stopping sends SIGTERM, waits 5 seconds, then SIGKILL. bash defers SIGTERM until a
 builtin finishes, and a slow builtin can take hours, so SIGTERM alone is not enough.
-Otherwise it exits with the command's own code. Standard library only.
+When the command itself exits, anything it left running in the group is stopped too.
+Otherwise it exits with the command's own code (128 plus the signal if a signal killed
+it; 127 if it is not found, 126 if it cannot run). A bad option or minutes value exits 2.
+Limit: a SIGKILL of bounded itself cannot be caught and leaves the group running;
+tools/agent-hygiene.sh reports such orphans. Standard library only.
 
   bounded --self-test
 """
+import math
 import os
 import signal
 import subprocess
@@ -49,7 +54,11 @@ def group_alive(pgid):
 
 def run(minutes, argv, poll=1.0):
     parent = os.getppid()
-    proc = subprocess.Popen(argv, start_new_session=True)
+    try:
+        proc = subprocess.Popen(argv, start_new_session=True)
+    except OSError as e:
+        print(f"bounded: {argv[0]}: {e.strerror or e}", file=sys.stderr)
+        return 127 if isinstance(e, FileNotFoundError) else 126
     reason = []
 
     def on_signal(signum, _frame):
@@ -62,6 +71,8 @@ def run(minutes, argv, poll=1.0):
     while True:
         try:
             code = proc.wait(timeout=poll)
+            if group_alive(proc.pid):
+                stop(proc)
             return code if code >= 0 else 128 - code
         except subprocess.TimeoutExpired:
             pass
@@ -79,31 +90,72 @@ def run(minutes, argv, poll=1.0):
             return 124
 
 
+USAGE = "usage: bounded [--minutes N] -- command [args...]"
+
+
+def minutes_value(text, source):
+    try:
+        value = float(text)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        print(f"bounded: {source} must be a number of minutes, 0 or more (0 means no limit), "
+              f"got {text!r}\n{USAGE}", file=sys.stderr)
+        sys.exit(2)
+    return value
+
+
 def parse(args):
-    minutes = float(os.environ.get("LEAN_BG_MINUTES") or 60)
-    if args[:1] == ["--minutes"] and len(args) > 1:
-        minutes = float(args[1])
+    minutes = minutes_value(os.environ.get("LEAN_BG_MINUTES") or "60", "LEAN_BG_MINUTES")
+    if args[:1] == ["--minutes"]:
+        if len(args) < 2 or args[1] == "--":
+            print(f"bounded: --minutes needs a value\n{USAGE}", file=sys.stderr)
+            sys.exit(2)
+        minutes = minutes_value(args[1], "--minutes")
         args = args[2:]
+    elif args[:1] and args[0].startswith("--minutes="):
+        minutes = minutes_value(args[0].split("=", 1)[1], "--minutes")
+        args = args[1:]
     if args[:1] == ["--"]:
         args = args[1:]
     if not args:
-        sys.exit("usage: bounded [--minutes N] -- command [args...]")
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
     return minutes, args
 
 
 def self_test():
     fails = []
+    script = os.path.realpath(__file__)
     if run(0, ["sh", "-c", "exit 3"]) != 3:
         fails.append("exit code not passed through")
     t0 = time.monotonic()
     code = run(0.02, ["sh", "-c", "sleep 30"], poll=0.1)
     if code != 124 or time.monotonic() - t0 > 10:
         fails.append(f"deadline not enforced: {code}")
-    # A child that ignores SIGTERM, the way bash does inside a slow builtin, still stops.
+    # A child that ignores SIGTERM, the way bash does inside a slow builtin, still stops,
+    # and its pid is gone (the SIGKILL step), not just the exit code set.
+    pidfile = f"/tmp/bounded-selftest-pid-{os.getpid()}"
     t0 = time.monotonic()
-    code = run(0.01, ["sh", "-c", "trap '' TERM; while :; do :; done"], poll=0.1)
+    code = run(0.01, ["sh", "-c", f"trap '' TERM; echo $$ > {pidfile}; while :; do :; done"], poll=0.1)
+    stubborn = read_pid(pidfile)
     if code != 124 or time.monotonic() - t0 > 15:
         fails.append(f"TERM-ignoring child not killed: {code}")
+    if stubborn is None or pid_alive(stubborn):
+        fails.append("TERM-ignoring child still alive after stop")
+        if stubborn:
+            os.kill(stubborn, signal.SIGKILL)
+    # A command killed by a signal exits 128 plus the signal.
+    code = run(0, ["sh", "-c", "kill -KILL $$"])
+    if code != 137:
+        fails.append(f"signal death not 128+sig: {code}")
+    # Anything the command left in the group is stopped when it exits normally.
+    code = run(0, ["sh", "-c", f"sleep 77 & echo $! > {pidfile}"])
+    left = read_pid(pidfile)
+    if code != 0 or left is None or pid_alive(left):
+        fails.append("grandchild survived the leader's normal exit")
+        if left:
+            os.kill(left, signal.SIGKILL)
     # The whole group stops, grandchildren included.
     marker = f"/tmp/bounded-selftest-{os.getpid()}"
     run(0.01, ["sh", "-c", f"(sleep 3; touch {marker}) & wait"], poll=0.1)
@@ -112,7 +164,6 @@ def self_test():
         os.remove(marker)
         fails.append("grandchild survived")
     # The shell that started it dies: the command stops instead of being orphaned.
-    script = os.path.realpath(__file__)
     shell = subprocess.Popen(["sh", "-c", f"python3 '{script}' --minutes 0 -- sleep 60 & echo $!; wait"],
                              stdout=subprocess.PIPE, text=True)
     pid = int(shell.stdout.readline())
@@ -125,12 +176,63 @@ def self_test():
     if pid_alive(pid):
         os.kill(pid, signal.SIGKILL)
         fails.append("orphaned runner kept going after its shell died")
+    # SIGTERM to bounded reaches the group: exit 143, child gone.
+    os.path.exists(pidfile) and os.remove(pidfile)
+    runner = subprocess.Popen([sys.executable, script, "--minutes", "0", "--", "sh", "-c",
+                               f"sleep 60 & echo $! > {pidfile}; wait"])
+    end = time.monotonic() + 5
+    while time.monotonic() < end and read_pid(pidfile) is None:
+        time.sleep(0.05)
+    kid = read_pid(pidfile)
+    runner.terminate()
+    try:
+        rc = runner.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        runner.kill()
+        rc = None
+    if rc != 143 or kid is None or pid_alive(kid):
+        fails.append(f"SIGTERM not forwarded to the group: rc={rc}")
+        if kid:
+            os.kill(kid, signal.SIGKILL)
+    os.path.exists(pidfile) and os.remove(pidfile)
+    # Bad input is a one-line usage error, exit 2.
+    for label, extra, args in (
+        ("--minutes abc", {}, ["--minutes", "abc", "--", "true"]),
+        ("--minutes --", {}, ["--minutes", "--"]),
+        ("bare --minutes", {}, ["--minutes"]),
+        ("--minutes=abc", {}, ["--minutes=abc", "--", "true"]),
+        ("LEAN_BG_MINUTES=abc", {"LEAN_BG_MINUTES": "abc"}, ["--", "true"]),
+        ("--minutes -5", {}, ["--minutes", "-5", "--", "true"]),
+        ("--minutes nan", {}, ["--minutes", "nan", "--", "true"]),
+        ("--minutes inf", {}, ["--minutes", "inf", "--", "true"]),
+        ("LEAN_BG_MINUTES=-1", {"LEAN_BG_MINUTES": "-1"}, ["--", "true"]),
+        ("LEAN_BG_MINUTES=inf", {"LEAN_BG_MINUTES": "inf"}, ["--", "true"]),
+    ):
+        r = subprocess.run([sys.executable, script] + args, capture_output=True, text=True,
+                           env=dict(os.environ, **extra))
+        if r.returncode != 2 or "Traceback" in r.stderr or not r.stderr.strip():
+            fails.append(f"{label}: rc={r.returncode} err={r.stderr[-80:]!r}")
+    r = subprocess.run([sys.executable, script, "--minutes=0", "--", "sh", "-c", "exit 4"])
+    if r.returncode != 4:
+        fails.append(f"--minutes=0 form rejected: {r.returncode}")
+    # A command that cannot start: 127 not found, 126 not executable, no traceback.
+    for label, cmd, want in (("not found", "no_such_cmd_bounded", 127), ("not executable", "/etc/hosts", 126)):
+        r = subprocess.run([sys.executable, script, "--", cmd], capture_output=True, text=True)
+        if r.returncode != want or "Traceback" in r.stderr or not r.stderr.startswith(f"bounded: {cmd}:"):
+            fails.append(f"{label}: rc={r.returncode} err={r.stderr[-80:]!r}")
     for f in fails:
         print("self-test failed:", f)
     if fails:
         return 1
     print("self-test passed")
     return 0
+
+
+def read_pid(path):
+    try:
+        return int(open(path).read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def pid_alive(pid):
