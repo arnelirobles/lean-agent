@@ -7,7 +7,7 @@
   brain show ID
   brain close ID (--resolution R | --wontfix) [--note N] [--commit H] [--tag T ...]
   brain reopen ID
-  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest|vitest|playwright]
+  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest|vitest|playwright|gradle]
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain flaky-clear --project P --test-project T [--runs 5]      closes each open flaky item of T with no new
@@ -18,6 +18,9 @@
             [--by NAME] [--project P] [--session ID] [--infer-session] [--platform apple|auto|none] [--again REASON] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
             A test project path ending in package.json is a Vitest job, and one ending in playwright.config.ts, .js, .mjs or .cjs is a Playwright job (test-phase runs either in that folder, with pnpm or npm).
+            A test project path ending in settings.gradle.kts or settings.gradle, or the folder holding one, is a Gradle job
+            (test-phase runs the repo's ./gradlew; the default task is check, --args='jvmTest ...' names other tasks). A Gradle job is private
+            (local lane only), and apple when its args name an iOS test task
             --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
             or -macos, and an npm job whose .npmrc names a private registry or holds a login private; a remote lane
             never claims an apple or private job
