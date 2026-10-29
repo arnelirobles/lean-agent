@@ -15,6 +15,18 @@ all exist), so the repo is compared loosely: the last path part, case-insensitiv
 repo from -R, the URL, gh pr view, or the origin remote. When none of those is known, the
 number alone decides.
 
+It only enforces for a repo that already has at least one logged review (same loose match),
+because lean-agent hooks create lean.db on their own: once a repo has a logged review, an
+unlogged pull request is refused; a repo that never logs reviews is left alone. `gh pr ready
+--undo` (back to draft) allows. GH_REPO is honoured after -R/--repo. Remotes are compared
+percent-decoded, without a fragment.
+
+az repos pr update has no repository argument and az pull request ids are organization wide,
+so for az the rule is: allow when any reviews row has that number, whatever the repo; deny only
+when the origin repo has logged reviews and none has that number.
+
+Best effort: wrappers (`bash -c`, `sudo`) and `gh api` merges are not caught.
+
 The database is LEAN_DB (default ~/.lean/lean.db), as in lean-stats. LEAN_STATS=off, no
 database file, no reviews table, or any error allows. --help and -h allow.
 
@@ -27,6 +39,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
@@ -39,24 +52,28 @@ AZ_VALUE_FLAGS = {"--id", "--status", "--draft", "--organization", "--org", "--d
                   "--description", "--auto-complete", "--squash", "--delete-source-branch",
                   "--bypass-policy", "--bypass-policy-reason", "--merge-commit-message",
                   "--transition-work-items", "--output", "-o", "--query", "--subscription"}
+LOG_REVIEW = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..",
+                                           "skills", "adversarial-review", "log-review.sh"))
 DENY = (
     "Pull request {name} has no review logged in lean.db, which the retro reads. Run the review "
     "(adversarial-review), then log it with "
-    "`${{CLAUDE_PLUGIN_ROOT}}/skills/adversarial-review/log-review.sh {repo} {number} <confirmed> "
+    "`{script} {repo} {number} <confirmed> "
     "<refuted> <blockers> \"<categories>\" \"<caught elsewhere first>\"`. "
-    "If the change was deliberately not reviewed, set " + SKIP + "=1 for this command.")
+    "log-review.sh hides lean-stats errors, so if it was run and this still refuses, check `lean-stats` "
+    "or set " + SKIP + "=1. If the change was deliberately not reviewed, set " + SKIP + "=1 for this command.")
 
 
 def last_part(repo):
     """The comparable form of a repo string: last path part, lower case, no .git."""
-    text = (repo or "").strip().rstrip("/")
+    text = urllib.parse.unquote((repo or "").split("#")[0].split("?")[0]).strip().rstrip("/")
     text = re.split(r"[/:]", text)[-1] if text else ""
     return text[:-4].lower() if text.lower().endswith(".git") else text.lower()
 
 
 def full_name(url):
     """owner/repo from a github remote or pull request URL, else the last two path parts."""
-    found = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?(?:/pull/\d+.*)?/?$", url or "")
+    url = urllib.parse.unquote((url or "").split("#")[0].split("?")[0])
+    found = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?(?:/pull/\d+.*)?/?$", url)
     return found.group(1) if found else ""
 
 
@@ -83,7 +100,7 @@ def parse_gh(words):
     j = i + 2
     while j < len(words):
         w = words[j]
-        if w in ("-h", "--help"):
+        if w in ("-h", "--help", "--undo"):
             helped = True
         elif w in ("-R", "--repo") and j + 1 < len(words):
             repo, j = words[j + 1], j + 1
@@ -123,11 +140,11 @@ def parse_az(words):
     return pairs.get("--id"), helped
 
 
-def view(cwd, arg, repo):
+def view(cwd, arg, repo, env=None):
     """(number, url) from gh pr view, else None."""
     cmd = ["gh", "pr", "view"] + ([arg] if arg else []) + (["-R", repo] if repo else []) + ["--json", "number,url"]
     try:
-        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
+        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5, env=env)
         if out.returncode != 0:
             return None
         data = json.loads(out.stdout)
@@ -137,6 +154,7 @@ def view(cwd, arg, repo):
 
 
 def target(seg, kind, parsed):
+    env = dict(os.environ, **seg.env)
     """(number, repo name as owner/repo or '') for the pull request this command acts on, else None."""
     if kind == "az":
         number = parsed[0]
@@ -144,6 +162,7 @@ def target(seg, kind, parsed):
             return None
         return int(number), full_name(hookkit.git(seg.cwd, "remote", "get-url", "origin") or "")
     action, arg, repo, helped = parsed
+    repo = repo or env.get("GH_REPO") or None
     if arg:
         found = re.fullmatch(r"#?(\d+)", arg)
         if found:
@@ -151,14 +170,14 @@ def target(seg, kind, parsed):
         found = re.search(r"([^/]+/[^/]+)/pull/(\d+)", arg)
         if found:
             return int(found.group(2)), found.group(1)
-    got = view(seg.cwd, arg, repo)
+    got = view(seg.cwd, arg, repo, env)
     if not got:
         return None
     return got[0], full_name(got[1]) or repo or ""
 
 
-def logged(number, repo):
-    """False only when the database is readable, has a reviews table, and holds no row for the pull request."""
+def logged(number, repo, kind="gh"):
+    """False only when the database has a reviews table, the repo has logged reviews, and none is for the pull request."""
     import leanstats
     if leanstats.off():
         return True
@@ -169,11 +188,16 @@ def logged(number, repo):
     try:
         if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reviews'").fetchone():
             return True
-        rows = [r[0] for r in conn.execute("SELECT repo FROM reviews WHERE pr = ?", (number,))]
+        rows = [(r[0], r[1]) for r in conn.execute("SELECT repo, pr FROM reviews")]
     finally:
         conn.close()
+    if kind == "az" and any(pr == number for _, pr in rows):
+        return True
     want = last_part(repo)
-    return any(not want or last_part(r) == want for r in rows)
+    mine = [(r, pr) for r, pr in rows if not want or last_part(r) == want]
+    if not mine:
+        return True
+    return any(pr == number for _, pr in mine)
 
 
 def message(command, cwd):
@@ -196,12 +220,12 @@ def message(command, cwd):
             else:
                 continue
             found = target(seg, kind, parsed)
-            if not found or logged(*found):
+            if not found or logged(*found, kind):
                 continue
         except Exception:
             continue
         number, repo = found
-        return DENY.format(name=f"{repo}#{number}" if repo else f"#{number}", repo=repo or "<owner/repo>", number=number)
+        return DENY.format(name=f"{repo}#{number}" if repo else f"#{number}", repo=repo or "<owner/repo>", number=number, script=LOG_REVIEW)
     return None
 
 
@@ -280,6 +304,30 @@ def self_test():
         check("other repo same number denies", message("gh pr ready 5 -R o/zzz", repo), True)
         check("other repo own row allows", message("gh pr ready 9 -R q/zzz", repo), False)
         check("repo case is loose", message("gh pr ready 5 -R BARYODEV/r", repo), False)
+        check("repo with no logged reviews allows", message("gh pr merge 6 -R o/nobody", repo), False)
+        check("--undo before the number allows", message("gh pr ready --undo 6", repo), False)
+        check("--undo after the number allows", message("gh pr ready 6 --undo", repo), False)
+        check("inline GH_REPO is used", message("GH_REPO=o/zzz gh pr ready 5", repo), True)
+        os.environ["GH_REPO"] = "o/zzz"
+        check("environment GH_REPO is used", message("gh pr ready 5", repo), True)
+        check("-R beats GH_REPO", message("gh pr ready 5 -R o/r", repo), False)
+        del os.environ["GH_REPO"]
+        check("deny has the real script path", LOG_REVIEW + " o/r 6" in (message("gh pr merge 6", repo) or ""), True)
+        check("deny has no plugin root variable", "CLAUDE_PLUGIN_ROOT" in (message("gh pr merge 6", repo) or ""), False)
+        check("deny mentions lean-stats", "check `lean-stats`" in (message("gh pr merge 6", repo) or ""), True)
+        enc = os.path.join(tmp, "enc")
+        os.mkdir(enc)
+        subprocess.run(["git", "-C", enc, "init", "-q"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", enc, "remote", "add", "origin",
+                        "https://dev.azure.com/org/proj/_git/My%20Repo#frag"], check=True, capture_output=True)
+        c = leanstats.connect(db)
+        c.execute("INSERT INTO reviews (date, repo, pr) VALUES ('2026-01-01', 'My Repo', 11)")
+        c.close()
+        check("encoded remote logged allows", message("az repos pr update --id 11 --draft false", enc), False)
+        check("encoded remote unlogged denies", message("az repos pr update --id 13 --draft false", enc), True)
+        check("encoded remote gh logged allows", message("gh pr merge 11", enc), False)
+        check("encoded remote gh unlogged denies", message("gh pr merge 13", enc), True)
+        check("az number logged in another repo allows", message("az repos pr update --id 9 --draft false", repo), False)
         check("--help allows", message("gh pr merge --help", repo), False)
         check("-h allows", message("gh pr ready 6 -h", repo), False)
         check("inline skip allows", message(SKIP + "=1 gh pr merge 6", repo), False)
@@ -304,7 +352,7 @@ def self_test():
         check("no argument denies", message("gh pr ready", repo), True)
         fake_gh("echo '{\"number\": 5, \"url\": \"https://github.com/o/r/pull/5\"}'")
         check("branch form logged allows", message("gh pr merge feat/x", repo), False)
-        fake_gh("echo '{\"number\": 5, \"url\": \"https://github.com/o/other/pull/5\"}'")
+        fake_gh("echo '{\"number\": 5, \"url\": \"https://github.com/o/zzz/pull/5\"}'")
         check("branch form other repo denies", message("gh pr merge feat/x", repo), True)
         fake_gh("exit 1")
         check("gh failure allows", message("gh pr merge feat/x", repo), False)
