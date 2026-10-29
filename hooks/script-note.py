@@ -89,8 +89,9 @@ def candidates(command):
         if name == PATH_FAMILY:
             m = BIN_PATH.search(command[:module.CAP])
             if m:
-                out.append((name, "Call `%s` as %s, not by its versioned plugin cache "
-                            "path, which breaks after an upgrade." % (m.group(1), hookkit.tool_path(m.group(1)))))
+                how = "by name" if hookkit.tools_on_path() else "as " + hookkit.tool_path(m.group(1))
+                out.append((name, "Call `%s` %s, not by its versioned plugin cache "
+                            "path, which breaks after an upgrade." % (m.group(1), how)))
             continue
         script = fam["covered_by"]
         usage = fam["usage"]
@@ -280,6 +281,23 @@ def self_test():
     check("a command naming the script gets no note", fire("holdout.sh --spec x.md  # mutation", "named")[1] == "")
     rc, text, _ = fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/style-scan --help", "vp")
     check("versioned path note", "`style-scan`" in text and hookkit.tool_path("style-scan") in text and "CLAUDE_PLUGIN_ROOT" not in text, repr(text))
+    saved_env = {k: os.environ.get(k) for k in ("CLAUDE_ENV_FILE", "PATH")}
+    try:
+        os.environ.pop("CLAUDE_ENV_FILE", None)
+        os.environ["PATH"] = "/usr/bin"
+        rc, text, _ = fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/style-scan --help", "vp-off")
+        check("versioned path note keeps the full path off PATH", "as " + hookkit.tool_path("style-scan") in text
+              and "/tools/style-scan" in text, repr(text))
+        os.environ["CLAUDE_ENV_FILE"] = "/tmp/env"
+        rc, text, _ = fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/style-scan --help", "vp-on")
+        check("versioned path note suggests the bare name on PATH", "Call `style-scan` by name" in text
+              and "/tools/style-scan" not in text.split("not by")[0], repr(text))
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     check("versioned path once", fire("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/tools/replace x", "vp")[1] == "")
     check("hooks path is not noted",
           fire("python3 ~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/hooks/wait-loop.py --self-test", "vh")[1] == "")

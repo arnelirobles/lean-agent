@@ -113,7 +113,9 @@ def message(env):
 
 
 def tools_note():
-    """Where the scripts are. They are not on PATH, so a bare `brain` or `style-scan` is not found."""
+    """Where the scripts are: on PATH when session-env could put them there, else by absolute path."""
+    if hookkit.tools_on_path():
+        return "lean-agent tools are on PATH. Run them by name, for example `brain list`."
     root = shlex.quote(hookkit.TOOLS)
     return "lean-agent tools are not on PATH. Run them as %s/<name>, for example %s." % (root, hookkit.tool_path("brain") + " list")
 
@@ -182,10 +184,25 @@ def self_test():
     expect("every role the same model", {"LEAN_MODEL_CHEAP": "opus", "LEAN_MODEL_FAST": "opus"},
            ("are both opus",), ("cost the most",))
     expect("fast steps in one session", {"LEAN_AGENTS": "one"}, ("fast steps", "run in the session itself"))
-    note = tools_note()
-    if "/tools/<name>" not in note or not os.path.isfile(hookkit.TOOLS + "/brain"):
-        print(f"FAIL tools note should name a real tools folder: {note}")
-        failures += 1
+    saved = {k: os.environ.get(k) for k in ("CLAUDE_ENV_FILE", "PATH")}
+    try:
+        os.environ.pop("CLAUDE_ENV_FILE", None)
+        os.environ["PATH"] = "/usr/bin"
+        note = tools_note()
+        if "/tools/<name>" not in note or "not on PATH" not in note or not os.path.isfile(hookkit.TOOLS + "/brain"):
+            print(f"FAIL tools note should name a real tools folder: {note}")
+            failures += 1
+        os.environ["CLAUDE_ENV_FILE"] = "/tmp/env"
+        note = tools_note()
+        if "are on PATH" not in note or "`brain list`" not in note or "/tools/" in note or "not on PATH" in note:
+            print(f"FAIL tools note should say the tools are on PATH: {note}")
+            failures += 1
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

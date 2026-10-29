@@ -33,6 +33,21 @@ def brain(*args):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def add_tools_to_path(env_file):
+    """Append the PATH line for the current tools folder unless it is already the last PATH line there. A resume after an
+    upgrade has a different folder, so it gets its own line, and the later export wins."""
+    line = f'export PATH={shlex.quote(hookkit.TOOLS)}:"$PATH"\n'
+    try:
+        with open(env_file, encoding="utf-8") as f:
+            mine = [ln for ln in f.read().splitlines(keepends=True) if ln.startswith("export PATH=")]
+            if mine and mine[-1] == line:
+                return
+    except OSError:
+        pass
+    with open(env_file, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
 def collect_session(transcript):
     """Start `lean-stats collect --transcript` detached and return the process, or None. Never waits, never raises."""
     if os.environ.get("LEAN_STATS") == "off" or not isinstance(transcript, str) or not transcript.endswith(".jsonl"):
@@ -63,6 +78,7 @@ def main():
     if name == "SessionStart":
         env_file = os.environ.get("CLAUDE_ENV_FILE")
         if env_file:
+            add_tools_to_path(env_file)
             with open(env_file, "a", encoding="utf-8") as f:
                 f.write(f"export LEAN_SESSION_ID={shlex.quote(sid)}\n")
                 if cwd:
@@ -110,6 +126,45 @@ def self_test():
                                   "\"$LEAN_SESSION_CWD\""], capture_output=True, text=True).stdout
         if sourced != f"abc-123|{cwd}":
             fails.append(f"env file must export the id and a quoted cwd: {written!r} gives {sourced!r}")
+        path_lines = [ln for ln in written.splitlines() if ln.startswith("export PATH=")]
+        want = f'export PATH={shlex.quote(hookkit.TOOLS)}:"$PATH"'
+        if path_lines != [want]:
+            fails.append(f"start must add the tools folder to PATH once: {path_lines!r}")
+        shown = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(env_file)}; command -v brain'],
+                               capture_output=True, text=True).stdout.strip()
+        if shown != os.path.join(hookkit.TOOLS, "brain"):
+            fails.append(f"a shell sourcing the env file must find brain: {shown!r}")
+        hook("SessionStart")
+        hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "abc-123", "cwd": cwd,
+                                           "source": "compact"}))
+        if open(env_file).read().count("export PATH=") != 1:
+            fails.append("a second SessionStart must not add the PATH line again")
+        spaced = os.path.join(d, "a dir", "tools")
+        spaced_file = os.path.join(d, "spaced-env")
+        saved_tools = hookkit.TOOLS
+        try:
+            hookkit.TOOLS = spaced
+            add_tools_to_path(spaced_file)
+        finally:
+            hookkit.TOOLS = saved_tools
+        os.makedirs(spaced)
+        with open(os.path.join(spaced, "hello"), "w") as fh:
+            fh.write("#!/bin/sh\necho hi\n")
+        os.chmod(os.path.join(spaced, "hello"), 0o755)
+        got = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(spaced_file)}; hello'],
+                             capture_output=True, text=True).stdout.strip()
+        if got != "hi":
+            fails.append(f"a tools folder with a space must be quoted: {got!r}")
+        try:
+            hookkit.TOOLS = os.path.join(d, "old-version", "tools")  # a resumed session whose file names the old version
+            add_tools_to_path(env_file)
+        finally:
+            hookkit.TOOLS = saved_tools
+        hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "abc-123", "cwd": cwd,
+                                           "source": "resume"}))
+        lines = [ln for ln in open(env_file).read().splitlines() if ln.startswith("export PATH=")]
+        if len(lines) != 3 or lines[-1] != want or lines[0] != want:
+            fails.append(f"a resume must write the current tools folder last: {lines!r}")
         if brain_out("session", "status", "abc-123") != f"open {cwd}":
             fails.append("start must record the session as open")
         hook("SessionEnd")

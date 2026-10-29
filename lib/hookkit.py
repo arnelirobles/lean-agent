@@ -46,8 +46,17 @@ def _fire(outcome):
 TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
 
 
+def tools_on_path():
+    """True when the tools folder is on PATH: session-env wrote it to CLAUDE_ENV_FILE, or PATH already names it."""
+    if os.environ.get("CLAUDE_ENV_FILE"):
+        return True
+    return TOOLS in [os.path.normpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+
+
 def tool_path(name, base=None):
-    """The absolute path of a plugin tool, quoted so it can be pasted into a shell."""
+    """How to run a plugin tool: the bare name when the tools folder is on PATH, else its absolute path, quoted."""
+    if base is None and tools_on_path():
+        return name
     return shlex.quote(os.path.join(base or TOOLS, name))
 
 
@@ -443,7 +452,23 @@ def self_test():
                 check("a self-test run records nothing", os.path.exists(quiet), False)
         finally:
             _RECORD, _EVENT = False, {}
-    check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
+    saved_env = {k: os.environ.get(k) for k in ("CLAUDE_ENV_FILE", "PATH")}
+    try:
+        os.environ.pop("CLAUDE_ENV_FILE", None)
+        os.environ["PATH"] = "/usr/bin"
+        check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
+        os.environ["CLAUDE_ENV_FILE"] = "/tmp/env"
+        check("tool_path is the bare name with CLAUDE_ENV_FILE set", tool_path("brain"), "brain")
+        os.environ.pop("CLAUDE_ENV_FILE")
+        os.environ["PATH"] = "/usr/bin" + os.pathsep + TOOLS
+        check("tool_path is the bare name when PATH names the tools", tool_path("brain"), "brain")
+        check("tool_path with a base stays a path", tool_path("brain", "/a/tools"), "/a/tools/brain")
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     check("tool_path quotes a path with a space", tool_path("brain", "/a b/tools"), "'/a b/tools/brain'")
     check("tool_path leaves a plain path bare", tool_path("brain", "/a/tools"), "/a/tools/brain")
 
