@@ -43,6 +43,7 @@ The scripts live in `${CLAUDE_PLUGIN_ROOT}/tools/`. They are on PATH when the se
 - `holdout.sh --spec <file>`: holds a change's production hunk out and requires its named test to fail. Use it for the mutation check, not a hand revert.
 - `replace`: exact text edit that fails unless the old text is there exactly once.
 - `wait-loop` hook (`hooks/wait-loop.py`): denies `sleep` and `pgrep` wait loops. Enqueue and end the turn instead, or start `brain queue wait ID...` or `pr-wait` in the background.
+- `review-log-check` hook (`hooks/review-log-check.py`): denies `git push`, `gh pr create` and `az repos pr create` on a branch with no row in `review-log.tsv`. Log the review first, or set `LEAN_REVIEW_LOG_CHECK=off` for a change that was not reviewed.
 - `pr-wait <pr>`: waits for a pull request's checks (or `--provider azure` for a pipeline run) and prints only the failed checks and the tail of their logs.
 - `orient [--all]`: repo, branch, dirty count, ahead and behind, open PR with its checks, and with `--all` one line per worktree. Use it instead of a status loop over worktrees.
 - `pkg-version <name> [--nuget|--npm]`: the latest stable version and what each project in the repo pins. Use it instead of a curl to a registry.
