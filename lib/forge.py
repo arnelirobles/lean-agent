@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reads from the code host a repository lives on. Only GitHub is wired up; GitLab and Azure DevOps come later.
+"""Reads from the code host a repository lives on. GitHub and, for lean-stats, Azure DevOps are wired up; GitLab comes later.
 
   forge.py kind [DIR]                 github, gitlab, azure or unknown, from DIR's origin (default .)
   forge.py merged-prs REPO SINCE      one TSV row per merged pull request: number, created_at, merged_at, head_sha
@@ -9,6 +9,12 @@
   forge.py --self-test
 
 REPO is owner/name (always GitHub) or a clone URL. A host other than GitHub prints one line and exits 2.
+
+Azure DevOps is reached through Azure (az repos pr list, az devops invoke), used by lean-stats through for_repo.
+This command line still refuses it. An Azure repository is named ORG/PROJECT/REPO (three parts, names
+percent-decoded), which cannot collide with GitHub's owner/name. azure_slug turns any clone URL into that name.
+Azure answers merged_prs and commits_after. failed_checks and escaped_refs return None: a check run is not
+found by commit, and az has no search over work item text.
 
 CI providers. tools/pr-wait waits on checks through a provider from ci_provider(kind, ...), kind being what
 kind_of returns. A provider is a class with this interface, nothing more:
@@ -83,11 +89,63 @@ def slug(repo):
     return re.sub(r"\.git$", "", path.strip("/"))
 
 
+def repo_kind(repo):
+    """github, gitlab, azure or unknown for a clone URL, an owner/name or an ORG/PROJECT/REPO."""
+    if is_url(repo):
+        return kind_of(repo)
+    return "azure" if repo.count("/") == 2 else "github"
+
+
 def for_repo(repo, run=run_command):
-    kind = kind_of(repo) if is_url(repo) else "github"
+    kind = repo_kind(repo)
+    if kind == "azure":
+        return Azure(run)
     if kind != "github":
         raise Unsupported(f"{kind} is not supported yet; only GitHub is")
     return GitHub(run)
+
+
+def parse_azure(repo):
+    """(org, project, repo) from an Azure DevOps clone URL or ORG/PROJECT/REPO, percent-decoded, or None.
+
+    https://[user@]dev.azure.com/ORG/PROJECT/_git/REPO, https://ORG.visualstudio.com/[DefaultCollection/]PROJECT/_git/REPO,
+    git@ssh.dev.azure.com:v3/ORG/PROJECT/REPO, ssh://git@ssh.dev.azure.com/v3/ORG/PROJECT/REPO. A URL
+    without a project (.../ORG/_git/REPO) has the project named after the repository.
+    """
+    from urllib.parse import unquote
+    repo = (repo or "").strip()
+    if not is_url(repo):
+        parts = repo.strip("/").split("/")
+        return tuple(parts) if len(parts) == 3 and all(parts) else None
+    host = host_of(repo)
+    path = re.sub(r"^[a-z+]+://[^/]+/|^[^@/]+@[^:/]+:", "", repo).split("?")[0].strip("/")
+    parts = [unquote(p) for p in path.split("/")]
+    if host == "ssh.dev.azure.com":
+        parts = parts[1:] if parts[:1] == ["v3"] else []
+        found = parts if len(parts) == 3 else None
+    elif host == "dev.azure.com":
+        found = _git_parts(parts[0], parts[1:]) if parts else None
+    elif host.endswith(".visualstudio.com"):
+        rest = parts[1:] if parts[:1] and parts[0].lower() == "defaultcollection" else parts
+        found = _git_parts(host[:-len(".visualstudio.com")], rest)
+    else:
+        found = None
+    return tuple(found) if found and all(found) else None
+
+
+def _git_parts(org, rest):
+    """[org, project, repo] from the path after the organization: PROJECT/_git/REPO or _git/REPO."""
+    if len(rest) == 3 and rest[1] == "_git":
+        return [org, rest[0], rest[2]]
+    if len(rest) == 2 and rest[0] == "_git":
+        return [org, rest[1], rest[1]]
+    return None
+
+
+def azure_slug(repo):
+    """ORG/PROJECT/REPO for an Azure DevOps clone URL or name, or empty when it is not one."""
+    found = parse_azure(repo)
+    return "/".join(found) if found else ""
 
 
 def count(out):
@@ -128,6 +186,86 @@ class GitHub:
     def escaped_refs(self, repo, number, merged_at):
         return count(self.run(["gh", "search", "issues", f'repo:{slug(repo)} "#{number}" fix in:body created:>{merged_at}',
                                "--json", "number", "-q", "length"]))
+
+
+AZURE_PAGE = 100
+AZURE_CAP = 1000
+
+
+def azure_time(text):
+    """An Azure timestamp as YYYY-MM-DDTHH:MM:SSZ, the shape GitHub gives. Anything else is returned as it came."""
+    m = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(?:Z|[+-]00:?00)", text or "")
+    return m.group(1) + "Z" if m else (text or "")
+
+
+class Azure:
+    """Pull requests of an Azure DevOps repository through az. Never calls gh.
+
+    The repository is a clone URL or ORG/PROJECT/REPO. merged_prs returns the shape GitHub's does and pages
+    az 100 at a time, newest closed first, until a page ends before `since`, a short page, or `cap` pull
+    requests; reaching the cap is reported on stderr. commits_after counts the commits on a pull request
+    committed after a time, merges not counted, from the first 500. failed_checks and escaped_refs return None:
+    check runs cannot be found by commit through az, and az has no search over work item text.
+    A failed az call gives None (merged_prs) or 0 (commits_after) the way GitHub's does.
+    """
+
+    def __init__(self, run=run_command, cap=AZURE_CAP, page=AZURE_PAGE):
+        self.run, self.cap, self.page = run, cap, page
+
+    def _target(self, repo):
+        found = parse_azure(repo)
+        if not found:
+            raise Unsupported(f"not an Azure DevOps repository: {repo}")
+        return f"https://dev.azure.com/{found[0]}", found[1], found[2]
+
+    def merged_prs(self, repo, since, limit=None):
+        org, project, name = self._target(repo)
+        cap = limit or self.cap
+        out = []
+        skip = 0
+        while True:
+            listing = self.run(["az", "repos", "pr", "list", "--status", "completed", "--repository", name,
+                                "--project", project, "--org", org, "--top", str(self.page), "--skip", str(skip),
+                                "--output", "json"])
+            if listing is None:
+                return None
+            try:
+                prs = json.loads(listing)
+                batch = [{"number": pr["pullRequestId"],
+                          "head_ref": re.sub(r"^refs/heads/", "", pr.get("sourceRefName") or ""),
+                          "head_sha": (pr.get("lastMergeSourceCommit") or {}).get("commitId") or "",
+                          "created_at": azure_time(pr.get("creationDate")),
+                          "merged_at": azure_time(pr.get("closedDate"))} for pr in prs]
+            except (ValueError, KeyError, TypeError, AttributeError):
+                return None
+            out += [pr for pr in batch if pr["merged_at"] >= since]
+            skip += len(prs)
+            if len(prs) < self.page or (batch and batch[-1]["merged_at"] < since):
+                return out
+            if skip >= cap:
+                print(f"forge: stopped at {skip} pull requests of {azure_slug(repo)}, older ones are not counted",
+                      file=sys.stderr)
+                return out
+
+    def commits_after(self, repo, number, after):
+        org, project, name = self._target(repo)
+        out = self.run(["az", "devops", "invoke", "--area", "git", "--resource", "pullRequestCommits",
+                        "--org", org, "--route-parameters", f"project={project}", f"repositoryId={name}",
+                        f"pullRequestId={number}", "--query-parameters", "$top=500", "--api-version", "7.1",
+                        "--output", "json"])
+        try:
+            commits = json.loads(out)["value"]
+            return sum(1 for c in commits
+                       if azure_time(c["committer"]["date"]) > azure_time(after)
+                       and not (c.get("comment") or "").startswith("Merge"))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return 0
+
+    def failed_checks(self, repo, sha):
+        return None
+
+    def escaped_refs(self, repo, number, merged_at):
+        return None
 
 
 class CiError(Exception):
@@ -288,6 +426,8 @@ def main(argv):
         return 2
     cmd, repo, rest = argv[0], argv[1], argv[2:]
     try:
+        if repo_kind(repo) == "azure":
+            raise Unsupported("azure is not supported yet; only GitHub is")
         gh = for_repo(repo)
     except Unsupported as e:
         print(f"forge: {e}", file=sys.stderr)
@@ -351,6 +491,19 @@ if a[:2] == ["devops", "invoke"] and val("--resource") == "timeline":
     print(open(os.path.join(d, "timeline.json")).read()); sys.exit(0)
 if a[:2] == ["devops", "invoke"] and val("--resource") == "logs":
     log([x for x in a if x.startswith("logId=")][0][6:]); sys.exit(0)
+sys.exit(9)
+"""
+
+
+FAKE_AZ_PR = FAKE_CLI + """
+if a[:3] == ["repos", "pr", "list"]:
+    if os.path.exists(os.path.join(d, "fail")):
+        sys.stderr.write("TF400813: not authorized\\n"); sys.exit(1)
+    prs = json.load(open(os.path.join(d, "prs.json")))
+    skip, top = int(val("--skip")), int(val("--top"))
+    print(json.dumps(prs[skip:skip + top])); sys.exit(0)
+if a[:2] == ["devops", "invoke"] and val("--resource") == "pullRequestCommits":
+    print(open(os.path.join(d, "commits.json")).read()); sys.exit(0)
 sys.exit(9)
 """
 
@@ -494,6 +647,106 @@ def azure_ci_test(check, root):
         pass
 
 
+def azure_test(check, root):
+    urls = (("https://dev.azure.com/org/proj/_git/repo", ("org", "proj", "repo")),
+            ("https://org@dev.azure.com/org/proj/_git/repo", ("org", "proj", "repo")),
+            ("https://dev.azure.com/org/My%20Proj/_git/my%20repo", ("org", "My Proj", "my repo")),
+            ("git@ssh.dev.azure.com:v3/org/proj/repo", ("org", "proj", "repo")),
+            ("git@ssh.dev.azure.com:v3/org/My%20Proj/repo", ("org", "My Proj", "repo")),
+            ("ssh://git@ssh.dev.azure.com/v3/org/proj/repo", ("org", "proj", "repo")),
+            ("https://org.visualstudio.com/proj/_git/repo", ("org", "proj", "repo")),
+            ("https://org.visualstudio.com/DefaultCollection/proj/_git/repo", ("org", "proj", "repo")),
+            ("https://org.visualstudio.com/_git/repo", ("org", "repo", "repo")),
+            ("https://dev.azure.com/org/_git/repo", ("org", "repo", "repo")),
+            ("org/proj/repo", ("org", "proj", "repo")),
+            ("https://dev.azure.com/org/proj", None), ("https://github.com/o/r", None), ("o/r", None), ("", None))
+    for url, want in urls:
+        check(f"azure parse {url!r}", parse_azure(url), want)
+    check("azure slug", azure_slug("https://dev.azure.com/baryodev/DopaDopa/_git/ToGo"), "baryodev/DopaDopa/ToGo")
+    check("azure slug of a GitHub URL is empty", azure_slug("https://github.com/o/r"), "")
+    check("owner/name/repo is Azure", isinstance(for_repo("org/proj/repo"), Azure), True)
+    check("an Azure URL is Azure", isinstance(for_repo("https://dev.azure.com/o/p/_git/r"), Azure), True)
+    check("owner/name stays GitHub", isinstance(for_repo("o/r"), GitHub), True)
+    check("azure time", [azure_time(t) for t in ("2026-10-25T12:37:30.535651+00:00", "2026-10-25T12:37:30Z", "x", None)],
+          ["2026-10-25T12:37:30Z", "2026-10-25T12:37:30Z", "x", ""])
+
+    def pr(n, closed, ref="refs/heads/b", sha="abc"):
+        return {"pullRequestId": n, "sourceRefName": ref, "creationDate": "2026-10-01T00:00:00.123456+00:00",
+                "closedDate": closed, "lastMergeSourceCommit": {"commitId": sha}, "status": "completed",
+                "title": "$(id)"}
+
+    calls = []
+
+    def fake(out):
+        def run(cmd, timeout=600):
+            calls.append(cmd)
+            return out
+        return run
+
+    one = json.dumps([pr(7, "2026-10-02T03:04:05.1+00:00", "refs/heads/feat/x", "deadbeef")])
+    got = Azure(fake(one)).merged_prs("https://dev.azure.com/org/My%20Proj/_git/r", "2026-10-01")
+    argv = calls[-1]
+    check("azure merged_prs has GitHub's shape", got, [{"number": 7, "head_ref": "feat/x", "head_sha": "deadbeef",
+          "created_at": "2026-10-01T00:00:00Z", "merged_at": "2026-10-02T03:04:05Z"}])
+    check("azure merged_prs keys match GitHub's",
+          sorted(got[0]), sorted(GitHub(fake(json.dumps([{"number": 1}]))).merged_prs("o/r", "x")[0]))
+    check("azure argv", argv, ["az", "repos", "pr", "list", "--status", "completed", "--repository", "r",
+          "--project", "My Proj", "--org", "https://dev.azure.com/org", "--top", "100", "--skip", "0",
+          "--output", "json"])
+    check("azure merged_prs on a failed az", Azure(fake(None)).merged_prs("org/p/r", "2026-10-01"), None)
+    check("azure merged_prs on bad JSON", Azure(fake("not json")).merged_prs("org/p/r", "2026-10-01"), None)
+    check("azure merged_prs on a wrong shape", Azure(fake('[{"id": 1}]')).merged_prs("org/p/r", "2026-10-01"), None)
+    try:
+        Azure(fake("[]")).merged_prs("o/r", "2026-10-01")
+        check("azure refuses a non-Azure name", "no error", "Unsupported")
+    except Unsupported:
+        pass
+
+    d, env = make_scene(root, {"az": FAKE_AZ_PR}, {"prs.json": [pr(n, f"2026-10-{30 - n:02d}T00:00:00Z") for n in range(1, 26)]})
+
+    def run_fake(cmd, timeout=600):
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        return r.stdout if r.returncode == 0 else None
+
+    az = Azure(run_fake, page=10)
+    got = az.merged_prs("org/p/r", "2026-10-01")
+    check("azure pages until a short page", [x["number"] for x in got], list(range(1, 26)))
+    check("azure paged three times", len([c for c in read_calls(d) if c.startswith("az repos pr list")]), 3)
+    d2, env = make_scene(root, {"az": FAKE_AZ_PR}, {"prs.json": [pr(n, f"2026-10-{30 - n:02d}T00:00:00Z") for n in range(1, 26)]})
+    got = Azure(run_fake, page=10).merged_prs("org/p/r", "2026-10-20")
+    check("azure stops once a page is older than since", ([x["number"] for x in got], len(read_calls(d2))),
+          (list(range(1, 11)), 2))
+    d3, env = make_scene(root, {"az": FAKE_AZ_PR}, {"prs.json": [pr(n, "2026-10-20T00:00:00Z") for n in range(1, 26)]})
+    import io
+    err = io.StringIO()
+    old, sys.stderr = sys.stderr, err
+    try:
+        got = Azure(run_fake, cap=20, page=10).merged_prs("org/p/r", "2026-10-01")
+    finally:
+        sys.stderr = old
+    check("azure cap keeps what it read", len(got), 20)
+    check("azure cap hit is reported", err.getvalue(), "forge: stopped at 20 pull requests of org/p/r, older ones are not counted\n")
+    open(os.path.join(d3, "fail"), "w").close()
+    check("azure failing az gives None", Azure(run_fake, page=10).merged_prs("org/p/r", "2026-10-01"), None)
+
+    d4, env = make_scene(root, {"az": FAKE_AZ_PR}, {"prs.json": [pr(3, "2026-10-20T00:00:00Z", "refs/heads/$(touch MARK)")]})
+    got = Azure(run_fake).merged_prs("org/p/r", "2026-10-01")
+    check("azure branch text with $(...) is returned as text", got[0]["head_ref"], "$(touch MARK)")
+    check("azure never reaches a shell", os.path.exists("MARK") or os.path.exists(os.path.join(d4, "MARK")), False)
+
+    commits = {"count": 3, "value": [
+        {"commitId": "a", "committer": {"date": "2026-10-01T00:00:00Z"}, "comment": "first"},
+        {"commitId": "b", "committer": {"date": "2026-10-02T00:00:00Z"}, "comment": "fix"},
+        {"commitId": "c", "committer": {"date": "2026-10-03T00:00:00Z"}, "comment": "Merge branch 'main'"}]}
+    check("azure commits_after skips merges and old ones",
+          Azure(fake(json.dumps(commits))).commits_after("org/p/r", 7, "2026-10-01T12:00:00Z"), 1)
+    check("azure commits_after argv", calls[-1][:8], ["az", "devops", "invoke", "--area", "git", "--resource",
+          "pullRequestCommits", "--org"])
+    check("azure commits_after on a failed az", Azure(fake(None)).commits_after("org/p/r", 7, "x"), 0)
+    check("azure failed_checks is unknown", Azure(fake("1")).failed_checks("org/p/r", "abc"), None)
+    check("azure escaped_refs is unknown", Azure(fake("1")).escaped_refs("org/p/r", 7, "x"), None)
+
+
 def self_test():
     fails = []
 
@@ -558,6 +811,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as root:
         github_ci_test(check, root)
         azure_ci_test(check, root)
+        azure_test(check, root)
 
     for f in fails:
         print("FAIL", f)

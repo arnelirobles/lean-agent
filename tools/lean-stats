@@ -103,7 +103,7 @@ def cmd_import_reviews(conn, args):
 
 
 ROLES = ("draft", "spec", "hunt", "refute", "escalate", "search", "gate", "retro")
-LABEL = re.compile(r"^lean:([a-z]+)(?:\s+([\w.-]+/[\w.-]+)(?:#(\d+)|@(\S+))?)?")
+LABEL = re.compile(r"^lean:([a-z]+)(?:\s+([\w.-]+/[\w.-]+(?:/[\w.-]+)?)(?:#(\d+)|@(\S+))?)?")
 REMOTE = re.compile(r"[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$")
 
 
@@ -158,6 +158,9 @@ def read_label(path):
 
 
 def repo_from_remote(url):
+    """owner/name of a GitHub-style remote, ORG/PROJECT/REPO for an Azure DevOps one (so it cannot collide)."""
+    if forge.kind_of((url or "").strip()) == "azure":
+        return forge.azure_slug(url)
     found = REMOTE.search((url or "").strip())
     return found.group(1) if found else ""
 
@@ -305,12 +308,16 @@ def run_command(cmd, timeout=600):
 
 
 def fetch_changes(repo, since, run=run_command):
-    """Rows for the changes table for one repository, or None when gh fails."""
+    """Rows for the changes table for one repository, or None when gh (az for Azure) fails.
+
+    Azure rows leave fix rounds, failed checks and escaped refs empty: retro-signals reads GitHub only.
+    """
     merged = forge.for_repo(repo, run).merged_prs(repo, since)
     if merged is None:
         return None
     signals = {}
-    for line in (run(["bash", RETRO, "--since", since, repo]) or "").splitlines()[1:]:
+    azure = forge.repo_kind(repo) == "azure"
+    for line in ([] if azure else (run(["bash", RETRO, "--since", since, repo]) or "").splitlines()[1:]):
         cells = line.split("\t")
         if len(cells) >= 6 and cells[1].isdigit():
             signals[int(cells[1])] = [int(c) if c.isdigit() else None for c in (cells[2], cells[3], cells[5])]
@@ -322,11 +329,94 @@ def fetch_changes(repo, since, run=run_command):
     return rows
 
 
+REPO_TABLES = ("agent_runs", "reviews", "changes")
+
+
+def azure_project_map(run):
+    """{lowercase repo name: [(ORG/PROJECT/REPO), ...]} for the default az organization, or None when az fails."""
+    text = run(["az", "devops", "configure", "-l"])
+    found = re.search(r"organization\s*=\s*https://dev\.azure\.com/([^/\s]+)", text or "")
+    if not found:
+        return None
+    org = found.group(1)
+    url = f"https://dev.azure.com/{org}"
+    listing = run(["az", "devops", "project", "list", "--org", url, "--query", "value[].name", "--output", "json"])
+    names = {}
+    try:
+        projects = json.loads(listing)
+        for project in projects:
+            repos = json.loads(run(["az", "repos", "list", "--project", project, "--org", url,
+                                    "--query", "[].name", "--output", "json"]))
+            for repo in repos:
+                names.setdefault(repo.lower(), []).append(f"{org}/{project}/{repo}")
+    except (ValueError, TypeError):
+        return None
+    return names
+
+
+def fix_legacy_azure(conn, run=run_command, which=shutil.which):
+    """Rewrite old `_git/NAME` repo names to ORG/PROJECT/NAME, using the repositories az lists for the default org.
+
+    Safe to repeat: it looks at `_git/` names only, and skips the az calls when the set of those names is the
+    one it already looked at. A name found in more than one project is left alone and printed. Returns
+    {new name: rows rewritten}.
+    """
+    legacy = sorted({r[0] for t in REPO_TABLES for r in conn.execute(
+        f"SELECT DISTINCT repo FROM {t} WHERE substr(repo, 1, 5) = '_git/'")})
+    if not legacy:
+        return {}
+    seen = conn.execute("SELECT value FROM meta WHERE key = 'azure_legacy_seen'").fetchone()
+    if seen and json.loads(seen[0]) == legacy:
+        return {}
+    if not which("az"):
+        print("legacy Azure names: skipped, az not found")
+        return {}
+    names = azure_project_map(run)
+    if names is None:
+        print("legacy Azure names: skipped, the az call failed")
+        return {}
+    done = {}
+    with leanstats.tx(conn):
+        for old in legacy:
+            matches = names.get(old[len("_git/"):].lower(), [])
+            if len(matches) > 1:
+                print(f"legacy Azure names: {old} is in {len(matches)} projects, left alone")
+            elif matches:
+                moved = 0
+                for table in REPO_TABLES:
+                    moved += conn.execute(f"UPDATE OR IGNORE {table} SET repo = ? WHERE repo = ?",
+                                          (matches[0], old)).rowcount
+                done[matches[0]] = moved
+        left = sorted({r[0] for t in REPO_TABLES for r in conn.execute(
+            f"SELECT DISTINCT repo FROM {t} WHERE substr(repo, 1, 5) = '_git/'")})
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('azure_legacy_seen', ?)", (json.dumps(left),))
+    return done
+
+
+def azure_repos(conn):
+    """The Azure repositories (ORG/PROJECT/REPO) that agent runs and changes already name."""
+    found = set()
+    for table in ("agent_runs", "changes"):
+        found.update(r[0] for r in conn.execute(f"SELECT DISTINCT repo FROM {table} WHERE repo LIKE '%/%/%'"))
+    return sorted(r for r in found if forge.repo_kind(r) == "azure" and forge.parse_azure(r))
+
+
 def collect_changes(conn, repos, since, run=run_command, which=shutil.which):
-    """Store the merged pull requests of each repository. Returns how many were stored."""
-    missing = [tool for tool in ("gh", "jq") if not which(tool)]
-    if missing:
-        print(f"changes: skipped, {' and '.join(missing)} not found")
+    """Store the merged pull requests of each repository. Returns how many were stored.
+
+    GitHub repositories (owner/name) need gh and jq, Azure ones (ORG/PROJECT/REPO) need az. A tool that
+    is missing skips only its own repositories, with one line.
+    """
+    missing = {}
+    for tool, kind in (("gh", "github"), ("jq", "github"), ("az", "azure")):
+        if not which(tool):
+            missing.setdefault(kind, []).append(tool)
+    for kind, tools in missing.items():
+        if not any(forge.repo_kind(r) == kind for r in repos):
+            continue
+        print(f"changes: skipped{' Azure' if kind == 'azure' else ''}, {' and '.join(tools)} not found")
+    repos = [r for r in repos if forge.repo_kind(r) not in missing]
+    if not repos:
         return 0
     stored = 0
     for repo in repos:
@@ -336,7 +426,7 @@ def collect_changes(conn, repos, since, run=run_command, which=shutil.which):
             print(f"changes: skipped {repo}: {e}")
             continue
         if rows is None:
-            print(f"changes: skipped {repo}, the gh call failed")
+            print(f"changes: skipped {repo}, the {'az' if forge.repo_kind(repo) == 'azure' else 'gh'} call failed")
             continue
         with leanstats.tx(conn):
             conn.executemany("INSERT OR REPLACE INTO changes VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
@@ -358,13 +448,18 @@ def cmd_collect(conn, args):
         print(f"transcripts: {imported} imported, {unchanged} unchanged")
         return 0
     since, _, repos = options(args)
-    bad = [r for r in repos if not re.fullmatch(r"[\w.-]+/[\w.-]+", r)]
+    bad = [r for r in repos if not re.fullmatch(r"[\w.-]+/[\w.-]+|[\w.-]+/[^/]+/[^/]+", r)]
     if bad:
-        raise ValueError(f"not an owner/repo: {bad[0]}")
+        raise ValueError(f"not an owner/repo or ORG/PROJECT/REPO: {bad[0]}")
     if repos and not since:
         raise ValueError("naming repositories needs --since YYYY-MM-DD, the start of the batch")
     imported, unchanged = collect_transcripts(conn, projects_root(), since, make_repo_of())
     print(f"transcripts: {imported} imported, {unchanged} unchanged")
+    fixed = fix_legacy_azure(conn)
+    if fixed:
+        print(f"legacy Azure names: {sum(fixed.values())} rows rewritten in {len(fixed)} repositories")
+    if not repos and since:
+        repos = azure_repos(conn)  # nothing named: the Azure repositories the transcripts already name
     if repos:
         collect_changes(conn, repos, since)
     return 0
@@ -807,6 +902,94 @@ def test_transcripts(check, tmp):
     conn.close()
 
 
+def test_azure_changes(check, conn):
+    az_list = json.dumps([
+        {"pullRequestId": 11, "sourceRefName": "refs/heads/$(id)", "creationDate": "2026-10-01T01:00:00.5+00:00",
+         "closedDate": "2026-10-02T01:00:00.5+00:00", "lastMergeSourceCommit": {"commitId": "abc"}}])
+    calls = []
+
+    def fake(cmd, timeout=600):
+        calls.append(cmd)
+        if cmd[0] == "az":
+            return None if "broken" in cmd else az_list
+        return None
+
+    def only(*tools):
+        return lambda tool: "/usr/bin/" + tool if tool in tools else None
+
+    repo = "baryodev/My Proj/r"
+    check("repo name from every Azure remote form", [repo_from_remote(u) for u in (
+        "https://baryodev@dev.azure.com/baryodev/My%20Proj/_git/r", "git@ssh.dev.azure.com:v3/baryodev/My%20Proj/r",
+        "https://baryodev.visualstudio.com/My%20Proj/_git/r\n")], [repo] * 3)
+    check("a GitHub remote is unchanged", repo_from_remote("https://github.com/o/r.git"), "o/r")
+    check("a label can name an Azure repository", parse_label("lean:draft org/proj/repo#5"), ("draft", "org/proj/repo", 5, ""))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("azure change stored", collect_changes(conn, [repo], "2026-10-01", fake, only("az")), 1)
+        check("no retro-signals or gh for Azure", [c[0] for c in calls], ["az"])
+        check("a failing az stores nothing", collect_changes(conn, ["o/broken/broken"], "2026-10-01", fake, only("az")), 0)
+        check("no az skips Azure and keeps GitHub's tools out of it",
+              collect_changes(conn, [repo], "2026-10-01", fake, only("gh", "jq")), 0)
+        check("no az does not stop GitHub", collect_changes(conn, ["o/r"], "2026-10-01", fake, only("gh", "jq")), 0)
+    check("branch text is stored as text", conn.execute("SELECT branch, merged_at, fix_rounds FROM changes WHERE repo = ?",
+          (repo,)).fetchone()[:], ("$(id)", "2026-10-02T01:00:00Z", None))
+    check("says az is missing, once", out.getvalue().count("changes: skipped Azure, az not found"), 1)
+    check("says which repository failed", "skipped o/broken/broken, the az call failed" in out.getvalue(), True)
+    check("known Azure repos come from runs and changes, GitHub ones left out", azure_repos(conn), [repo])
+    conn.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, started_at, ended_at, source_path) "
+                 "VALUES ('az1', 's', 'main', 'other', 'm', 'org/proj/r2', '2026-10-01', '2026-10-01', 'p')")
+    conn.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, started_at, ended_at, source_path) "
+                 "VALUES ('az2', 's', 'main', 'other', 'm', '_git/old', '2026-10-01', '2026-10-01', 'p')")
+    check("a legacy _git/ name is not an Azure repository", azure_repos(conn), ["baryodev/My Proj/r", "org/proj/r2"])
+
+
+def test_legacy_azure(check, tmp):
+    conn = leanstats.connect()
+    for i, repo in enumerate(("_git/one", "_git/dup", "_git/gone", "o/r", "baryodev/P/one")):
+        conn.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, started_at, ended_at, "
+                     "source_path) VALUES (?, 's', 'main', 'other', 'm', ?, '2026-10-01', '2026-10-01', 'p')",
+                     (f"r{i}", repo))
+    calls = []
+    projects = {"P": ["One", "Dup"], "Q": ["dup"]}
+
+    def fake(cmd, timeout=600):
+        calls.append(cmd)
+        if cmd[:3] == ["az", "devops", "configure"]:
+            return "[defaults]\norganization = https://dev.azure.com/baryodev\n"
+        if cmd[:4] == ["az", "devops", "project", "list"]:
+            return json.dumps(list(projects))
+        return json.dumps(projects[cmd[cmd.index("--project") + 1]])
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("unique match rewritten, others left", fix_legacy_azure(conn, fake, lambda t: "/bin/az"),
+              {"baryodev/P/One": 1})
+        rows = [tuple(r) for r in conn.execute("SELECT run_id, repo FROM agent_runs ORDER BY run_id")]
+        check("rows after the first run", rows, [("r0", "baryodev/P/One"), ("r1", "_git/dup"), ("r2", "_git/gone"),
+              ("r3", "o/r"), ("r4", "baryodev/P/one")])
+        asked = len(calls)
+        check("a second run changes nothing", fix_legacy_azure(conn, fake, lambda t: "/bin/az"), {})
+        check("a second run does not call az", len(calls), asked)
+        check("rows after the second run", [tuple(r) for r in conn.execute(
+            "SELECT run_id, repo FROM agent_runs ORDER BY run_id")], rows)
+        conn.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, started_at, ended_at, "
+                     "source_path) VALUES ('r9', 's', 'main', 'other', 'm', '_git/new', '2026-10-01', '2026-10-01', 'p')")
+        projects["Q"].append("New")
+        check("a new legacy name is looked at", fix_legacy_azure(conn, fake, lambda t: "/bin/az"),
+              {"baryodev/Q/New": 1})
+        conn.execute("INSERT INTO agent_runs (run_id, session_id, kind, role, model, repo, started_at, ended_at, "
+                     "source_path) VALUES ('r10', 's', 'main', 'other', 'm', '_git/late', '2026-10-01', '2026-10-01', 'p')")
+        check("no az leaves the rows and says so", fix_legacy_azure(conn, fake, lambda t: None), {})
+        check("a failing az leaves the rows", fix_legacy_azure(conn, lambda c, timeout=600: None, lambda t: "/bin/az"), {})
+    text = out.getvalue()
+    check("one line per ambiguous name per run that looked", text.count("_git/dup is in 2 projects, left alone"), 2)
+    check("one line for no az", text.count("legacy Azure names: skipped, az not found"), 1)
+    check("one line for a failing az", text.count("skipped, the az call failed"), 1)
+    check("the legacy name still there", conn.execute("SELECT repo FROM agent_runs WHERE run_id='r10'").fetchone()[0],
+          "_git/late")
+    conn.close()
+
+
 def test_changes(check, tmp):
     listing = json.dumps([
         {"number": 7, "headRefName": "fix-a", "createdAt": "2026-09-30T01:00:00Z", "mergedAt": "2026-10-01T01:00:00Z"},
@@ -844,6 +1027,7 @@ def test_changes(check, tmp):
     check("says which tool is missing", "gh and jq not found" in out.getvalue(), True)
     check("retro-signals failing still stores the changes",
           len(fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else None)), 2)
+    test_azure_changes(check, conn)
     with contextlib.redirect_stderr(io.StringIO()):
         check("repositories need a window", main(["collect", "o/r"]), 2)
         check("a repository is owner/name", main(["collect", "--since", "2026-10-01", "nonsense"]), 2)
@@ -1112,7 +1296,7 @@ COMMANDS = {
     "collect": cmd_collect,
     "report": cmd_report,
 }
-TESTS = [test_reviews, test_transcripts, test_changes, test_report, test_avoidable, test_collect_session, test_self_tests_leave_the_real_database]
+TESTS = [test_reviews, test_legacy_azure, test_transcripts, test_changes, test_report, test_avoidable, test_collect_session, test_self_tests_leave_the_real_database]
 
 
 def main(argv):
