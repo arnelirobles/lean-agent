@@ -189,19 +189,22 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 
 ## Keep keys out of git
 
-`tools/secret-scan` checks the lines a commit adds for keys and tokens: Google `AIza`, GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`, AWS `AKIA`, Slack `xox`, Stripe `sk_live_`/`rk_live_`, npm `npm_`, private key blocks, and an Azure DevOps PAT when it sits next to a name like `token` or `pat`. When `gitleaks` is on PATH its rules run as well. The output names the file, line and pattern, never the value. A line with `allow-secret` on it is skipped, that line only.
+`tools/secret-scan` checks the lines a commit adds for keys and tokens: Google `AIza`, GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`, AWS `AKIA`, Slack `xox`, Stripe `sk_live_`/`rk_live_`, npm `npm_`, private key blocks, and an Azure DevOps PAT when it sits next to a name like `token` or `pat`. When `gitleaks` is on PATH its rules run as well, once per scan, with a time limit (`LEAN_SECRET_SCAN_TIMEOUT`, 20 seconds). If it fails or times out that is printed and the built in result stands. The output names the file, line and pattern, never the value. A line with `allow-secret` on it is skipped, that line only.
 
-The `secret-scan` hook runs it on `git commit` (staged lines, plus unstaged for `-a`), `git push` (commits on no remote yet) and Write, Edit and MultiEdit (a file git tracks or would track; a gitignored `.env.local` is fine). Every block is a `hook_fires` row in `lean.db`.
+The `secret-scan` hook runs it on `git commit` (staged lines; the work tree for `-a`; the named paths for `git commit a.txt`, `-o` and `-i`), `git push` (the commits that remote does not have yet, by remote and refspec, so a commit already on a private remote is still checked on its way to a public one) and Write, Edit, MultiEdit and NotebookEdit (a file git tracks or would track; a gitignored `.env.local` is fine). It looks inside `bash -c`, `eval`, braces, `if` and `xargs`, and follows `-C`, `--git-dir`, `--work-tree` and `GIT_DIR`. If the scanner is missing or fails, or the repository cannot be worked out, the call is blocked with the reason. Git is run with fsmonitor, textconv, external diff and clean filters switched off, so a repository's own config cannot run code during the scan. Every block is a `hook_fires` row in `lean.db`.
+
+Not covered: the commit message and the command text, binary files (a NUL in the first 4 KB), edits made while resolving a merge, `git stash`, `rebase` and `cherry-pick` (the push check is the gate for those), and `--no-verify` typed in a shell, which skips the git hooks.
 
 Commits made outside Claude need the git hooks:
 
 ```
 secret-scan install [REPO]       pre-commit and pre-push in one repo
+secret-scan install --force-shared  also when the hooks folder is shared
 secret-scan install --all DIR    every git repo under DIR
 secret-scan uninstall [REPO]     (or --all DIR) take them out
 ```
 
-An existing hook is kept and still runs after the scan, and `core.hooksPath` is respected. Install copies the scanner to `~/.local/share/lean/secret-scan`, so the hooks keep working after a plugin upgrade; run `install` again to refresh the copy. `git commit --no-verify` and `LEAN_SKIP_SECRET_SCAN=1` skip the git hooks.
+An existing hook is kept and still runs after the scan, and a `core.hooksPath` for that repo is respected. A hooks path that is tracked inside the work tree, or set in global or system config, is shared by other people or repos, so install refuses it unless you pass `--force-shared`. Uninstall keeps a hook you edited and says so, and reports a leftover `.pre-secret-scan`. The scan exits 0 clean, 1 on a finding and 2 when it could not run (a git error, a bad range); the git hooks block on both. Install copies the scanner to `~/.local/share/lean/secret-scan`, so the hooks keep working after a plugin upgrade; run `install` again to refresh the copy. `git commit --no-verify` and `LEAN_SKIP_SECRET_SCAN=1` (not `SKIP`, which belongs to other tools) skip the git hooks.
 
 ## The method
 
