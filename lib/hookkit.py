@@ -46,11 +46,28 @@ def _fire(outcome):
 TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
 
 
+def marker_file(sid):
+    """Where session-env records that it put TOOLS on this session's PATH. Hooks never see CLAUDE_ENV_FILE
+    outside a few events, so they read this instead."""
+    if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,100}", sid):
+        return None
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "lean", "tools-on-path", sid)
+
+
 def tools_on_path():
-    """True when the tools folder is on PATH: session-env wrote it to CLAUDE_ENV_FILE, or PATH already names it."""
-    if os.environ.get("CLAUDE_ENV_FILE"):
+    """True when the tools folder is on PATH for this session. SessionStart sees CLAUDE_ENV_FILE; any other
+    event needs the marker session-env wrote for its session id (the marker names the folder, so an upgrade
+    does not match an old one). PATH naming the folder counts too."""
+    if _EVENT.get("hook_event_name") == "SessionStart" and os.environ.get("CLAUDE_ENV_FILE"):
         return True
-    return TOOLS in [os.path.normpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if TOOLS in [os.path.normpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]:
+        return True
+    marker = marker_file(_EVENT.get("session_id"))
+    try:
+        with open(marker, encoding="utf-8") as f:
+            return f.read().strip() == TOOLS
+    except (OSError, TypeError):
+        return False
 
 
 def tool_path(name, base=None):
@@ -452,18 +469,39 @@ def self_test():
                 check("a self-test run records nothing", os.path.exists(quiet), False)
         finally:
             _RECORD, _EVENT = False, {}
-    saved_env = {k: os.environ.get(k) for k in ("CLAUDE_ENV_FILE", "PATH")}
+    saved_env = {k: os.environ.get(k) for k in ("CLAUDE_ENV_FILE", "PATH", "HOME")}
+    saved_event = _EVENT
+    home = tempfile.mkdtemp(prefix="hookkit-home-")
     try:
         os.environ.pop("CLAUDE_ENV_FILE", None)
         os.environ["PATH"] = "/usr/bin"
+        os.environ["HOME"] = home
+        _EVENT = {}
         check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
         os.environ["CLAUDE_ENV_FILE"] = "/tmp/env"
-        check("tool_path is the bare name with CLAUDE_ENV_FILE set", tool_path("brain"), "brain")
+        _EVENT = {"hook_event_name": "SessionStart", "session_id": "m-1"}
+        check("tool_path is the bare name at SessionStart with CLAUDE_ENV_FILE set", tool_path("brain"), "brain")
+        _EVENT = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
+        check("CLAUDE_ENV_FILE alone does not count outside SessionStart", tools_on_path(), False)
         os.environ.pop("CLAUDE_ENV_FILE")
+        marker = marker_file("m-1")
+        os.makedirs(os.path.dirname(marker))
+        with open(marker, "w") as fh:
+            fh.write(TOOLS)
+        check("the session's marker puts the tools on PATH", tool_path("brain"), "brain")
+        _EVENT = {"hook_event_name": "PreToolUse", "session_id": "m-2"}
+        check("another session has no marker", tool_path("brain").startswith("/"), True)
+        with open(marker, "w") as fh:
+            fh.write("/old/tools")
+        _EVENT = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
+        check("a marker for another folder does not count", tools_on_path(), False)
+        _EVENT = {}
         os.environ["PATH"] = "/usr/bin" + os.pathsep + TOOLS
         check("tool_path is the bare name when PATH names the tools", tool_path("brain"), "brain")
         check("tool_path with a base stays a path", tool_path("brain", "/a/tools"), "/a/tools/brain")
     finally:
+        _EVENT = saved_event
+        shutil.rmtree(home, True)
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)

@@ -4,9 +4,9 @@
 SessionStart: writes LEAN_SESSION_ID and LEAN_SESSION_CWD to $CLAUDE_ENV_FILE, so `brain add` in this
 session stores them, and records the session as open in brain. SessionEnd: records it as ended, and
 starts `lean-stats collect --transcript` for that session in the background, so the numbers collect
-themselves. The extension resumes only an ended session, so it never starts a second copy of a live one.
+themselves. It also appends the tools folder to PATH there, once. The extension resumes only an ended session, so it never starts a second copy of a live one.
 UserPromptSubmit: hands the session the answers to its questions that it has not had yet.
-Never fails the session. LEAN_SESSION_ENV=off turns off the brain parts; LEAN_STATS=off stops the collect.
+Never fails the session. LEAN_SESSION_ENV=off turns off the brain parts, not the PATH line; LEAN_STATS=off stops the collect.
 
   session-env.py --self-test
 """
@@ -33,19 +33,28 @@ def brain(*args):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def add_tools_to_path(env_file):
-    """Append the PATH line for the current tools folder unless it is already the last PATH line there. A resume after an
-    upgrade has a different folder, so it gets its own line, and the later export wins."""
-    line = f'export PATH={shlex.quote(hookkit.TOOLS)}:"$PATH"\n'
+def add_tools_to_path(env_file, sid=None):
+    """Append the PATH line for the current tools folder unless the file already has it, and record the session
+    in a marker so hooks, which never see the env file, know the tools are on PATH. The line goes after the
+    other exports (a PowerShell session reads the file only if every line is a plain assignment) and appends,
+    so a tool named like a system command does not shadow it."""
+    line = f'export PATH="$PATH":{shlex.quote(hookkit.TOOLS)}\n'
     try:
         with open(env_file, encoding="utf-8") as f:
-            mine = [ln for ln in f.read().splitlines(keepends=True) if ln.startswith("export PATH=")]
-            if mine and mine[-1] == line:
-                return
+            content = f.read()
     except OSError:
-        pass
-    with open(env_file, "a", encoding="utf-8") as f:
-        f.write(line)
+        content = ""
+    if line not in content.splitlines(keepends=True):
+        with open(env_file, "a", encoding="utf-8") as f:
+            f.write(("\n" if content and not content.endswith("\n") else "") + line)
+    marker = hookkit.marker_file(sid)
+    if marker:
+        try:
+            os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(hookkit.TOOLS)
+        except OSError:
+            pass
 
 
 def collect_session(transcript):
@@ -66,23 +75,27 @@ STARTED = []  # the collects this process started, so a test can wait on them
 def main():
     event = hookkit.read_event()
     name = event.get("hook_event_name")
+    sid, cwd = str(event.get("session_id") or ""), str(event.get("cwd") or "")
+    sid_ok = bool(re.fullmatch(r"[A-Za-z0-9-]{1,100}", sid))
+    off = (os.environ.get("LEAN_SESSION_ENV") or "").lower() == "off"
     if name == "SessionEnd":
         proc = collect_session(event.get("transcript_path"))
         if proc:
             STARTED.append(proc)
-    if (os.environ.get("LEAN_SESSION_ENV") or "").lower() == "off":
-        return 0
-    sid, cwd = str(event.get("session_id") or ""), str(event.get("cwd") or "")
-    if not re.fullmatch(r"[A-Za-z0-9-]{1,100}", sid):
-        return 0
-    if name == "SessionStart":
-        env_file = os.environ.get("CLAUDE_ENV_FILE")
-        if env_file:
-            add_tools_to_path(env_file)
+        marker = hookkit.marker_file(sid)
+        if marker and os.path.exists(marker):
+            os.unlink(marker)
+    if name == "SessionStart" and os.environ.get("CLAUDE_ENV_FILE"):
+        env_file = os.environ["CLAUDE_ENV_FILE"]
+        if sid_ok and not off:
             with open(env_file, "a", encoding="utf-8") as f:
                 f.write(f"export LEAN_SESSION_ID={shlex.quote(sid)}\n")
                 if cwd:
                     f.write(f"export LEAN_SESSION_CWD={shlex.quote(cwd)}\n")
+        add_tools_to_path(env_file, sid if sid_ok else None)
+    if off or not sid_ok:
+        return 0
+    if name == "SessionStart":
         brain("session", "start", sid, "--cwd", cwd)
     elif name == "SessionEnd":
         brain("session", "end", sid)
@@ -127,9 +140,14 @@ def self_test():
         if sourced != f"abc-123|{cwd}":
             fails.append(f"env file must export the id and a quoted cwd: {written!r} gives {sourced!r}")
         path_lines = [ln for ln in written.splitlines() if ln.startswith("export PATH=")]
-        want = f'export PATH={shlex.quote(hookkit.TOOLS)}:"$PATH"'
+        want = f'export PATH="$PATH":{shlex.quote(hookkit.TOOLS)}'
+        if written.splitlines()[-1] != want:
+            fails.append(f"the PATH line must come after the LEAN_SESSION lines: {written!r}")
         if path_lines != [want]:
             fails.append(f"start must add the tools folder to PATH once: {path_lines!r}")
+        marker = os.path.join(home, ".local", "share", "lean", "tools-on-path", "abc-123")
+        if not os.path.exists(marker) or open(marker).read() != hookkit.TOOLS:
+            fails.append("start must leave a marker naming the tools folder for the hooks that never see the env file")
         shown = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(env_file)}; command -v brain'],
                                capture_output=True, text=True).stdout.strip()
         if shown != os.path.join(hookkit.TOOLS, "brain"):
@@ -155,16 +173,25 @@ def self_test():
                              capture_output=True, text=True).stdout.strip()
         if got != "hi":
             fails.append(f"a tools folder with a space must be quoted: {got!r}")
+        stale_file = os.path.join(d, "stale-env")
         try:
             hookkit.TOOLS = os.path.join(d, "old-version", "tools")  # a resumed session whose file names the old version
-            add_tools_to_path(env_file)
+            add_tools_to_path(stale_file)
         finally:
             hookkit.TOOLS = saved_tools
-        hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "abc-123", "cwd": cwd,
-                                           "source": "resume"}))
-        lines = [ln for ln in open(env_file).read().splitlines() if ln.startswith("export PATH=")]
-        if len(lines) != 3 or lines[-1] != want or lines[0] != want:
-            fails.append(f"a resume must write the current tools folder last: {lines!r}")
+        add_tools_to_path(stale_file)
+        add_tools_to_path(stale_file)
+        lines = open(stale_file).read().splitlines()
+        if len(lines) != 2 or lines[-1] != want:
+            fails.append(f"an upgrade must add the current tools folder once, after the old one: {lines!r}")
+        loose = os.path.join(d, "loose-env")
+        with open(loose, "w") as fh:
+            fh.write('export PATH=/other:"$PATH"')
+        for _ in range(3):
+            add_tools_to_path(loose)
+        text = open(loose).read()
+        if text != f'export PATH=/other:"$PATH"\n{want}\n':
+            fails.append(f"a file with no final newline must get one line of ours on its own line: {text!r}")
         if brain_out("session", "status", "abc-123") != f"open {cwd}":
             fails.append("start must record the session as open")
         hook("SessionEnd")
@@ -184,12 +211,30 @@ def self_test():
         before = open(env_file).read()
         if hook("SessionStart", sid="x; rm -rf ~")[0] != 0 or open(env_file).read() != before:
             fails.append("an odd session id must be ignored")
+        hook("SessionEnd")
+        if os.path.exists(marker):
+            fails.append("SessionEnd must remove the marker")
         if hook("", raw="not json")[0] != 0:
             fails.append("a bad event must not fail")
         env["LEAN_SESSION_ENV"] = "off"
+        off_file = os.path.join(d, "off-env")
+        env["CLAUDE_ENV_FILE"] = off_file
         hook("SessionStart", sid="off-1")
-        if "off-1" in open(env_file).read():
+        off_text = open(off_file).read() if os.path.exists(off_file) else ""
+        if "off-1" in off_text:
             fails.append("LEAN_SESSION_ENV=off must turn it off")
+        if off_text != want + "\n" or not os.path.exists(os.path.join(home, ".local", "share", "lean",
+                                                                      "tools-on-path", "off-1")):
+            fails.append(f"LEAN_SESSION_ENV=off must still put the tools on PATH, as mode.py says: {off_text!r}")
+        del env["LEAN_SESSION_ENV"]
+        odd_file = os.path.join(d, "odd-env")
+        env["CLAUDE_ENV_FILE"] = odd_file
+        hook("SessionStart", sid="x; rm -rf ~")
+        odd_text = open(odd_file).read() if os.path.exists(odd_file) else ""
+        if odd_text != want + "\n":
+            fails.append(f"an odd session id must still get the PATH line and nothing else: {odd_text!r}")
+        env["CLAUDE_ENV_FILE"] = env_file
+        env["LEAN_SESSION_ENV"] = "off"
         began = time.monotonic()
         rc, out, err = hook("SessionEnd", raw=json_str({"hook_event_name": "SessionEnd", "session_id": "gone-1",
                                                         "transcript_path": os.path.join(d, "none", "x.jsonl")}))

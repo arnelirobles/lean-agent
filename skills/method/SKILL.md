@@ -38,7 +38,7 @@ Label every agent you start, so lean-stats can count it by role. The Agent descr
 - A task is not done until the pull request URL exists.
 
 ## Scripts
-The scripts are not on PATH. They live in `${CLAUDE_PLUGIN_ROOT}/tools/`, so run one as `${CLAUDE_PLUGIN_ROOT}/tools/<name>`; the names below stand for that path. A session start note also prints the absolute folder. Use them instead of writing your own.
+The scripts live in `${CLAUDE_PLUGIN_ROOT}/tools/`. They are on PATH when the session-env hook ran, so run one by name; otherwise run it as `${CLAUDE_PLUGIN_ROOT}/tools/<name>`. The names below stand for either. A session start note also prints the absolute folder. Use them instead of writing your own.
 - `style-scan`: checks the lines you add (and untracked files, so a body file counts) for dashes, arrows, slop and attribution. Run it before every commit, and on a body file before `gh ... --body-file`.
 - `holdout.sh --spec <file>`: holds a change's production hunk out and requires its named test to fail. Use it for the mutation check, not a hand revert.
 - `replace`: exact text edit that fails unless the old text is there exactly once.

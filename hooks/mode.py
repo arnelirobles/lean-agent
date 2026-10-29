@@ -193,6 +193,7 @@ def self_test():
             print(f"FAIL tools note should name a real tools folder: {note}")
             failures += 1
         os.environ["CLAUDE_ENV_FILE"] = "/tmp/env"
+        hookkit._EVENT = {"hook_event_name": "SessionStart", "session_id": "m-1"}
         note = tools_note()
         if "are on PATH" not in note or "`brain list`" not in note or "/tools/" in note or "not on PATH" in note:
             print(f"FAIL tools note should say the tools are on PATH: {note}")
