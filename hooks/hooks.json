@@ -1,5 +1,5 @@
 {
-  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author and wait-loop checks that block, and notes on house style, stale test runs, hand-written commands a script already does, unverified claims, containers for docs-only diffs, lessons, and a coordinator whose context or own lookups are costing the most. A session that ends is collected into lean-stats in the background, and the brain page server starts.",
+  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author and wait-loop checks that block, and notes on house style, stale test runs, hand-written commands a script already does, unverified claims, containers for docs-only diffs, lessons, and a coordinator whose context, own lookups or images are costing the most (an opt-in setting refuses them). A session that ends is collected into lean-stats in the background, and the brain page server starts.",
   "hooks": {
     "SessionStart": [
       {
@@ -94,6 +94,15 @@
       }
     ],
     "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/context-cost.py\"",
+            "timeout": 10
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
