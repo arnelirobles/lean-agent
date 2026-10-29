@@ -61,7 +61,7 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 echo "logged to $log"
 
 # The same row goes to the lean-stats database. The TSV is the record, so nothing here may fail the log.
-stats="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/bin/lean-stats"
+stats="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tools/lean-stats"
 if [ "${LEAN_STATS:-}" != "off" ] && [ -f "$stats" ] && command -v python3 >/dev/null 2>&1; then
   python3 "$stats" log-review "$@" >/dev/null 2>&1 || true
 fi

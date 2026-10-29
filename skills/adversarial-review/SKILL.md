@@ -64,7 +64,7 @@ test that loses assertions.
 ## 3. Hunt (agent one, fresh context)
 
 Start the hunter with the description `lean:hunt <owner/repo>#<pr>` (or `@<branch>` before the pull
-request exists), so `lean-stats` can tie its cost and its misses to the change.
+request exists), so lean-stats can tie its cost and its misses to the change.
 
 Give the hunter the diff, the PR description and linked issue, the rules file, and a checkout it
 can build and test. It reads whole files around each hunk and every caller of a changed symbol,
@@ -105,7 +105,7 @@ comparison, rate limits); stability (timeouts, bounded lists, cache staleness un
 shutdown); data integrity (ordering of side effects against failures, replay and duplicates);
 missing behaviour (the handler, default, rollback or check that should be in the diff and is not);
 tests that pass for the wrong reason (a disabled retry, an empty collection, a mock asserting on itself).
-To check that a test fails without the code it names, run `holdout.sh --spec <description file>`
+To check that a test fails without the code it names, run `${CLAUDE_PLUGIN_ROOT}/tools/holdout.sh --spec <description file>`
 rather than reverting a line by hand.
 
 The hunter writes candidates as `category | severity | file:line | input | path | wrong result |
@@ -150,7 +150,7 @@ If nothing survives, say so, and list what was checked. A clean review is a resu
   only for something that needs a different repository or a decision nobody in the change can make.
 
 Before a review body goes out with `gh ... --body-file`, put the file in the checkout and run
-`style-scan`. It reads added lines and untracked files, so it catches dashes and slop in the body. Delete the file right after the scan so it is never committed.
+`${CLAUDE_PLUGIN_ROOT}/tools/style-scan`. It reads added lines and untracked files, so it catches dashes and slop in the body. Delete the file right after the scan so it is never committed.
 
 ## 7. Record
 
@@ -161,7 +161,7 @@ CI and any review bot:
 ${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" "<caught elsewhere first>"
 ```
 
-The same row goes into the `lean-stats` database (`~/.lean/lean.db`), where `lean-stats report` joins
+The same row goes into the lean-stats database (`~/.lean/lean.db`), where `${CLAUDE_PLUGIN_ROOT}/tools/lean-stats report` joins
 it to the agents that worked on the change. Logging the same pull request again replaces its row
 there, which is how `escaped` gets filled in later.
 

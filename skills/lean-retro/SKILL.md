@@ -12,20 +12,20 @@ The method improves only through this routine, and only with a person's approval
 Run, for the batch's window and every repository it touched:
 
 ```bash
-lean-stats collect --since <YYYY-MM-DD> owner/repo ...
-lean-stats report --since <YYYY-MM-DD>
+${CLAUDE_PLUGIN_ROOT}/tools/lean-stats collect --since <YYYY-MM-DD> owner/repo ...
+${CLAUDE_PLUGIN_ROOT}/tools/lean-stats report --since <YYYY-MM-DD>
 ```
 
 The collection step can run as a `lean:retro` agent on the fast model (`LEAN_MODEL_FAST`, default `haiku`), which runs the commands and returns the rows. The reasoning in sections 2 to 4 stays with the session.
 
 `collect` reads the session transcripts and the merged pull requests into `~/.lean/lean.db`. `report`
 prints cost per change by model and by role, the escalation rate, findings by where they were caught,
-critic misses, fix rounds and hook fires, each with the count behind it. A line that says `no data`
+critic misses, fix rounds, hook fires and an Avoidable section (the share of tokens and USD in context above 80k, coordinator lookups, images carried in a long context, errored tool calls and wait loops, and Haiku's share of runs against the method's), each with the count behind it. A line that says `no data`
 is a gap in what was recorded, not a zero: say so in the retro and do not reason from it. For the raw
 row per pull request, run
-`REVIEW_LOG=<path to review-log.tsv> retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
+`REVIEW_LOG=<path to review-log.tsv> ${CLAUDE_PLUGIN_ROOT}/tools/retro-signals.sh --since <YYYY-MM-DD> owner/repo ...`.
 
-`retro-signals.sh` ends with a script repeats section from `script-repeats --days 7`: per family of hand-written commands, the uses, transcripts and projects, and the script that covers it. It prints family names, counts and normalised command shapes (quoted strings, paths, numbers, hashes and unfamiliar words replaced), never transcript text. Run `script-repeats` alone to change the window.
+`${CLAUDE_PLUGIN_ROOT}/tools/retro-signals.sh` ends with a script repeats section from `${CLAUDE_PLUGIN_ROOT}/tools/script-repeats --days 7`: per family of hand-written commands, the uses, transcripts and projects, and the script that covers it. It prints family names, counts and normalised command shapes (quoted strings, paths, numbers, hashes and unfamiliar words replaced), never transcript text. Run `${CLAUDE_PLUGIN_ROOT}/tools/script-repeats` alone to change the window.
 
 Also gather, from the session or the coordinator's notes:
 - the adversarial review findings of the batch, by category (the review reports, or `review-log.tsv`);
@@ -44,10 +44,11 @@ Read the previous retro's accepted changes (the method's history, or `retro-log.
 | A finding category in two or more changes | A scripted check, a Risks line (section 0) or a critic question |
 | A check or critic question with no findings for three batches | Drop it for that tier |
 | Reasoning repeated across agents | A script (section 4a), with a test |
-| A family with no covering script, used in 3 or more projects in a week (`script-repeats`) | A ticket for a script that covers it, with the family's count as evidence |
-| A family whose covering script exists but is still hand-rolled (`script-repeats`) | The method does not name the script: add it to the scripts block, or to the agent brief |
+| A family with no covering script, used in 3 or more projects in a week (`${CLAUDE_PLUGIN_ROOT}/tools/script-repeats`) | A ticket for a script that covers it, with the family's count as evidence |
+| A family whose covering script exists but is still hand-rolled (`${CLAUDE_PLUGIN_ROOT}/tools/script-repeats`) | The method does not name the script: add it to the scripts block, or to the agent brief |
 | A step that needed a person in two or more changes | Automate it or script it with confirmations |
 | Fix rounds or cost per change rising | Name the step that grew and a change to it |
+| Any one Avoidable signal over 15% of the period's USD (or of its tokens) | A method change aimed at that signal: end batches earlier for context, send lookups to `lean:search`, a script for the errored calls, or a notify instead of a wait loop. Name the share that should fall and by when |
 | An escaped defect | A check that would have caught it, proven against that defect |
 | Reviews not logged | Make logging part of the review script |
 

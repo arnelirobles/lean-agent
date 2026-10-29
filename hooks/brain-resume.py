@@ -17,7 +17,8 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
-BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "brain")
+TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
+BRAIN = os.path.join(TOOLS, "brain")
 
 
 def db_path():
@@ -40,7 +41,7 @@ def main():
     event = hookkit.read_event()
     text = digest(str(event.get("cwd") or ""), event.get("source") == "compact")  # only a compaction loses state
     if text:
-        hookkit.note("SessionStart", "Brain digest for this project (full list: brain list --project NAME --status open). "
+        hookkit.note("SessionStart", f"Brain digest for this project (full list: {hookkit.tool_path("brain")} list --project NAME --status open). "
                      "Do not work around a blocker.\n" + text)
     return 0
 

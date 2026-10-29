@@ -1,0 +1,32 @@
+Test run for /private/tmp/hang-capture/vs/bin/Debug/net10.0/Vs.dll (.NETCoreApp,Version=v10.0)
+VSTest version 18.0.1 (arm64)
+
+Starting test execution, please wait...
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.0+00ab0a9ec4 (64-bit .NET 10.0.3)
+[xUnit.net 00:00:00.04]   Discovering: Vs
+[xUnit.net 00:00:00.06]   Discovered:  Vs
+[xUnit.net 00:00:00.07]   Starting:    Vs
+  Passed Capture.HangTests.Passes [2 ms]
+[createdump] Gathering state for process 66993 
+[createdump] Writing minidump to file /var/folders/zh/8hhy2mqn2rj4nj_4nyfw7_440000gn/T/4bef90d6-f5cf-4178-9acc-b8af5e0fde9e/dotnet_66993_20261026T004611_hangdump.dmp
+[createdump] Written 39801192 bytes (2429 pages) to core file
+[createdump] Target process is alive
+[createdump] Dump successfully written in 316ms
+The active test run was aborted. Reason: Test host process crashed
+Data collector 'Blame' message: The specified inactivity time of 30 seconds has elapsed. Collecting hang dumps from testhost and its child processes.
+
+Test Run Aborted.
+Total tests: Unknown
+     Passed: 1
+ Total time: 31.0017 Seconds
+
+The active Test Run was aborted because the host process exited unexpectedly. Please inspect the call stack above, if available, to get more information about where the exception originated from.
+The test running when the crash occurred: 
+Capture.HangTests.Theory_with_a_string
+
+This test may, or may not be the source of the crash.
+
+Attachments:
+  /tmp/results/9580e186-1294-40a4-809f-8d9451bc9541/dotnet_66993_20261026T004611_hangdump.dmp
+  /tmp/results/9580e186-1294-40a4-809f-8d9451bc9541/Sequence_e1f4044a808d4617a94386eb9436ac60.xml

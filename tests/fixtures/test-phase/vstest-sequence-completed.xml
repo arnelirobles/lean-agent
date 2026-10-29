@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<TestSequence>
+  <Test Name="Acme.HangTests.Fast" Source="/r/Acme.Tests.dll" Completed="True" />
+  <Test Name="Acme.HangTests.Waits_forever" Source="/r/Acme.Tests.dll" Completed="False" />
+  <Test Name="Acme.HangTests.Holds_a_lock" Source="/r/Acme.Tests.dll" Completed="False" />
+</TestSequence>

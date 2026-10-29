@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import * as cli from "./brainCli";
 import { answerPrompt, answerRoute, canSend, validSession } from "./claude";
 import * as db from "./db";
+import { noticeOnce, openPage, type Host } from "./deprecation";
 import { Store } from "./store";
 import { projectNames } from "./workspace";
 import { ItemsTree, itemFromArg } from "./views/itemsTree";
@@ -100,8 +101,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   const dashboard = new DashboardPanel(ctx.extensionUri, actions);
   const itemPanel = new ItemPanel(ctx.extensionUri, actions);
 
+  const pageHost: Host = {
+    showInformationMessage: (m, ...b) => vscode.window.showInformationMessage(m, ...b),
+    openExternal: (u) => vscode.env.openExternal(vscode.Uri.parse(u)),
+  };
   ctx.subscriptions.push(
     status,
+    vscode.commands.registerCommand("leanBrain.openPage", () => openPage(pageHost)),
     vscode.window.registerTreeDataProvider("leanBrain.items", items),
     vscode.window.registerTreeDataProvider("leanBrain.queue", queueTree),
     vscode.commands.registerCommand("leanBrain.openDashboard", async () => {
@@ -159,7 +165,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
 
   function findOrWarn(): string | undefined {
     const brain = cli.findBrain(userSetting("brainPath"));
-    if (!brain) void vscode.window.showWarningMessage("Lean Brain: bin/brain not found. Set leanBrain.brainPath.");
+    if (!brain) void vscode.window.showWarningMessage("Lean Brain: tools/brain not found. Set leanBrain.brainPath.");
     return brain;
   }
 
@@ -227,6 +233,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   }
   ctx.subscriptions.push({ dispose: () => { for (const w of watchers) w.close(); if (debounce) clearTimeout(debounce); } });
 
+  void noticeOnce(ctx.globalState, String(ctx.extension.packageJSON.version), pageHost);
   await store.init();
   watch();
   await refresh();

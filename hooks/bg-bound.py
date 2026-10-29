@@ -2,7 +2,7 @@
 """Make every background shell bounded.
 
 PreToolUse hook on Bash. A run_in_background command that does not start with
-bin/bounded, bin/test-phase or bin/heavy.sh is denied, and the message gives the
+tools/bounded, tools/test-phase or tools/heavy.sh is denied, and the message gives the
 same command wrapped in bounded to run instead. bounded stops the command's whole
 process group after LEAN_BG_MINUTES (default 60), when the task is stopped, and
 when its shell dies, so a stopped task cannot leave a process spinning for hours.
@@ -20,8 +20,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
-BIN = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin"))
-BOUNDED = os.path.join(BIN, "bounded")
+BOUNDED = os.path.join(hookkit.TOOLS, "bounded")
 OWN_LANES = ("bounded", "test-phase", "heavy.sh")
 
 
@@ -86,8 +85,8 @@ def self_test():
     check("background denied", bg("cd /x && bash scripts/preflight.sh > log 2>&1"), True)
     check("bounded passes", bg(f"{BOUNDED} -- bash -c 'make'"), False)
     check("python3 bounded passes", bg(f"python3 {BOUNDED} --minutes 90 -- make"), False)
-    check("test-phase passes", bg("~/.claude/plugins/cache/lean-agent/lean-agent/1.14.1/bin/test-phase --project x"), False)
-    check("heavy.sh passes", bg("bash bin/heavy.sh dotnet dotnet test"), False)
+    check("test-phase passes", bg("~/.claude/plugins/cache/lean-agent/lean-agent/1.19.0/tools/test-phase --project x"), False)
+    check("heavy.sh passes", bg("bash tools/heavy.sh dotnet dotnet test"), False)
     check("env prefix then bounded", bg(f"LEAN_BG_MINUTES=120 {BOUNDED} -- make"), False)
     check("bounded later in a chain is not enough", bg(f"make; {BOUNDED} -- true"), True)
     check("background false passes", {"command": "make", "run_in_background": False}, False)

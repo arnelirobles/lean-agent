@@ -8,7 +8,7 @@ PreToolUse hook on Bash. It denies:
     pgrep; a loop reading redirected input (done < file) is not a poll
   - pgrep
 It looks inside bash -c, sh -c and zsh -c arguments too. It adds a note (never a deny)
-on dotnet test, npx vitest, go test and pytest run outside bin/test-phase and heavy.sh.
+on dotnet test, npx vitest, go test and pytest run outside test-phase and heavy.sh.
 The note only fires when the brain script is present, since it names `brain queue add`.
 Quoted strings and heredoc bodies are not commands, so a sleep inside them passes. A
 run_in_background command is checked the same way. A hook error never fails the session.
@@ -17,12 +17,14 @@ run_in_background command is checked the same way. A hook error never fails the 
   wait-loop.py --self-test
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import direct_test  # noqa: E402
 import hookkit  # noqa: E402
 
-BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "brain")
+BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")
 KEYWORDS = {"do", "then", "else", "elif", "!", "{", "}", "time"}
 LOOP_OPEN = {"until", "while", "for"}
 SLEEP_READERS = {"cat", "tail", "head", "grep", "egrep", "fgrep", "rg", "less", "more", "wc"}
@@ -32,17 +34,20 @@ LANES = {"test-phase", "heavy.sh"}
 
 DENY_SLEEP_READ = (
     "Do not sleep and then read a file or task output. End the turn and wait for the "
-    "notification, or check a lane with `heavy.sh status <lane>`.")
+    f"notification, or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the "
+    f"background, or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
 DENY_LOOP = (
     "Do not poll a file or process in a loop with sleep. End the turn and wait for the "
-    "notification, or check a lane with `heavy.sh status <lane>`.")
+    f"notification, or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the "
+    f"background, or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
 DENY_PGREP = (
     "Do not use pgrep to wait on a process. End the turn and wait for the notification, "
-    "or check a lane with `heavy.sh status <lane>`.")
+    f"or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the background, "
+    f"or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
 TURN_OFF = " LEAN_WAIT_GUARD=off turns this check off."
 NOTE_TEST = (
     "This runs tests outside the lane lock, and its failures never reach brain. Queue it: "
-    "`brain queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
+    f"`{hookkit.tool_path('brain')} queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
 
 
 def is_off(segs):
@@ -138,7 +143,8 @@ def verdict(command, cwd="."):
         if name(words) == "sleep" and name(cmds[i + 1]) in SLEEP_READERS:
             return "deny", DENY_SLEEP_READ + TURN_OFF
     if os.path.exists(BRAIN) and any(is_test_run(w) for w in cmds) \
-            and not any(name(w) in LANES for w in cmds):
+            and not any(name(w) in LANES for w in cmds) \
+            and not direct_test.blocks(re.split(r"\|\||&&|;|\||\n", command), cwd):
         return "note", NOTE_TEST
     return None
 
@@ -239,19 +245,39 @@ def self_test():
     check("off switch environment", "pgrep -f dotnet", None)
     del os.environ["LEAN_WAIT_GUARD"]
     reason = (verdict("pgrep x") or ("", ""))[1]
-    if "LEAN_WAIT_GUARD=off" not in reason or "heavy.sh status" not in reason:
+    if "LEAN_WAIT_GUARD=off" not in reason or f"`{hookkit.tool_path('heavy.sh')} status" not in reason:
         print("FAIL deny reason names the fix and the off switch")
         failures += 1
+    for label, command in (("sleep", "sleep 100; cat x.output"), ("loop", "until grep -q x f; do sleep 1; done"),
+                           ("pgrep", "pgrep -f x")):
+        text = (verdict(command) or ("", ""))[1]
+        if f"`{hookkit.tool_path('brain')} queue wait" not in text or f"`{hookkit.tool_path('pr-wait')}" not in text:
+            print(f"FAIL {label} deny text names brain queue wait and pr-wait")
+            failures += 1
 
     # notes
     check("bare dotnet test notes", "dotnet test X | tail -20", "note")
     check("npx vitest notes", "npx vitest run", "note")
     check("go test notes", "cd svc && go test ./...", "note")
     check("pytest notes", "python3 -m pytest -q", "note")
-    check("test inside test-phase passes", "bin/test-phase run -- dotnet test X", None)
+    check("test inside test-phase passes", "tools/test-phase run -- dotnet test X", None)
     check("test inside heavy.sh passes", "heavy.sh run lane dotnet test X", None)
     check("queued test passes", "brain queue add repo proj --filter 'dotnet test'", None)
     check("dotnet build is quiet", "dotnet build X", None)
+    lane_tmp = tempfile.TemporaryDirectory()
+    lane_dir = lane_tmp.name
+    open(os.path.join(lane_dir, "App.sln"), "w").close()
+    open(os.path.join(lane_dir, "pnpm-lock.yaml"), "w").close()
+    for label, command in (("dotnet test", "dotnet test X"), ("npx vitest", "npx vitest run")):
+        if verdict(command, lane_dir) is not None:
+            print(f"FAIL {label} where script-note blocks gets no second note")
+            failures += 1
+    if (verdict("go test ./...", lane_dir) or ("", ""))[0] != "note":
+        print("FAIL go test still notes where a lane exists")
+        failures += 1
+    if (verdict("timeout 60 dotnet test X", lane_dir) or ("", ""))[0] != "note":
+        print("FAIL wrapped dotnet test keeps its note")
+        failures += 1
     BRAIN = os.path.join(tmp.name, "missing")
     check("no note without the brain script", "dotnet test X", None)
     BRAIN = fake
@@ -266,7 +292,7 @@ def self_test():
         context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
     except (ValueError, KeyError):
         context = ""
-    if rc != 0 or "brain queue add" not in context or err:
+    if rc != 0 or f"`{hookkit.tool_path('brain')} queue add" not in context or err:
         print(f"FAIL main note: rc={rc} out={out!r} err={err!r}")
         failures += 1
     for label, stdin in (("junk stdin", "not json"), ("non-string command", '{"tool_input":{"command":5}}'),
@@ -278,6 +304,7 @@ def self_test():
 
     BRAIN = real_brain
     tmp.cleanup()
+    lane_tmp.cleanup()
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

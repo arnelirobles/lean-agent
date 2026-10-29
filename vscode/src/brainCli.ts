@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-// Runs bin/brain with argument arrays. No shell. This is the only way the extension changes anything.
+// Runs tools/brain with argument arrays. No shell. This is the only way the extension changes anything.
 
 export function defaultDbPath(setting: string, env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
   return setting || env.LEAN_BRAIN_DB || path.join(home, ".local", "share", "lean", "brain.db");
@@ -46,8 +46,10 @@ export function findBrain(setting: string, env: NodeJS.ProcessEnv = process.env,
   }
   versions.sort(compareVersions);
   for (const v of versions.reverse()) {
-    const p = path.join(root, v, "bin", "brain");
-    if (isExecutable(p)) return p;
+    for (const dir of ["tools", "bin"]) {
+      const p = path.join(root, v, dir, "brain");
+      if (isExecutable(p)) return p;
+    }
   }
   return undefined;
 }

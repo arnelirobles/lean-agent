@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 from .items import infer_session, session_ok
 from .store import connect, now
@@ -30,6 +31,15 @@ def project_of(path):
 def git_out(repo, *args):
     r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def current_branch(repo):
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True,
+                           timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def cancel_dependents(con, job_id, reason):
@@ -123,8 +133,47 @@ def detect_platform(repo, test_project):
     return ""
 
 
+def wait_line(con, r):
+    """One line for a job that ended: id, status, passed and failed of its run, the items it filed."""
+    run = con.execute("SELECT passed, failed FROM runs WHERE id=?", (r["run_id"],)).fetchone() if r["run_id"] else None
+    ids = [str(i["id"]) for i in con.execute("SELECT id FROM items WHERE run_id=? ORDER BY id", (r["run_id"],))] \
+        if r["run_id"] else []
+    s = f"job #{r['id']} {r['status']} passed={run['passed'] if run else '-'} failed={run['failed'] if run else '-'}"
+    s += " items=" + (",".join("#" + i for i in ids) if ids else "-")
+    if r["reason"]:
+        s += " (" + " ".join(r["reason"].split())[:200] + ")"
+    return s
+
+
+def queue_wait(con, a):
+    """Block until every named job ends. Exit 0 all done, 1 any failed or cancelled, 2 unknown id, 3 timeout."""
+    ids = list(dict.fromkeys(a.ids))
+    for i in ids:
+        if not con.execute("SELECT 1 FROM jobs WHERE id=?", (i,)).fetchone():
+            print(f"brain: no job #{i}", file=sys.stderr)
+            return 2
+    deadline = time.monotonic() + a.timeout
+    while True:
+        rows = [con.execute("SELECT * FROM jobs WHERE id=?", (i,)).fetchone() for i in ids]
+        pending = [r for r in rows if r["status"] in ("queued", "running")]
+        if not pending:
+            break
+        if time.monotonic() >= deadline:
+            for r in rows:
+                print(wait_line(con, r) if r not in pending else f"{job_line(r)} (still {r['status']})")
+            print(f"brain: timed out after {a.timeout:g}s with {len(pending)} of {len(ids)} jobs not ended: "
+                  + ", ".join(f"#{r['id']} {r['status']}" for r in pending), file=sys.stderr)
+            return 3
+        time.sleep(min(a.interval, max(0.0, deadline - time.monotonic())))
+    for r in rows:
+        print(wait_line(con, r))
+    return 0 if all(r["status"] == "done" for r in rows) else 1
+
+
 def cmd_queue(a):
     con = connect()
+    if a.qcmd == "wait":
+        return queue_wait(con, a)
     if a.qcmd == "add":
         if a.tier == "fast" and not a.filter:
             sys.exit("brain: a fast job needs --filter")
@@ -185,13 +234,13 @@ def cmd_queue(a):
                                  f"would not be the commit {commit[:8]}; commit first, or pass --again \"reason\"")
             cur = con.execute(
                 "INSERT INTO jobs (cycle, project, repo_dir, test_project, filter, tier, after_id, enqueued_by,"
-                " enqueued_at, status, reason, ended_at, args, platform, commit_hash, session_id, session_cwd)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " enqueued_at, status, reason, ended_at, args, platform, commit_hash, session_id, session_cwd, branch)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (a.cycle, project, repo, a.test_project, a.filter, a.tier, a.after,
                  a.by, now(), "cancelled" if dead else "queued",
                  f"dependency #{a.after} {dep['status']}" if dead else
                  (f"again: {again}" if again else ""), now() if dead else None, a.args,
-                 platform, commit, session, session_cwd))
+                 platform, commit, session, session_cwd, current_branch(repo)))
             con.execute("COMMIT")
         except BaseException:
             if con.in_transaction:

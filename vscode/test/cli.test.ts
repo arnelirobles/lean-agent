@@ -34,10 +34,10 @@ describe("brain cli", () => {
   it("finds brain: setting, then PATH, then the newest plugin", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "lb-"));
     const root = path.join(home, ".claude", "plugins", "cache", "lean-agent", "lean-agent");
-    exe(path.join(root, "1.9.0", "bin", "brain"));
-    exe(path.join(root, "1.10.0", "bin", "brain"));
-    exe(path.join(root, "1.2.0", "bin", "brain"));
-    expect(findBrain("", { PATH: "" }, home)).toBe(path.join(root, "1.10.0", "bin", "brain"));
+    exe(path.join(root, "1.9.0", "tools", "brain"));
+    exe(path.join(root, "1.10.0", "tools", "brain"));
+    exe(path.join(root, "1.2.0", "tools", "brain"));
+    expect(findBrain("", { PATH: "" }, home)).toBe(path.join(root, "1.10.0", "tools", "brain"));
     const bin = path.join(home, "bin");
     exe(path.join(bin, "brain"));
     expect(findBrain("", { PATH: bin }, home)).toBe(path.join(bin, "brain"));
@@ -46,6 +46,13 @@ describe("brain cli", () => {
     expect(findBrain(set, { PATH: bin }, home)).toBe(set);
     expect(findBrain(path.join(home, "missing"), { PATH: bin }, home)).toBeUndefined();
     expect(findBrain("", { PATH: "" }, path.join(home, "empty"))).toBeUndefined();
+  });
+
+  it("finds brain in bin/ for a plugin version before tools/", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "lb-"));
+    const root = path.join(home, ".claude", "plugins", "cache", "lean-agent", "lean-agent");
+    exe(path.join(root, "1.15.0", "bin", "brain"));
+    expect(findBrain("", { PATH: "" }, home)).toBe(path.join(root, "1.15.0", "bin", "brain"));
   });
 
   it("knows whether a brain has queue move from its queue help", async () => {

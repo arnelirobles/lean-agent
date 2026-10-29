@@ -116,7 +116,7 @@ fi
 
 # 2b. Orphaned shells and scripts. A background task that was stopped can leave its command behind:
 # bash defers SIGTERM until a builtin returns, so a stopped preflight kept one CPU busy for two
-# hours, reparented to init, with nothing in any task list. bin/bounded prevents it; this finds it.
+# hours, reparented to init, with nothing in any task list. tools/bounded prevents it; this finds it.
 busy=""
 while read -r p ppid cpu args; do
     [ "$ppid" = "1" ] || continue

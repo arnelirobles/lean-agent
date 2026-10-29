@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import initSqlJs, { Database } from "sql.js";
 
-// Copied from bin/brain (migrate_2 to migrate_5, and the meta table; LATER has migrate_6 to migrate_9). schema.test.ts keeps it honest.
+// Copied from tools/brain (migrate_2 to migrate_5, and the meta table; LATER has migrate_6 to migrate_9). schema.test.ts keeps it honest.
 export const SCHEMA = [
   `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE runs (
@@ -48,6 +48,7 @@ export const LATER = [
   `ALTER TABLE jobs ADD COLUMN commit_hash TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE jobs ADD COLUMN session_cwd TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
 ];
 
 export const ACTIVITY = [

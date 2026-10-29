@@ -30,6 +30,11 @@
         "icon": "$(graph)"
       },
       {
+        "command": "leanBrain.openPage",
+        "title": "Lean Brain: Open brain page",
+        "icon": "$(link-external)"
+      },
+      {
         "command": "leanBrain.refresh",
         "title": "Lean Brain: Refresh",
         "icon": "$(refresh)"
@@ -281,7 +286,7 @@
         "leanBrain.brainPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the bin/brain script. Empty uses brain on PATH, then the newest lean-agent plugin.",
+          "description": "Path to the tools/brain script. Empty uses a brain on PATH, then tools/brain (or bin/brain before 1.16.0) in the newest installed lean-agent plugin.",
           "scope": "machine"
         },
         "leanBrain.claudeCommand": {

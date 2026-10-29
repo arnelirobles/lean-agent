@@ -1,5 +1,5 @@
 {
-  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author, wait-loop and background-shell checks that block, and notes on house style, stale test runs, unverified claims, containers for docs-only diffs and lessons.",
+  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author, wait-loop and background-shell checks that block, and notes on house style, stale test runs, hand-written commands a script already does, unverified claims, containers for docs-only diffs, lessons, and a coordinator whose context, own lookups or images are costing the most (an opt-in setting refuses them). A session that ends is collected into lean-stats in the background, and the brain page server starts.",
   "hooks": {
     "SessionStart": [
       {
@@ -29,6 +29,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/serve-start.py\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -40,6 +49,18 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/lesson-log.py\"",
             "timeout": 10,
             "if": "Bash(git *)"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/created-log.py\"",
+            "timeout": 10,
+            "if": "Bash(gh *)"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/created-log.py\"",
+            "timeout": 10,
+            "if": "Bash(az *)"
           },
           {
             "type": "command",
@@ -61,9 +82,27 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/context-cost.py\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/context-cost.py\"",
+            "timeout": 10
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
@@ -96,6 +135,11 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/bg-bound.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/script-note.py\"",
             "timeout": 10
           },
           {

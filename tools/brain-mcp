@@ -7,7 +7,7 @@ stay in one place. A nonzero exit becomes a tool result with isError true and th
 
 Tools: brain_list, brain_show, brain_add, brain_close, brain_queue_list, brain_queue_add,
 brain_queue_cancel, brain_queue_bump, brain_queue_route, brain_stats, brain_digest. `queue next` and `queue finish` are not exposed:
-only the drainer (bin/test-phase) claims and finishes jobs.
+only the drainer (tools/test-phase) claims and finishes jobs.
 
 brain_list answers small by default: open items, newest first, 50 lines (the limit argument changes that, and
 a status or open=false asks for more). brain_queue_list defaults to queued and running jobs. A cut says how
