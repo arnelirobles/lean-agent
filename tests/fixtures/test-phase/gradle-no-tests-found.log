@@ -1,0 +1,14 @@
+> Task :core:jvmTest
+> Task :core:iosSimulatorArm64Test FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':core:iosSimulatorArm64Test'.
+> No tests found for given includes: [CartTest](--tests filter)
+
+* Try:
+> Run with --scan to get full insights.
+
+BUILD FAILED in 12s
+lean-gradle: passed 3 failed 0 skipped 0 files 1
