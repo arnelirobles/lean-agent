@@ -140,7 +140,7 @@ What goes where:
 
 Brain never holds secrets, tokens or passwords.
 
-brain's code lives in `lib/brain/`, and `tools/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub; GitLab and Azure DevOps come with tracker support. `lean-stats collect` also counts merged Azure DevOps pull requests through `az` (they are stored as `ORG/PROJECT/REPO`), for the Azure repositories your transcripts already name; fix rounds, failed checks and escaped refs stay empty for them.
+brain's code lives in `lib/brain/`, and `tools/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub; GitLab and Azure DevOps come with tracker support. `lean-stats collect` also counts merged Azure DevOps pull requests through `az` (they are stored as `ORG/PROJECT/REPO`), for the Azure repositories your transcripts already name. Naming repositories on the command line collects only those, and a line says when Azure ones were skipped. Fix rounds, failed checks and escaped refs stay empty for Azure rows. `forge.py` can also count the commits on an Azure pull request, but nothing calls it yet. Once a day `collect` rewrites old `_git/NAME` and `org/project` repo names to `ORG/PROJECT/REPO` from what `az repos list` shows for your default organization, so cost joins the changes. A three-part name counts as Azure only when its organization is your az default or one seen in an Azure remote.
 
 ## Brain page
 

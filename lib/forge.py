@@ -13,8 +13,10 @@ REPO is owner/name (always GitHub) or a clone URL. A host other than GitHub prin
 Azure DevOps is reached through Azure (az repos pr list, az devops invoke), used by lean-stats through for_repo.
 This command line still refuses it. An Azure repository is named ORG/PROJECT/REPO (three parts, names
 percent-decoded), which cannot collide with GitHub's owner/name. azure_slug turns any clone URL into that name.
-Azure answers merged_prs and commits_after. failed_checks and escaped_refs return None: a check run is not
-found by commit, and az has no search over work item text.
+Azure answers merged_prs, default_org, projects and repos. commits_after works but nothing calls it yet.
+failed_checks and escaped_refs return None: a check run is not found by commit, and az has no search over
+work item text. A bare ORG/PROJECT/REPO is Azure only when ORG is in the `orgs` a caller passes to
+repo_kind and for_repo; any other three-part name is not a repository this module knows.
 
 CI providers. tools/pr-wait waits on checks through a provider from ci_provider(kind, ...), kind being what
 kind_of returns. A provider is a class with this interface, nothing more:
@@ -71,7 +73,7 @@ def remote_url(cwd):
 def run_command(cmd, timeout=600):
     """stdout of a command, or None when it is missing, fails or runs too long."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout if result.returncode == 0 else None
@@ -89,15 +91,20 @@ def slug(repo):
     return re.sub(r"\.git$", "", path.strip("/"))
 
 
-def repo_kind(repo):
-    """github, gitlab, azure or unknown for a clone URL, an owner/name or an ORG/PROJECT/REPO."""
+def repo_kind(repo, orgs=()):
+    """github, gitlab, azure or unknown for a clone URL, an owner/name or an ORG/PROJECT/REPO.
+
+    A bare three-part name is Azure only when its first part is one of `orgs` (case-insensitive).
+    """
     if is_url(repo):
         return kind_of(repo)
-    return "azure" if repo.count("/") == 2 else "github"
+    if repo.count("/") == 2 and repo.split("/")[0].lower() in {o.lower() for o in orgs}:
+        return "azure"
+    return "github"
 
 
-def for_repo(repo, run=run_command):
-    kind = repo_kind(repo)
+def for_repo(repo, run=run_command, orgs=()):
+    kind = repo_kind(repo, orgs)
     if kind == "azure":
         return Azure(run)
     if kind != "github":
@@ -109,8 +116,10 @@ def parse_azure(repo):
     """(org, project, repo) from an Azure DevOps clone URL or ORG/PROJECT/REPO, percent-decoded, or None.
 
     https://[user@]dev.azure.com/ORG/PROJECT/_git/REPO, https://ORG.visualstudio.com/[DefaultCollection/]PROJECT/_git/REPO,
-    git@ssh.dev.azure.com:v3/ORG/PROJECT/REPO, ssh://git@ssh.dev.azure.com/v3/ORG/PROJECT/REPO. A URL
-    without a project (.../ORG/_git/REPO) has the project named after the repository.
+    git@ssh.dev.azure.com:v3/ORG/PROJECT/REPO, ORG@vs-ssh.visualstudio.com:v3/ORG/PROJECT/REPO,
+    ssh://git@ssh.dev.azure.com/v3/ORG/PROJECT/REPO. A trailing .git is dropped. A URL without a
+    project (.../ORG/_git/REPO) has the project named after the repository. A name that holds a slash
+    after decoding (%2F) is refused.
     """
     from urllib.parse import unquote
     repo = (repo or "").strip()
@@ -119,8 +128,12 @@ def parse_azure(repo):
         return tuple(parts) if len(parts) == 3 and all(parts) else None
     host = host_of(repo)
     path = re.sub(r"^[a-z+]+://[^/]+/|^[^@/]+@[^:/]+:", "", repo).split("?")[0].strip("/")
-    parts = [unquote(p) for p in path.split("/")]
-    if host == "ssh.dev.azure.com":
+    path = re.sub(r"\.git$", "", path)
+    raw = path.split("/")
+    parts = [unquote(p) for p in raw]
+    if any("/" in p for p in parts):
+        return None
+    if host == "ssh.dev.azure.com" or (host.startswith("vs-ssh.") and host.endswith(".visualstudio.com")):
         parts = parts[1:] if parts[:1] == ["v3"] else []
         found = parts if len(parts) == 3 else None
     elif host == "dev.azure.com":
@@ -190,6 +203,7 @@ class GitHub:
 
 AZURE_PAGE = 100
 AZURE_CAP = 1000
+AZ_TIMEOUT = 60
 
 
 def azure_time(text):
@@ -199,18 +213,24 @@ def azure_time(text):
 
 
 class Azure:
-    """Pull requests of an Azure DevOps repository through az. Never calls gh.
+    """Pull requests and repository lists of Azure DevOps through az. Never calls gh.
 
-    The repository is a clone URL or ORG/PROJECT/REPO. merged_prs returns the shape GitHub's does and pages
-    az 100 at a time, newest closed first, until a page ends before `since`, a short page, or `cap` pull
-    requests; reaching the cap is reported on stderr. commits_after counts the commits on a pull request
-    committed after a time, merges not counted, from the first 500. failed_checks and escaped_refs return None:
-    check runs cannot be found by commit through az, and az has no search over work item text.
-    A failed az call gives None (merged_prs) or 0 (commits_after) the way GitHub's does.
+    The repository is a clone URL or ORG/PROJECT/REPO. Every az call has a 60 second timeout and no stdin.
+    merged_prs returns the shape GitHub's does and pages az 100 at a time, newest closed first, until a page
+    ends before `since`, a short page, or `limit` (default 1000) pull requests were read. It asks for one more
+    than the limit to know the limit was really hit, trims to the limit, and reports a hit on stderr.
+    A completed pull request with no close date is skipped. default_org, projects and repos answer the
+    listing questions lean-stats needs; each gives None when az fails. commits_after counts the commits on a
+    pull request committed after a time, merges not counted, from the first 500; nothing calls it yet.
+    failed_checks and escaped_refs return None: check runs cannot be found by commit through az, and az has
+    no search over work item text. A failed az call gives None (merged_prs) or 0 (commits_after).
     """
 
     def __init__(self, run=run_command, cap=AZURE_CAP, page=AZURE_PAGE):
         self.run, self.cap, self.page = run, cap, page
+
+    def _az(self, argv):
+        return self.run(argv, timeout=AZ_TIMEOUT)
 
     def _target(self, repo):
         found = parse_azure(repo)
@@ -218,14 +238,52 @@ class Azure:
             raise Unsupported(f"not an Azure DevOps repository: {repo}")
         return f"https://dev.azure.com/{found[0]}", found[1], found[2]
 
+    def default_org(self):
+        """The organization name az has as its default: "" when it has none, None when az fails."""
+        out = self._az(["az", "devops", "configure", "-l"])
+        if out is None:
+            return None
+        m = re.search(r"organization\s*=\s*(\S+)", out)
+        if not m:
+            return ""
+        url = m.group(1)
+        if host_of(url) == "dev.azure.com":
+            org = re.sub(r"^[a-z+]+://[^/]+/", "", url).strip("/").split("/")[0]
+        elif host_of(url).endswith(".visualstudio.com"):
+            org = host_of(url)[:-len(".visualstudio.com")]
+        else:
+            org = ""
+        return org
+
+    def projects(self, org):
+        """Project names of an organization, or None when az fails."""
+        out = self._az(["az", "devops", "project", "list", "--org", f"https://dev.azure.com/{org}", "--top", "500",
+                        "--query", "value[].name", "--output", "json"])
+        return self._names(out)
+
+    def repos(self, org, project):
+        """Repository names of one project, or None when az fails."""
+        out = self._az(["az", "repos", "list", "--project", project, "--org", f"https://dev.azure.com/{org}",
+                        "--query", "[].name", "--output", "json"])
+        return self._names(out)
+
+    @staticmethod
+    def _names(out):
+        try:
+            names = json.loads(out)
+        except (ValueError, TypeError):
+            return None
+        return names if isinstance(names, list) and all(isinstance(n, str) for n in names) else None
+
     def merged_prs(self, repo, since, limit=None):
         org, project, name = self._target(repo)
         cap = limit or self.cap
         out = []
-        skip = 0
+        read = 0
         while True:
-            listing = self.run(["az", "repos", "pr", "list", "--status", "completed", "--repository", name,
-                                "--project", project, "--org", org, "--top", str(self.page), "--skip", str(skip),
+            top = min(self.page, cap + 1 - read)
+            listing = self._az(["az", "repos", "pr", "list", "--status", "completed", "--repository", name,
+                                "--project", project, "--org", org, "--top", str(top), "--skip", str(read),
                                 "--output", "json"])
             if listing is None:
                 return None
@@ -235,21 +293,27 @@ class Azure:
                           "head_ref": re.sub(r"^refs/heads/", "", pr.get("sourceRefName") or ""),
                           "head_sha": (pr.get("lastMergeSourceCommit") or {}).get("commitId") or "",
                           "created_at": azure_time(pr.get("creationDate")),
-                          "merged_at": azure_time(pr.get("closedDate"))} for pr in prs]
+                          "merged_at": azure_time(pr.get("closedDate"))}
+                         for pr in prs]
+                closed = [bool(pr.get("closedDate")) for pr in prs]
             except (ValueError, KeyError, TypeError, AttributeError):
                 return None
-            out += [pr for pr in batch if pr["merged_at"] >= since]
-            skip += len(prs)
-            if len(prs) < self.page or (batch and batch[-1]["merged_at"] < since):
-                return out
-            if skip >= cap:
-                print(f"forge: stopped at {skip} pull requests of {azure_slug(repo)}, older ones are not counted",
+            over = read + len(prs) > cap
+            if over:
+                batch, closed = batch[:cap - read], closed[:cap - read]
+            dated = [pr for pr, ok in zip(batch, closed) if ok]
+            out += [pr for pr in dated if pr["merged_at"] >= since]
+            read += len(batch)
+            if over:
+                print(f"forge: stopped at {cap} pull requests of {azure_slug(repo)}, older ones are not counted",
                       file=sys.stderr)
+                return out
+            if len(prs) < top or (dated and dated[-1]["merged_at"] < since):
                 return out
 
     def commits_after(self, repo, number, after):
         org, project, name = self._target(repo)
-        out = self.run(["az", "devops", "invoke", "--area", "git", "--resource", "pullRequestCommits",
+        out = self._az(["az", "devops", "invoke", "--area", "git", "--resource", "pullRequestCommits",
                         "--org", org, "--route-parameters", f"project={project}", f"repositoryId={name}",
                         f"pullRequestId={number}", "--query-parameters", "$top=500", "--api-version", "7.1",
                         "--output", "json"])
@@ -279,7 +343,8 @@ class ToolMissing(CiError):
 def capture_command(argv, timeout=600):
     """(exit code, stdout, stderr) of a command, whatever the exit code."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
+        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
+                           stdin=subprocess.DEVNULL)
     except OSError as ex:
         raise ToolMissing(f"cannot run {argv[0]}: {ex.strerror}")
     except subprocess.SubprocessError as ex:
@@ -659,12 +724,22 @@ def azure_test(check, root):
             ("https://org.visualstudio.com/_git/repo", ("org", "repo", "repo")),
             ("https://dev.azure.com/org/_git/repo", ("org", "repo", "repo")),
             ("org/proj/repo", ("org", "proj", "repo")),
+            ("https://dev.azure.com/org/proj/_git/repo.git", ("org", "proj", "repo")),
+            ("git@ssh.dev.azure.com:v3/org/proj/repo.git", ("org", "proj", "repo")),
+            ("org@vs-ssh.visualstudio.com:v3/org/proj/repo", ("org", "proj", "repo")),
+            ("org@vs-ssh.visualstudio.com:v3/org/My%20Proj/my%20repo", ("org", "My Proj", "my repo")),
+            ("https://dev.azure.com/org/proj%2Fx/_git/repo", None),
+            ("https://dev.azure.com/org/proj/_git/a%2Fb", None),
             ("https://dev.azure.com/org/proj", None), ("https://github.com/o/r", None), ("o/r", None), ("", None))
     for url, want in urls:
         check(f"azure parse {url!r}", parse_azure(url), want)
     check("azure slug", azure_slug("https://dev.azure.com/baryodev/DopaDopa/_git/ToGo"), "baryodev/DopaDopa/ToGo")
     check("azure slug of a GitHub URL is empty", azure_slug("https://github.com/o/r"), "")
-    check("owner/name/repo is Azure", isinstance(for_repo("org/proj/repo"), Azure), True)
+    check("owner/name/repo is Azure when the org is known",
+          isinstance(for_repo("org/proj/repo", orgs=("ORG",)), Azure), True)
+    check("a bare three-part name with an unknown org is not Azure",
+          [repo_kind("lib/brain/x", ("org",)), repo_kind("lib/brain/x")], ["github", "github"])
+    check("a URL is Azure whatever the orgs", repo_kind("https://dev.azure.com/o/p/_git/r"), "azure")
     check("an Azure URL is Azure", isinstance(for_repo("https://dev.azure.com/o/p/_git/r"), Azure), True)
     check("owner/name stays GitHub", isinstance(for_repo("o/r"), GitHub), True)
     check("azure time", [azure_time(t) for t in ("2026-10-25T12:37:30.535651+00:00", "2026-10-25T12:37:30Z", "x", None)],
@@ -747,6 +822,121 @@ def azure_test(check, root):
     check("azure escaped_refs is unknown", Azure(fake("1")).escaped_refs("org/p/r", 7, "x"), None)
 
 
+    # cap: not a multiple of the page, exactly at the cap, below the page size
+    def many(n, closed="2026-10-20T00:00:00Z"):
+        return {"prs.json": [pr(i, closed) for i in range(1, n + 1)]}
+
+    def listed(files, cap, page, since="2026-10-01"):
+        dd, e = make_scene(root, {"az": FAKE_AZ_PR}, files)
+
+        def run_here(cmd, timeout=600):
+            r = subprocess.run(cmd, capture_output=True, text=True, env=e, stdin=subprocess.DEVNULL)
+            return r.stdout if r.returncode == 0 else None
+
+        err = io.StringIO()
+        old, sys.stderr = sys.stderr, err
+        try:
+            got = Azure(run_here, cap=cap, page=page).merged_prs("org/p/r", since)
+        finally:
+            sys.stderr = old
+        return got, err.getvalue(), dd
+
+    got, msg, _ = listed(many(40), 15, 10)
+    check("azure cap not a multiple of the page", (len(got), msg),
+          (15, "forge: stopped at 15 pull requests of org/p/r, older ones are not counted\n"))
+    got, msg, _ = listed(many(20), 20, 10)
+    check("azure exactly the cap is not a cap hit", (len(got), msg), (20, ""))
+    got, msg, _ = listed(many(30), 5, 10)
+    check("azure a limit below the page size is respected", (len(got), msg.startswith("forge: stopped at 5 ")), (5, True))
+    nulls = [dict(pr(1, "2026-10-20T00:00:00Z"), closedDate=None), pr(2, "2026-10-20T00:00:00Z"),
+             dict(pr(3, "2026-10-19T00:00:00Z"), closedDate=None), pr(4, "2026-10-19T00:00:00Z")]
+    got, msg, _ = listed({"prs.json": nulls}, 100, 2, "2026-10-01")
+    check("azure skips a PR with no close date and keeps paging", [x["number"] for x in got], [2, 4])
+    got, msg, dd = listed({"prs.json": [dict(pr(9, "x"), closedDate=None)] * 2 + [pr(5, "2026-10-20T00:00:00Z")]},
+                          100, 2, "2026-10-01")
+    check("a null close date is not a stop signal", [x["number"] for x in got], [5])
+
+    # timeout and the listing questions
+    seen = []
+
+    def recording(out):
+        def run(cmd, timeout=None):
+            seen.append((cmd, timeout))
+            return out
+        return run
+
+    Azure(recording("[]")).merged_prs("org/p/r", "2026-10-01")
+    check("azure calls have a 60 second timeout", seen[-1][1], 60)
+    for cfg, want in (("[defaults]\norganization = https://dev.azure.com/baryodev\n", "baryodev"),
+                      ("organization = https://acme.visualstudio.com/\n", "acme"),
+                      ("[defaults]\nproject = x\n", ""), ("", ""), (None, None)):
+        check(f"azure default org from {cfg!r}", Azure(recording(cfg)).default_org(), want)
+    check("azure projects", Azure(recording('["A", "B"]')).projects("org"), ["A", "B"])
+    check("azure projects argv", seen[-1][0][:5], ["az", "devops", "project", "list", "--org"])
+    check("azure repos", Azure(recording('["r"]')).repos("org", "My Proj"), ["r"])
+    check("azure repos argv", seen[-1][0][:6], ["az", "repos", "list", "--project", "My Proj", "--org"])
+    check("azure lists on a failed az", (Azure(recording(None)).projects("o"), Azure(recording(None)).repos("o", "p")),
+          (None, None))
+    check("azure lists on bad JSON", (Azure(recording("x")).projects("o"), Azure(recording('{"a": 1}')).repos("o", "p")),
+          (None, None))
+
+    # a command never waits on stdin
+    check("run_command gives a command no stdin", run_command(["sh", "-c", "cat; echo done"]), "done\n")
+    check("capture_command gives a command no stdin", capture_command(["sh", "-c", "cat; echo done"])[1], "done\n")
+
+
+class Deadline:
+    """`with Deadline(20):` raises TimeoutError in the block after that many seconds, so a self-test that
+    would hang (a mutated loop, a real CLI waiting for a login) fails instead."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def __enter__(self):
+        import signal
+
+        def fire(signum, frame):
+            raise TimeoutError(f"no result after {self.seconds} seconds")
+
+        self.old = signal.signal(signal.SIGALRM, fire)
+        signal.alarm(self.seconds)
+
+    def __exit__(self, *exc):
+        import signal
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self.old)
+        return False
+
+
+def guarded(check, name, seconds, fn, *args):
+    """Run a test function under a deadline; a hang or a crash is one failed check, not the end of the run."""
+    try:
+        with Deadline(seconds):
+            fn(check, *args)
+    except Exception as ex:  # noqa: BLE001
+        check(name, f"{type(ex).__name__}: {ex}", "finished")
+
+
+def azure_cli_test(check, root):
+    """The command line refuses Azure. A fake az first on PATH, so a missing refusal cannot reach the real one."""
+    d, env = make_scene(root, {"az": "#!/bin/sh\necho az >> \"$FAKE_DIR/az-called\"\nexit 9\n"}, {})
+    here = os.path.realpath(__file__)
+    try:
+        r = subprocess.run([sys.executable, here, "merged-prs", "https://dev.azure.com/o/p/_git/r", "2026-10-01"],
+                           capture_output=True, text=True, env=env, timeout=30, stdin=subprocess.DEVNULL)
+        check("azure CLI exit", r.returncode, 2)
+        check("azure CLI message", r.stderr.strip(), "forge: azure is not supported yet; only GitHub is")
+        retro = os.path.join(os.path.dirname(here), "..", "tools", "retro-signals.sh")
+        r = subprocess.run(["bash", retro, "--since", "2026-10-01", "https://dev.azure.com/o/p/_git/r"],
+                           capture_output=True, text=True, env=env, timeout=30, stdin=subprocess.DEVNULL)
+        check("retro-signals on azure exits 2", r.returncode, 2)
+        check("retro-signals on azure says why", r.stderr.strip(), "forge: azure is not supported yet; only GitHub is")
+        check("retro-signals on azure prints only the header", len(r.stdout.splitlines()), 1)
+    except subprocess.TimeoutExpired:
+        check("azure CLI refusal finishes", "timed out", "finished")
+    check("the refusal never calls az", os.path.exists(os.path.join(d, "az-called")), False)
+
+
 def self_test():
     fails = []
 
@@ -794,24 +984,12 @@ def self_test():
         check(f"{name} parses a count", getattr(GitHub(fake("3\n")), name)(*args), 3)
     check("commits_after sums pages", GitHub(fake("2\n1\n")).commits_after("o/r", 7, "x"), 3)
 
-    here = os.path.realpath(__file__)
-    r = subprocess.run([sys.executable, here, "merged-prs", "https://dev.azure.com/o/p/_git/r", "2026-10-01"],
-                       capture_output=True, text=True)
-    check("azure CLI exit", r.returncode, 2)
-    check("azure CLI message", r.stderr.strip(), "forge: azure is not supported yet; only GitHub is")
-
-    retro = os.path.join(os.path.dirname(here), "..", "tools", "retro-signals.sh")
-    r = subprocess.run(["bash", retro, "--since", "2026-10-01", "https://dev.azure.com/o/p/_git/r"],
-                       capture_output=True, text=True)
-    check("retro-signals on azure exits 2", r.returncode, 2)
-    check("retro-signals on azure says why", r.stderr.strip(), "forge: azure is not supported yet; only GitHub is")
-    check("retro-signals on azure prints only the header", len(r.stdout.splitlines()), 1)
-
     import tempfile
     with tempfile.TemporaryDirectory() as root:
-        github_ci_test(check, root)
-        azure_ci_test(check, root)
-        azure_test(check, root)
+        guarded(check, "azure CLI refusal", 90, azure_cli_test, root)
+        guarded(check, "github ci", 60, github_ci_test, root)
+        guarded(check, "azure ci", 60, azure_ci_test, root)
+        guarded(check, "azure", 120, azure_test, root)
 
     for f in fails:
         print("FAIL", f)
