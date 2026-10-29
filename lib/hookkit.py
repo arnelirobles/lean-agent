@@ -16,7 +16,7 @@ import sys
 SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")", ";;", "|&"}
 PIPES = {"|", "|&"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
-HEREDOC = re.compile(r"<<(-?)[ \t]*((?:'[^'\n]*'|\"[^\"\n]*\"|\\.|[^\s;&|()<>'\"\\])+)")
+HEREDOC = re.compile(r"<<(-?)[ \t]*((?:'[^'\n]*'|\"(?:[^\"\\\n]|\\.)*\"|\\.|[^\s;&|()<>'\"\\])+)")
 HEREDOC_MARK = re.compile(r"__lean_heredoc_(\d+)__")
 GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 _EVENT = {}  # the last event read, for the session id and cwd of a recorded fire
@@ -168,11 +168,14 @@ def test_marker(cwd):
 
 
 def _end_word(word):
-    """The heredoc end word as bash reads it: quotes and backslashes removed, so <<E"O"F ends at EOF."""
+    """The heredoc end word as bash reads it: quotes and backslashes removed, so <<E"O"F ends at EOF.
+
+    None when the word will not parse; the caller then leaves the text in place for the strict parse to refuse.
+    """
     try:
         return "".join(shlex.split(word))
     except ValueError:
-        return word
+        return None
 
 
 def prepare(command):
@@ -211,8 +214,8 @@ def prepare(command):
             continue
         if command.startswith("<<", i) and not command.startswith("<<<", i):
             match = HEREDOC.match(command, i)
-            if match:
-                delim = _end_word(match.group(2))
+            delim = _end_word(match.group(2)) if match else None
+            if delim is not None:
                 out.append(f" __lean_heredoc_{len(bodies) + len(pending)}__ ")
                 pending.append((delim, bool(match.group(1))))
                 i = match.end()
