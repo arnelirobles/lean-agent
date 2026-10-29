@@ -662,10 +662,11 @@ def gradle_wrapper(folder):
         d = os.path.dirname(d)
 
 
-def gradle_results(folder, since):
+def gradle_results(folder, since, cached=()):
     """JUnit XML written at or after `since` under any build/test-results folder: (passed, failed, skipped,
     files, [(class, test, detail, task)]). The task is the Gradle path that wrote the file, from the folder it sits
-    in (shared/build/test-results/jvmTest is :shared:jvmTest). Older files are leftovers of an earlier run and are ignored."""
+    in (shared/build/test-results/jvmTest is :shared:jvmTest). Older files are leftovers of an earlier run and are
+    ignored, except the files of a task in `cached` (UP-TO-DATE or FROM-CACHE: Gradle reused them on purpose)."""
     p = f = s = n = 0
     bad = []
     for root, dirs, files in os.walk(folder):
@@ -676,15 +677,15 @@ def gradle_results(folder, since):
             if not (fn.startswith("TEST-") and fn.endswith(".xml")):
                 continue
             path = os.path.join(root, fn)
+            m = re.match(r"^(?:(.*)/)?build/test-results/([^/]+)", os.path.relpath(root, folder).replace(os.sep, "/") + "/")
+            task = (":" + m.group(1).replace("/", ":") + ":" if m and m.group(1) and m.group(1) != "." else ":") + m.group(2) if m else ""
             try:
-                if os.path.getmtime(path) < since:
+                if os.path.getmtime(path) < since and task not in cached:
                     continue
                 tree = ET.parse(path).getroot()
             except (OSError, ET.ParseError):
                 continue
             n += 1
-            m = re.match(r"^(?:(.*)/)?build/test-results/([^/]+)", os.path.relpath(root, folder).replace(os.sep, "/") + "/")
-            task = (":" + m.group(1).replace("/", ":") + ":" if m and m.group(1) and m.group(1) != "." else ":") + m.group(2) if m else ""
             for case in tree.iter("testcase"):
                 kinds = {c.tag for c in case}
                 if kinds & {"failure", "error"}:
@@ -712,7 +713,7 @@ def gradle_run(argv):
     cmd = [wrapper, "--console=plain", "--continue", "--no-daemon"] + args
     # Same process group as this command: heavy_lock stops the group on a stall, and a child in its own session
     # would be missed by the SIGKILL.
-    p = subprocess.Popen(cmd, cwd=folder, env=gradle_env(os.environ))
+    p = subprocess.Popen(cmd, cwd=folder, env=gradle_env(os.environ), stdout=subprocess.PIPE, text=True, errors="replace")
 
     def forward(signum, _frame):
         try:
@@ -722,9 +723,16 @@ def gradle_run(argv):
     import signal
     for sg in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sg, forward)
+    cached = set()  # test tasks Gradle skipped because their inputs did not change: their old results stand
+    for line in p.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        m = re.match(r"^> Task (\S+) (?:UP-TO-DATE|FROM-CACHE)\s*$", line)
+        if m and ga.is_test_task(m.group(1)):
+            cached.add(m.group(1))
     rc = p.wait()
     rc = 128 - rc if rc < 0 else rc
-    passed, failed, skipped, files, bad = gradle_results(folder, start)
+    passed, failed, skipped, files, bad = gradle_results(folder, start, cached)
     print(f"lean-gradle: passed {passed} failed {failed} skipped {skipped} files {files}")
     tasks = set()
     for cls, name, detail, task in bad:
@@ -2309,6 +2317,7 @@ def gradle_job_checks(fails, d, env, fixture):
 echo "gradlew $*" >> '{log}'
 case "$(cat '{mode}')" in
   notests) echo "> Task :core:jvmTest UP-TO-DATE"; exit 0 ;;
+  uptodate) echo "> Task :core:jvmTest UP-TO-DATE"; exit 0 ;;
   taskfail)
     echo "> Task :core:verifyFixtures FAILED"; cat '{d}/gradle-taskfail'; exit 1 ;;
   toolchain)
@@ -2350,6 +2359,18 @@ exit 0
         fails.append(f"a Gradle run that wrote no test result must file ran-no-tests ({rc}): {out} {items()}")
     if calls != ["gradlew --console=plain --continue --no-daemon jvmTest --rerun"]:
         fails.append(f"the Gradle job must run ./gradlew with --rerun after the test task: {calls}")
+
+    # An UP-TO-DATE test task keeps its old results: they are read without the mtime filter, and the job is green.
+    old = os.path.join(repo, "kmp", "core", "build", "test-results", "jvmTest")
+    os.makedirs(old)
+    open(os.path.join(old, "TEST-com.acme.CartTest.xml"), "w").write(fixture("gradle-junit-pass.xml"))
+    os.utime(os.path.join(old, "TEST-com.acme.CartTest.xml"), (time.time() - 7200, time.time() - 7200))
+    mode_is("uptodate")
+    qadd(repo, "kmp", "--cycle", "g1b", "--args=jvmTest")
+    rc, out, calls = drain()
+    if rc != 0 or "ran-no-tests" in out or not re.search(r"grepo:kmp\s+gradle/gradle\s+full\s+pass", out):
+        fails.append(f"an UP-TO-DATE test task over old passing results must be green ({rc}): {out}")
+    shutil.rmtree(os.path.join(repo, "kmp", "core"))
 
     # A failed task that is not a test task is a run-failed item that names the task.
     mode_is("taskfail")
