@@ -103,6 +103,7 @@ MIGRATIONS = [  # one entry per schema version, applied in order; never edit an 
 CONTEXT_LIMIT = 80000
 LOOKUP_TOOLS = {"Grep", "Glob", "Read"}
 LOOKUP_WORDS = {"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "ls"}
+SEARCH_WORDS = {"grep", "egrep", "fgrep", "rg", "find", "cat"}
 LOOKUP_GIT = {"status", "log", "diff", "show", "fetch"}
 LOOKUP_GH = {"view", "list", "checks"}
 LOOKUP_GH_AREAS = {"pr", "issue", "run"}
@@ -298,6 +299,20 @@ def is_lookup(command):
     try:
         segs = _hookkit().segments(command)
         return bool(segs) and all(lookup_segment(s) for s in segs)
+    except Exception:
+        return False
+
+
+def is_search(name, tool_input):
+    """True for Grep, Glob, or a read-only Bash command with a grep, rg, find or cat in it. git and gh state
+    checks and ls are lookups but not searches."""
+    if name in ("Grep", "Glob"):
+        return True
+    if name != "Bash" or not isinstance(tool_input, dict) or not is_lookup(tool_input.get("command")):
+        return False
+    try:
+        return any(seg.words and os.path.basename(seg.words[0]) in SEARCH_WORDS
+                   for seg in _hookkit().segments(tool_input["command"]))
     except Exception:
         return False
 

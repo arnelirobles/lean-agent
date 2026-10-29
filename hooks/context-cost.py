@@ -13,8 +13,8 @@ PostToolUse (notes):
     image file or a pdf with pages, a screenshot or thumbnail tool) once context is above LEAN_IMAGE_CONTEXT tokens (default 60000)
 PreToolUse (blocks, exit 2 with the reason on stderr, both off by default):
   - LEAN_LOOKUP_MODE=block: an Opus coordinator that has made more than LEAN_LOOKUP_WARN
-    read-only lookups since it last started an Agent has the next Grep, Glob or read-only Bash
-    search refused. Read counts but is never refused, since an Edit needs a Read first
+    read-only lookups since it last started an Agent has the next Grep, Glob or Bash grep, rg,
+    find or cat refused. Read, ls and git or gh state checks count but are never refused
   - LEAN_IMAGE_MODE=block: above LEAN_IMAGE_CONTEXT tokens a tool that returns an image is refused
 
 It reads the tail of the transcript, not the whole file, and keeps a small counter file per
@@ -172,7 +172,7 @@ class Locked:
 
 
 def is_subagent(event, path):
-    return bool(event.get("agent_id")) or f"{os.sep}subagents{os.sep}" in path
+    return bool(event.get("agent_id") or event.get("agent_type")) or f"{os.sep}subagents{os.sep}" in path
 
 
 def context_note(last, state, limit):
@@ -221,7 +221,7 @@ def image_note(event, last, state, limit):
 
 
 REFUSE_LOOKUP = ("{n} read-only lookups since the last delegation, on Opus. Refused. Start a lean:search "
-                 "agent on the fast model with the questions and read its answer. Read is never refused. "
+                 "agent on the fast model with the questions and read its answer. Read is never refused, nor ls, git or gh. "
                  "Starting any Agent resets the count. LEAN_LOOKUP_MODE=note stops this refusal, LEAN_LOOKUP_WARN=off turns it off.")
 REFUSE_IMAGE = ("The context is {k}k tokens and an image would stay in it for every later turn. Refused. Have "
                 "a subagent open the image or take the screenshot and report in text. LEAN_IMAGE_MODE=note "
@@ -244,7 +244,7 @@ def pre(event, sid):
         if last and leanstats.prompt_size(last) > limit:
             print(REFUSE_IMAGE.format(k=leanstats.prompt_size(last) // 1000), file=sys.stderr)
             return 2
-    if lookups and name != "Read" and leanstats.tool_kind(name, tool_input) == "lookup":
+    if lookups and leanstats.is_search(name, tool_input):
         limit = setting("LEAN_LOOKUP_WARN", LOOKUP_DEFAULT)
         if limit is None:
             return 0
@@ -266,7 +266,7 @@ def main():
     if event.get("hook_event_name") == "PreToolUse":
         try:
             return pre(event, sid)
-        except (OSError, ValueError):
+        except Exception:
             return 0
     limit, lookups = setting("LEAN_CONTEXT_WARN", CONTEXT_DEFAULT), setting("LEAN_LOOKUP_WARN", LOOKUP_DEFAULT)
     pictures = setting("LEAN_IMAGE_CONTEXT", IMAGE_DEFAULT) if mode("LEAN_IMAGE_MODE") == "note" else None
@@ -425,7 +425,13 @@ def self_test():
             code, text, err = fire(1000, sid="lk-2", phase="PreToolUse", **grep)
             check("block mode refuses the next lookup past the limit", (code, text, "lean:search" in err, "fast model" in err),
                   (2, "", True, True))
-            check("a git log is refused too", fire(1000, sid="lk-2", phase="PreToolUse", **glog)[0], 2)
+            check("a git log is never refused", fire(1000, sid="lk-2", phase="PreToolUse", **glog)[0], 0)
+            for cmd in ("git status", "git diff", "gh pr view 110", "ls -la"):
+                check(f"{cmd} is never refused", fire(1000, sid="lk-2", phase="PreToolUse", name="Bash",
+                                                       tool_input={"command": cmd})[0], 0)
+            for cmd in ("rg foo", "cat a.py", "find . -name x", "git log | grep fix"):
+                check(f"{cmd} is refused", fire(1000, sid="lk-2", phase="PreToolUse", name="Bash",
+                                                 tool_input={"command": cmd})[0], 2)
             check("a write is never refused", fire(1000, sid="lk-2", phase="PreToolUse", name="Edit")[0], 0)
             check("Read is never refused", fire(1000, sid="lk-2", phase="PreToolUse", name="Read",
                                                  tool_input={"file_path": "/a/b.py"})[0], 0)
@@ -438,8 +444,14 @@ def self_test():
             check("a refusal text says Read is not refused", "Read is never refused" in fire(1000, sid="lk-2", phase="PreToolUse", **grep)[2], True)
             check("starting an Agent is allowed", fire(1000, sid="lk-2", phase="PreToolUse", name="Agent")[0], 0)
             check("and resets the count", load("lk-2")["since_agent"], 0)
+            fire(1000, sid="lk-2", **grep)
+            fire(1000, sid="lk-2", **grep)
+            fire(1000, sid="lk-2", **grep)
+            fire(1000, sid="lk-2", **grep)
+            check("Task resets the count like Agent", (fire(1000, sid="lk-2", phase="PreToolUse", name="Task")[0],
+                                                       load("lk-2")["since_agent"]), (0, 0))
             check("so a lookup is allowed again", fire(1000, sid="lk-2", phase="PreToolUse", **grep)[0], 0)
-            check("the total count is kept", load("lk-2")["lookups"], 5)
+            check("the total count is kept", load("lk-2")["lookups"], 9)
 
             fire(1000, sid="lk-4", name="Grep")
             fire(1000, sid="lk-4", name="Grep")
@@ -455,6 +467,8 @@ def self_test():
                   (0, "", ""))
             check("a subagent by its id is never refused", fire(1000, sid="lk-3", phase="PreToolUse",
                                                                   extra={"agent_id": "a1"}, **grep), (0, "", ""))
+            check("a subagent by its type is never refused", fire(1000, sid="lk-3", phase="PreToolUse",
+                                                                    extra={"agent_type": "Explore"}, **grep), (0, "", ""))
             os.environ["LEAN_LOOKUP_WARN"] = "off"
             check("turning the count off turns the block off", fire(1000, sid="lk-3", phase="PreToolUse", **grep)[0], 0)
             os.environ["LEAN_LOOKUP_WARN"] = "3"
