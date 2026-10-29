@@ -44,6 +44,9 @@ CAUSES = [
      re.compile(r"NpgsqlException[^\n]*Failed to connect to")),
     ("playwright browsers missing", "run `npx playwright install` in the project, or use an image that has the browsers",
      re.compile(r"Executable doesn't exist at|npx playwright install")),
+    ("npm registry login", "the npm registry needs credentials this lane does not have; run it on the local lane",
+     re.compile(r"npm (?:error|ERR!) (?:code )?(?:E401|ENEEDAUTH)\b|Unable to authenticate"
+                r"|npm (?:error|ERR!)[^\n]*\b403\b[^\n]*(?:Forbidden|install)")),
 ]
 MIN_SHARED = 3  # fewer than this is a test problem, not a machine problem
 
@@ -192,6 +195,15 @@ def environmental(failing):
     top = max(by, key=lambda k: len(by[k][1]))
     hint = by[top][0] if len(by) == 1 else "; ".join(h for h, _ in by.values())
     return top, hint, names, {k: len(v[1]) for k, v in by.items()}
+
+
+def log_cause(text):
+    """(label, hint) of the first cause whose pattern is in a whole run log, else None. For a run that failed
+    with no test named, where there is no per-test text to group."""
+    for label, hint, rx in CAUSES:
+        if rx.search(text or ""):
+            return label, hint
+    return None
 
 
 def repo_root():
@@ -348,6 +360,18 @@ def self_test():
     got = environmental(pw)
     if not got or got[0] != "playwright browsers missing":
         fails.append(f"missing Playwright browsers must be environmental: {got}")
+    for sample in ("npm error code E401\nnpm error Unable to authenticate, your authentication token seems to be invalid.",
+                   "npm ERR! code ENEEDAUTH", "npm error code ENEEDAUTH",
+                   "npm error 403 403 Forbidden - GET https://x/pkg/-/pkg-1.tgz"):
+        got = log_cause(sample)
+        if not got or got[0] != "npm registry login" or "local lane" not in got[1]:
+            fails.append(f"an npm auth failure must be an environmental cause: {sample!r} {got}")
+    if log_cause("npm error code E404\nnpm error 404 Not Found") or log_cause("exit 1: Assert.Equal failed"):
+        fails.append("a missing package or an ordinary failure is not an npm login cause")
+    npm = {f"a.test.ts > t{i}": "npm error code E401\nUnable to authenticate" for i in range(3)}
+    got = environmental(npm)
+    if not got or got[0] != "npm registry login":
+        fails.append(f"failures that all show an npm login error must group as one cause: {got}")
     two = {f"T.D{i}": "DockerUnavailableException" for i in range(2)}
     two.update({f"T.P{i}": "NpgsqlException : Failed to connect to x" for i in range(3)})
     got = environmental(two)

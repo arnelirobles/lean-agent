@@ -88,11 +88,13 @@ ResourceReaper failing to start, Npgsql "Failed to connect to"; added together, 
 filed as tests: one blocker for the run names the cause and the count, and those tests are not rerun, so
 none of them can become a flaky item. Other failures are filed unverified, not rerun. A remote lane rests
 afterwards, and a later passing full run closes the blocker.
+A failed run that names no test but whose log shows a npm login error (E401, ENEEDAUTH, "Unable to authenticate")
+gets the same kind of blocker, with the hint to run it on the local lane.
 
 Remote lanes. When ~/.config/lean/remotes.ini names SSH hosts, the one drainer runs one lane per host next
 to the local lane, each claiming the next ready job with `brain queue next`. A remote lane copies the job's
 worktree to the host, runs the same test command in a capped container there, and streams the output back
-into the same log, so parsing and brain stay local. A job that targets an Apple platform runs only on the
+into the same log, so parsing and brain stay local. A job that targets an Apple platform, or an npm job whose .npmrc names a private registry, runs only on the
 local lane. If the host, the connection or the copy fails, the job goes back to queued and the lane rests
 (TEST_PHASE_REST seconds, default 600) while the other lanes go on. TEST_PHASE_REMOTES=off turns every
 remote lane off. See docs/remote-lane.md.
@@ -105,7 +107,7 @@ Runner support is a class with mode, command, failures, counts and class_of; ano
 class in RUNNERS. Dotnet runs a test project. Vitest runs a job whose test path ends in package.json (for
 example web/package.json): in that folder it installs with the nearest lockfile, looked up from that folder
 to the repo root (pnpm-lock.yaml: pnpm install --frozen-lockfile; package-lock.json: npm ci in the lockfile's
-folder; yarn.lock is refused, and with no lockfile pnpm install runs), then runs `vitest run --reporter=verbose`
+folder; yarn.lock is refused, and with no lockfile pnpm install runs), then runs `vitest run --reporter=verbose` (or `npm test -- --reporter=verbose`, `pnpm run test`, when the package.json has a "test" script)
 (pnpm exec, or npx for npm), the fast filter pieces as file filters. A failed test file is the class, so the
 rerun is per file. Playwright runs a job whose test path ends in playwright.config.ts, .js, .mjs or .cjs: the
 same install in the config's folder, then `playwright test --reporter=list` with the filter pieces as file
@@ -406,8 +408,12 @@ while :; do
   [ "$d" = "$R" ] || [ "$d" = / ] && break
   d=$(dirname "$d")
 done
+# A package.json with a "test" script runs that script: it may set --root, the time zone or other flags that a bare
+# vitest run from this folder would miss. Extra arguments (the reporter, file filters) go after it.
+S=
+if [ "$T" = vitest ] && [ -n "$(node -p "(require('./package.json').scripts||{}).test?1:''" 2>/dev/null)" ]; then S=1; fi
 case "$T" in
-  vitest) set -- vitest run --reporter=verbose "$@" ;;
+  vitest) if [ -n "$S" ]; then set -- --reporter=verbose "$@"; else set -- vitest run --reporter=verbose "$@"; fi ;;
   playwright) set -- playwright test --reporter=list "$@" ;;
 esac
 if [ -z "$L" ] && [ "$NK" = yarn.lock ]; then
@@ -422,6 +428,7 @@ if [ -z "$L" ] && [ "$NK" = package-lock.json ]; then
     cd -- "$N" && npm ci || exit $?
     cd -- "$W" || exit 2
   fi
+  [ -n "$S" ] && exec npm test -- "$@"
   exec npx --no-install "$@"
 fi
 # Without a packageManager field corepack takes the newest pnpm, which can refuse a lockfile an older one wrote.
@@ -429,6 +436,7 @@ if command -v pnpm >/dev/null 2>&1; then P=pnpm
 elif grep -q '"packageManager"' package.json 2>/dev/null; then P="corepack pnpm"
 else P="corepack pnpm@${LEAN_PNPM_VERSION:-10}"; fi
 if [ -n "$L" ]; then $P install --frozen-lockfile || exit $?; else $P install || exit $?; fi
+[ -n "$S" ] && exec $P run test "$@"
 exec $P exec "$@"
 """
 
@@ -1220,6 +1228,15 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         row["notes"].append("filter matched no test")
         add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
                  f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
+    elif rc != 0 and not failing and not row.get("env") and tn and tn.log_cause(text):
+        label, hint = tn.log_cause(text)  # the install or build never reached a test: say why, not "build error?"
+        row["env"], row["env_label"] = 1, label
+        row["notes"].append(f"exit {rc}, environment: {label}")
+        add_item(row, "blocker", f"environment: {label}: {project}", "important",
+                 f"exit {rc} before any test ran, and the log shows {label}. {hint}. Log: {stem}.log\n"
+                 + "\n".join(text.splitlines()[-15:]), run_id, ctx)
+        if remote:
+            row["lane_rest"] = f"environment: {label}"
     elif rc != 0 and not failing and not row.get("env"):
         tail = "\n".join(text.splitlines()[-15:])
         add_item(row, "test-fail", f"run-failed: {project}", "important",
@@ -1802,6 +1819,21 @@ def node_checks(fails, fixture):
         rc, err, calls = run_script_in(d, "e2e/playwright.config.ts", "playwright", "tests/e2e/online.spec.ts")
         if calls != ["npm ci in " + os.path.basename(d), "npx --no-install playwright test --reporter=list tests/e2e/online\\.spec\\.ts in e2e"]:
             fails.append(f"a playwright config must install with npm ci, then run playwright test with the list reporter: {calls}")
+    # A package.json with a "test" script runs through that script (it may set --root and pin TZ), not a bare vitest run.
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "package-lock.json", ())
+        with open(os.path.join(d, "packages", "dopa", "package.json"), "w") as fh:
+            fh.write('{"scripts": {"test": "node scripts/run-tests.js"}}\n')
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest", "test/a.test.ts|test/b.test.ts")
+        if rc != 0 or calls[1:] != ["npm test -- --reporter=verbose test/a.test.ts test/b.test.ts in dopa"]:
+            fails.append(f"a package.json with a test script must run npm test with the args after --: {rc} {calls} {err}")
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "pnpm-lock.yaml", ())
+        with open(os.path.join(d, "packages", "dopa", "package.json"), "w") as fh:
+            fh.write('{"scripts": {"test": "node scripts/run-tests.js"}}\n')
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if rc != 0 or calls != ["pnpm install --frozen-lockfile in dopa", "pnpm run test --reporter=verbose in dopa"]:
+            fails.append(f"a pnpm package with a test script must run pnpm run test: {rc} {calls} {err}")
     with tempfile.TemporaryDirectory() as d:
         tree(d, "pnpm-lock.yaml", ())
         rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
@@ -3037,6 +3069,12 @@ exit 0
         if calls != ["pnpm install --frozen-lockfile in -x", "pnpm exec vitest run --reporter=verbose in -x"] \
                 or "-a.test.ts" not in out:
             fails.append(f"a package folder or test file starting with - must not crash the lane ({rc}): {calls} {out}")
+        # npm ci failing on a private feed names no test: it is the machine's missing login, not a build error.
+        put("vitest-full", "npm error code E401\nnpm error Unable to authenticate, your authentication token seems to be invalid.\n")
+        rc, out, calls = run(f"{wrepo} web/package.json\n")
+        got = brain_list("--kind", "blocker")
+        if "environment: npm registry login: web/package.json" not in got or "build error" in out:
+            fails.append(f"an npm E401 with no test named must be an environment blocker, not a build error ({rc}): {got!r} {out}")
         for code in ("0", "1"):
             put("nofiles.rc", code)
             rc, out, calls = run(f"{repo_n} web/package.json src/none{code}.test.ts\n")
