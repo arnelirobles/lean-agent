@@ -77,7 +77,7 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 | `brain` | A local SQLite list of open failures, deferred minors, questions, blockers, running agents and next steps, plus the test queue, with tags, runs and stats. `brain resume` prints what is open for a project, and `brain digest` a 2 KB summary of it (counts, blockers, questions, running jobs, stale agents). | [The cycle](#the-cycle) |
 | `brain-mcp` | An MCP server (the plugin registers it as `brain`) that gives a session eleven tools over the brain database: `brain_list` (open items, newest first, 50 lines unless `limit` says otherwise), `brain_show`, `brain_add`, `brain_close`, `brain_queue_list` (queued and running unless `status` says otherwise), `brain_queue_add`, `brain_queue_cancel`, `brain_queue_bump`, `brain_queue_route`, `brain_digest` and `brain_stats`. It runs the `brain` CLI, sends a body on stdin, and does not expose `queue next` or `queue finish`, which only the drainer uses. | [The cycle](#the-cycle) |
 | `vscode/` | The Lean Brain VS Code extension: a read-only dashboard, status bar and trees over the brain database. Build it with `npm run package` in `vscode/`. | [vscode/README.md](vscode/README.md) |
-| Hooks | Three block (attribution and slop in public text, a bad commit author, files in a scratchpad root). The rest add a note and never stop the call. One of them hands the session a brain digest for its project at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
+| Hooks | Four block (attribution and slop in public text, a bad commit author, files in a scratchpad root, keys and tokens in a commit, push or written file). The rest add a note and never stop the call. One of them hands the session a brain digest for its project at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
 | `lean-stats` | One local SQLite file of tokens, reviews, merges and hook fires. Nothing leaves the machine. | [Measure every batch](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) |
 
 Everything in the method still works without the plugin. Without it, run the scripts from `tools/` (for example `tools/holdout.sh`).
@@ -179,12 +179,29 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_IMAGE_MODE` | `note` | `block` refuses tools that return an image (Read of an image file or a pdf with pages, screenshot and thumbnail tools) above `LEAN_IMAGE_CONTEXT`, so a subagent looks and reports in text. |
 | `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where `brain` keeps its database. |
 | `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing the brain digest. |
+| `LEAN_SKIP_SECRET_SCAN` | off | `1` turns off `secret-scan`, the Claude hook and the git hooks it installs. A line with `allow-secret` on it is skipped without this. |
 | `LEAN_SCRIPT_NOTE` | on | `off` stops the note that names the script behind a hand-written command. |
 | `LEAN_DIRECT_TEST` | block | `allow` stops the block on a direct `dotnet test`, `npm test`, `npx vitest` or `vitest run` where test-phase can take the job. Tests go through `brain queue add` and `test-phase`. |
 | `LEAN_NPM_REGISTRY` | `npm config get registry`, else `https://registry.npmjs.org` | The npm registry `pkg-version` asks. |
 | `LEAN_NUGET_REGISTRY` | `https://api.nuget.org/v3-flatcontainer` | The nuget flat container `pkg-version` asks. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
+
+## Keep keys out of git
+
+`tools/secret-scan` checks the lines a commit adds for keys and tokens: Google `AIza`, GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`, AWS `AKIA`, Slack `xox`, Stripe `sk_live_`/`rk_live_`, npm `npm_`, private key blocks, and an Azure DevOps PAT when it sits next to a name like `token` or `pat`. When `gitleaks` is on PATH its rules run as well. The output names the file, line and pattern, never the value. A line with `allow-secret` on it is skipped, that line only.
+
+The `secret-scan` hook runs it on `git commit` (staged lines, plus unstaged for `-a`), `git push` (commits on no remote yet) and Write, Edit and MultiEdit (a file git tracks or would track; a gitignored `.env.local` is fine). Every block is a `hook_fires` row in `lean.db`.
+
+Commits made outside Claude need the git hooks:
+
+```
+secret-scan install [REPO]       pre-commit and pre-push in one repo
+secret-scan install --all DIR    every git repo under DIR
+secret-scan uninstall [REPO]     (or --all DIR) take them out
+```
+
+An existing hook is kept and still runs after the scan, and `core.hooksPath` is respected. Install copies the scanner to `~/.local/share/lean/secret-scan`, so the hooks keep working after a plugin upgrade; run `install` again to refresh the copy. `git commit --no-verify` and `LEAN_SKIP_SECRET_SCAN=1` skip the git hooks.
 
 ## The method
 
@@ -210,7 +227,7 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 
 ## Data
 
-lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`), stats (`~/.lean/lean.db`) and which script notes a session has seen (`~/.local/share/lean/script-note`, deleted after 14 days). The `commit-author` hook reads the git author email to check it and stores nothing.
+lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`), stats (`~/.lean/lean.db`) and which script notes a session has seen (`~/.local/share/lean/script-note`, deleted after 14 days). The `commit-author` hook reads the git author email to check it and stores nothing. The `secret-scan` hook reads the lines being committed, pushed or written and stores only that it blocked.
 
 It sends data to other services only through tools you already run, and only where you point them:
 
