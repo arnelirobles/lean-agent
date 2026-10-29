@@ -99,7 +99,7 @@ Each claim prunes: the newest `build_keep` folders of the repository stay (newes
 
 ## Which jobs go where
 
-A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
+A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. An npm job (a `package.json` or Playwright config) whose `.npmrc`, in its folder or any folder up to the repo root, names a registry other than registry.npmjs.org is marked `platform=private` and also runs on the local lane only: its login lives in `~/.npmrc` on this machine, and the copy to a remote host never sends secrets. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
 
 To choose for a job already queued, use `brain queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs queued before the upgrade to schema 7 are all marked `platform=apple`, so route the ones you want on a remote host. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
 
