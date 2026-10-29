@@ -43,7 +43,10 @@ from dataclasses import dataclass, field
 
 DEFAULT_EXCLUDE = [".env*", "*.key", "*.pem", "*license-key*", "secrets*"]
 # Package manager config can hold a login token. It is never copied, whatever `exclude =` says.
-NEVER_COPY = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"]
+NEVER_COPY = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc",
+              # Gradle and Maven config can hold publishing credentials or signing keys.
+              "gradle.properties", "local.properties", "init.gradle", "init.gradle.kts", "init.d", "settings.xml",
+              ".gnupg", "*.gpg", "*.asc", "*.jks", "*.keystore", "*.p12", "*.pfx", "*.p8"]
 DEFAULT_IMAGE = "mcr.microsoft.com/dotnet/sdk:10.0"
 DEFAULT_NODE_IMAGE = "node:22-bookworm-slim"
 MARKER = "lean-remote: started"
@@ -384,7 +387,11 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None, kind="dotn
     dest is a kept build folder. build is the build command to run first in it, and the folder's lock is
     released after it, with mark written only when the build succeeded.
     kind vitest or playwright runs in node_image with a pnpm store volume (corepack and the store live in <workdir>/.node-cache);
-    the container is on the job's bridge network, so it has outbound network for the install."""
+    the container is on the job's bridge network, so it has outbound network for the install.
+    kind gradle is refused: a Gradle build can reach publishing credentials and signing keys, and the remote lane
+    never receives them."""
+    if kind == "gradle":
+        raise ValueError("a Gradle job does not run on a remote lane: it could reach the Gradle or Maven credentials of this machine")
     jd = sh_path(dest or job_dir(r, job_id))
     node = kind in ("vitest", "playwright")
     nuget = sh_path(r.workdir.rstrip("/") + ("/.node-cache" if node else "/.nuget"))
@@ -627,6 +634,23 @@ docker = yes
             fails.append(f"file_list must never copy a package manager config, even with an empty exclude: {left}")
         for rc_name in (".npmrc", "web/.npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"):
             os.remove(os.path.join(repo, rc_name))
+        gr = [".gnupg/secring.gpg", "gradle.properties", "app/gradle.properties", "local.properties",
+              "init.d/x.gradle", "signing.jks", "release.asc"]
+        for name in gr:
+            os.makedirs(os.path.dirname(os.path.join(repo, name)) or repo, exist_ok=True)
+            with open(os.path.join(repo, name), "w") as fh:
+                fh.write("signing.password=x\n")
+        left = [f for f in file_list(repo, [], []) if f in gr]
+        if left:
+            fails.append(f"file_list must never copy Gradle credentials or signing keys: {left}")
+        try:
+            run_script(Remote(name="dev", host="h", workdir="~/w"), None, 1, "./gradlew check", kind="gradle")
+            fails.append("run_script must refuse a Gradle job")
+        except ValueError as e:
+            if "remote lane" not in str(e):
+                fails.append(f"the Gradle refusal must say why: {e}")
+        for name in gr:
+            os.remove(os.path.join(repo, name))
         os.symlink("/etc/hosts", os.path.join(repo, ".lean.env"))
         if ".lean.env" in file_list(repo, [], []):
             fails.append("a repo file named .lean.env must never be copied over the env file")
