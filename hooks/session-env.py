@@ -33,20 +33,68 @@ def brain(*args):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def add_tools_to_path(env_file, sid=None):
-    """Append the PATH line for the current tools folder unless the file already has it, and record the session
-    in a marker so hooks, which never see the env file, know the tools are on PATH. The line goes after the
-    other exports (a PowerShell session reads the file only if every line is a plain assignment) and appends,
-    so a tool named like a system command does not shadow it."""
-    line = f'export PATH="$PATH":{shlex.quote(hookkit.TOOLS)}\n'
+PATH_LINE = re.compile(r'export PATH=(?:"\$PATH":|"\$\{PATH:\+\$PATH:\}")(.+)')
+SESSION_LINE = re.compile(r"export LEAN_SESSION_(?:ID|CWD)=")
+
+
+def path_line():
+    """The PATH line for the current tools folder. An empty PATH gets no leading colon, which would put the
+    current folder on PATH."""
+    return f'export PATH="${{PATH:+$PATH:}}"{shlex.quote(hookkit.TOOLS)}'
+
+
+def ours(line):
+    """True for a PATH line this hook wrote, for this tools folder or any other lean-agent version's."""
+    m = PATH_LINE.fullmatch(line)
+    if not m:
+        return False
+    try:
+        parts = shlex.split(m.group(1))
+    except ValueError:
+        return False
+    if len(parts) != 1:
+        return False
+    folder = os.path.normpath(parts[0])
+    if folder == hookkit.TOOLS:
+        return True
+    return os.path.basename(folder) == "tools" and (
+        "lean-agent" in folder.split(os.sep)
+        or os.path.exists(os.path.join(os.path.dirname(folder), "hooks", "session-env.py")))
+
+
+def write_env(env_file, sid=None, cwd="", session=True):
+    """Write our lines to the env file and return True, or False when it cannot be written. Our earlier lines
+    go first (on resume and compact SessionStart runs again on the same file), so each appears once and
+    the PATH line comes last: a PowerShell session reads the file only if every line is a plain assignment,
+    and the newest tools folder must win over an old version's. The PATH line appends, so a tool named like a
+    system command does not shadow it. With no sid, or session False (LEAN_SESSION_ENV=off), only the PATH
+    line is written and any LEAN_SESSION lines stay.
+    The marker, for hooks that never see the env file, is written only when the PATH line landed."""
+    new = []
+    session = bool(sid and session)
+    if session:
+        new.append(f"export LEAN_SESSION_ID={shlex.quote(sid)}")
+        if cwd:
+            new.append(f"export LEAN_SESSION_CWD={shlex.quote(cwd)}")
+    new.append(path_line())
     try:
         with open(env_file, encoding="utf-8") as f:
             content = f.read()
-    except OSError:
+    except FileNotFoundError:
         content = ""
-    if line not in content.splitlines(keepends=True):
-        with open(env_file, "a", encoding="utf-8") as f:
-            f.write(("\n" if content and not content.endswith("\n") else "") + line)
+    except (OSError, UnicodeDecodeError):
+        return False  # never overwrite a file we could not read
+    lines = content.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    kept = [ln for ln in lines if not ours(ln) and not (session and SESSION_LINE.match(ln))]
+    text = "".join(ln + "\n" for ln in kept + new)
+    if text != content:
+        try:
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            return False
     marker = hookkit.marker_file(sid)
     if marker:
         try:
@@ -55,6 +103,7 @@ def add_tools_to_path(env_file, sid=None):
                 f.write(hookkit.TOOLS)
         except OSError:
             pass
+    return True
 
 
 def collect_session(transcript):
@@ -75,8 +124,8 @@ STARTED = []  # the collects this process started, so a test can wait on them
 def main():
     event = hookkit.read_event()
     name = event.get("hook_event_name")
-    sid, cwd = str(event.get("session_id") or ""), str(event.get("cwd") or "")
-    sid_ok = bool(re.fullmatch(r"[A-Za-z0-9-]{1,100}", sid))
+    sid, cwd = hookkit.session_id(event.get("session_id")), str(event.get("cwd") or "")
+    sid_ok = sid is not None
     off = (os.environ.get("LEAN_SESSION_ENV") or "").lower() == "off"
     if name == "SessionEnd":
         proc = collect_session(event.get("transcript_path"))
@@ -86,13 +135,7 @@ def main():
         if marker and os.path.exists(marker):
             os.unlink(marker)
     if name == "SessionStart" and os.environ.get("CLAUDE_ENV_FILE"):
-        env_file = os.environ["CLAUDE_ENV_FILE"]
-        if sid_ok and not off:
-            with open(env_file, "a", encoding="utf-8") as f:
-                f.write(f"export LEAN_SESSION_ID={shlex.quote(sid)}\n")
-                if cwd:
-                    f.write(f"export LEAN_SESSION_CWD={shlex.quote(cwd)}\n")
-        add_tools_to_path(env_file, sid if sid_ok else None)
+        write_env(os.environ["CLAUDE_ENV_FILE"], sid, cwd, session=not off)
     if off or not sid_ok:
         return 0
     if name == "SessionStart":
@@ -140,7 +183,7 @@ def self_test():
         if sourced != f"abc-123|{cwd}":
             fails.append(f"env file must export the id and a quoted cwd: {written!r} gives {sourced!r}")
         path_lines = [ln for ln in written.splitlines() if ln.startswith("export PATH=")]
-        want = f'export PATH="$PATH":{shlex.quote(hookkit.TOOLS)}'
+        want = f'export PATH="${{PATH:+$PATH:}}"{shlex.quote(hookkit.TOOLS)}'
         if written.splitlines()[-1] != want:
             fails.append(f"the PATH line must come after the LEAN_SESSION lines: {written!r}")
         if path_lines != [want]:
@@ -155,14 +198,64 @@ def self_test():
         hook("SessionStart")
         hook("SessionStart", raw=json_str({"hook_event_name": "SessionStart", "session_id": "abc-123", "cwd": cwd,
                                            "source": "compact"}))
-        if open(env_file).read().count("export PATH=") != 1:
-            fails.append("a second SessionStart must not add the PATH line again")
+        again = open(env_file).read().splitlines()
+        if again != [f"export LEAN_SESSION_ID=abc-123", f"export LEAN_SESSION_CWD={shlex.quote(cwd)}", want]:
+            fails.append(f"a repeat SessionStart must leave each of our lines once, PATH last: {again!r}")
+        empty = subprocess.run(["bash", "-c", f'PATH=; . {shlex.quote(env_file)}; printf %s "$PATH"'],
+                               capture_output=True, text=True).stdout
+        if empty != hookkit.TOOLS:
+            fails.append(f"an empty PATH must not gain an empty element (the current folder): {empty!r}")
+        glued = os.path.join(d, "glued-env")
+        with open(glued, "w") as fh:
+            fh.write("export A=1")
+        env["CLAUDE_ENV_FILE"] = glued
+        hook("SessionStart", sid="glue-1")
+        got = subprocess.run(["bash", "-c", f'. {shlex.quote(glued)}; printf "%s|%s" "$A" "$LEAN_SESSION_ID"'],
+                             capture_output=True, text=True).stdout
+        if got != "1|glue-1":
+            fails.append(f"a file with no final newline must keep its last line apart from ours: {got!r}")
+        cache = os.path.join(d, "cache", "lean-agent")
+        old_tools = os.path.join(cache, "1.16.0", "tools")
+        os.makedirs(old_tools)
+        with open(os.path.join(old_tools, "brain"), "w") as fh:
+            fh.write("#!/bin/sh\necho old\n")
+        os.chmod(os.path.join(old_tools, "brain"), 0o755)
+        upgraded = os.path.join(d, "upgraded-env")
+        with open(upgraded, "w") as fh:
+            fh.write(f'export LEAN_SESSION_ID=up-1\nexport PATH="$PATH":{shlex.quote(old_tools)}\n')
+        env["CLAUDE_ENV_FILE"] = upgraded
+        hook("SessionStart", sid="up-1")
+        wins = subprocess.run(["bash", "-c", f'PATH=/usr/bin:/bin; . {shlex.quote(upgraded)}; command -v brain'],
+                              capture_output=True, text=True).stdout.strip()
+        if wins != os.path.join(hookkit.TOOLS, "brain"):
+            fails.append(f"after an upgrade bare brain must run the current version, not {wins!r}: "
+                         f"{open(upgraded).read()!r}")
+        for label, bad in (("a missing folder", os.path.join(d, "no-such-dir", "env")),
+                           ("a read-only file", os.path.join(d, "ro-env"))):
+            if label == "a read-only file":
+                with open(bad, "w") as fh:
+                    fh.write("export A=1\n")
+                os.chmod(bad, 0o444)
+            env["CLAUDE_ENV_FILE"] = bad
+            sid = "ro-1" if label == "a read-only file" else "nodir-1"
+            rc, out, err = hook("SessionStart", sid=sid)
+            if rc != 0 or err or brain_out("session", "status", sid) != f"open {cwd}":
+                fails.append(f"{label} as the env file must not stop the session start: {rc} {err!r}")
+            if os.path.exists(os.path.join(home, ".local", "share", "lean", "tools-on-path", sid)):
+                fails.append(f"{label} as the env file must leave no marker, the tools are not on PATH")
+        numeric = os.path.join(d, "numeric-env")
+        env["CLAUDE_ENV_FILE"] = numeric
+        hook("SessionStart", raw='{"hook_event_name": "SessionStart", "session_id": 12345, "cwd": "/w"}')
+        wrote = os.path.exists(os.path.join(home, ".local", "share", "lean", "tools-on-path", "12345"))
+        if wrote != (hookkit.marker_file(12345) is not None):
+            fails.append("a numeric session id must get a marker only if the hooks read one for it")
+        env["CLAUDE_ENV_FILE"] = env_file
         spaced = os.path.join(d, "a dir", "tools")
         spaced_file = os.path.join(d, "spaced-env")
         saved_tools = hookkit.TOOLS
         try:
             hookkit.TOOLS = spaced
-            add_tools_to_path(spaced_file)
+            write_env(spaced_file)
         finally:
             hookkit.TOOLS = saved_tools
         os.makedirs(spaced)
@@ -173,22 +266,11 @@ def self_test():
                              capture_output=True, text=True).stdout.strip()
         if got != "hi":
             fails.append(f"a tools folder with a space must be quoted: {got!r}")
-        stale_file = os.path.join(d, "stale-env")
-        try:
-            hookkit.TOOLS = os.path.join(d, "old-version", "tools")  # a resumed session whose file names the old version
-            add_tools_to_path(stale_file)
-        finally:
-            hookkit.TOOLS = saved_tools
-        add_tools_to_path(stale_file)
-        add_tools_to_path(stale_file)
-        lines = open(stale_file).read().splitlines()
-        if len(lines) != 2 or lines[-1] != want:
-            fails.append(f"an upgrade must add the current tools folder once, after the old one: {lines!r}")
         loose = os.path.join(d, "loose-env")
         with open(loose, "w") as fh:
             fh.write('export PATH=/other:"$PATH"')
         for _ in range(3):
-            add_tools_to_path(loose)
+            write_env(loose)
         text = open(loose).read()
         if text != f'export PATH=/other:"$PATH"\n{want}\n':
             fails.append(f"a file with no final newline must get one line of ours on its own line: {text!r}")

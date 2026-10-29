@@ -46,10 +46,19 @@ def _fire(outcome):
 TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools"))
 
 
+def session_id(value):
+    """The event's session id when it is a string safe for a file name and a shell line, else None. A number
+    or anything else is refused, so session-env and the hooks agree on which sessions get a marker."""
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9-]{1,100}", value):
+        return value
+    return None
+
+
 def marker_file(sid):
     """Where session-env records that it put TOOLS on this session's PATH. Hooks never see CLAUDE_ENV_FILE
     outside a few events, so they read this instead."""
-    if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,100}", sid):
+    sid = session_id(sid)
+    if not sid:
         return None
     return os.path.join(os.path.expanduser("~"), ".local", "share", "lean", "tools-on-path", sid)
 
