@@ -37,9 +37,17 @@ def lane(words):
 
 
 def exempt(command):
-    """True when every command in the line runs under bounded or a lean lane runner."""
+    """True when every command in the line runs under bounded or a lean lane runner.
+
+    Comments and heredoc bodies are dropped first. A line that will not parse is not exempt.
+    """
+    text, _ = hookkit.prepare(command)
+    try:
+        toks = hookkit.tokens(text, strict=True)
+    except ValueError:
+        return False
     parts, current = [], []
-    for tok in hookkit.tokens(command):
+    for tok in toks:
         if hookkit.is_separator(tok):
             parts.append(current)
             current = []
@@ -105,6 +113,10 @@ def self_test():
     check("heavy.sh then sleep", bg("bash heavy.sh && sleep 999"), True)
     check("two lanes chained pass", bg(f"{BOUNDED} -- true && bash tools/heavy.sh x"), False)
     check("quoted separator stays one argument", bg(f"{BOUNDED} -- sh -c 'a && b; c | d'"), False)
+    check("glued separator before an unbalanced quote", bg(f"{BOUNDED} -- true&&sleep 999 # don't"), True)
+    check("unbalanced quote is denied", bg(f"{BOUNDED} -- echo 'oops"), True)
+    check("separator inside a comment passes", bg(f"{BOUNDED} -- npm test # a && b"), False)
+    check("separator inside a heredoc body passes", bg(f"{BOUNDED} -- cat <<EOF\nfoo && bar\nEOF"), False)
     check("two env assignments then bounded", bg(f"A=1 B=2 {BOUNDED} -- true"), False)
     check("three env assignments then bounded is denied", bg(f"A=1 B=2 C=3 {BOUNDED} -- true"), True)
     check("background false passes", {"command": "make", "run_in_background": False}, False)

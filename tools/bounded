@@ -199,6 +199,7 @@ def self_test():
     for label, extra, args in (
         ("--minutes abc", {}, ["--minutes", "abc", "--", "true"]),
         ("--minutes --", {}, ["--minutes", "--"]),
+        ("bare --minutes", {}, ["--minutes"]),
         ("--minutes=abc", {}, ["--minutes=abc", "--", "true"]),
         ("LEAN_BG_MINUTES=abc", {"LEAN_BG_MINUTES": "abc"}, ["--", "true"]),
         ("--minutes -5", {}, ["--minutes", "-5", "--", "true"]),

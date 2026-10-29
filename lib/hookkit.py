@@ -230,7 +230,8 @@ def prepare(command):
     return "".join(out), bodies
 
 
-def tokens(text):
+def tokens(text, strict=False):
+    """Split shell text into words and separators; strict raises on unbalanced quotes."""
     lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
     lexer.commenters = ""
     lexer.whitespace = " \t\r"
@@ -238,6 +239,8 @@ def tokens(text):
     try:
         return list(lexer)
     except ValueError:
+        if strict:
+            raise
         return text.split()
 
 
