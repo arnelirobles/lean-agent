@@ -175,6 +175,7 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where `brain` keeps its database. |
 | `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing the brain digest. |
 | `LEAN_SCRIPT_NOTE` | on | `off` stops the note that names the script behind a hand-written command. |
+| `LEAN_DIRECT_TEST` | block | `allow` stops the block on a direct `dotnet test`, `npx vitest`, `vitest run` or `npm test`. Tests go through `brain queue add` and `test-phase`. |
 | `LEAN_NPM_REGISTRY` | `npm config get registry`, else `https://registry.npmjs.org` | The npm registry `pkg-version` asks. |
 | `LEAN_NUGET_REGISTRY` | `https://api.nuget.org/v3-flatcontainer` | The nuget flat container `pkg-version` asks. |
 
