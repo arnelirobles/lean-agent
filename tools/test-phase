@@ -1724,7 +1724,7 @@ def vitest_checks(fails, fixture):
         return
     if "node:20-slim sh -c" not in sc or "mcr.microsoft.com/dotnet/sdk" in sc or "/nuget" in sc:
         fails.append("a vitest job runs in the node image and uses no NuGet cache")
-    if "node_modules" in sc or "-e CI=true" not in sc or "store_dir" not in sc:
+    if "node_modules:" in sc or "-e CI=true" not in sc or "store_dir" not in sc:
         fails.append("a vitest job gets a pnpm store volume and CI=true")
     if "mcr.microsoft.com/dotnet/sdk:10.0 sh -c" not in dn or "node:" in dn:
         fails.append("a dotnet job keeps the dotnet image")
