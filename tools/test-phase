@@ -88,11 +88,13 @@ ResourceReaper failing to start, Npgsql "Failed to connect to"; added together, 
 filed as tests: one blocker for the run names the cause and the count, and those tests are not rerun, so
 none of them can become a flaky item. Other failures are filed unverified, not rerun. A remote lane rests
 afterwards, and a later passing full run closes the blocker.
+A failed run that names no test but whose log shows a npm login error (E401, ENEEDAUTH, "Unable to authenticate")
+gets the same kind of blocker, with the hint to run it on the local lane.
 
 Remote lanes. When ~/.config/lean/remotes.ini names SSH hosts, the one drainer runs one lane per host next
 to the local lane, each claiming the next ready job with `brain queue next`. A remote lane copies the job's
 worktree to the host, runs the same test command in a capped container there, and streams the output back
-into the same log, so parsing and brain stay local. A job that targets an Apple platform runs only on the
+into the same log, so parsing and brain stay local. A job that targets an Apple platform, or an npm job whose .npmrc names a private registry, runs only on the
 local lane. If the host, the connection or the copy fails, the job goes back to queued and the lane rests
 (TEST_PHASE_REST seconds, default 600) while the other lanes go on. TEST_PHASE_REMOTES=off turns every
 remote lane off. See docs/remote-lane.md.
@@ -103,11 +105,16 @@ failures were all flaky finishes done, so the jobs after it still run.
 
 Runner support is a class with mode, command, failures, counts and class_of; another runner is another
 class in RUNNERS. Dotnet runs a test project. Vitest runs a job whose test path ends in package.json (for
-example web/package.json): in that folder it installs with the lockfile (pnpm install --frozen-lockfile,
-the lockfile found in that folder or a parent; npm and yarn projects are refused), then runs `vitest run --reporter=verbose`, the fast filter pieces as file filters. A failed test file is
-the class, so the rerun is per file. The runner is chosen per job from the test path (runner_for).
-TEST_PHASE_DOTNET_ARGS does not reach a Vitest job; `args=` on the job does. A remote lane runs it in the
-node_image container; see docs/remote-lane.md.
+example web/package.json): in that folder it installs with the nearest lockfile, looked up from that folder
+to the repo root (pnpm-lock.yaml: pnpm install --frozen-lockfile; package-lock.json: npm ci in the lockfile's
+folder; yarn.lock is refused, and with no lockfile pnpm install runs), then runs `vitest run --reporter=verbose` (or `npm test -- --reporter=verbose`, `pnpm run test`, when the package.json "test" script runs vitest or one node file, with no &&, ; or |)
+(pnpm exec, or npx for npm), the fast filter pieces as file filters. A failed test file is the class, so the
+rerun is per file. Playwright runs a job whose test path ends in playwright.config.ts, .js, .mjs or .cjs: the
+same install in the config's folder, then `playwright test --reporter=list` with the filter pieces as file
+filters. A failed test is named file > title, and the spec file is the class. The runner is chosen per job
+from the test path (runner_for). TEST_PHASE_DOTNET_ARGS does not reach a Vitest or Playwright job; `args=` on
+the job does. A remote lane runs them in the node_image container, which has no Playwright browsers; see
+docs/remote-lane.md.
 """
 import argparse
 import fcntl
@@ -387,25 +394,61 @@ VITEST_FILE = re.compile(r"(?:(?! > | \[ ).)+?\.[cm]?[jt]sx?(?: > | \[ |$)")
 VITEST_SCRIPT = """R=$PWD
 cd -- "$1" || exit 2
 shift
-# The lockfile may sit in a parent folder (a pnpm workspace); only pnpm is run.
-L=; N=; d=$PWD
+T=$0
+# A pnpm-lock.yaml anywhere from the package folder up to the repo root means pnpm. Otherwise the nearest
+# package-lock.json means npm, and the nearest yarn.lock is refused (package-lock.json first in one folder).
+L=; N=; NK=; d=$PWD
 while :; do
   [ -f "$d/pnpm-lock.yaml" ] && L=$d && break
-  for f in package-lock.json yarn.lock; do [ -f "$d/$f" ] && N=$f; done
+  if [ -z "$NK" ]; then
+    for f in package-lock.json yarn.lock; do
+      if [ -f "$d/$f" ]; then N=$d; NK=$f; break; fi
+    done
+  fi
   [ "$d" = "$R" ] || [ "$d" = / ] && break
   d=$(dirname "$d")
 done
-if [ -z "$L" ] && [ -n "$N" ]; then
-  echo "run-failed: found $N and no pnpm-lock.yaml; test-phase runs package.json jobs with pnpm only" >&2
+# A "test" script that runs vitest, or one node file that does (it may set --root or the time zone, which a bare
+# vitest run from this folder would miss), is run instead, with the extra arguments after it. A chained script
+# (&&, ; or |), the npm init placeholder, jest and the like keep the bare vitest run.
+S=
+if [ "$T" = vitest ] && [ -n "$(node -p "s=(require('./package.json').scripts||{}).test||'';(/\\bvitest\\b|^\\s*node\\s/.test(s)&&!/&&|;|\\||no test specified/.test(s))?1:''" 2>/dev/null)" ]; then S=1; fi
+case "$T" in
+  vitest) if [ -n "$S" ]; then set -- --reporter=verbose "$@"; else set -- vitest run --reporter=verbose "$@"; fi ;;
+  playwright) set -- playwright test --reporter=list "$@" ;;
+esac
+if [ -z "$L" ] && [ "$NK" = yarn.lock ]; then
+  echo "run-failed: found yarn.lock; test-phase runs package.json and Playwright jobs with pnpm or npm only" >&2
   exit 2
+fi
+if [ -z "$L" ] && [ "$NK" = package-lock.json ]; then
+  W=$PWD
+  # npm ci deletes node_modules, so it runs only when they are missing or older than the lockfile.
+  M=$N/node_modules/.package-lock.json
+  if [ ! -f "$M" ] || [ -n "$(find "$N/package-lock.json" -newer "$M")" ]; then
+    cd -- "$N" && npm ci || exit $?
+    cd -- "$W" || exit 2
+  fi
+  [ -n "$S" ] && exec npm test -- "$@"
+  exec npx --no-install "$@"
 fi
 # Without a packageManager field corepack takes the newest pnpm, which can refuse a lockfile an older one wrote.
 if command -v pnpm >/dev/null 2>&1; then P=pnpm
-elif grep -q '"packageManager"' package.json; then P="corepack pnpm"
+elif grep -q '"packageManager"' package.json 2>/dev/null; then P="corepack pnpm"
 else P="corepack pnpm@${LEAN_PNPM_VERSION:-10}"; fi
 if [ -n "$L" ]; then $P install --frozen-lockfile || exit $?; else $P install || exit $?; fi
-exec $P exec vitest run --reporter=verbose "$@"
+[ -n "$S" ] && exec $P run test "$@"
+exec $P exec "$@"
 """
+
+
+def node_files(cls_filter):
+    """The filter pieces (split on |) as file filters; a piece that starts with - would be read as an option."""
+    files = [c.strip() for c in (cls_filter or "").split("|")]
+    files = [c for c in files if c]
+    if any(c.startswith("-") for c in files):
+        raise ValueError("a filter piece starts with -")
+    return files
 
 
 class Vitest:
@@ -419,12 +462,9 @@ class Vitest:
 
     @staticmethod
     def command(mode, project, cls_filter=None, fast=False, extra=(), probe=False):
-        """A shell that goes to the project folder, installs with the lockfile and runs vitest. Each filter
+        """A shell that goes to the project folder, installs with the lockfile (pnpm or npm) and runs vitest. Each filter
         piece (split on |) is a file filter; with none, everything runs."""
-        files = [c.strip() for c in (cls_filter or "").split("|")]
-        files = [c for c in files if c]
-        if any(c.startswith("-") for c in files):  # a piece read as a vitest option instead of a file
-            raise ValueError("a filter piece starts with -")
+        files = node_files(cls_filter)
         return ["sh", "-c", VITEST_SCRIPT, "vitest", os.path.dirname(project) or "."] + list(extra) + files
 
     @staticmethod
@@ -462,19 +502,120 @@ class Vitest:
         return re.split(r" > | \[ ", test, maxsplit=1)[0]
 
 
-RUNNERS = [Dotnet, Vitest]
+PW_FAIL = re.compile(r"^\s*[\u2718\u00d7x]\s+\d+\s+(\S.*?)\s*$")
+PW_PASS = re.compile(r"^\s*(?:\u2713|ok)\s+\d+\s+(\S.*?)\s*$")
+PW_BLOCK = re.compile(r"^\s*\d+\)\s+(\S.*?)(?:\s+\u2500+)?\s*$")
+PW_SUMMARY = re.compile(r"^\s*\d+\s+(?:failed|flaky|passed|skipped|did not run|interrupted)\b")
+PW_TIME = re.compile(r"\s+\(\d+(?:\.\d+)?(?:ms|s|m|h)(?:\s+\d+(?:\.\d+)?(?:ms|s|m|h))*\)$")
+PW_RETRY = re.compile(r"\s+\((?:retry|repeat) #\d+\)$")
+PW_PROJECT = re.compile(r"^\[[^\]]*\]\s+\u203a\s+")
+PW_WHERE = re.compile(r"^(.+?\.[cm]?[jt]sx?):\d+:\d+(?=$| \u203a )")
+
+
+class Playwright:
+    """Playwright's list reporter. A test is named file \u203a title, without the project, the line and column,
+    the retry suffix or the time, so the file is the class and a rerun is per spec file."""
+    name = "playwright"
+    progress = r"^\s*(?:[\u2713\u2718\u00d7x-]|ok)\s+\d+\s.*|^Progress: .*|^Packages: .*"
+
+    @staticmethod
+    def mode(repo):
+        return "playwright"
+
+    @staticmethod
+    def command(mode, project, cls_filter=None, fast=False, extra=(), probe=False):
+        """A shell that goes to the config folder, installs with the lockfile (pnpm or npm) and runs
+        playwright test with the list reporter. Each filter piece (split on |) is a file filter."""
+        # Playwright reads each file argument as a regular expression, so a path is escaped to match itself.
+        files = [re.sub(r"[.*+?^${}()|\[\]\\]", r"\\\g<0>", f) for f in node_files(cls_filter)]
+        return ["sh", "-c", VITEST_SCRIPT, "playwright", os.path.dirname(project) or "."] + list(extra) + files
+
+    @staticmethod
+    def parse_name(raw, timed=True):
+        """(project, file \u203a title) from what follows the mark and the number, or None when it is not a test line."""
+        name = PW_RETRY.sub("", PW_TIME.sub("", raw)) if timed else raw
+        name = name.strip()
+        pm = PW_PROJECT.match(name)
+        project = pm.group(0) if pm else ""
+        m = PW_WHERE.match(name[len(project):])
+        return (project, m.group(1) + name[len(project) + m.end():]) if m else None
+
+    @staticmethod
+    def test_name(raw, timed=True):
+        """file \u203a title without the project, or None when it is not a test line."""
+        got = Playwright.parse_name(raw, timed)
+        return got[1] if got else None
+
+    @staticmethod
+    def failures(text):
+        """[(test name, the lines that follow it)] in order, each name once. A test that failed and then passed on
+        a retry in the same project is flaky, not a failure. The numbered block after the run has the error, so it
+        wins. The project is part of the flaky check and not of the name."""
+        lines = [ANSI.sub("", l).rstrip() for l in text.splitlines()]
+        first, blocks, last_fail, last_pass = {}, {}, {}, {}
+        for i, l in enumerate(lines):
+            for rx, into, timed in ((PW_FAIL, first, True), (PW_BLOCK, blocks, False)):
+                m = rx.match(l)
+                got = Playwright.parse_name(m.group(1), timed) if m else None
+                if got:
+                    end = i + 1
+                    while end < min(i + 12, len(lines)) and not PW_FAIL.match(lines[end]) \
+                            and not PW_BLOCK.match(lines[end]) and not PW_SUMMARY.match(lines[end]):
+                        end += 1
+                    into.setdefault(got, "\n".join(lines[i:end]))
+                    if into is first:
+                        last_fail[got] = i
+            m = PW_PASS.match(l)
+            got = Playwright.parse_name(m.group(1)) if m else None
+            if got:
+                last_pass[got] = i
+        out = {}
+        for key in list(first) + [b for b in blocks if b not in first]:
+            if last_pass.get(key, -1) > last_fail.get(key, 1 << 30):
+                continue
+            out.setdefault(key[1], blocks.get(key) or first.get(key, ""))
+        return list(out.items())
+
+    @staticmethod
+    def counts(text):
+        """(passed, failed, skipped) from the summary lines "N failed", "N flaky", "N skipped", "N passed (T)".
+        A flaky test passed in the end, so it counts as passed."""
+        n = {}
+        for v, k in re.findall(r"^\s*(\d+)\s+(failed|flaky|passed|skipped|did not run|interrupted)\b", ANSI.sub("", text), re.M):
+            n[k] = int(v)
+        return n.get("passed", 0) + n.get("flaky", 0), n.get("failed", 0) + n.get("interrupted", 0), \
+            n.get("skipped", 0) + n.get("did not run", 0)
+
+    @staticmethod
+    def class_of(test):
+        return test.split(" \u203a ", 1)[0]
+
+
+RUNNERS = [Dotnet, Vitest, Playwright]
+
+
+def skips_node_modules(runner):
+    """Whether a copy to a remote host leaves node_modules behind."""
+    return runner in (Vitest, Playwright)
+
+
+PLAYWRIGHT_CONFIG = re.compile(r"^playwright\.config\.(?:ts|js|mjs|cjs)$")
 
 
 def tp_name(path):
-    """How a test project is named in runs and tags: its file name, and for a package.json its folder too."""
+    """How a test project is named in runs and tags: its file name, and for a package.json or a Playwright
+    config its folder too."""
     base = os.path.basename(path)
-    return os.path.join(os.path.basename(os.path.dirname(path)), base) if base == "package.json" \
-        and os.path.dirname(path) else base
+    return os.path.join(os.path.basename(os.path.dirname(path)), base) if (base == "package.json"
+        or PLAYWRIGHT_CONFIG.match(base)) and os.path.dirname(path) else base
 
 
 def runner_for(test_project):
-    """Vitest for a package.json, Dotnet for everything else."""
-    return Vitest if os.path.basename(test_project) == "package.json" else Dotnet
+    """Vitest for a package.json, Playwright for a playwright.config file, Dotnet for everything else."""
+    base = os.path.basename(test_project)
+    if PLAYWRIGHT_CONFIG.match(base):
+        return Playwright
+    return Vitest if base == "package.json" else Dotnet
 
 
 class Lane:
@@ -834,6 +975,8 @@ def matched_none(rc, text):
         return True
     if "No test files found" in ANSI.sub("", text):  # vitest, which exits 0 under passWithNoTests
         return True
+    if re.search(r"^Error: No tests found", ANSI.sub("", text), re.M):  # playwright, which exits 1
+        return True
     if rc != 0:
         return False
     text = ANSI.sub("", text)
@@ -936,7 +1079,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     def prepare():  # the copy and the env file go once per job, however many commands follow
         if synced:
             return
-        files = lr.file_list(repo, remote.extra_paths, remote.exclude, skip_node_modules=runner is Vitest)
+        files = lr.file_list(repo, remote.extra_paths, remote.exclude, skip_node_modules=skips_node_modules(runner))
         dest = None
         if remote.reuse_build and runner is Dotnet and build_args(extra) is not None:
             # One build folder per repository, commit, tree state, image and build arguments. A match skips the
@@ -1048,6 +1191,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     cause = tn.environmental(failing) if tn else None
     if cause:  # the machine failed, not the tests: one blocker, and none of these is rerun or counted as flaky
         label, hint, names, counts = cause
+        hint = tn.lane_hint(label, hint, remote)
         total = len(failing)
         for n in names:
             del failing[n]
@@ -1086,6 +1230,16 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         row["notes"].append("filter matched no test")
         add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
                  f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
+    elif rc != 0 and not failing and not row.get("env") and tn and tn.log_cause(text):
+        label, hint = tn.log_cause(text)
+        hint = tn.lane_hint(label, hint, remote)  # the install or build never reached a test: say why, not "build error?"
+        row["env"], row["env_label"] = 1, label
+        row["notes"].append(f"exit {rc}, environment: {label}")
+        add_item(row, "blocker", f"environment: {label}: {project}", "important",
+                 f"exit {rc} before any test ran, and the log shows {label}. {hint}. Log: {stem}.log\n"
+                 + "\n".join(text.splitlines()[-15:]), run_id, ctx)
+        if remote:
+            row["lane_rest"] = f"environment: {label}"
     elif rc != 0 and not failing and not row.get("env"):
         tail = "\n".join(text.splitlines()[-15:])
         add_item(row, "test-fail", f"run-failed: {project}", "important",
@@ -1590,7 +1744,7 @@ def vitest_checks(fails, fixture):
         return
     if "node:20-slim sh -c" not in sc or "mcr.microsoft.com/dotnet/sdk" in sc or "/nuget" in sc:
         fails.append("a vitest job runs in the node image and uses no NuGet cache")
-    if "node_modules" in sc or "-e CI=true" not in sc or "store_dir" not in sc:
+    if "node_modules:" in sc or "-e CI=true" not in sc or "store_dir" not in sc:
         fails.append("a vitest job gets a pnpm store volume and CI=true")
     if "mcr.microsoft.com/dotnet/sdk:10.0 sh -c" not in dn or "node:" in dn:
         fails.append("a dotnet job keeps the dotnet image")
@@ -1618,6 +1772,198 @@ def vitest_checks(fails, fixture):
         got = lr.file_list(d, [], [], skip_node_modules=True)
         if got != ["web/a.test.ts", "web/package.json"]:
             fails.append(f"a vitest copy must leave node_modules behind: {got}")
+
+
+def node_checks(fails, fixture):
+    """npm and pnpm lockfiles for Vitest, the Playwright runner. The shell script runs for real against fake
+    npm, npx and pnpm that log what they were asked."""
+    V, P = globals().get("Vitest"), globals().get("Playwright")
+    if V is None or P is None:
+        fails.append("no Playwright runner class")
+        return
+    pick = globals().get("runner_for")
+    for cfg in ("playwright.config.ts", "e2e/playwright.config.js", "x/playwright.config.mjs", "playwright.config.cjs"):
+        if not pick or pick(cfg) is not P:
+            fails.append(f"a test path ending in {cfg} must use Playwright")
+    if pick("web/package.json") is not V or pick("tests/T.csproj") is not Dotnet or pick("playwright.config.json") is not Dotnet:
+        fails.append("package.json stays Vitest and an unknown path stays Dotnet")
+    tp = globals().get("tp_name")
+    if tp("e2e/playwright.config.ts") != "e2e/playwright.config.ts" or tp("a/playwright.config.ts") == tp("b/playwright.config.ts"):
+        fails.append("a playwright config is named by folder and file")
+
+    def run_script_in(root, project, tool, *args):
+        """Run the command the runner builds, from root, with the fakes first on PATH. [rc, stderr, calls]"""
+        with tempfile.TemporaryDirectory() as bins:
+            log = os.path.join(bins, "calls.log")
+            for tool_name in ("npm", "npx", "pnpm"):
+                with open(os.path.join(bins, tool_name), "w") as fh:
+                    fh.write(f'#!/bin/sh\necho "{tool_name} $* in $(basename "$PWD")" >> "{log}"\n')
+                os.chmod(os.path.join(bins, tool_name), 0o755)
+            cmd = (V if tool == "vitest" else P).command(tool, project, *args)
+            env = dict(os.environ, PATH=bins + os.pathsep + os.environ["PATH"])
+            r = subprocess.run(cmd, cwd=root, env=env, capture_output=True, text=True)
+            calls = open(log).read().splitlines() if os.path.exists(log) else []
+            return r.returncode, r.stderr, calls
+
+    def tree(d, lock, files):
+        os.makedirs(os.path.join(d, "packages", "dopa"))
+        os.makedirs(os.path.join(d, "e2e"))
+        for f in ("packages/dopa/package.json", "e2e/playwright.config.ts") + ((lock,) if lock else ()):
+            open(os.path.join(d, f), "w").write("{}\n")
+
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "package-lock.json", ())
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if rc != 0 or calls != ["npm ci in " + os.path.basename(d), "npx --no-install vitest run --reporter=verbose in dopa"]:
+            fails.append(f"a package-lock.json in a parent folder must run npm ci there, then npx vitest in the package: {rc} {calls} {err}")
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest", "test/a.test.ts|test/b.test.ts")
+        if calls[1:] != ["npx --no-install vitest run --reporter=verbose test/a.test.ts test/b.test.ts in dopa"]:
+            fails.append(f"npm vitest filter pieces must become file arguments: {calls}")
+        rc, err, calls = run_script_in(d, "e2e/playwright.config.ts", "playwright", "tests/e2e/online.spec.ts")
+        if calls != ["npm ci in " + os.path.basename(d), "npx --no-install playwright test --reporter=list tests/e2e/online\\.spec\\.ts in e2e"]:
+            fails.append(f"a playwright config must install with npm ci, then run playwright test with the list reporter: {calls}")
+    # A package.json with a "test" script runs through that script (it may set --root and pin TZ), not a bare vitest run.
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "package-lock.json", ())
+        with open(os.path.join(d, "packages", "dopa", "package.json"), "w") as fh:
+            fh.write('{"scripts": {"test": "node scripts/run-tests.js"}}\n')
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest", "test/a.test.ts|test/b.test.ts")
+        if rc != 0 or calls[1:] != ["npm test -- --reporter=verbose test/a.test.ts test/b.test.ts in dopa"]:
+            fails.append(f"a package.json with a test script must run npm test with the args after --: {rc} {calls} {err}")
+    for script in ('echo \\"Error: no test specified\\" && exit 1', "jest", "vitest run && tsc", "node a.js; node b.js"):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "package-lock.json", ())
+            with open(os.path.join(d, "packages", "dopa", "package.json"), "w") as fh:
+                fh.write(json.dumps({"scripts": {"test": script}}) + "\n")
+            rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+            if rc != 0 or calls[1:] != ["npx --no-install vitest run --reporter=verbose in dopa"]:
+                fails.append(f"a test script {script!r} that is a placeholder, jest or chained must keep the bare vitest run: {rc} {calls} {err}")
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "pnpm-lock.yaml", ())
+        with open(os.path.join(d, "packages", "dopa", "package.json"), "w") as fh:
+            fh.write('{"scripts": {"test": "node scripts/run-tests.js"}}\n')
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if rc != 0 or calls != ["pnpm install --frozen-lockfile in dopa", "pnpm run test --reporter=verbose in dopa"]:
+            fails.append(f"a pnpm package with a test script must run pnpm run test: {rc} {calls} {err}")
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "pnpm-lock.yaml", ())
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if rc != 0 or calls != ["pnpm install --frozen-lockfile in dopa", "pnpm exec vitest run --reporter=verbose in dopa"]:
+            fails.append(f"a pnpm-lock.yaml must still pick pnpm: {rc} {calls} {err}")
+        rc, err, calls = run_script_in(d, "e2e/playwright.config.ts", "playwright", "a.spec.ts|b.spec.ts")
+        if calls != ["pnpm install --frozen-lockfile in e2e", "pnpm exec playwright test --reporter=list a\\.spec\\.ts b\\.spec\\.ts in e2e"]:
+            fails.append(f"a playwright config under a pnpm lockfile must use pnpm: {calls}")
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "yarn.lock", ())
+        for project, tool in (("packages/dopa/package.json", "vitest"), ("e2e/playwright.config.ts", "playwright")):
+            rc, err, calls = run_script_in(d, project, tool)
+            if rc == 0 or calls or "yarn.lock" not in err or "run-failed" not in err:
+                fails.append(f"yarn must be refused by name before anything runs ({tool}): {rc} {calls} {err}")
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "package-lock.json", ())
+        open(os.path.join(d, "packages", "dopa", "pnpm-lock.yaml"), "w").write("{}\n")
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if calls[:1] != ["pnpm install --frozen-lockfile in dopa"]:
+            fails.append(f"the nearest lockfile wins over one further up: {calls}")
+
+    # npm ci wipes node_modules, so it runs only when they are missing or older than the lockfile.
+    with tempfile.TemporaryDirectory() as d:
+        tree(d, "package-lock.json", ())
+        nm = os.path.join(d, "node_modules")
+        os.makedirs(nm)
+        os.utime(os.path.join(d, "package-lock.json"), (1000, 1000))
+        marker = os.path.join(nm, ".package-lock.json")
+        open(marker, "w").write("{}\n")
+        os.utime(marker, (2000, 2000))
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if calls != ["npx --no-install vitest run --reporter=verbose in dopa"]:
+            fails.append(f"npm ci must be skipped when node_modules is not older than the lockfile: {calls}")
+        os.utime(os.path.join(d, "package-lock.json"), (3000, 3000))
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if calls[:1] != ["npm ci in " + os.path.basename(d)]:
+            fails.append(f"npm ci must run when the lockfile is newer than node_modules: {calls}")
+        os.remove(marker)
+        rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+        if calls[:1] != ["npm ci in " + os.path.basename(d)]:
+            fails.append(f"npm ci must run when node_modules has no install marker: {calls}")
+    # a pnpm lockfile above the package wins over a stray npm or yarn lockfile in the package folder
+    for stray in ("package-lock.json", "yarn.lock"):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "pnpm-lock.yaml", ())
+            open(os.path.join(d, "packages", "dopa", stray), "w").write("{}\n")
+            rc, err, calls = run_script_in(d, "packages/dopa/package.json", "vitest")
+            if rc != 0 or calls != ["pnpm install --frozen-lockfile in dopa", "pnpm exec vitest run --reporter=verbose in dopa"]:
+                fails.append(f"a pnpm-lock.yaml above the package must win over a {stray} in it: {rc} {calls} {err}")
+
+    # two projects, one test: a fail in chromium and a pass in firefox is still a failure; an odd path still parses
+    two = ("  \u2718  1 [chromium] \u203a a.spec.ts:3:5 \u203a t (1s)\n  \u2713  2 [firefox] \u203a a.spec.ts:3:5 \u203a t (1s)\n")
+    if [n for n, _ in P.failures(two)] != ["a.spec.ts \u203a t"]:
+        fails.append("a pass in another project must not hide a failure")
+    flaky = ("  \u2718  1 [chromium] \u203a a.spec.ts:3:5 \u203a t (1s)\n"
+             "  \u2713  2 [chromium] \u203a a.spec.ts:3:5 \u203a t (retry #1) (1s)\n")
+    if P.failures(flaky):
+        fails.append("a pass on retry in the same project is not a failure")
+    spaced = "  \u2718  4 [phone] \u203a tests/my dir/a b.spec.ts:3:1 \u203a login (1s)\n"
+    if [n for n, _ in P.failures(spaced)] != ["tests/my dir/a b.spec.ts \u203a login"]:
+        fails.append(f"a spec path with spaces must parse: {P.failures(spaced)}")
+    ok_mark = ("  x  1 [chromium] \u203a a.spec.ts:3:5 \u203a t (1s)\n  ok 2 [chromium] \u203a a.spec.ts:3:5 \u203a t (retry #1) (1s)\n")
+    if P.failures(ok_mark):
+        fails.append("the ok pass mark must count as a pass")
+    if P.counts("  2 did not run\n  1 passed (1s)\n") != (1, 0, 2):
+        fails.append("did not run counts as skipped")
+    esc = P.command("playwright", "e2e/playwright.config.ts", "tests/(auth)/login.spec.ts|tests/e2e/[id].spec.ts")[-2:]
+    if esc != ["tests/\\(auth\\)/login\\.spec\\.ts", "tests/e2e/\\[id\\]\\.spec\\.ts"] \
+            or not all(re.fullmatch(e, o) for e, o in zip(esc, ["tests/(auth)/login.spec.ts", "tests/e2e/[id].spec.ts"])):
+        fails.append(f"playwright file pieces must be regex-escaped so they match themselves: {esc}")
+    if not globals().get("skips_node_modules") or not skips_node_modules(P) or not skips_node_modules(V) \
+            or skips_node_modules(Dotnet):
+        fails.append("a remote copy for Vitest and Playwright leaves node_modules behind, Dotnet does not")
+    rr = lr.Remote(name="dev", host="devbox") if lr else None
+    if rr is not None:
+        rr.node_image = "node:20-slim"
+        pw = lr.run_script(rr, None, 5, P.command("playwright", "e2e/playwright.config.ts"), kind="playwright")
+        dn = lr.run_script(rr, None, 5, ["dotnet", "test"])
+        if "node:20-slim sh -c" not in pw or "-e CI=true" not in pw or "npm_config_cache=/cache/npm" not in pw \
+                or "npm_config_cache" in dn:
+            fails.append("a playwright job runs in the node image with a persistent npm cache, a dotnet job does not")
+
+    cmd = P.command("playwright", "e2e/playwright.config.ts", "tests/a.spec.ts|tests/b.spec.ts")
+    if cmd[3:] != ["playwright", "e2e", "tests/a\\.spec\\.ts", "tests/b\\.spec\\.ts"] or "playwright test --reporter=list" not in cmd[2]:
+        fails.append(f"playwright command: the config folder, one file argument per filter piece: {cmd}")
+    if P.command("playwright", "playwright.config.ts")[3:] != ["playwright", "."]:
+        fails.append("a playwright run with no filter runs everything, in the config folder")
+    for bad in ("a.spec.ts| --headed", "--grep=x"):
+        try:
+            P.command("playwright", "e2e/playwright.config.ts", bad)
+            fails.append(f"a playwright filter piece starting with - must be refused: {bad!r}")
+        except ValueError:
+            pass
+
+    names = [n for n, _ in P.failures(fixture("playwright-failed.log"))]
+    want = ["tests/e2e/online.spec.ts \u203a online \u203a joins a room",
+            "tests/e2e/online.spec.ts \u203a online \u203a leaves a room",
+            "tests/e2e/odd.spec.ts \u203a Cart (v2) \u203a adds $5 item [x] at 10:30:1"]
+    if names != want:
+        fails.append(f"playwright failures: each failed test once as file \u203a title, no line, retry or time, a pass on retry is not one: {names}")
+    fl = P.failures(fixture("playwright-failed.log"))
+    if not fl or "toBeVisible" not in fl[0][1] or "Expected: 0" in fl[0][1]:
+        fails.append(f"a playwright failure must carry its error block: {fl[:1]}")
+    if P.failures(fixture("playwright-passed.log")):
+        fails.append("a passing playwright run has no failures")
+    if P.counts(fixture("playwright-passed.log")) != (2, 0, 1) or P.counts(fixture("playwright-failed.log")) != (2, 3, 1) \
+            or P.counts("no summary\n") != (0, 0, 0):
+        fails.append(f"playwright counts: {P.counts(fixture('playwright-passed.log'))} {P.counts(fixture('playwright-failed.log'))}")
+    if P.counts("\x1b[31m  3 failed\x1b[39m\n\x1b[32m  5 passed\x1b[39m (2s)\n") != (5, 3, 0):
+        fails.append("a colored playwright summary must parse")
+    if {P.class_of(n) for n in names} != {"tests/e2e/online.spec.ts", "tests/e2e/odd.spec.ts"}:
+        fails.append("the class of a playwright test is its spec file, so the rerun is per file")
+    if [n for n, _ in P.failures("\x1b[31m  \u2718  1 [chromium] \u203a a.spec.ts:3:5 \u203a t (1s)\x1b[39m\n")] != ["a.spec.ts \u203a t"]:
+        fails.append("a colored playwright failure line")
+    if matched_none(1, "Error: No tests found\n") is not True:
+        fails.append("playwright's no-tests error is a filter that matched nothing")
+    got = [n for n, _ in V.failures(fixture("vitest-npm-failed.log"))]
+    if got != ["test/store.test.ts > store > saves a value"] or V.counts(fixture("vitest-npm-failed.log")) != (1, 1, 0):
+        fails.append(f"vitest output after an npm ci run: {got}")
 
 
 # Fake credentials for the self-test, joined at runtime so secret scanners do not flag the source.
@@ -1940,6 +2286,7 @@ def self_test():
         fails.append("the one-line summary must still parse")
 
     vitest_checks(fails, fixture)
+    node_checks(fails, fixture)
 
     # Secrets in test output are masked, and the body travels by stdin.
     jwt = ".".join(("eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiIxIn0", "sig_nature"))
@@ -2709,10 +3056,10 @@ exit 0
         if "flaky nrepo src/cart/cart.test.tsx > Cart > adds an item" not in brain_list("--kind", "flaky"):
             fails.append(f"a failed vitest test that passes alone is flaky in brain: {brain_list('--kind', 'flaky')!r}")
 
-        # Vitest edge cases. The lockfile may sit above the package; an npm project is refused; a path may start with -;
+        # Vitest edge cases. The lockfile may sit above the package; a yarn project is refused; a path may start with -;
         # a failed rerun filter may too; a filter that matches nothing is not a pass; the result marks keep a run alive.
         wrepo, nprepo, drepo = (os.path.join(d, x) for x in ("wrepo", "nprepo", "drepo"))
-        for rp, lock, pkg in ((wrepo, "pnpm-lock.yaml", "web"), (nprepo, "package-lock.json", "app"),
+        for rp, lock, pkg in ((wrepo, "pnpm-lock.yaml", "web"), (nprepo, "yarn.lock", "app"),
                               (drepo, "", "-x")):
             os.makedirs(os.path.join(rp, pkg))
             open(os.path.join(rp, pkg, "package.json"), "w").write("{}\n")
@@ -2725,14 +3072,20 @@ exit 0
         rc, out, calls = run(f"{nprepo} app/package.json\n")
         runlogs = "".join(open(os.path.join(r_, f), errors="replace").read()
                           for r_, _, fs in os.walk(os.path.join(d, "runs")) for f in fs if f.endswith(".log"))
-        if calls or rc == 0 or "package-lock.json" not in runlogs or "run-failed" not in brain_list("--kind", "test-fail"):
-            fails.append(f"an npm project must be refused before pnpm runs, with a run-failed item ({rc}): {calls} {out}")
+        if calls or rc == 0 or "yarn.lock" not in runlogs or "run-failed" not in brain_list("--kind", "test-fail"):
+            fails.append(f"a yarn project must be refused before pnpm runs, with a run-failed item ({rc}): {calls} {out}")
         put("vitest-full", fixture("vitest-dash.log"))
         subprocess.run([sys.executable, BRAIN, "queue", "add", "--", drepo, "-x/package.json"], env=env, capture_output=True)
         rc, out, calls = drain()
         if calls != ["pnpm install --frozen-lockfile in -x", "pnpm exec vitest run --reporter=verbose in -x"] \
                 or "-a.test.ts" not in out:
             fails.append(f"a package folder or test file starting with - must not crash the lane ({rc}): {calls} {out}")
+        # npm ci failing on a private feed names no test: it is the machine's missing login, not a build error.
+        put("vitest-full", "npm error code E401\nnpm error Unable to authenticate, your authentication token seems to be invalid.\n")
+        rc, out, calls = run(f"{wrepo} web/package.json\n")
+        got = brain_list("--kind", "blocker")
+        if "environment: npm registry login: web/package.json" not in got or "build error" in out:
+            fails.append(f"an npm E401 with no test named must be an environment blocker, not a build error ({rc}): {got!r} {out}")
         for code in ("0", "1"):
             put("nofiles.rc", code)
             rc, out, calls = run(f"{repo_n} web/package.json src/none{code}.test.ts\n")

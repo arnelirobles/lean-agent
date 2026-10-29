@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 
 from .items import infer_session, session_ok
 from .store import connect, now
@@ -87,13 +88,46 @@ def _apple_text(text):
     return any(APPLE_TFM.search(m.group(1)) for m in TFM_ELEMENT.finditer(text)) or bool(USE_MAUI.search(text))
 
 
+NPM_REGISTRY = re.compile(r"^\s*(?:@[^:=\s]+:)?registry\s*=\s*(\S+)", re.I)
+NPM_AUTH = re.compile(r"^\s*(?://\S*:)?_?(?:authToken|auth|password|username)\s*=", re.I)
+
+
+def private_npm_feed(repo, test_project):
+    """True when a .npmrc from the package.json folder up to the repo root names a registry other than
+    registry.npmjs.org. Its login lives on this machine (~/.npmrc), which a remote lane never gets."""
+    folder = os.path.dirname(os.path.abspath(os.path.join(repo, test_project)))
+    root = os.path.abspath(repo)
+    while True:
+        try:
+            lines = open(os.path.join(folder, ".npmrc"), encoding="utf-8-sig", errors="replace").read().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            if NPM_AUTH.match(line) or "${" in line:  # a login or an env placeholder: the value lives on this machine
+                return True
+            m = NPM_REGISTRY.match(line)
+            if m:
+                try:
+                    host = urlparse(m.group(1).strip("\"'")).hostname
+                except ValueError:
+                    host = None
+                if host != "registry.npmjs.org":  # a host that does not parse, such as ${REGISTRY}, counts as private
+                    return True
+        if folder == root or os.path.dirname(folder) == folder or not (folder + os.sep).startswith(root + os.sep):
+            return False
+        folder = os.path.dirname(folder)
+
+
 def detect_platform(repo, test_project):
-    """'apple' when the job may need an Apple platform, else ''.
+    """'apple' when the job may need an Apple platform, 'private' when an npm job needs a private feed, else ''.
 
     Conservative: the project file, Directory.Build.props from its folder up to the repo root, and every
     project it references (transitively) are checked. A project that cannot be found or read, or a folder
     with more than one csproj, gives 'apple' too: unknown means local only."""
     path = os.path.join(repo, test_project)
+    base = os.path.basename(test_project)
+    if base == "package.json" or base.startswith("playwright.config"):
+        return "private" if private_npm_feed(repo, test_project) else ""
     try:
         if os.path.isdir(path):
             found = [f for f in os.listdir(path) if f.endswith(".csproj")]
@@ -316,7 +350,7 @@ def cmd_queue(a):
     if a.qcmd == "next":  # claims the oldest ready job; prints it as one line of JSON, or nothing
         con.isolation_level = None
         con.execute("BEGIN IMMEDIATE")
-        skip = " AND j.platform != 'apple'" if a.where == "remote" else " AND j.platform != 'remote'"
+        skip = " AND j.platform NOT IN ('apple', 'private')" if a.where == "remote" else " AND j.platform != 'remote'"
         r = con.execute(
             "SELECT j.* FROM jobs j WHERE j.status='queued' AND (j.after_id IS NULL OR "
             "(SELECT status FROM jobs d WHERE d.id=j.after_id)='done')" + skip
@@ -339,11 +373,20 @@ def cmd_queue(a):
             if r["status"] != "queued":
                 sys.exit(f"brain: job #{a.id} is {r['status']}, only a queued job can be routed")
             # Refuse only a job marked apple: detect_platform also says apple for a project it cannot read.
+            if a.to == "remote" and r["platform"] == "private" and not a.force:
+                sys.exit(f"brain: job #{a.id} uses a private npm feed whose login only this machine has, so npm ci "
+                         "would fail with E401 on a remote host; pass --force to send it anyway")
+            if a.to == "any" and r["platform"] == "private" and not a.force:
+                sys.exit(f"brain: job #{a.id} uses a private npm feed whose login only this machine has, so a remote "
+                         "lane would fail it with E401; pass --force to let any lane take it")
             if a.to == "remote" and r["platform"] == "apple" and not a.force:
                 sys.exit(f"brain: job #{a.id} is marked Apple, this machine only, and would likely fail to build on a remote host; "
                          "pass --force to send it anyway")
             con.execute("UPDATE jobs SET platform=? WHERE id=?",
                         ({"remote": "remote", "local": "apple", "any": ""}[a.to], a.id))
+        if a.to == "remote" and detect_platform(r["repo_dir"], r["test_project"]) == "private":
+            print(f"brain: job #{a.id} uses a private npm feed; npm ci can fail with E401 on a remote host",
+                  file=sys.stderr)
         if a.to == "remote" and detect_platform(r["repo_dir"], r["test_project"]) == "apple":
             print(f"brain: job #{a.id} may need an Apple platform; it can fail to build on a remote host",
                   file=sys.stderr)

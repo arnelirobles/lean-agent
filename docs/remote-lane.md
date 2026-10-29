@@ -69,16 +69,18 @@ The copy is the files `git ls-files` lists (tracked and untracked, not ignored) 
 
 ## Vitest jobs
 
-A job whose test path is a `package.json` (for example `brain queue add ~/app web/package.json`) runs Vitest, not `dotnet test`. In that folder it installs with the lockfile (`pnpm install --frozen-lockfile`, through corepack when pnpm is not installed), then runs `vitest run --reporter=verbose`. The fast filter pieces are file filters, and a failed test file is rerun alone.
+A job whose test path is a `package.json` (for example `brain queue add ~/app web/package.json`) runs Vitest, not `dotnet test`. In that folder it installs with the nearest lockfile (`pnpm install --frozen-lockfile`, through corepack when pnpm is not installed, or `npm ci` for a `package-lock.json`), then runs `vitest run --reporter=verbose` (`pnpm exec`, or `npx` for npm). The fast filter pieces are file filters, and a failed test file is rerun alone.
 
 On a host it runs in `node_image`. The container sits on the job's bridge network, so it has outbound network for the install. pnpm's store and corepack's download are kept in `<workdir>/.node-cache`, which `cache_max_gb` also caps. The host needs no Node.
 
-The lockfile is looked up from the package folder to the repo root, so a pnpm workspace with one root `pnpm-lock.yaml` installs frozen. A project with `package-lock.json` or `yarn.lock` and no `pnpm-lock.yaml` is refused with a `run-failed` item, because only pnpm is run. `LEAN_PNPM_VERSION` (default 10, used when pnpm is not installed and `package.json` has no `packageManager`) is passed to the container.
+The lockfile is looked up from the package folder to the repo root, so a pnpm workspace with one root `pnpm-lock.yaml` installs frozen. The nearest lockfile wins: `pnpm-lock.yaml` means pnpm, `package-lock.json` means `npm ci` in the lockfile's folder (so an npm workspace root installs once for its packages). A project whose nearest lockfile is `yarn.lock` is refused with a `run-failed` item that names it, because only pnpm and npm are run. `LEAN_PNPM_VERSION` (default 10, used when pnpm is not installed and `package.json` has no `packageManager`) is passed to the container.
+
+A job whose test path is a `playwright.config.ts` (or `.js`, `.mjs`, `.cjs`) runs Playwright from that folder: the same install, then `playwright test --reporter=list`. The fast filter pieces are file filters, and a failed test is named `file > title`, so a rerun is per spec file. The default `node_image` has no Playwright browsers, so on a host set `node_image` to an image that has them (for example `mcr.microsoft.com/playwright`) or run the job on the local lane.
 
 Three things to know:
 
 - A drainer from before the Vitest runner does not know `package.json` jobs. It runs one as `dotnet test` and fails it with a `run-failed` item. Replace every copy of `test-phase` before queueing one.
-- A tracked `.npmrc` is copied to the host like any tracked file, token included. Add `.npmrc` to `exclude` if it holds one (and send the token through `env_file`).
+- The copy never sends `.npmrc`, `.yarnrc`, `.yarnrc.yml` or `.pnpmrc` (a token may be in them), and `exclude =` cannot bring them back. The host installs from the public registry only; a job that needs a private feed stays on the local lane.
 - A cold first run downloads pnpm and installs with little output. If it trips `--stall` (default 600 seconds), raise `--stall` for that run.
 
 ## Build reuse
@@ -97,7 +99,7 @@ Each claim prunes: the newest `build_keep` folders of the repository stay (newes
 
 ## Which jobs go where
 
-A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
+A job whose test project targets `-maccatalyst`, `-ios` or `-macos` is marked `platform=apple` and runs on the local lane only. An npm job (a `package.json` or Playwright config) whose `.npmrc`, in its folder or any folder up to the repo root, names a registry other than registry.npmjs.org is marked `platform=private` and also runs on the local lane only: its login lives in `~/.npmrc` on this machine, and the copy to a remote host never sends secrets. Everything else can run on any lane. `brain queue add --platform apple|auto|none` overrides the detection.
 
 To choose for a job already queued, use `brain queue route ID --to remote|local|any`. `remote` sends it to a remote lane only, so the local lane skips it even when idle. `local` pins it to this machine. `any` lets whichever lane is free take it. Jobs queued before the upgrade to schema 7 are all marked `platform=apple`, so route the ones you want on a remote host. Routing a job to `remote` whose project looks Apple-only prints a warning and still routes it. A job routed to `remote` with no remote lane up stays queued, and test-phase names it at the end of the drain.
 

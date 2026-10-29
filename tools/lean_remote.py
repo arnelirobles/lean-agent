@@ -16,7 +16,7 @@ remote off. One section per host and, optionally, one per repository:
   reuse_build = yes           ; later jobs on the same commit and tree skip the copy and the build, no turns it off
   build_keep = 3              ; build folders kept per repository
   image = mcr.microsoft.com/dotnet/sdk:10.0
-  node_image = node:22-bookworm-slim   ; for package.json (Vitest) jobs
+  node_image = node:22-bookworm-slim   ; for package.json (Vitest) and Playwright jobs
   extra_paths = local-packages
   exclude = .env*, *.key, *.pem, *license-key*, secrets*
 
@@ -42,6 +42,8 @@ import time
 from dataclasses import dataclass, field
 
 DEFAULT_EXCLUDE = [".env*", "*.key", "*.pem", "*license-key*", "secrets*"]
+# Package manager config can hold a login token. It is never copied, whatever `exclude =` says.
+NEVER_COPY = [".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"]
 DEFAULT_IMAGE = "mcr.microsoft.com/dotnet/sdk:10.0"
 DEFAULT_NODE_IMAGE = "node:22-bookworm-slim"
 MARKER = "lean-remote: started"
@@ -256,6 +258,7 @@ def file_list(repo, extra_paths, exclude, skip_node_modules=False):
         elif os.path.lexists(top):
             found.add(os.path.normpath(extra))
     # .lean.env is where send_env writes; a repo file of that name must not be copied over it.
+    exclude = list(exclude) + NEVER_COPY
     if skip_node_modules:
         exclude = list(exclude) + ["node_modules"]
     return sorted(f for f in found if os.path.lexists(os.path.join(repo, f)) and not excluded(f, exclude)
@@ -380,10 +383,10 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None, kind="dotn
     """One shell script for ssh: network, sidecars, then the capped test container. Its exit code is the test's.
     dest is a kept build folder. build is the build command to run first in it, and the folder's lock is
     released after it, with mark written only when the build succeeded.
-    kind vitest runs in node_image with a pnpm store volume (corepack and the store live in <workdir>/.node-cache);
+    kind vitest or playwright runs in node_image with a pnpm store volume (corepack and the store live in <workdir>/.node-cache);
     the container is on the job's bridge network, so it has outbound network for the install."""
     jd = sh_path(dest or job_dir(r, job_id))
-    node = kind == "vitest"
+    node = kind in ("vitest", "playwright")
     nuget = sh_path(r.workdir.rstrip("/") + ("/.node-cache" if node else "/.nuget"))
     label, net = f"lean.job={job_id}", f"lean-{job_id}"
     caps = f"--cpus {shlex.quote(r.cpus)} --memory {shlex.quote(r.memory)}"
@@ -428,7 +431,7 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None, kind="dotn
     pnpm = os.environ.get("LEAN_PNPM_VERSION")
     tools = ("-e HOME=/tmp -e CI=true -e COREPACK_HOME=/cache/corepack -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 "
              + (f"-e LEAN_PNPM_VERSION={shlex.quote(pnpm)} " if pnpm else "")
-             + f"-e npm_config_store_dir=/cache/store -v {nuget}:/cache") if node else \
+             + f"-e npm_config_store_dir=/cache/store -e npm_config_cache=/cache/npm -v {nuget}:/cache") if node else \
         f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget"
     out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
                f"{tools} -v {jd}:/work -w /work{env}{denv} "
@@ -615,6 +618,15 @@ docker = yes
             fails.append(f"file_list must drop excluded files, extra paths included, and keep ignored extra paths: {got}")
         if file_list(repo, [], ["a.*"]) != [".env.local", ".gitignore", "secrets.json"]:
             fails.append("exclude must apply to a custom list")
+        for rc_name in (".npmrc", "web/.npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"):
+            os.makedirs(os.path.dirname(os.path.join(repo, rc_name)) or repo, exist_ok=True)
+            with open(os.path.join(repo, rc_name), "w") as fh:
+                fh.write("//registry.npmjs.org/:_authToken=npm_abc\n")
+        left = [f for f in file_list(repo, [], []) if "rc" in os.path.basename(f)]
+        if left:
+            fails.append(f"file_list must never copy a package manager config, even with an empty exclude: {left}")
+        for rc_name in (".npmrc", "web/.npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmrc"):
+            os.remove(os.path.join(repo, rc_name))
         os.symlink("/etc/hosts", os.path.join(repo, ".lean.env"))
         if ".lean.env" in file_list(repo, [], []):
             fails.append("a repo file named .lean.env must never be copied over the env file")

@@ -7,7 +7,7 @@
   brain show ID
   brain close ID (--resolution R | --wontfix) [--note N] [--commit H] [--tag T ...]
   brain reopen ID
-  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest|vitest]
+  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest|vitest|playwright]
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain flaky-clear --project P --test-project T [--runs 5]      closes each open flaky item of T with no new
@@ -17,9 +17,10 @@
   brain queue add <repo-dir> <test-project> [--filter F] [--tier fast|full] [--after ID] [--cycle C]
             [--by NAME] [--project P] [--session ID] [--infer-session] [--platform apple|auto|none] [--again REASON] [--args=EXTRA]      prints the job id and returns at once; EXTRA is
             extra dotnet arguments for this job, written --args=-p:X=1 so a leading dash is not read as an option.
-            A test project path ending in package.json is a Vitest job (test-phase runs it in that folder).
+            A test project path ending in package.json is a Vitest job, and one ending in playwright.config.ts, .js, .mjs or .cjs is a Playwright job (test-phase runs either in that folder, with pnpm or npm).
             --platform auto (the default) marks the job apple when the test project targets -maccatalyst, -ios
-            or -macos; a remote lane never claims an apple job
+            or -macos, and an npm job whose .npmrc names a private registry or holds a login private; a remote lane
+            never claims an apple or private job
             The job records the repo HEAD. A full job for a project, test project and commit that already has a
             queued, running or done full job (one without a filter) is refused with that job's id, and so is a
             full job from a tree with uncommitted or untracked files (the refusal names up to 5 paths) or
@@ -32,7 +33,8 @@
             moves ahead of the job it waits on
   brain queue cancel ID                    a queued job; jobs waiting on it are cancelled too
   brain queue route ID --to remote|local|any [--force]   remote: only a remote lane claims it; local: only this
-            machine (platform=apple); any: whichever lane is free. remote refuses an Apple job without --force
+            machine (platform=apple); any: whichever lane is free. remote refuses an Apple or private job, and any
+            refuses a private job, without --force
   brain queue wait ID... [--timeout SECS] [--interval SECS]   blocks until every named job ends, then prints one
             line per job (id, status, passed and failed of its run, the item ids it filed). Exit 0 when all are
             done, 1 when any failed or was cancelled, 2 for an unknown id, 3 on timeout (default 7200 s; the

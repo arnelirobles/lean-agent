@@ -294,6 +294,13 @@ def run(brain_cli):
                              "--tier", tier, "--runner", "mtp", "--started", "1000", "--ended", str(1000 + dur),
                              "--lane-wait", str(wait), "--passed", "9", "--failed", "1", "--exit-code", "1")
             ids.append(out)
+        # A valid runner reaches the missing --tier error; an unknown one stops at its own choice list. No row is added.
+        rc, _, err = run("run-add", "--project", "core", "--test-project", "e2e/playwright.config.ts", "--runner", "playwright")
+        if "invalid choice" in err or "--tier" not in err:
+            fails.append(f"run-add must accept --runner playwright: {rc} {err!r}")
+        rc, _, err = run("run-add", "--project", "core", "--test-project", "T.csproj", "--runner", "nope")
+        if "invalid choice" not in err:
+            fails.append(f"run-add must refuse an unknown runner: {rc} {err!r}")
         if ids != ["1", "2", "3"]:
             fails.append(f"run ids: {ids}")
         run("add", "--project", "core", "--kind", "flaky", "--ref", "Other.Flaky", "--run-id", "2", "--cycle", "c1")
@@ -636,6 +643,56 @@ def run(brain_cli):
                           ("Two", "apple"), ("Plain.Tests/Plain.Tests.csproj", "")):
             if detect_platform(rp, rel) != want:
                 fails.append(f"detect_platform({rel}) must be {want!r}")
+        # An npm job whose .npmrc names a registry other than npmjs stays on the local lane: the login is on this machine.
+        mk("Web/package.json", "{}")
+        mk("Web/.npmrc", "@acme:registry=https://pkgs.dev.azure.com/o/_packaging/f/npm/registry/\n")
+        mk("Pub/package.json", "{}")
+        mk("Pub/.npmrc", "# comment\nregistry=https://registry.npmjs.org/\n")
+        mk("Env/package.json", "{}")
+        mk("Env/.npmrc", "registry=${NPM_REGISTRY}\n")
+        mk("Up/Deep/package.json", "{}")
+        mk("Up/.npmrc", "registry=https://pkgs.example.com/npm/\n")
+        mk("Bare/package.json", "{}")
+        mk("Tok/package.json", "{}")
+        mk("Tok/.npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n")
+        mk("Lit/package.json", "{}")
+        mk("Lit/.npmrc", "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=npm_abc\n")
+        mk("Basic/package.json", "{}")
+        mk("Basic/.npmrc", "_auth=abc\n")
+        mk("Pw/package.json", "{}")
+        mk("Pw/.npmrc", "//registry.npmjs.org/:_password=abc\n")
+        mk("Usr/package.json", "{}")
+        mk("Usr/.npmrc", "//registry.npmjs.org/:username=me\n")
+        mk("Bom/package.json", "{}")
+        with open(os.path.join(rp, "Bom", ".npmrc"), "w", encoding="utf-8-sig") as fh:
+            fh.write("registry=https://pkgs.example.com/npm/\n")
+        for rel, want in (("Web/package.json", "private"), ("Pub/package.json", ""), ("Env/package.json", "private"),
+                          ("Up/Deep/package.json", "private"), ("Bare/package.json", ""),
+                          ("Tok/package.json", "private"), ("Lit/package.json", "private"),
+                          ("Basic/package.json", "private"), ("Pw/package.json", "private"),
+                          ("Usr/package.json", "private"), ("Bom/package.json", "private")):
+            if detect_platform(rp, rel) != want:
+                fails.append(f"detect_platform({rel}) must be {want!r}")
+        pn = run("queue", "add", rp, "Web/package.json")[1]
+        if "platform=private" not in [x for x in run("queue", "list", "--status", "queued")[1].splitlines()
+                                      if x.startswith(f"job #{pn} ")][0]:
+            fails.append("an npm job with a private registry must queue as platform=private")
+        if nxt("--where", "remote", "--peek") is not None and nxt("--where", "remote", "--peek")["id"] == int(pn):
+            fails.append("a remote lane claimed an npm job that needs a private feed")
+        rc, out, err = run("queue", "route", pn, "--to", "remote")
+        if rc == 0 or "private npm feed" not in err or "--force" not in err:
+            fails.append(f"route --to remote on a private feed job must be refused without --force: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "route", pn, "--to", "any")
+        if rc == 0 or "private npm feed" not in err or "--force" not in err:
+            fails.append(f"route --to any on a private feed job must be refused without --force: {rc} {out!r} {err!r}")
+        rc, out, err = run("queue", "route", pn, "--to", "remote", "--force")
+        if rc != 0 or "platform=remote" not in out or "private npm feed" not in err:
+            fails.append(f"route --to remote --force must send a private job and warn: {rc} {out!r} {err!r}")
+        run("queue", "route", pn, "--to", "local")
+        rc, out, err = run("queue", "route", pn, "--to", "any", "--force")
+        if rc != 0:
+            fails.append(f"route --to any --force must be allowed on a private job: {rc} {out!r} {err!r}")
+        run("queue", "cancel", pn)
         # route: send a queued job to a remote lane, back to the Mac, or to whichever lane is free.
         ra = run("queue", "add", rp, "Apple.Tests")[1]
         rc, out, err = run("queue", "route", ra, "--to", "remote")

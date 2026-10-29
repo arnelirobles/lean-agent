@@ -42,6 +42,11 @@ CAUSES = [
      re.compile(r"ResourceReaper")),
     ("database unreachable", "nothing answered on the database address; start the database or its container",
      re.compile(r"NpgsqlException[^\n]*Failed to connect to")),
+    ("playwright browsers missing", "run `npx playwright install` in the project, or use an image that has the browsers",
+     re.compile(r"Executable doesn't exist at|npx playwright install")),
+    ("npm registry login", "the npm registry needs credentials this lane does not have; run it on the local lane",
+     re.compile(r"npm (?:error|ERR!)[^\n]*(?:\bE401\b|\bENEEDAUTH\b|Unable to authenticate)"
+                r"|npm (?:error|ERR!) 403\b")),
 ]
 MIN_SHARED = 3  # fewer than this is a test problem, not a machine problem
 
@@ -190,6 +195,23 @@ def environmental(failing):
     top = max(by, key=lambda k: len(by[k][1]))
     hint = by[top][0] if len(by) == 1 else "; ".join(h for h, _ in by.values())
     return top, hint, names, {k: len(v[1]) for k, v in by.items()}
+
+
+LOCAL_NPM_HINT = "check the login in ~/.npmrc or run npm login"
+
+
+def lane_hint(label, hint, remote):
+    """The npm login hint depends on the lane: a remote lane cannot be logged in, the local one can."""
+    return hint if remote or label != "npm registry login" else LOCAL_NPM_HINT
+
+
+def log_cause(text):
+    """(label, hint) of the first cause whose pattern is in a whole run log, else None. For a run that failed
+    with no test named, where there is no per-test text to group."""
+    for label, hint, rx in CAUSES:
+        if rx.search(text or ""):
+            return label, hint
+    return None
 
 
 def repo_root():
@@ -342,6 +364,27 @@ def self_test():
     if not environmental(half):
         fails.append("4 of 7 failures is more than half")
     # Causes add up, the commonest names the blocker, and the later of two causes can be the commonest.
+    pw = {f"a.spec.ts \u203a t{i}": "Error: browserType.launch: Executable doesn't exist at /x/chrome\n  npx playwright install" for i in range(3)}
+    got = environmental(pw)
+    if not got or got[0] != "playwright browsers missing":
+        fails.append(f"missing Playwright browsers must be environmental: {got}")
+    for sample in ("npm error code E401\nnpm error Unable to authenticate, your authentication token seems to be invalid.",
+                   "npm ERR! code ENEEDAUTH", "npm error code ENEEDAUTH",
+                   "npm error 403 403 Forbidden - GET https://x/pkg/-/pkg-1.tgz"):
+        got = log_cause(sample)
+        if not got or got[0] != "npm registry login" or "local lane" not in got[1]:
+            fails.append(f"an npm auth failure must be an environmental cause: {sample!r} {got}")
+    if log_cause("FAIL auth.test.ts > shows Unable to authenticate message\n  AssertionError: E401 not shown"):
+        fails.append("a test that merely mentions E401 or Unable to authenticate is not an npm login cause")
+    if lane_hint("npm registry login", "x", False) != LOCAL_NPM_HINT or lane_hint("npm registry login", "x", True) != "x" \
+            or lane_hint("database unreachable", "y", False) != "y":
+        fails.append("lane_hint must change only the npm login hint, and only on the local lane")
+    if log_cause("npm error code E404\nnpm error 404 Not Found") or log_cause("exit 1: Assert.Equal failed"):
+        fails.append("a missing package or an ordinary failure is not an npm login cause")
+    npm = {f"a.test.ts > t{i}": "npm error code E401\nUnable to authenticate" for i in range(3)}
+    got = environmental(npm)
+    if not got or got[0] != "npm registry login":
+        fails.append(f"failures that all show an npm login error must group as one cause: {got}")
     two = {f"T.D{i}": "DockerUnavailableException" for i in range(2)}
     two.update({f"T.P{i}": "NpgsqlException : Failed to connect to x" for i in range(3)})
     got = environmental(two)
