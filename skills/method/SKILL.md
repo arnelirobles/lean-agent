@@ -22,6 +22,7 @@ Label every agent you start, so lean-stats can count it by role. The Agent descr
 - Write tickets in the agent-ready shape with the `shape-ticket` skill: Goal, Where, Covers, Done when, Risks, Constraints, Out of scope.
 - Bigger tickets get a cheap spec review (read the ticket and the code, list what could go wrong) before anyone builds.
 - Plan the steps that need a person up front: merges without a standing authorisation, production, writes to outside services, destructive git. Record any standing authorisation with its scope (which changes, until when, what it excludes). End a run with one block of exact commands for the person.
+- Do not stack pull requests on Azure DevOps: `az` cannot change a target branch, so each retarget is a person in the web UI. Open each pull request against the default branch. Either open the next one after the one before merges, or open it against the default branch now and name in its body which commits belong to the earlier pull request.
 
 ## While working
 - Scripts, not instructions: run the repository's full gate script, not the one gate that seems relevant.
