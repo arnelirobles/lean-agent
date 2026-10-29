@@ -34,20 +34,26 @@ LANES = {"test-phase", "heavy.sh"}
 
 DENY_SLEEP_READ = (
     "Do not sleep and then read a file or task output. End the turn and wait for the "
-    f"notification, or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the "
-    f"background, or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
+    "notification, or start `{brain} queue wait ID...` (test jobs) or `{pr_wait}` (checks) in the "
+    "background, or check a lane with `{heavy} status <lane>`.")
 DENY_LOOP = (
     "Do not poll a file or process in a loop with sleep. End the turn and wait for the "
-    f"notification, or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the "
-    f"background, or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
+    "notification, or start `{brain} queue wait ID...` (test jobs) or `{pr_wait}` (checks) in the "
+    "background, or check a lane with `{heavy} status <lane>`.")
 DENY_PGREP = (
     "Do not use pgrep to wait on a process. End the turn and wait for the notification, "
-    f"or start `{hookkit.tool_path('brain')} queue wait ID...` (test jobs) or `{hookkit.tool_path('pr-wait')}` (checks) in the background, "
-    f"or check a lane with `{hookkit.tool_path('heavy.sh')} status <lane>`.")
+    "or start `{brain} queue wait ID...` (test jobs) or `{pr_wait}` (checks) in the background, "
+    "or check a lane with `{heavy} status <lane>`.")
 TURN_OFF = " LEAN_WAIT_GUARD=off turns this check off."
 NOTE_TEST = (
     "This runs tests outside the lane lock, and its failures never reach brain. Queue it: "
-    f"`{hookkit.tool_path('brain')} queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
+    "`{brain} queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
+
+
+def fill(text):
+    """The notes name the tools by bare name when session-env put them on PATH, else by full path."""
+    return text.format(brain=hookkit.tool_path("brain"), pr_wait=hookkit.tool_path("pr-wait"),
+                       heavy=hookkit.tool_path("heavy.sh"))
 
 
 def is_off(segs):
@@ -136,16 +142,16 @@ def verdict(command, cwd="."):
                 return inner
     if any(name(w) == "pgrep" or (name(w) in LOOP_OPEN | {"if"} and name(after_keywords(w[1:])) == "pgrep")
            for w in cmds):
-        return "deny", DENY_PGREP + TURN_OFF
+        return "deny", fill(DENY_PGREP + TURN_OFF)
     if loop_poll(cmds):
-        return "deny", DENY_LOOP + TURN_OFF
+        return "deny", fill(DENY_LOOP + TURN_OFF)
     for i, words in enumerate(cmds[:-1]):
         if name(words) == "sleep" and name(cmds[i + 1]) in SLEEP_READERS:
-            return "deny", DENY_SLEEP_READ + TURN_OFF
+            return "deny", fill(DENY_SLEEP_READ + TURN_OFF)
     if os.path.exists(BRAIN) and any(is_test_run(w) for w in cmds) \
             and not any(name(w) in LANES for w in cmds) \
             and not direct_test.blocks(re.split(r"\|\||&&|;|\||\n", command), cwd):
-        return "note", NOTE_TEST
+        return "note", fill(NOTE_TEST)
     return None
 
 
