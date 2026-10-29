@@ -452,7 +452,8 @@ def avoidable_rows(runs):
         ran = sum(1 for run in runs if is_fast(run["model"], fast))
         meant = sum(1 for run in runs if run["role"] in FAST_ROLES)
         rows.append((f"{fast.capitalize()} share of runs", f"{ratio(ran, len(runs))} ran on {fast}, the method gives it {ratio(meant, len(runs))}",
-                     f"{ran} of {len(runs)} runs; {meant} have a read-and-report role ({', '.join(FAST_ROLES)})"))
+                     f"{ran} of {len(runs)} runs; {meant} have a read-and-report role ({', '.join(FAST_ROLES)})"
+                     + ("" if meant else "; none started with a lean:search, lean:gate or lean:retro description")))
     else:
         rows.append((f"{fast.capitalize()} share of runs", NO_DATA, ""))
     return rows
@@ -1002,6 +1003,9 @@ def test_avoidable(check, tmp):
         check("a model whose id holds the setting counts as fast",
               dict((l, v) for l, v, _ in measures(conn))["Gemma share of runs"].split(" ran")[0], "25%")
     conn.execute("DELETE FROM agent_runs WHERE run_id = 'x'")
+    conn.execute("DELETE FROM agent_runs WHERE role IN ('gate', 'search')")
+    check("no read-and-report run says so", dict((l, b) for l, _, b in measures(conn))["Haiku share of runs"],
+          "0 of 1 runs; 0 have a read-and-report role (search, gate, retro); none started with a lean:search, lean:gate or lean:retro description")
     text = render(measures(conn), "", False, "2026-10-02")
     check("the section prints", "Avoidable: wait loops: 0% of tokens, 0% of USD" in text, True)
     conn.close()
