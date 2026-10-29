@@ -1,0 +1,21 @@
+$ npm ci
+
+added 212 packages, and audited 213 packages in 6s
+
+42 packages are looking for funding
+  run `npm fund` for details
+
+$ npx vitest run --reporter=verbose
+
+ RUN  v3.2.4 /work/packages/dopaminejs
+
+ ✓ test/clock.test.ts > clock > ticks 1ms
+ × test/store.test.ts > store > saves a value 3ms
+   - expected 'a' to be 'b' // Object.is equality
+
+ FAIL  test/store.test.ts > store > saves a value
+AssertionError: expected 'a' to be 'b' // Object.is equality
+ at test/store.test.ts:9:21
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 1 passed (2)

@@ -69,11 +69,13 @@ The copy is the files `git ls-files` lists (tracked and untracked, not ignored) 
 
 ## Vitest jobs
 
-A job whose test path is a `package.json` (for example `brain queue add ~/app web/package.json`) runs Vitest, not `dotnet test`. In that folder it installs with the lockfile (`pnpm install --frozen-lockfile`, through corepack when pnpm is not installed), then runs `vitest run --reporter=verbose`. The fast filter pieces are file filters, and a failed test file is rerun alone.
+A job whose test path is a `package.json` (for example `brain queue add ~/app web/package.json`) runs Vitest, not `dotnet test`. In that folder it installs with the nearest lockfile (`pnpm install --frozen-lockfile`, through corepack when pnpm is not installed, or `npm ci` for a `package-lock.json`), then runs `vitest run --reporter=verbose` (`pnpm exec`, or `npx` for npm). The fast filter pieces are file filters, and a failed test file is rerun alone.
 
 On a host it runs in `node_image`. The container sits on the job's bridge network, so it has outbound network for the install. pnpm's store and corepack's download are kept in `<workdir>/.node-cache`, which `cache_max_gb` also caps. The host needs no Node.
 
-The lockfile is looked up from the package folder to the repo root, so a pnpm workspace with one root `pnpm-lock.yaml` installs frozen. A project with `package-lock.json` or `yarn.lock` and no `pnpm-lock.yaml` is refused with a `run-failed` item, because only pnpm is run. `LEAN_PNPM_VERSION` (default 10, used when pnpm is not installed and `package.json` has no `packageManager`) is passed to the container.
+The lockfile is looked up from the package folder to the repo root, so a pnpm workspace with one root `pnpm-lock.yaml` installs frozen. The nearest lockfile wins: `pnpm-lock.yaml` means pnpm, `package-lock.json` means `npm ci` in the lockfile's folder (so an npm workspace root installs once for its packages). A project whose nearest lockfile is `yarn.lock` is refused with a `run-failed` item that names it, because only pnpm and npm are run. `LEAN_PNPM_VERSION` (default 10, used when pnpm is not installed and `package.json` has no `packageManager`) is passed to the container.
+
+A job whose test path is a `playwright.config.ts` (or `.js`, `.mjs`, `.cjs`) runs Playwright from that folder: the same install, then `playwright test --reporter=list`. The fast filter pieces are file filters, and a failed test is named `file > title`, so a rerun is per spec file. The default `node_image` has no Playwright browsers, so on a host set `node_image` to an image that has them (for example `mcr.microsoft.com/playwright`) or run the job on the local lane.
 
 Three things to know:
 

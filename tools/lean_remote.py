@@ -16,7 +16,7 @@ remote off. One section per host and, optionally, one per repository:
   reuse_build = yes           ; later jobs on the same commit and tree skip the copy and the build, no turns it off
   build_keep = 3              ; build folders kept per repository
   image = mcr.microsoft.com/dotnet/sdk:10.0
-  node_image = node:22-bookworm-slim   ; for package.json (Vitest) jobs
+  node_image = node:22-bookworm-slim   ; for package.json (Vitest) and Playwright jobs
   extra_paths = local-packages
   exclude = .env*, *.key, *.pem, *license-key*, secrets*
 
@@ -380,10 +380,10 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None, kind="dotn
     """One shell script for ssh: network, sidecars, then the capped test container. Its exit code is the test's.
     dest is a kept build folder. build is the build command to run first in it, and the folder's lock is
     released after it, with mark written only when the build succeeded.
-    kind vitest runs in node_image with a pnpm store volume (corepack and the store live in <workdir>/.node-cache);
+    kind vitest or playwright runs in node_image with a pnpm store volume (corepack and the store live in <workdir>/.node-cache);
     the container is on the job's bridge network, so it has outbound network for the install."""
     jd = sh_path(dest or job_dir(r, job_id))
-    node = kind == "vitest"
+    node = kind in ("vitest", "playwright")
     nuget = sh_path(r.workdir.rstrip("/") + ("/.node-cache" if node else "/.nuget"))
     label, net = f"lean.job={job_id}", f"lean-{job_id}"
     caps = f"--cpus {shlex.quote(r.cpus)} --memory {shlex.quote(r.memory)}"
