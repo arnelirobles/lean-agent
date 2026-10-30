@@ -9,9 +9,11 @@ or push made any way at all is checked. This hook makes sure they run:
          either, a git command it does not know, or a git call it cannot place)
          is blocked when the repository has no working secret-scan pre-commit
          and pre-push hooks, with the command that installs them. It is also
-         blocked when it skips them: --no-verify, commit -n, core.hooksPath set
-         with -c, --config-env or git config, or GIT_CONFIG_*, HOME or
-         XDG_CONFIG_HOME set in the command. git send-pack and git http-push
+         blocked when it skips them: --no-verify, commit -n, core.hooksPath,
+         include.path or includeIf set with -c, --config-env or git config, or
+         GIT_CONFIG_*, HOME or XDG_CONFIG_HOME set in the command. Commands that
+         run commands (submodule foreach, rebase --exec, bisect run, filter-branch,
+         difftool, for-each-repo) count as commits and what they run is read. git send-pack and git http-push
          never run pre-push and are blocked too.
   Write, Edit, MultiEdit, NotebookEdit
          the text being written, when the file is tracked or would be tracked.
@@ -64,14 +66,20 @@ EXPORTS = {"export", "declare", "typeset", "local", "readonly"}
 BUILTINS = set("""add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file
 check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry cherry-pick clean
 clone column commit-graph commit-tree config count-objects credential describe diagnose diff diff-files
-diff-index diff-pairs diff-tree difftool fetch fetch-pack filter-branch fmt-merge-msg for-each-ref
-for-each-repo format-patch fsck gc grep hash-object help hook index-pack init init-db interpret-trailers
+diff-index diff-pairs diff-tree fetch fetch-pack fmt-merge-msg for-each-ref
+format-patch fsck gc grep hash-object help hook index-pack init init-db interpret-trailers
 log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-tree
-mergetool mktag mktree multi-pack-index mv name-rev notes pack-objects pack-refs patch-id prune pull
+mktag mktree multi-pack-index mv name-rev notes pack-objects pack-refs patch-id prune pull
 range-diff read-tree rebase reflog refs remote repack replace replay repo rerere reset restore rev-list
 rev-parse revert rm shortlog show show-branch show-index show-ref sparse-checkout stage stash status
 stripspace submodule switch symbolic-ref tag unpack-file unpack-objects update-index update-ref var
 verify-commit verify-pack verify-tag version whatchanged worktree""".split())
+# git commands that run other commands for you. Always possible commits; the command is read where it can be.
+RUNNERS = {"for-each-repo", "filter-branch", "difftool", "mergetool"}
+# Known external and read-only commands that neither commit through pre-commit nor push. filter-repo,
+# fast-import and subtree rewrite history, so they are not here: they need the hooks, like commit.
+EXTERNALS = set("""lfs svn p4 flow absorb machete send-email request-pull instaweb daemon gui citool scalar
+update-server-info quiltimport sh-setup delta last-modified""".split())
 NO_HOOK_PUSH = {"send-pack", "http-push"}
 COMMIT_VALUE_SHORT = set("mFCctSu")
 VALUE_LONG = {"--author", "--date", "--cleanup", "--fixup", "--squash", "--trailer", "--message", "--file",
@@ -154,11 +162,36 @@ def parse_git(words, seg_cwd, base, env, dynamic, env_dirs):
     return Call(words[i], words[i + 1:], cwd, base, git_dir, work_tree, env, dynamic, config)
 
 
+def backticks(text):
+    """Backtick bodies written as $( ), so they are split like one. Single quotes and escapes are left alone."""
+    out, i, n, quote, open_ = [], 0, len(text), None, False
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and quote != "'" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "`":
+            out.append(" ) " if open_ else " $( ")
+            open_ = not open_
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def split(text, cwd, base):
     """Simple commands of a shell line as (segment, dynamic, assigned names). Like hookkit.segments,
     and it follows pushd too. After a cd it cannot follow (a variable, a command, a folder that does
     not exist yet, cd -, popd) every later segment is dynamic and runs, as far as we know, in base."""
     text, bodies = hookkit.prepare(text)
+    text = backticks(text)
     out, current, dyn = [], [], False
     for tok in hookkit.tokens(text) + [";"]:
         if not hookkit.is_separator(tok):
@@ -195,9 +228,10 @@ def split(text, cwd, base):
 
 def find_calls(command, cwd):
     """(calls, odd, assigned): the git invocations in a command, looking inside sh -c, eval, braces,
-    if/then and xargs; odd is True when some command word is itself a variable or a command
-    substitution, so a git call may hide there; assigned is every variable the command sets."""
-    calls, odd, assigned = [], [False], set()
+    if/then and xargs; odd lists the arguments of each command whose command word is itself a
+    variable or a command substitution (a git call may hide there; for a substitution it is every word
+    of the command); assigned is every variable the command sets."""
+    calls, odd, assigned = [], [], set()
     env_dirs = {}
     for m in ENV_PATH.finditer(command):
         env_dirs[m.group(1)] = m.group(2) or m.group(3) or m.group(4) or ""
@@ -223,7 +257,11 @@ def find_calls(command, cwd):
                 continue
             first = os.path.basename(words[0])
             if is_dynamic(words[0]) or words[0] == "$":
-                odd[0] = True
+                if words[0] == "$":
+                    odd.append([w for w in hookkit.tokens(backticks(hookkit.prepare(command)[0]))
+                                if not hookkit.is_separator(w)])
+                else:
+                    odd.append(words[1:])
             if first in SHELLS or first == "eval":
                 inner = shell_string(words)
                 if inner is not None and depth < 4:
@@ -238,7 +276,7 @@ def find_calls(command, cwd):
                 calls.append(call)
 
     walk(command, cwd, {}, 0, False)
-    return calls, odd[0], assigned
+    return calls, odd, assigned
 
 
 def alias_value(call):
@@ -256,17 +294,62 @@ def alias_value(call):
     return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else None
 
 
+def exec_flag(word):
+    return word in ("-x", "--exec") or word.startswith("--exec=") or (word.startswith("-x") and len(word) > 2)
+
+
+def runs_commands(call):
+    """True for a git subcommand that runs other commands for you (a hook skipping flag may sit in them)."""
+    a = call.args
+    if call.sub in RUNNERS:
+        return True
+    if call.sub == "submodule":
+        return "foreach" in a
+    if call.sub == "bisect":
+        return "run" in a
+    return call.sub == "rebase" and any(exec_flag(w) for w in a)
+
+
+def inner_commands(call):
+    """The command text a runner will run, where it can be read."""
+    a = call.args
+    if call.sub == "submodule" and "foreach" in a:
+        rest = [w for w in a[a.index("foreach") + 1:] if w != "--recursive"]
+        return [" ".join(rest)] if rest else []
+    if call.sub == "bisect" and "run" in a:
+        rest = a[a.index("run") + 1:]
+        return [" ".join(rest)] if rest else []
+    out = []
+    if call.sub == "rebase":
+        for i, w in enumerate(a):
+            if w in ("-x", "--exec") and i + 1 < len(a):
+                out.append(a[i + 1])
+            elif w.startswith("--exec="):
+                out.append(w[7:])
+            elif w.startswith("-x") and len(w) > 2 and w != "--exec":
+                out.append(w[2:])
+    return out
+
+
 def effective(call, depth=0):
     """The calls that commit or push, once aliases are expanded: [] for a git command that does
     neither. A shell alias (!...) counts as one, and the git calls in its text are added."""
     sub = call.sub
     if sub in ("commit", "push") or sub in NO_HOOK_PUSH or is_dynamic(sub):
         return [call]
+    if sub in RUNNERS or (sub in BUILTINS and runs_commands(call)):
+        out = [call]
+        for text in inner_commands(call) if depth < 5 else []:
+            inner, _odd, _names = find_calls(text, call.cwd)
+            for c in inner:
+                c.dynamic = c.dynamic or call.dynamic
+                out += effective(c, depth + 1)
+        return out
     if sub in BUILTINS:
         return []
     alias = alias_value(call) if depth < 5 else None
     if alias is None:
-        return [call]
+        return [] if sub in EXTERNALS else [call]
     if alias.startswith("!"):
         inner, _odd, _names = find_calls(alias[1:], call.cwd)
         out = [call]
@@ -319,10 +402,15 @@ def bypasses(calls, touching, assigned):
             found.append(f"{name}= in the command")
     for c in calls + touching:
         for key, _value in c.config:
-            if key.lower() == "core.hookspath":
+            low = key.lower()
+            if low == "core.hookspath":
                 found.append("core.hooksPath on the command line")
+            elif low == "include.path" or low.startswith("includeif."):
+                found.append(f"{low.split('.')[0]} config include on the command line")
         if c.sub == "config" and any("core.hookspath" in a.lower() for a in c.args):
             found.append("git config core.hooksPath")
+        if c.sub == "config" and any(re.search(r"\binclude(if\..*)?\.path\b", a.lower()) for a in c.args):
+            found.append("git config include.path")
     for c in touching:
         why = skips_hooks(c)
         if why:
@@ -339,7 +427,8 @@ def bash_check(command, cwd):
             touching += effective(c)
     unplaced = odd and re.search(r"\b(commit|push)\b", hookkit.prepare(command)[0])
     if unplaced and SKIP + "=1" not in command:
-        touching.append(Call("commit", [], cwd, cwd, None, None, {}, True, []))
+        for args in odd:
+            touching.append(Call("commit", args, cwd, cwd, None, None, {}, True, []))
     touching = [c for c in touching if not hookkit.disabled(SKIP, c)]
     if not touching:
         return None
@@ -369,9 +458,10 @@ def bash_check(command, cwd):
         seen.add(key)
         ok, why = tool.hooks_installed(repo)
         if not ok:
+            note = tool.install_note(repo)
             return (f"Blocked by lean-agent: {tool.toplevel(repo)} cannot scan this commit or push for keys: {why}. "
                     f"Install the git hooks, then run the command again:\n  {tool.install_command(repo)}\n"
-                    + skip_note)
+                    + (note + "\n" if note else "") + skip_note)
     return None
 
 
@@ -620,11 +710,75 @@ def self_test():
                            ("an alias that adds --no-verify", "git -c alias.c='commit --no-verify' c -m x"),
                            ("an alias that sets hooksPath", "git -c 'alias.c=-c core.hooksPath=/x commit' c -m x"),
                            ("a shell alias that skips", "git -c 'alias.c=!git commit -n' c"),
-                           ("send-pack", f"git send-pack {origin} main"), ("wrapped", "bash -c 'git commit --no-verify -m x'")):
+                           ("send-pack", f"git send-pack {origin} main"), ("wrapped", "bash -c 'git commit --no-verify -m x'"),
+                           ("-c include.path", "git -c include.path=/x commit -m x"),
+                           ("-c INCLUDE.PATH", "git -c INCLUDE.PATH=/x commit -m x"),
+                           ("-c includeIf", "git -c includeIf.gitdir:/x/.path=/y commit -m x"),
+                           ("--config-env include.path", "git --config-env=include.path=P commit -m x"),
+                           ("--config-env includeIf", "git --config-env includeIf.gitdir:/x/.path=P commit -m x"),
+                           ("git config include.path", "git config include.path /x && git commit -m x"),
+                           ("a variable git word with -n", "g=git; $g commit -n -m x"),
+                           ("a variable git word with --no-verify", "g=git; $g commit --no-verify -m x"),
+                           ("a substituted git word with -n", "$(printf git) commit -n -m x"),
+                           ("a backtick commit with -n", "echo `git commit -n -m x`"),
+                           ("a backtick push with --no-verify", "x=`git push --no-verify`"),
+                           ("submodule foreach with -n", "git submodule foreach 'git commit -n -m x'"),
+                           ("rebase --exec with --no-verify", "git rebase --exec 'git commit --no-verify -m x' main"),
+                           ("rebase -x with -n", "git rebase -x 'git commit -n -m x' main"),
+                           ("bisect run with -n", "git bisect run git commit -n -m x")):
             p = bash(cmd, bare)
             check(f"bypass, {label}: blocks", p.returncode, 2)
             check(f"bypass, {label}: says why", "without the git hooks" in p.stderr, True)
         check("bypass with skip set is allowed", bash("LEAN_SKIP_SECRET_SCAN=1 git commit --no-verify -m x", bare).returncode, 0)
+        for label, cmd in (("a variable git word without a skip flag", "g=git; $g commit -m x"),
+                           ("a backtick body that is not a commit", "echo `git status`"),
+                           ("a backtick in a commit message", 'git commit -m "use `foo` here"'),
+                           ("submodule foreach of a read-only command", "git submodule foreach 'git status'"),
+                           ("rebase --exec of a build", "git rebase -x make main"),
+                           ("bisect run of a test", "git bisect run make test"),
+                           ("filter-branch", "git filter-branch --tree-filter true"),
+                           ("filter-repo", "git filter-repo --path x")):
+            check(f"installed, {label}: passes", bash(cmd, bare).returncode, 0)
+
+        # externals and read-only commands pass without hooks; history rewriters and unknown ones do not
+        nohooks = make("nohooks")
+        put(nohooks, "a.txt", "a\n")
+        commit(nohooks, "base")
+        for sub in ("lfs pull", "svn log", "p4 sync", "flow init", "absorb", "machete status", "send-email x.patch",
+                    "request-pull v1 origin", "instaweb", "daemon", "gui", "citool", "scalar list",
+                    "update-server-info", "quiltimport", "sh-setup", "delta", "last-modified", "submodule status",
+                    "bisect start", "rebase main"):
+            check(f"no hooks, git {sub}: passes", bash(f"git {sub}", nohooks).returncode, 0)
+        for sub in ("filter-repo --path x", "fast-import", "subtree add x", "frobnicate"):
+            check(f"no hooks, git {sub}: blocks", bash(f"git {sub}", nohooks).returncode, 2)
+        for label, cmd in (("a backtick commit", "echo `git commit -m x`"),
+                           ("submodule foreach", "git submodule foreach 'git status'"),
+                           ("rebase --exec", "git rebase --exec make main"), ("rebase -x", "git rebase -x make main"),
+                           ("bisect run", "git bisect run make test"), ("for-each-repo", "git for-each-repo --config=x.y fetch"),
+                           ("filter-branch", "git filter-branch --tree-filter true"), ("difftool", "git difftool"),
+                           ("mergetool", "git mergetool")):
+            check(f"no hooks, {label}: blocks", bash(cmd, nohooks).returncode, 2)
+
+        # a shared or tracked hooks folder: the block message gives a command that works
+        shared = make("shared")
+        sh("git", "-C", shared, "config", "core.hooksPath", ".githooks")
+        p = bash("git commit -m x", shared)
+        check("shared hooks folder: blocks", p.returncode, 2)
+        check("and the message names --force-shared and the skip", "--force-shared" in p.stderr and SKIP + "=1" in p.stderr, True)
+        cmd_line = [l.strip() for l in p.stderr.splitlines() if "install" in l and "--force-shared" in l and scan in l]
+        check("and the install command is on a line of its own", len(cmd_line) >= 1, True)
+        p = sh("python3", scan, "install", "--force-shared", shared)
+        check("that command installs", p.returncode, 0)
+        check("and then the commit passes", bash("git commit -m x", shared).returncode, 0)
+
+        # an edited hook is not an installed hook
+        edited = make("edited")
+        install(edited)
+        with open(os.path.join(edited, ".git", "hooks", "pre-commit"), "a") as f:
+            f.write("echo edit\n")
+        p = bash("git commit -m x", edited)
+        check("an edited hook blocks", p.returncode, 2)
+        check("and the message says it was changed", "changed after install" in p.stderr and "install again" in p.stderr, True)
 
         # where the repository cannot be worked out
         outer = os.path.join(tmp, "elsewhere")
