@@ -77,7 +77,7 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 | `brain` | A local SQLite list of open failures, deferred minors, questions, blockers, running agents and next steps, plus the test queue, with tags, runs and stats. `brain resume` prints what is open for a project, and `brain digest` a 2 KB summary of it (counts, blockers, questions, running jobs, stale agents). | [The cycle](#the-cycle) |
 | `brain-mcp` | An MCP server (the plugin registers it as `brain`) that gives a session eleven tools over the brain database: `brain_list` (open items, newest first, 50 lines unless `limit` says otherwise), `brain_show`, `brain_add`, `brain_close`, `brain_queue_list` (queued and running unless `status` says otherwise), `brain_queue_add`, `brain_queue_cancel`, `brain_queue_bump`, `brain_queue_route`, `brain_digest` and `brain_stats`. It runs the `brain` CLI, sends a body on stdin, and does not expose `queue next` or `queue finish`, which only the drainer uses. | [The cycle](#the-cycle) |
 | `vscode/` | The Lean Brain VS Code extension: a read-only dashboard, status bar and trees over the brain database. Build it with `npm run package` in `vscode/`. | [vscode/README.md](vscode/README.md) |
-| Hooks | Three block (attribution and slop in public text, a bad commit author, files in a scratchpad root). The rest add a note and never stop the call. One of them hands the session a brain digest for its project at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
+| Hooks | Four block (attribution and slop in public text, a bad commit author, files in a scratchpad root, keys and tokens in a commit, push or written file). The rest add a note and never stop the call. One of them hands the session a brain digest for its project at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
 | `lean-stats` | One local SQLite file of tokens, reviews, merges and hook fires. Nothing leaves the machine. | [Measure every batch](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) |
 
 Everything in the method still works without the plugin. Without it, run the scripts from `tools/` (for example `tools/holdout.sh`).
@@ -179,12 +179,49 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_IMAGE_MODE` | `note` | `block` refuses tools that return an image (Read of an image file or a pdf with pages, screenshot and thumbnail tools) above `LEAN_IMAGE_CONTEXT`, so a subagent looks and reports in text. |
 | `LEAN_BRAIN_DB` | `~/.local/share/lean/brain.db` | Where `brain` keeps its database. |
 | `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing the brain digest. |
+| `LEAN_SKIP_SECRET_SCAN` | off | `1` turns off `secret-scan`, the Claude hook and the git hooks it installs. A line with `allow-secret` on it is skipped without this. |
 | `LEAN_SCRIPT_NOTE` | on | `off` stops the note that names the script behind a hand-written command. |
 | `LEAN_DIRECT_TEST` | block | `allow` stops the block on a direct `dotnet test`, `npm test`, `npx vitest` or `vitest run` where test-phase can take the job. Tests go through `brain queue add` and `test-phase`. |
 | `LEAN_NPM_REGISTRY` | `npm config get registry`, else `https://registry.npmjs.org` | The npm registry `pkg-version` asks. |
 | `LEAN_NUGET_REGISTRY` | `https://api.nuget.org/v3-flatcontainer` | The nuget flat container `pkg-version` asks. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
+
+## Keep keys out of git
+
+The scan runs in git's own pre-commit and pre-push hooks, so a commit or push is checked however it is made: by Claude, by you in a terminal, through an alias, with a pathspec or `-a`. Install them per repository:
+
+```
+secret-scan install [REPO]       pre-commit and pre-push in one repo
+secret-scan install --force-shared  also when the hooks folder is shared
+secret-scan install --all DIR    every git repo under DIR
+secret-scan uninstall [REPO]     (or --all DIR) take them out
+```
+
+pre-commit checks the lines the commit adds, from the index git is about to commit. pre-push checks the commits the push sends that the target remote does not have, merges included (what a conflict resolution adds), and a tag that points at a blob or a tree. A commit that sits only on another remote is checked again on its way to a new one, unless that other remote is public (an anonymous `git ls-remote` over https works), so a fork of a public repo does not rescan its history. The edge of a shallow clone counts as already known. Diffs are read as text even when `.gitattributes` or config marks a file binary; a file's text ends at its first NUL byte.
+
+The patterns: Google `AIza`, GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`, AWS `AKIA`, Slack `xox`, Stripe `sk_live_`/`rk_live_`, npm `npm_`, private key blocks, and an Azure DevOps PAT when it sits next to a name like `token` or `pat`. When `gitleaks` is on PATH its rules run as well, once per scan, with a time limit (`LEAN_SECRET_SCAN_TIMEOUT`, 20 seconds), and not at all for a scan over 8 MB. If it is skipped, fails or times out the hook prints a warning and the pattern result stands. The output names the file, line and pattern, never the value. A line with `allow-secret` on it is skipped, that line only. Git runs with fsmonitor, textconv, external diff, signature checks and clean filters off, so a repository's own config cannot run code during the scan.
+
+The `secret-scan` Claude hook does not scan commits. Before a Bash command that commits or pushes (including an alias, a git command it does not know, and calls inside `bash -c`, `eval`, braces, `if` and `xargs`), it checks that the repository has both git hooks and the scanner copy they run, and blocks with the install command when not. It also blocks a command that skips them: `--no-verify`, `commit -n`, `core.hooksPath`, `include.path` or `includeIf` set with `-c`, `--config-env` or `git config`, `GIT_CONFIG_*`, `HOME` or `XDG_CONFIG_HOME` set in the command, and `git send-pack`. Git commands that run other commands count as a commit, and the command they run is checked for the same flags: `submodule foreach`, `rebase --exec` and `-x`, `bisect run`, `filter-branch` (`--env-filter`, `--tree-filter`, `--index-filter`, `--parent-filter`, `--msg-filter`, `--commit-filter`, `--tag-name-filter`, `--setup`), `difftool` and `mergetool` (`-x`, `--extcmd`), and `for-each-repo` (its arguments are read as a git command). A `$( )` or backtick substitution is read too, also inside double quotes (a heredoc inside it is cut out first). Some external commands pass only in read-only forms: `lfs` (pull, fetch, install, update, prune, version, ls-files, status, track, but not with `--force`), `svn` (log, fetch, rebase, info, clone), `p4` (sync, clone), `machete` (status, discover), `flow` (init, start, list). The rest of `lfs`, `svn`, `p4`, `machete` and `flow`, and `absorb`, `send-email`, `gui`, `citool`, `filter-repo`, `fast-import`, `subtree` and unknown commands, need the hooks, like commit. `request-pull`, `instaweb`, `daemon`, `scalar`, `delta`, `last-modified`, `update-server-info`, `sh-setup` and `quiltimport` pass. A command that never says `git` is checked when a variable that looks like git (`$GIT`, `${G}`) is followed by `commit` or `push`. When the folder is a variable, a command or a cd target that does not exist yet, it checks the starting repository, and blocks when that is not one. Write, Edit, MultiEdit and NotebookEdit are scanned directly when the file is tracked or would be (a gitignored `.env.local` and files inside `.git` are fine). A block in a repo whose hooks folder is shared or tracked (husky, any `core.hooksPath`) names `--force-shared`. A hook that was edited after install does not count as installed. Every block is a `hook_fires` row in `lean.db`.
+
+An existing hook is kept and still runs after the scan, and a `core.hooksPath` for that repo is respected. The hooks call the python that ran `install` by its full path (python3 from PATH if that file is gone). If a framework overwrites the hook after it was chained, `install` again chains the new hook and moves the older chained one to `<hook>.pre-secret-scan.bak001` (older ones move up to `.bak002` and so on); the chained hook runs first, then `.bak001`, `.bak002` and the rest, newest to oldest, so every foreign hook still runs. Uninstall puts the chained hook back and lists the `.bak` files it leaves. A hooks path that is tracked inside the work tree, or set in global, system or command-line config, is shared by other people or repos, so install refuses it unless you pass `--force-shared`. Uninstall keeps a hook you edited and says so, reports a leftover `.pre-secret-scan`, and says when there was nothing to remove. The scan exits 0 clean, 1 on a finding and 2 when it could not run (a git error, a bad range); the git hooks block on both. Install copies the scanner to `~/.local/share/lean/secret-scan`, so the hooks keep working after a plugin upgrade; if that copy is gone the hooks block and say to run `install` again. `LEAN_SKIP_SECRET_SCAN=1` (not `SKIP`, which belongs to other tools) skips the git hooks and the Claude hook.
+
+Not covered:
+
+- the commit message and the command text
+- variable flags and options that are not expanded: `$g -c core.hooksPath=... commit`, `a=-n; git commit $a`
+- a substitution inside double quotes nested more than three deep
+- `git lfs install` in a repo with our hooks refuses or, with `--force`, replaces our pre-push hook; the Claude hook then blocks pushes until `secret-scan install` runs again
+- anything after the first NUL in a file
+- commits made by `rebase`, `cherry-pick`, `am`, `stash` and `merge`, which do not run pre-commit (the push check gates them)
+- the changes inside the commits at a shallow clone's edge, and an edited `.git/shallow`
+- a hand-made `refs/remotes` ref, which makes the push scan skip a commit
+- hooks turned off outside the command (an exported variable from an earlier command, a global config edited by hand), which the Claude hook cannot see
+- tampering with the hook, the scanner copy or `core.hooksPath` inside the same command as the commit
+- a commit made outside Claude with `--no-verify`
+- `gh repo sync`, `gh api` contents PUT, and `gh pr create --body` holding a key
+- libgit2 and scripts that call git
+- the public-remote check contacts whatever host a remote URL names, and needs the network; when it fails the other remote counts as private and the commits are scanned
 
 ## The method
 
@@ -210,7 +247,7 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 
 ## Data
 
-lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`), stats (`~/.lean/lean.db`) and which script notes a session has seen (`~/.local/share/lean/script-note`, deleted after 14 days). The `commit-author` hook reads the git author email to check it and stores nothing.
+lean-agent has no service of its own and keeps nothing off your machine. What it stores stays local: the brain database (`~/.local/share/lean/brain.db`), test-phase logs (`~/.local/share/lean/test-phase`), stats (`~/.lean/lean.db`) and which script notes a session has seen (`~/.local/share/lean/script-note`, deleted after 14 days). The `commit-author` hook reads the git author email to check it and stores nothing. The `secret-scan` git hooks read the lines being committed or pushed and store nothing; the Claude hook reads the text being written and stores only that it blocked. The push check asks a remote's https address, without credentials, whether it is public.
 
 It sends data to other services only through tools you already run, and only where you point them:
 

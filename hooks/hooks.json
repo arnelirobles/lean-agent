@@ -1,5 +1,5 @@
 {
-  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author, wait-loop, background-shell and review-log checks (no logged review when a pull request goes ready or merges) that block, and notes on house style, stale test runs, hand-written commands a script already does, unverified claims, containers for docs-only diffs, lessons, and a coordinator whose context, own lookups or images are costing the most (an opt-in setting refuses them). A session that ends is collected into lean-stats in the background, and the brain page server starts.",
+  "description": "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author, secret-scan (a commit or push needs the key-scanning git hooks installed and not skipped; a written file is checked for keys), wait-loop, background-shell and review-log checks (no logged review when a pull request goes ready or merges) that block, and notes on house style, stale test runs, hand-written commands a script already does, unverified claims, containers for docs-only diffs, lessons, and a coordinator whose context, own lookups or images are costing the most (an opt-in setting refuses them). A session that ends is collected into lean-stats in the background, and the brain page server starts.",
   "hooks": {
     "SessionStart": [
       {
@@ -114,6 +114,11 @@
           },
           {
             "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/secret-scan.py\"",
+            "timeout": 30
+          },
+          {
+            "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/docs-containers.py\"",
             "timeout": 10
           },
@@ -169,6 +174,16 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/scratchpad-root.py\"",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|MultiEdit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/secret-scan.py\"",
+            "timeout": 30
           }
         ]
       }
