@@ -338,7 +338,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.connection.settimeout(60)
-            out(f'<!doctype html><html><head><meta charset="utf-8"><title>lean brain</title><style>{page.CSS}</style>'
+            out(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<title>lean brain</title><style>{page.CSS}</style>'
                 f'</head><body><h1>lean brain</h1><p><a href="/">Back to the page</a></p><h2>Question</h2>'
                 f'<pre>{e(question)}</pre><!-- {" " * 1024} --><h2>Answer</h2>'
                 '<div style="white-space:pre-wrap">')

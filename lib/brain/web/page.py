@@ -11,12 +11,47 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-CSS = """body{font:15px/1.4 system-ui,sans-serif;margin:1.5rem auto;max-width:70rem;padding:0 1rem;color:#222}
-h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ccc}
-table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.25rem .5rem;border-bottom:1px solid #eee;vertical-align:top}
-.note{color:#8a4b00}.flag{color:#b00020;font-weight:bold}.muted{color:#666}
-form{display:inline-block;margin:.2rem .4rem .2rem 0}textarea{width:30rem;height:3.5rem;display:block}
-pre{white-space:pre-wrap;margin:.2rem 0}"""
+CSS = """:root{--ink:#1c2321;--body:#4d5552;--muted:#6b736f;--leaf:#0b7a55;--leaf-dark:#075a3e;--sun:#ffcd3c;--cream:#fff8e8;
+--sand:#fbf7ee;--line:#ece4d0;--rust:#c2461a;--mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+html{overflow-x:clip}
+body{font:15px/1.5 "Plus Jakarta Sans",ui-sans-serif,system-ui,sans-serif;margin:0 auto;max-width:1160px;padding:0 20px 64px;
+color:var(--ink);background:#fff;-webkit-font-smoothing:antialiased;overflow-x:clip}
+@media(min-width:640px){body{padding:0 40px 64px}}
+a{color:var(--leaf);font-weight:600;text-underline-offset:2px}a:hover{color:var(--leaf-dark)}
+h1{position:sticky;top:0;z-index:2;margin:0 -100vmax 20px;padding:14px 100vmax;background:rgba(255,255,255,.94);
+border-bottom:1px solid var(--line);font-size:19px;font-weight:700;letter-spacing:-.01em;line-height:1.3}
+h1::before{content:"";display:inline-block;width:12px;height:12px;margin-right:10px;border-radius:50%;background:var(--leaf)}
+h2{margin:40px 0 12px;color:var(--rust);font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+h3{margin:24px 0 8px;font-size:15px}
+table{border-collapse:separate;border-spacing:0;width:100%;border:1px solid var(--line);border-radius:14px;overflow:hidden;
+box-shadow:0 1px 2px rgba(28,35,33,.04)}
+td,th{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word}
+td:nth-child(n+4){overflow-wrap:anywhere}
+@media(max-width:800px){table,tbody,tr,td{display:block}tr:has(th){display:none}td{border:0;padding:4px 14px;min-width:0}
+tr{padding:8px 0;border-bottom:1px solid var(--line)}tr:last-child{border-bottom:0}
+td form,td textarea,td button{display:block;margin:6px 0}}
+tr:last-child td{border-bottom:0}
+th{background:var(--sand);color:var(--body);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+tr:hover td{background:var(--sand)}
+.note{color:var(--rust)}.flag{color:var(--rust);font-weight:700}.muted{color:var(--muted)}
+form{display:inline-block;margin:4px 8px 4px 0;vertical-align:middle}
+form[action="/ask"]{box-sizing:border-box;display:block;margin:0 0 12px;padding:20px;background:var(--cream);
+border:1px solid var(--line);border-radius:16px}
+form[action="/assistant-key"]{display:block}
+textarea,input[type=password],select{box-sizing:border-box;font:inherit;color:var(--ink);background:#fff;
+border:1.5px solid var(--line);border-radius:12px;padding:10px 12px}
+textarea{display:block;width:100%;height:6rem;margin:4px 0 12px;resize:vertical}
+input[type=password]{max-width:100%;margin-right:8px}
+select{padding-right:8px;margin-right:6px}
+textarea:focus,input:focus,select:focus,button:focus-visible,a:focus-visible{outline:2px solid var(--leaf);outline-offset:1px}
+button{white-space:nowrap;font:inherit;font-size:12.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;
+color:#fff;background:var(--leaf);border:0;border-radius:999px;padding:9px 18px;transition:background-color .2s,filter .2s}
+button:hover{background:var(--leaf-dark)}
+form[action="/ask"] button{color:var(--ink);background:var(--sun);padding:12px 26px;box-shadow:0 6px 16px rgba(255,205,60,.35)}
+form[action="/ask"] button:hover{filter:brightness(.97)}
+pre,code{font-family:var(--mono);font-size:13px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0;padding:12px 14px;background:var(--sand);border:1px solid var(--line);border-radius:12px}
+summary{cursor:pointer;font-weight:600}"""
 
 
 def e(v) -> str:
@@ -192,7 +227,7 @@ def _ask(st, key):
 def render(data: dict, key: str, port: int, ask=None) -> str:
     err = data.get("errors") or {}
     parts = [
-        '<!doctype html><html><head><meta charset="utf-8">',
+        '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
         f"<title>lean brain</title><style>{CSS}</style></head><body><h1>lean brain</h1>"
         f'<p>updated {time.strftime("%H:%M")} <a href="/">Refresh</a></p>',
         _ask(ask, key) if ask else "",
