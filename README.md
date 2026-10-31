@@ -160,6 +160,10 @@ The session button on an item starts Claude Code on it. On macOS it opens Termin
 
 The VS Code panel is deprecated. It shows a notice once per version and `Lean Brain: Open brain page` opens the page.
 
+### Ask the brain (optional)
+
+The page has an Ask section for questions about your brain database, answered by Claude with your own Anthropic credentials. It is off until you run `brain assistant-setup` and give it a key. Without that the section only shows the setup command. The assistant can only run read-only SELECT queries. Your question and the rows it reads are sent to Anthropic. The page has tabs (`/?tab=overview|needs|ask|tests|work|log`); each loads only its own sections. The assistant can also draw charts. The Activity section charts 14 days from `brain.db` and `lean.db`, and its buttons ask for a summary of today or the last 7 days. Summaries are saved in `summaries.json` next to `brain.db` (masked text from the brain, mode 0600), and `LEAN_ASSISTANT_AUTO_SUMMARY=1` writes the daily one automatically. Setup, credentials, limits and cost are in [docs/assistant.md](docs/assistant.md).
+
 ## Settings
 
 Set these in the `env` block of your Claude Code settings. The defaults run the method as written.

@@ -4,18 +4,86 @@
 """
 import html
 import os
+import re
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-CSS = """body{font:15px/1.4 system-ui,sans-serif;margin:1.5rem auto;max-width:70rem;padding:0 1rem;color:#222}
-h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ccc}
-table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.25rem .5rem;border-bottom:1px solid #eee;vertical-align:top}
-.note{color:#8a4b00}.flag{color:#b00020;font-weight:bold}.muted{color:#666}
-form{display:inline-block;margin:.2rem .4rem .2rem 0}textarea{width:30rem;height:3.5rem;display:block}
-pre{white-space:pre-wrap;margin:.2rem 0}"""
+import activity  # noqa: E402
+import summary  # noqa: E402
+
+CSS = """:root{--ink:#1c2321;--body:#4d5552;--muted:#6b736f;--leaf:#0b7a55;--leaf-dark:#075a3e;--sun:#ffcd3c;--cream:#fff8e8;
+--sand:#fbf7ee;--line:#ece4d0;--rust:#c2461a;--mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+html{overflow-x:clip}
+body{font:15px/1.5 "Plus Jakarta Sans",ui-sans-serif,system-ui,sans-serif;margin:0 auto;max-width:1160px;padding:0 20px 64px;
+color:var(--ink);background:#fff;-webkit-font-smoothing:antialiased;overflow-x:clip}
+@media(min-width:640px){body{padding:0 40px 64px}}
+a{color:var(--leaf);font-weight:600;text-underline-offset:2px}a:hover{color:var(--leaf-dark)}
+header{position:sticky;top:0;z-index:2;margin:0 -100vmax 20px;padding:0 100vmax;background:rgba(255,255,255,.94);
+border-bottom:1px solid var(--line)}
+h1{margin:0;padding:14px 0 8px;font-size:19px;font-weight:700;letter-spacing:-.01em;line-height:1.3}
+nav.tabs{display:flex;gap:6px;padding:0 14px 10px 0;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+nav.tabs::-webkit-scrollbar{display:none}
+nav.tabs a{flex:none;padding:7px 14px;border-radius:999px;color:var(--body);font-size:13px;font-weight:600;text-decoration:none}
+nav.tabs a:hover{background:var(--sand);color:var(--ink)}
+nav.tabs a[aria-current]{background:var(--leaf);color:#fff}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 16px}.actions form{margin:0}
+h1::before{content:"";display:inline-block;width:12px;height:12px;margin-right:10px;border-radius:50%;background:var(--leaf)}
+h2{margin:40px 0 12px;color:var(--rust);font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+h3{margin:24px 0 8px;font-size:15px}
+table{border-collapse:separate;border-spacing:0;width:100%;border:1px solid var(--line);border-radius:14px;overflow:hidden;
+box-shadow:0 1px 2px rgba(28,35,33,.04)}
+td,th{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word}
+table:not(.md) td:nth-child(n+4){overflow-wrap:anywhere;min-width:6.5rem}
+@media(max-width:800px){table:not(.md),table:not(.md) tbody,table:not(.md) tr,table:not(.md) td{display:block}
+table:not(.md) tr:has(th){display:none}table:not(.md) td{border:0;padding:4px 14px;min-width:0}
+table:not(.md) tr{padding:8px 0;border-bottom:1px solid var(--line)}table:not(.md) tr:last-child{border-bottom:0}
+td form,td textarea,td button{display:block;margin:6px 0}}
+tr:last-child td{border-bottom:0}
+th{background:var(--sand);color:var(--body);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+tr:hover td{background:var(--sand)}
+.note{color:var(--rust)}.flag{color:var(--rust);font-weight:700}.muted{color:var(--muted)}
+form{display:inline-block;margin:4px 8px 4px 0;vertical-align:middle}
+form[action="/ask"]{box-sizing:border-box;display:block;margin:0 0 12px;padding:20px;background:var(--cream);
+border:1px solid var(--line);border-radius:16px}
+form[action="/assistant-key"]{display:block}
+textarea,input[type=password],select{box-sizing:border-box;font:inherit;color:var(--ink);background:#fff;
+border:1.5px solid var(--line);border-radius:12px;padding:10px 12px}
+textarea{display:block;width:100%;height:6rem;margin:4px 0 12px;resize:vertical}
+input[type=password]{max-width:100%;margin-right:8px}
+select{padding-right:8px;margin-right:6px}
+textarea:focus,input:focus,select:focus,button:focus-visible,a:focus-visible{outline:2px solid var(--leaf);outline-offset:1px}
+button{white-space:nowrap;font:inherit;font-size:12.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;
+color:#fff;background:var(--leaf);border:0;border-radius:999px;padding:9px 18px;transition:background-color .2s,filter .2s}
+button:hover{background:var(--leaf-dark)}
+form[action="/ask"] button{color:var(--ink);background:var(--sun);padding:12px 26px;box-shadow:0 6px 16px rgba(255,205,60,.35)}
+form[action="/ask"] button:hover{filter:brightness(.97)}
+pre,code{font-family:var(--mono);font-size:13px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0;padding:12px 14px;background:var(--sand);border:1px solid var(--line);border-radius:12px}
+summary{cursor:pointer;font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:0 0 16px}
+.tile{padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--cream);font-size:13px;color:var(--body)}
+.tile b{display:block;font-size:26px;line-height:1.2;color:var(--ink)}.tile span{display:block;margin-top:2px;color:var(--muted)}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:800px){.charts{grid-template-columns:1fr}}
+.chart{margin:0;padding:14px 16px;min-width:0;border:1px solid var(--line);border-radius:14px;background:#fff}
+.answer h3.lab{margin:20px 0 6px;color:var(--rust);font-size:12px;letter-spacing:.08em;text-transform:uppercase}.answer .chart{margin:0 0 12px}.chart figcaption{margin-bottom:6px;font-size:13px;font-weight:700;color:var(--ink)}
+.chart .plot{display:block}.chart .grid{stroke:var(--line);stroke-width:1}.chart .base{stroke:var(--muted);stroke-width:1}
+.chart .tick{fill:var(--muted);font-size:11px}.chart .lbl{fill:var(--ink);font-size:11px;font-weight:700}
+.chart .legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin:0 0 6px;padding:0;list-style:none;font-size:12px;color:var(--body)}
+.chart .sw{display:inline-block;width:10px;height:10px;margin-right:6px;border-radius:3px}
+.sw.s0{background:#0b7a55}.sw.s1{background:#c2461a}.sw.s2{background:#7b4fa8}
+.chart details{margin-top:8px;font-size:12px}.chart details table{font-size:12px}
+.answer{line-height:1.6}.answer p,.answer ul,.answer ol,.answer blockquote{margin:0 0 12px}
+.answer ul,.answer ol{padding-left:24px}.answer li{margin:3px 0}.answer li>ul,.answer li>ol{margin:3px 0}
+.answer h3,.answer h4{margin:20px 0 6px;color:var(--ink);line-height:1.3}.answer h4{font-size:14px}
+.answer blockquote{padding:2px 0 2px 14px;border-left:3px solid var(--leaf);color:var(--body)}
+.answer hr{border:0;border-top:1px solid var(--line);margin:18px 0}
+.answer :not(pre)>code{padding:1px 5px;background:var(--sand);border-radius:6px}
+.scroll{overflow-x:auto;margin:0 0 12px}.scroll table.md{width:auto;min-width:100%;overflow:visible}
+table.md td,table.md th{overflow-wrap:normal}
+details.tool{margin:8px 0;font-size:13px;color:var(--muted)}details.tool summary{font-weight:500}details.tool pre{font-size:12px}"""
 
 
 def e(v) -> str:
@@ -144,24 +212,138 @@ def _decided(data):
     return _table(["#", "Kind", "Project", "Item", "Answer"], rows)
 
 
-def render(data: dict, key: str, port: int) -> str:
-    err = data.get("errors") or {}
-    parts = [
-        '<!doctype html><html><head><meta charset="utf-8">',
-        f"<title>lean brain</title><style>{CSS}</style></head><body><h1>lean brain</h1>"
-        f'<p>updated {time.strftime("%H:%M")} <a href="/">Refresh</a></p>',
-        _section("Needs you", err, "needs_you", _needs(data, key), "Nothing is waiting on you."),
-        _section("Test queue", err, "queue", _queue(data), "The queue is empty."),
-        _section("Created by agents", err, "created", _created(data), "Nothing created yet."),
-        _section("Pending tickets", err, "tickets", _tickets(data), "No open tickets assigned to you."),
-        _section("Worktrees", err, "worktrees", _trees(data), "No worktrees found."),
-        _section("Tested or not", err, "tested", _tested(data), "No pull requests to check."),
-        _section("Notices", err, "notices", _notices(data, key), "No notices."),
-        _section("Usage", err, "usage", _usage(data), "No usage data."),
-        _section("Decided", err, "decided", _decided(data), "Nothing decided yet."),
-        "</body></html>",
-    ]
-    return "".join(parts)
+def _options(pairs, chosen):
+    return "".join(f'<option value="{e(v)}"{" selected" if v == chosen else ""}>{e(t)}</option>' for v, t in pairs)
+
+
+def _ask(st, key):
+    """The Ask section. st comes from Assistant.state(); it holds no key."""
+    out = ["<h2>Ask</h2>"]
+    if st.get("too_old"):
+        out.append('<p class="note">The assistant needs Python 3.11 or later.</p>')
+        return "".join(out)
+    if not st.get("sdk"):
+        out.append('<p class="note">The assistant is not set up. Run this once, then reload:</p>'
+                   f'<pre>{e(st.get("setup"))}</pre>')
+        return "".join(out)
+    sources = {"env": "an Anthropic key from the environment", "keychain": "the key saved in the macOS Keychain",
+               "default": "the Anthropic SDK default credentials"}
+    if st.get("source"):
+        models = [(m, st["labels"].get(m, m)) for m in st["models"]]
+        spent, cap = f'{st["usd"]:.2f}', f'{st["limit"]:g}'
+        out.append(f'<form method="post" action="/ask">{_key(key)}<textarea name="question" maxlength="{e(st["max_question"])}"'
+                   ' placeholder="Ask about your brain"></textarea>'
+                   f'<select name="model">{_options(models, st["default_model"])}</select> '
+                   f'<select name="effort">{_options([(x, x) for x in st["efforts"]], st["default_effort"])}</select> '
+                   '<button>Ask</button></form>')
+        out.append(f'<p class="muted">Using {e(sources.get(st["source"], st["source"]))}. '
+                   f'Spent so far: about ${e(spent)} (estimate) over {e(st["questions"])} questions. '
+                   f'Cap per question: ${e(cap)}.</p>')
+        if st["source"] == "keychain":
+            out.append(_form("/assistant-key-remove", key, [], "Remove the saved key"))
+    else:
+        out.append('<p class="note">No Anthropic credentials found.</p>')
+    if st.get("source") in (None, "default"):
+        if st.get("mac"):
+            out.append(f'<form method="post" action="/assistant-key">{_key(key)}'
+                       '<input type="password" name="apikey" autocomplete="off" placeholder="sk-ant-..." size="40"> '
+                       '<button>Save key in the Keychain</button></form>')
+            out.append('<p class="muted">Or set ANTHROPIC_API_KEY, or run ant auth login, then restart brain serve.</p>')
+        else:
+            out.append('<p class="muted">Set ANTHROPIC_API_KEY in the environment brain serve runs in, '
+                       'or run ant auth login, then restart brain serve.</p>')
+    out.append('<p class="muted">Questions and the brain rows the assistant reads are sent to Anthropic under your own account.</p>')
+    return "".join(out)
+
+
+def _activity(data, err):
+    if not data.get("activity"):
+        return ""
+    try:
+        return activity.render(data["activity"])
+    except Exception as ex:
+        err["activity"] = f"could not draw: {type(ex).__name__}"
+        return ""
+
+
+TABS = (("overview", "Overview"), ("needs", "Needs you"), ("ask", "Ask"), ("tests", "Tests"), ("work", "Work"),
+        ("log", "Log"))
+TAB_NAMES = tuple(n for n, _ in TABS)
+# brain sections each tab needs; needs_you is always read for the count in its label
+TAB_SECTIONS = {"overview": ("activity",), "needs": (), "ask": (), "tests": ("flaky", "queue", "tested"),
+                "work": ("created", "tickets", "worktrees"), "log": ("notices", "usage", "decided")}
+
+
+def tab_name(v) -> str:
+    return v if isinstance(v, str) and v in TAB_NAMES else "overview"
+
+
+def sections_for(tab):
+    return ("needs_you",) + TAB_SECTIONS[tab_name(tab)]
+
+
+def _summary(summ, ask, key):
+    """Stored summaries, the buttons when a key is ready, and a muted note for a failed automatic one."""
+    summ = summ or {}
+    ready = bool(ask and ask.get("source"))
+    out = ["<h2>Summary</h2>"]
+    if ready:
+        out.append('<div class="actions">' + "".join(_form("/summary", key, [("range", r)], label) for r, label in
+                                                     (("today", "Summarise today"), ("week", "Last 7 days"))) + "</div>")
+    shown = False
+    for rng in summary.RANGES:
+        entry = (summ.get("entries") or {}).get(rng)
+        if entry:
+            shown = True
+            try:
+                out.append(summary.render(entry, rng))
+            except Exception as ex:
+                out.append(f'<p class="note">could not draw the {e(rng)} summary: {e(type(ex).__name__)}</p>')
+    if not ready and not shown:
+        out.append('<p class="muted">Set up an Anthropic key under Ask to get daily summaries.</p>')
+    if summ.get("error"):
+        out.append(f'<p class="muted">{e(summ["error"])}</p>')
+    return "".join(out)
+
+
+def _nav(tab, data):
+    n = len(data.get("needs_you") or [])
+    links = []
+    for name, label in TABS:
+        if name == "needs" and n:
+            label += f" ({n})"
+        cur = ' aria-current="page"' if name == tab else ""
+        links.append(f'<a href="/?tab={name}"{cur}>{e(label)}</a>')
+    return '<nav class="tabs">' + "".join(links) + "</nav>"
+
+
+def render(data: dict, key: str, port: int, ask=None, summ=None, tab="overview") -> str:
+    tab = tab_name(tab)
+    err = dict(data.get("errors") or {})
+    if tab == "overview":
+        body = [_section("Activity", err, "activity", _activity(data, err), "No activity yet."), _summary(summ, ask, key)]
+    elif tab == "needs":
+        body = [_section("Needs you", err, "needs_you", _needs(data, key), "Nothing is waiting on you.")]
+    elif tab == "ask":
+        body = [_ask(ask, key) if ask else '<h2>Ask</h2><p class="muted">The assistant is not available.</p>']
+    elif tab == "tests":
+        body = [_section("Test queue", err, "queue", _queue(data), "The queue is empty."),
+                _section("Tested or not", err, "tested", _tested(data), "No pull requests to check.")]
+    elif tab == "work":
+        body = [_section("Created by agents", err, "created", _created(data), "Nothing created yet."),
+                _section("Pending tickets", err, "tickets", _tickets(data), "No open tickets assigned to you."),
+                _section("Worktrees", err, "worktrees", _trees(data), "No worktrees found.")]
+    else:
+        body = [_section("Notices", err, "notices", _notices(data, key), "No notices."),
+                _section("Usage", err, "usage", _usage(data), "No usage data."),
+                _section("Decided", err, "decided", _decided(data), "Nothing decided yet.")]
+    keyed = _key(key)
+    main = "".join(body).replace(keyed, keyed + f'<input type="hidden" name="tab" value="{e(tab)}">')
+    return ("".join([
+        '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+        f"<title>lean brain</title><style>{CSS}</style></head><body><header><h1>lean brain</h1>{_nav(tab, data)}</header>",
+        f'<p>updated {time.strftime("%H:%M")} <a href="/?tab={tab}">Refresh</a></p>',
+        main, "</body></html>"]))
 
 
 def _self_test() -> int:
@@ -175,10 +357,19 @@ def _self_test() -> int:
     os.environ["LEAN_DB"] = os.path.join(tmp, "nostats", "lean.db")
     fails = []
 
+    def rall(*a, **kw):
+        return "".join(render(*a, tab=n, **kw) for n in TAB_NAMES)
+
     def check(name, got, want):
         if got != want:
             fails.append(name)
             print(f"FAIL {name}: got {got!r}, want {want!r}")
+
+    media = CSS[CSS.index("@media(max-width:800px)"):]
+    media = media[:media.index("}}") + 2].split("{", 1)[1]
+    sels = [x.strip() for g in re.findall(r"([^{}@]+)\{", media) for x in g.split(",")]
+    loose = [x for x in sels if not x.startswith(("table:not(.md)", "td form", "td textarea", "td button"))]
+    check("stacking rule skips answer tables", (loose, "table:not(.md) td:nth-child(n+4)" in CSS, ".scroll{overflow-x:auto" in CSS), ([], True, True))
 
     sys.path.insert(0, os.path.join(HERE, "..", ".."))
     import forges
@@ -242,7 +433,61 @@ def _self_test() -> int:
     check("gh missing note", "gh is not installed" in data["errors"].get("tickets", ""), True)
     check("usage error not crash", "usage" in data["errors"], True)
     check("usage error is no data, not a missing script", "no data yet" in data["errors"].get("usage", ""), True)
-    page = render(data, "KEY123", 8770)
+    page = rall(data, "KEY123", 8770)
+    check("activity collected", (len(data["activity"]["days"]), "activity" in data["errors"]), (14, False))
+    check("activity section drawn", ("<h2>Activity</h2>" in page, page.count("<figure"), "Tests failed today" in page), (True, 5, True))
+    broken = rall({**data, "activity": {"days": ["2026-01-01"]}}, "k", 1)
+    check("activity failure keeps the page", ("could not draw" in broken, "<h2>Needs you</h2>" in broken), (True, True))
+    bad_entry = {"at": "x", "model": "m", "usd": 0, "blocks": [{"t": "text", "s": "<script>"}]}
+    sp = render(data, "k", 1, summ={"entries": {"today": bad_entry}, "error": "The automatic summary failed (X)."})
+    check("a summary that cannot draw is a note", ("could not draw the today summary: " in sp, "<script>" in sp, "<h2>Summary</h2>" in sp), (True, False, True))
+    check("an automatic error is shown", "The automatic summary failed (X)." in sp, True)
+    check("legend swatches match the chart colours", all(f".sw.s{i}{{background:{c}}}" in CSS for i, c in enumerate(activity.charts.COLORS)), True)
+    check("tab row styles", all(x in CSS for x in ("header{position:sticky", "nav.tabs{display:flex", "overflow-x:auto", "nav.tabs a[aria-current]{background:var(--leaf);color:#fff}",
+                                                   ".actions{display:flex;flex-wrap:wrap;gap:8px")), True)
+    check("summary label style", ".answer h3.lab{" in CSS and "color:var(--rust)" in CSS.split(".answer h3.lab{")[1].split("}")[0], True)
+    check("chart and tile styles", all(x in CSS for x in (".tiles{", ".tile{", ".charts{", ".chart .plot", ".chart details")), True)
+    heads = {"overview": ("Activity", "Summary"), "needs": ("Needs you",), "ask": ("Ask",), "tests": ("Test queue", "Tested or not"),
+             "work": ("Created by agents", "Pending tickets", "Worktrees"), "log": ("Notices", "Usage", "Decided")}
+    for t, mine in heads.items():
+        h = render(data, "k", 1, {"source": "env"}, None, t)
+        others = [x for u, xs in heads.items() if u != t for x in xs]
+        check("tab " + t + " shows its sections", all(f"<h2>{x}</h2>" in h for x in mine), True)
+        check("tab " + t + " hides the others", any(f"<h2>{x}</h2>" in h for x in others), False)
+        check("tab " + t + " is current", (h.count('aria-current="page"'), f'<a href="/?tab={t}" aria-current="page">' in h), (1, True))
+        check("tab " + t + " forms carry the tab", h.count('name="key"') == h.count(f'name="tab" value="{t}"'), True)
+    check("unknown tab falls back", (tab_name("nope"), tab_name(None), tab_name(5), tab_name("<b>"), tab_name("work")),
+          ("overview", "overview", "overview", "overview", "work"))
+    odd = render(data, "k", 1, None, None, '"><script>')
+    check("tab value never reaches the html", ("<script>" in odd, 'tab=overview" aria-current="page"' in odd), (False, True))
+    check("needs count in the label", "Needs you (" in render({"needs_you": [{"id": 1, "kind": "blocker", "project": "p", "title": "t"}]}, "k", 1)
+          and "Needs you (1)" in render({"needs_you": [{"id": 1, "kind": "blocker", "project": "p", "title": "t"}]}, "k", 1), True)
+    check("no count when nothing waits", "Needs you</a>" in render({"needs_you": []}, "k", 1), True)
+    check("tab sections", [sections_for(x) for x in ("work", "bad")], [("needs_you", "created", "tickets", "worktrees"), ("needs_you", "activity")])
+    quiet = forges.Cache()
+    seen = []
+
+    def rec(argv, **kw):
+        seen.append(argv)
+        return R()
+    only = sections.collect(con, quiet, [], which=lambda n: seen.append(n), run=rec, only=sections_for("overview"))
+    quiet.wait()
+    check("overview makes no forge or worktree call", (seen, only["created"], only["worktrees"], "worktrees" in only["errors"], "tickets" in only["errors"]),
+          ([], [], [], False, False))
+    check("overview still has the activity data", bool(only["activity"]), True)
+    busy = forges.Cache()
+    sections.collect(con, busy, [], which=lambda n: seen.append(n), run=rec, only=sections_for("work"))
+    busy.wait()
+    check("work tab does call out", bool(seen), True)
+    nokey = render(data, "k", 1, {"source": None})
+    check("no key shows the hint, no buttons", ("daily summaries" in nokey, 'name="range"' in nokey), (True, False))
+    ready = render(data, "k", 1, {"source": "env"}, {"entries": {}, "error": "Failed <b>x</b>"})
+    check("key shows buttons and a muted error", ('name="range" value="today"' in ready, "daily summaries" in ready,
+                                                  "Failed &lt;b&gt;x&lt;/b&gt;" in ready), (True, False, True))
+    entry = {"at": time.time(), "model": "m<i>", "usd": 0.5, "blocks": [{"t": "text", "s": "## Shipped\n\n<script>x</script>"}]}
+    shown = render(data, "k", 1, {"source": "env"}, {"entries": {"today": entry}})
+    check("stored summary rendered and escaped", ("<h3>Shipped</h3>" in shown, "<script>x" in shown, "m&lt;i&gt;" in shown, "daily summaries" in shown),
+          (True, False, True, False))
     check("script escaped", "<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page, True)
     check("notice escaped", "&lt;b&gt;note&lt;/b&gt;" in page, True)
     check("flaky lines", page.count("flaky items in"), 2)
@@ -250,16 +495,29 @@ def _self_test() -> int:
     check("merged untested shown", "merged untested" in page, True)
     check("gh note shown", "gh is not installed" in page, True)
     check("no auto refresh", "http-equiv" in page, False)
-    check("refresh link", ('<a href="/">Refresh</a>' in page, "updated " in page), (True, True))
+    check("refresh link", ('<a href="/?tab=overview">Refresh</a>' in render(data, "k", 1), "updated " in page), (True, True))
+    import assistant
+    off = {"sdk": False, "source": None, "mac": True, "setup": "python3 /x/brain assistant-setup", "usd": 0, "questions": 0,
+           "limit": 10, "labels": assistant.LABELS, "models": assistant.MODELS, "efforts": assistant.EFFORTS,
+           "default_model": assistant.DEFAULT_MODEL, "default_effort": assistant.DEFAULT_EFFORT, "max_question": 8000}
+    with_ask = rall(data, "KEY123", 8770, off)
+    check("ask hidden on old python", 'name="question"' in rall(data, "k", 1, {**off, "sdk": True, "source": "env", "too_old": True}), False)
+    check("ask section when sdk missing", ("<h2>Ask</h2>" in with_ask, "assistant-setup" in with_ask), (True, True))
+    ready = rall(data, "KEY123", 8770, {**off, "sdk": True, "source": "keychain", "setup": "<b>x</b>"})
+    check("ask form and remove button", ('name="question"' in ready, "/assistant-key-remove" in ready, 'name="apikey"' in ready),
+          (True, True, False))
+    nokey = rall(data, "KEY123", 8770, {**off, "sdk": True, "mac": False})
+    check("no key form off mac", ('name="apikey"' in nokey, "ANTHROPIC_API_KEY" in nokey), (False, True))
+    check("ask values escaped", "<b>x</b>" in rall(data, "k", 1, {**off, "setup": "<b>x</b>"}), False)
     check("key in forms", page.count('name="key" value="KEY123"') >= 5, True)
     check("approve form", 'name="approve" value="1"' in page, True)
     check("approve only with marker", page.count('name="approve"'), 1)
     check("javascript url is text", 'href="javascript' not in page, True)
     check("https url is link", 'href="https://github.com/o/r/pull/1"' in page, True)
     check("quote in href escaped", 'href="https://x/"onmouseover=1"' not in link('https://x/"onmouseover=1'), True)
-    check("unknown dirty", "uncommitted: unknown" in render({"worktrees": [{"path": "/p", "branch": "b", "unpushed": None,
+    check("unknown dirty", "uncommitted: unknown" in rall({"worktrees": [{"path": "/p", "branch": "b", "unpushed": None,
           "dirty": None, "missing": False, "repo": "/r"}], "errors": {}}, "k", 1), True)
-    check("missing worktree", "folder is missing" in render({"worktrees": [{"path": "/p", "branch": "b", "unpushed": 0,
+    check("missing worktree", "folder is missing" in rall({"worktrees": [{"path": "/p", "branch": "b", "unpushed": 0,
           "dirty": False, "missing": True, "repo": "/r"}], "errors": {}}, "k", 1), True)
     con.close()
 
@@ -285,7 +543,7 @@ def _self_test() -> int:
     d1 = sections.collect(con, sc, [], which=nowhere, run=slow)
     check("slow forge load is quick", time.monotonic() - t0 < 1, True)
     check("all checking", {c["pr_state"] for c in d1["created"]}, {"checking"})
-    check("checking rendered", "checking" in render(d1, "k", 1), True)
+    check("checking rendered", "checking" in rall(d1, "k", 1), True)
     sc.wait(30)
     d2 = sections.collect(con, sc, [], which=nowhere, run=slow)
     check("second load has states", {c["pr_state"] for c in d2["created"]}, {"merged"})
@@ -321,7 +579,7 @@ def _self_test() -> int:
     took = time.monotonic() - t0
     check("locked collect under 3s", took < 3, True)
     check("locked errors filled", all(k in d2["errors"] for k in ("needs_you", "queue", "created", "decided")), True)
-    check("locked page renders", "lean brain" in render(d2, "k", 1) and "locked" in render(d2, "k", 1), True)
+    check("locked page renders", "lean brain" in rall(d2, "k", 1) and "locked" in rall(d2, "k", 1), True)
     lock.execute("ROLLBACK")
     lock.close()
     c2.close()
