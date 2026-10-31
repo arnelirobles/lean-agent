@@ -28,6 +28,8 @@ MAX_TEXT = 40000
 MAX_CHARTS = 2
 INTERVAL = 600
 RETRY = 3600
+MAX_TRIES = 3
+LOCK_WAIT = 3.0
 
 
 def path():
@@ -52,13 +54,37 @@ def question(rng, now=None):
             f"{MAX_CHARTS} charts. Use local time for every date and hour.")
 
 
-def due(now, last_at, last_try, retry=RETRY):
-    """True when the daily summary should be made: none since local midnight, and no failed try in the last hour."""
+def _midnight(now):
     m = time.localtime(now)
-    midnight = time.mktime((m.tm_year, m.tm_mon, m.tm_mday, 0, 0, 0, 0, 0, -1))
-    if last_at is not None and last_at >= midnight:
-        return False
-    return last_try is None or now - last_try >= retry
+    return time.mktime((m.tm_year, m.tm_mon, m.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def decide(now, last_at, tries, active, retry=RETRY, max_tries=MAX_TRIES):
+    """What the daily check does: "skip", "empty" (nothing happened, so no model call) or "run".
+    tries is {"day", "n", "at"} or None; active is a callable, asked last."""
+    if last_at is not None and last_at >= _midnight(now):
+        return "skip"
+    if tries:
+        if tries["day"] == str(_day(now)) and tries["n"] >= max_tries:
+            return "skip"
+        if 0 <= now - tries["at"] < retry:
+            return "skip"
+    return "run" if active() else "empty"
+
+
+def has_activity(data):
+    """True when the last two days of an activity.collect result hold any run or item."""
+    return any(sum(data[k][-2:]) > 0 for k in ("runs", "opened", "closed", "prs", "issues"))
+
+
+def _probe():
+    from brain import store
+    import activity
+    con = store.connect(timeout=2)
+    try:
+        return has_activity(activity.collect(con, days=2))
+    finally:
+        con.close()
 
 
 class Collector:
@@ -78,13 +104,16 @@ class Collector:
     def add(self, kind, text):
         if kind == "text":
             self.buf.append(text)
-        elif kind == "chart":
+        elif kind in ("chart", "tool"):
             self._flush()
+        if kind == "chart":
             if self.charts < MAX_CHARTS:
                 try:
-                    self.blocks.append({"t": "chart", "spec": charts.validate(text)})
+                    spec = charts.validate(text)
+                    charts.svg(spec)
+                    self.blocks.append({"t": "chart", "spec": spec})
                     self.charts += 1
-                except ValueError:
+                except Exception:
                     pass
 
     def finish(self):
@@ -93,13 +122,18 @@ class Collector:
         out, used = [], 0
         for b in self.blocks:
             if b["t"] == "text":
-                s = assistant.mask(b["s"])[:max(0, MAX_TEXT - used)]
+                s = assistant.mask(_text(b["s"]))[:max(0, MAX_TEXT - used)]
                 used += len(s)
                 if s.strip():
                     out.append({"t": "text", "s": s})
             else:
                 out.append(b)
         return out
+
+
+def _text(s):
+    """The text with lone surrogates replaced, so it always encodes."""
+    return s.encode("utf-8", "replace").decode()
 
 
 def _clean(entry):
@@ -123,7 +157,7 @@ def _clean(entry):
             used += len(b["s"])
             if used > MAX_TEXT:
                 return None
-            blocks.append({"t": "text", "s": b["s"]})
+            blocks.append({"t": "text", "s": _text(b["s"])})
         elif b.get("t") == "chart":
             try:
                 blocks.append({"t": "chart", "spec": charts.validate(b.get("spec"))})
@@ -135,9 +169,19 @@ def _clean(entry):
             "blocks": blocks}
 
 
-def load(p=None):
-    """{range: entry} from the file; {} when it is missing, too big or not what it should be."""
-    p = p or path()
+def _clean_tries(t):
+    if not isinstance(t, dict):
+        return None
+    day, n, at = t.get("day"), t.get("n"), t.get("at")
+    if not isinstance(day, str) or len(day) != 10 or isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 1000:
+        return None
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or at != at or abs(at) > 1e11:
+        return None
+    return {"day": day, "n": n, "at": float(at)}
+
+
+def _read(p):
+    """Everything in the file: the entries by range and the auto try count under "auto"."""
     try:
         if os.path.getsize(p) > MAX_FILE:
             return {}
@@ -152,19 +196,58 @@ def load(p=None):
         e = _clean(data.get(rng))
         if e:
             out[rng] = e
+    t = _clean_tries(data.get("auto"))
+    if t:
+        out["auto"] = t
     return out
 
 
-def save(rng, blocks, model, usd, now=None, p=None):
-    """Store one range's summary. Atomic, mode 0600; the other range is kept."""
-    p = p or path()
-    cur = load(p)
-    cur[rng] = {"at": time.time() if now is None else now, "model": model, "usd": usd, "blocks": blocks}
+def load(p=None):
+    """{range: entry} from the file; {} when it is missing, too big or not what it should be."""
+    return {k: v for k, v in _read(p or path()).items() if k in RANGES}
+
+
+def tries(p=None):
+    return _read(p or path()).get("auto")
+
+
+class _Lock:
+    """A lock file beside the data, made with O_EXCL so it works on every platform. A lock older than
+    10 seconds is taken as left over by a crash."""
+
+    def __init__(self, p, wait=None):
+        self.p, self.wait = p + ".lock", LOCK_WAIT if wait is None else wait
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.p), exist_ok=True)
+        end = time.monotonic() + self.wait
+        while True:
+            try:
+                os.close(os.open(self.p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.stat(self.p).st_mtime > 10:
+                        os.unlink(self.p)
+                        continue
+                except OSError:
+                    continue
+                if time.monotonic() >= end:
+                    raise TimeoutError("the summary file is busy")
+                time.sleep(0.02)
+
+    def __exit__(self, *a):
+        try:
+            os.unlink(self.p)
+        except OSError:
+            pass
+        return False
+
+
+def _write(p, cur):
     folder = os.path.dirname(p)
-    os.makedirs(folder, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".summaries-")
     try:
-        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(cur, f)
         os.replace(tmp, p)
@@ -174,6 +257,32 @@ def save(rng, blocks, model, usd, now=None, p=None):
         except OSError:
             pass
         raise
+
+
+def save(rng, blocks, model, usd, now=None, p=None, unless_today=False):
+    """Store one range's summary. Atomic, mode 0600 (mkstemp), under a lock; the other range is kept.
+    With unless_today, a summary that appeared since the run began is left alone. Returns True when stored."""
+    p = p or path()
+    now = time.time() if now is None else now
+    with _Lock(p):
+        cur = _read(p)
+        mine = cur.get(rng)
+        if unless_today and mine and mine["at"] >= _midnight(now):
+            return False
+        cur[rng] = {"at": now, "model": model, "usd": usd, "blocks": blocks}
+        _write(p, cur)
+    return True
+
+
+def note_try(now, p=None):
+    """Count one automatic try for the local day, so a restart does not retry at once."""
+    p = p or path()
+    with _Lock(p):
+        cur = _read(p)
+        t = cur.get("auto")
+        n = t["n"] + 1 if t and t["day"] == str(_day(now)) else 1
+        cur["auto"] = {"day": str(_day(now)), "n": n, "at": float(now)}
+        _write(p, cur)
 
 
 def render(entry, rng):
@@ -198,7 +307,7 @@ def _esc(s):
     return html.escape(str(s), quote=True)
 
 
-def generate(asst, rng, now=None, p=None, limit_usd=None):
+def generate(asst, rng, now=None, p=None, limit_usd=None, unless_today=False):
     """Make and store one summary without a browser. Raises on failure. Returns the stored entry."""
     client, _src = asst.client()
     chat = {"system": assistant.build_system(), "messages": [], "model": assistant.DEFAULT_MODEL,
@@ -211,23 +320,23 @@ def generate(asst, rng, now=None, p=None, limit_usd=None):
     blocks = col.finish()
     if not blocks:
         raise RuntimeError("empty")
-    save(rng, blocks, chat["model"], res["usd"], now, p)
+    save(rng, blocks, chat["model"], res["usd"], now, p, unless_today)
     return load(p)[rng]
 
 
 class Auto:
     """The once-a-day summary. tick() is one 10 minute check; it never raises."""
 
-    def __init__(self, asst, clock=time.time, p=None):
-        self.asst, self.clock, self.p = asst, clock, p
-        self.last_try = None
+    def __init__(self, asst, clock=time.time, p=None, active=_probe):
+        self.asst, self.clock, self.p, self.active = asst, clock, p, active
         self.error = None
 
     def tick(self):
         now = self.clock()
-        last = (load(self.p).get("today") or {}).get("at")
-        if not due(now, last, self.last_try):
-            return "skip"
+        st = _read(self.p or path())
+        what = decide(now, (st.get("today") or {}).get("at"), st.get("auto"), self.active)
+        if what != "run":
+            return what
         try:
             self.asst.client()
         except Exception:
@@ -235,11 +344,11 @@ class Auto:
         if not self.asst.slots.acquire(blocking=False):
             return "busy"
         try:
-            generate(self.asst, "today", now, self.p)
+            note_try(now, self.p)
+            generate(self.asst, "today", now, self.p, unless_today=True)
             self.error = None
             return "ran"
         except Exception as ex:
-            self.last_try = now
             self.error = f"The automatic summary failed ({type(ex).__name__}). It tries again within the hour."
             return "failed"
         finally:
@@ -277,14 +386,24 @@ def _self_test():
     # due(): 2026-10-31 10:00 Manila is the base
     base = datetime.datetime(2026, 10, 31, 10, 0).timestamp()
     mid = datetime.datetime(2026, 10, 31, 0, 0).timestamp()
-    check("due: never written", due(base, None, None), True)
-    check("due: written today", due(base, mid + 60, None), False)
-    check("due: written at midnight", due(base, mid, None), False)
-    check("due: written just before midnight", due(base, mid - 1, None), True)
-    check("due: failed 10 minutes ago", due(base, mid - 1, base - 600), False)
-    check("due: failed an hour ago", due(base, mid - 1, base - 3600), True)
-    check("due: written today beats a stale try", due(base, mid + 5, base - 7200), False)
-    check("due: just after midnight, yesterday's summary", due(mid + 30, mid - 600, None), True)
+    yes = lambda: True
+    never = lambda: (_ for _ in ()).throw(AssertionError("asked"))
+    t0 = {"day": "2026-10-31", "n": 1, "at": base - 7200}
+    check("decide: never written", decide(base, None, None, yes), "run")
+    check("decide: written today", decide(base, mid + 60, None, never), "skip")
+    check("decide: written at midnight", decide(base, mid, None, never), "skip")
+    check("decide: written just before midnight", decide(base, mid - 1, None, yes), "run")
+    check("decide: tried 10 minutes ago", decide(base, mid - 1, {**t0, "at": base - 600}, never), "skip")
+    check("decide: tried an hour ago", decide(base, mid - 1, {**t0, "at": base - 3600}, yes), "run")
+    check("decide: written today beats a stale try", decide(base, mid + 5, t0, never), "skip")
+    check("decide: just after midnight, yesterday's summary", decide(mid + 30, mid - 600, None, yes), "run")
+    check("decide: three tries today", decide(base, None, {**t0, "n": 3}, never), "skip")
+    check("decide: two tries today", decide(base, None, {**t0, "n": 2}, yes), "run")
+    check("decide: yesterday's tries do not count", decide(base, None, {"day": "2026-10-30", "n": 3, "at": base - 7200}, yes), "run")
+    check("decide: a try in the future waits for the clock", decide(base, None, {**t0, "at": base + 99999}, yes), "run")
+    check("decide: nothing happened", decide(base, None, None, lambda: False), "empty")
+    quiet = {"runs": [0, 0], "opened": [0, 0], "closed": [0, 0], "prs": [0, 0], "issues": [0, 0]}
+    check("has_activity", (has_activity(quiet), has_activity({**quiet, "runs": [0, 1]}), has_activity({**quiet, "issues": [1, 0]})), (False, True, True))
 
     # question
     q = question("week", base)
@@ -298,8 +417,13 @@ def _self_test():
     spec = {"title": "T", "kind": "bar", "labels": ["a"], "series": [{"name": "n", "values": [1]}]}
     blocks = [{"t": "text", "s": "hi **there**"}, {"t": "chart", "spec": charts.validate(spec)}]
     save("today", blocks, "m", 0.01, base, p)
+    old = os.umask(0)
+    try:
+        save("week", blocks, "m", 0.02, base, p)
+        check("mode 0600 with an open umask", oct(os.stat(p).st_mode & 0o777), "0o600")
+    finally:
+        os.umask(old)
     check("mode 0600", oct(os.stat(p).st_mode & 0o777), "0o600")
-    save("week", blocks, "m", 0.02, base, p)
     got = load(p)
     check("both kept", sorted(got), ["today", "week"])
     check("no temp files left", [f for f in os.listdir(tmp) if f.startswith(".summaries-")], [])
@@ -349,6 +473,66 @@ def _self_test():
     check("file over the size limit is ignored", load(p), {})
     check("default question uses the clock", datetime.date.today().isoformat() in question("today"), True)
 
+    # lone surrogates never reach the page
+    lone = "a\udc80b"
+    cs = Collector()
+    cs.add("text", lone)
+    check("collector replaces a lone surrogate", [b["s"] for b in cs.finish()], ["a?b"])
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"today": {"at": base, "model": "m", "usd": 0, "blocks": [{"t": "text", "s": lone}]}}))
+    got = load(p)
+    check("load replaces a lone surrogate", got["today"]["blocks"][0]["s"], "a?b")
+    check("a stored surrogate renders and encodes", render(got["today"], "today").encode("utf-8") != b"", True)
+
+    # the lock
+    lp = os.path.join(tmp, "lock", "s.json")
+    os.makedirs(os.path.dirname(lp))
+    old_wait = globals()["LOCK_WAIT"]
+    globals()["LOCK_WAIT"] = 0.2
+    try:
+        with _Lock(lp):
+            try:
+                save("today", blocks, "m", 0, base, lp)
+                got_lock = "saved"
+            except TimeoutError:
+                got_lock = "timeout"
+        check("a held lock times out", got_lock, "timeout")
+        check("the lock is released", os.path.exists(lp + ".lock"), False)
+        with open(lp + ".lock", "w"):
+            pass
+        os.utime(lp + ".lock", (time.time() - 100, time.time() - 100))
+        save("today", blocks, "m", 0, base, lp)
+        check("a stale lock is cleared", sorted(load(lp)), ["today"])
+    finally:
+        globals()["LOCK_WAIT"] = old_wait
+    errs = []
+
+    def writer(name):
+        try:
+            for i in range(10):
+                save(name, blocks, "m", 0, base + i, lp)
+        except Exception as ex:
+            errs.append(ex)
+    ts = [threading.Thread(target=writer, args=(n,)) for n in ("today", "week")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("parallel saves keep both ranges", (errs, sorted(load(lp)), os.path.exists(lp + ".lock")), ([], ["today", "week"], False))
+    up = os.path.join(tmp, "unless.json")
+    save("today", blocks, "first", 0, base, up)
+    check("unless_today leaves today's entry", (save("today", blocks, "second", 0, base + 5, up, unless_today=True), load(up)["today"]["model"]), (False, "first"))
+    check("unless_today saves when none today", save("today", blocks, "third", 0, base + 86400, up, unless_today=True), True)
+    check("tries survive a save", tries(up), None)
+    note_try(base, up)
+    note_try(base + 5, up)
+    check("note_try counts the day", tries(up), {"day": "2026-10-31", "n": 2, "at": base + 5})
+    save("week", blocks, "m", 0, base, up)
+    check("a save keeps the tries", tries(up)["n"], 2)
+    note_try(base + 86400, up)
+    check("a new day starts again", tries(up)["n"], 1)
+    check("load does not list the tries", sorted(load(up)), ["today", "week"])
+
     # the loop stops when told to, and the env switch
     class Never(Auto):
         def tick(self):
@@ -367,8 +551,18 @@ def _self_test():
     c.add("chart", spec)
     c.add("text", "two")
     c.add("tool", "select 1")
+    c.add("text", "three")
     out = c.finish()
-    check("collector shape", [b["t"] for b in out], ["text", "chart", "chart", "text"])
+    check("collector shape", [b["t"] for b in out], ["text", "chart", "chart", "text", "text"])
+    check("text stays apart across a tool call", [b["s"] for b in out if b["t"] == "text"][1:], ["two", "three"])
+    c = Collector()
+    real_svg = charts.svg
+    charts.svg = lambda sp: (_ for _ in ()).throw(ZeroDivisionError())
+    try:
+        c.add("chart", spec)
+    finally:
+        charts.svg = real_svg
+    check("a chart that cannot draw is dropped", c.finish(), [])
     check("collector masks", (key in out[0]["s"], "[secret removed]" in out[0]["s"]), (False, True))
 
     # generate and the auto thread, with a fake client
@@ -405,7 +599,7 @@ def _self_test():
     store.connect().close()
     clock = [base]
     ap = os.path.join(tmp, "auto", "summaries.json")
-    auto = Auto(asst, lambda: clock[0], ap)
+    auto = Auto(asst, lambda: clock[0], ap, yes)
     check("auto ran", (auto.tick(), "Shipped" in load(ap)["today"]["blocks"][0]["s"]), ("ran", True))
     check("fixed question sent", "what got worse" in seen[0]["messages"][0]["content"] or "got worse" in str(seen[0]["messages"][0]), True)
     check("auto skips once written", auto.tick(), "skip")
@@ -423,8 +617,45 @@ def _self_test():
     turns.clear()
     clock[0] += 3600
     check("retry after the hour", (auto.tick(), auto.error), ("ran", None))
+    n_seen = len(seen)
+    clock[0] += 86400
+    check("empty brain never calls the model", (Auto(asst, lambda: clock[0], ap, lambda: False).tick(), len(seen)), ("empty", n_seen))
+    check("default probe sees an empty brain", Auto(asst, lambda: clock[0], ap).tick(), "empty")
+    # three tries a day, kept in the file across a restart
+    tp = os.path.join(tmp, "tries", "summaries.json")
+    turns.append("boom")
+    t1 = [base + 5 * 86400]
+    first = Auto(asst, lambda: t1[0], tp, yes)
+    outcome = []
+    for _ in range(4):
+        outcome.append(Auto(asst, lambda: t1[0], tp, yes).tick())
+        t1[0] += 3600
+    check("tries stop at three a day", outcome, ["failed", "failed", "failed", "skip"])
+    check("tries are in the file", tries(tp)["n"], 3)
+    t1[0] = base + 6 * 86400
+    turns.clear()
+    check("the next day tries again", Auto(asst, lambda: t1[0], tp, yes).tick(), "ran")
+    # a manual summary written during the run stops the auto save
+    mp = os.path.join(tmp, "manual", "summaries.json")
+    real_gen_client = asst.client
+    def manual_first():
+        save("today", [{"t": "text", "s": "mine"}], "manual", 0, base + 7 * 86400, mp)
+        return real_gen_client()
+    ma = Auto(types.SimpleNamespace(client=manual_first, slots=asst.slots, sdk_loader=asst.sdk_loader), lambda: base + 7 * 86400, mp, yes)
+    ma.asst.client = manual_first
+    check("manual summary written meanwhile is kept", (ma.tick(), load(mp)["today"]["model"]), ("ran", "manual"))
+    # a run that ends on a limit still counts
+    lp2 = os.path.join(tmp, "limit", "summaries.json")
+    capped = Auto(asst, lambda: base + 8 * 86400, lp2, yes)
+    real_gen = globals()["generate"]
+    globals()["generate"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stopped: cap"))
+    try:
+        r = capped.tick()
+    finally:
+        globals()["generate"] = real_gen
+    check("a capped run counts as a try", (r, tries(lp2)["n"]), ("failed", 1))
     nokey = assistant.Assistant(run=lambda *a, **k: None, sdk_loader=lambda: None, platform="linux", env={})
-    check("auto waits for a key", Auto(nokey, lambda: base, os.path.join(tmp, "n", "s.json")).tick(), "no key")
+    check("auto waits for a key", Auto(nokey, lambda: base, os.path.join(tmp, "n", "s.json"), yes).tick(), "no key")
     check("env off by default", start_auto(asst, {}), None)
     check("env must be 1", start_auto(asst, {"LEAN_ASSISTANT_AUTO_SUMMARY": "yes"}), None)
     check("env default reads the process environment", start_auto(asst), None)

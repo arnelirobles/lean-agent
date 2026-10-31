@@ -19,6 +19,7 @@ MAX_SERIES = 3
 MAX_NAME = 40
 MAX_HBAR = 12
 MAX_ABS = 1e15
+MIN_ABS = 1e-9
 W, H = 640, 260
 GAP = 2
 EMPTY = "No data in this range."
@@ -41,8 +42,13 @@ def _number(v):
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ValueError("values must be numbers or null")
-    if not math.isfinite(v) or abs(v) > MAX_ABS:
-        raise ValueError("values must be finite numbers")
+    try:
+        small = v != 0 and abs(v) < MIN_ABS
+        big = not math.isfinite(v) or abs(v) > MAX_ABS
+    except OverflowError:
+        raise ValueError("values must be finite numbers") from None
+    if big or small:
+        raise ValueError("values must be finite numbers, zero or at least 1e-9 in size")
     return v
 
 
@@ -355,6 +361,10 @@ def _self_test() -> int:
     check("no labels refused", bad(good(labels=[], series=[{"name": "n", "values": []}])), True)
     check("abs limit", (bad(good(series=[{"name": "n", "values": [MAX_ABS, 0, 0]}])),
                         bad(good(series=[{"name": "n", "values": [MAX_ABS * 2, 0, 0]}]))), (False, True))
+    tiny = lambda *v: bad(good(series=[{"name": "n", "values": list(v)}]))
+    check("tiny values refused", (tiny(-5e-324, 5e-324, 0), tiny(1e-320, 2e-320, 0), tiny(1e-10, 0, 0)), (True, True, True))
+    check("small values at the edge kept", (tiny(1e-9, 0, 0), tiny(-1e-9, 0, 0), tiny(0, 0, 0)), (False, False, False))
+    check("huge int is a refusal", tiny(10 ** 400, 0, 0), True)
     check("ticks steps", [_ticks(0, x) for x in (3, 6, 7.5, 15, 30, 10)],
           [[0, 1, 2, 3], [0, 2, 4, 6], [0, 2.5, 5, 7.5], [0, 5, 10, 15], [0, 10, 20, 30], [0, 5, 10]])
     check("negative ticks", (_ticks(-10, 10)[0], _ticks(-10, 10)[-1]), (-10, 10))

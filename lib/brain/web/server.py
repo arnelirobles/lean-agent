@@ -169,7 +169,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
         if isinstance(body, str):
-            body = body.encode("utf-8")
+            body = body.encode("utf-8", "replace")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -344,10 +344,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         e = page.e
 
         def out(text):
-            self.wfile.write(text.encode("utf-8"))
+            self.wfile.write(text.encode("utf-8", "replace"))
             self.wfile.flush()
 
-        md = mdlite.Stream()
+        md = mdlite.Stream(clean=assistant.mask)
         col = summary.Collector() if rng else None
         back = "/?tab=overview" if rng else "/?tab=ask"
 
@@ -359,7 +359,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             out(md.flush())
             if kind == "chart":
-                out(charts.svg(text) + "\n")
+                try:
+                    drawn = charts.svg(text)
+                except Exception:
+                    drawn = '<p class="note">The chart could not be drawn.</p>'
+                out(drawn + "\n")
             elif kind == "tool":
                 out(f'<details class="tool"><summary>Ran a query</summary><pre>{e(text[:500])}</pre></details>\n')
             else:
@@ -431,13 +435,15 @@ def make_server(port, key, db_path=None, roots=None) -> http.server.ThreadingHTT
     return srv
 
 
-def main(argv) -> int:
+def main(argv, make=make_server, start=summary.start_auto, env=None) -> int:
     if "--self-test" in argv:
         return _self_test()
-    port = int(os.environ.get("LEAN_SERVE_PORT") or 8770)
+    env = os.environ if env is None else env
+    port = int(env.get("LEAN_SERVE_PORT") or 8770)
     key = secrets.token_urlsafe(32)
-    srv = make_server(port, key)
-    srv.app.auto = summary.start_auto(srv.app.assistant)
+    srv = make(port, key)
+    if env.get("LEAN_ASSISTANT_AUTO_SUMMARY") == "1":
+        srv.app.auto = start(srv.app.assistant)
     print(f"http://leanagent.localhost:{srv.app.port}  (also http://127.0.0.1:{srv.app.port})", flush=True)
     try:
         srv.serve_forever()
@@ -739,6 +745,28 @@ def _self_test() -> int:
     a = b.split("<h2>Answer</h2>")[1]
     check("chart drawn in the answer", (a.count("<figure"), "<svg" in a, "<i>T</i>" in a, "&lt;i&gt;T&lt;/i&gt;" in a), (1, True, False, True))
     check("chart result sent back", seen[1]["messages"][-1]["content"][0]["content"], "drawn")
+    seen.clear()
+    turns.extend([{"text": ["the key is " + fake_key + " ok\n\nnext"]}])
+    s, h, b = post("/ask", ask_form)
+    a = b.split("<h2>Answer</h2>")[1]
+    check("a key inside one streamed line is masked", (fake_key in a, "[secret removed]" in a), (False, True))
+    turns.extend([{"text": ["a\udc80b\n\nc"]}])
+    s, h, b = post("/ask", ask_form)
+    check("a lone surrogate in the stream does not stop it", (s, "a?b" in b, b.rstrip().endswith("</html>")), (200, True, True))
+    real_svg, calls = charts.svg, []
+    def flaky(spec):
+        calls.append(1)
+        if len(calls) > 1:
+            raise ZeroDivisionError()
+        return real_svg(spec)
+    charts.svg = flaky
+    turns.extend([{"text": [], "chart": {"title": "T", "kind": "bar", "labels": ["a"], "series": [{"name": "n", "values": [1]}]}},
+                  {"text": ["after"]}])
+    try:
+        s, h, b = post("/ask", ask_form)
+    finally:
+        charts.svg = real_svg
+    check("a chart that cannot draw does not end the stream", (s, "could not be drawn" in b, "after" in b, b.rstrip().endswith("</html>")), (200, True, True, True))
     for _ in range(assistant.MAX_RUNNING):
         asst.slots.acquire()
     status = post("/ask", {"key": key, "question": "hi", "model": "claude-opus-5-5", "effort": "high"})[0]
@@ -785,6 +813,13 @@ def _self_test() -> int:
     open(summary.path(), "w").write("{broken")
     s, h, p = req("GET", "/")
     check("corrupt summary file still serves the page", (s, "Written " in p, "<h2>Activity</h2>" in p), (200, False, True))
+    with open(summary.path(), "w") as fh:
+        fh.write(json.dumps({"today": {"at": time.time(), "model": "m", "usd": 0, "blocks": [{"t": "text", "s": "x\udc80y"}]}}))
+    s, h, p = req("GET", "/")
+    check("a lone surrogate in a stored summary keeps the page", (s, "x?y" in allp()), (200, True))
+    srv.app.auto = types.SimpleNamespace(error="The automatic summary failed (RuntimeError). It tries again within the hour.")
+    check("auto error reaches the page", "The automatic summary failed (RuntimeError)" in allp(), True)
+    srv.app.auto = None
     os.unlink(summary.path())
     turns.append({"text": ["x"], "sql": "SELECT 1"})
     seen.clear()
@@ -816,6 +851,41 @@ def _self_test() -> int:
     page_ = req("GET", h["location"])[2]
     check("no key form off mac", ("needs macOS" in page_, "key" in vault, 'name="apikey"' in allp()), (True, False, False))
     check("item routes still need an id", post("/answer", {"key": key})[0], 400)
+
+    import io as _io
+
+    class Sink:
+        def __init__(self):
+            self.wfile, self.sent = _io.BytesIO(), []
+
+        def send_response(self, code):
+            self.sent.append(code)
+
+        def send_header(self, k, v):
+            self.sent.append((k, v))
+
+        def end_headers(self):
+            pass
+    sink = Sink()
+    Handler._send(sink, 200, "a\udc80b")
+    check("a lone surrogate cannot stop a response", (sink.wfile.getvalue(), ("Content-Length", "3") in sink.sent), (b"a?b", True))
+    calls = []
+
+    def fake_make(port, key):
+        return types.SimpleNamespace(app=types.SimpleNamespace(port=port, assistant="A", auto=None),
+                                     serve_forever=lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    import contextlib
+    import io
+    for env, want in (({}, []), ({"LEAN_ASSISTANT_AUTO_SUMMARY": "0"}, []), ({"LEAN_ASSISTANT_AUTO_SUMMARY": "1"}, ["A"])):
+        calls.clear()
+        holder = []
+
+        def fake_make2(port, key, holder=holder):
+            holder.append(fake_make(port, key))
+            return holder[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main([], make=fake_make2, start=lambda a: (calls.append(a), "AUTO")[1], env=env)
+        check(f"main auto wiring {env}", (rc, calls, holder[0].app.auto), (0, want, "AUTO" if want else None))
 
     srv.shutdown()
     srv.server_close()

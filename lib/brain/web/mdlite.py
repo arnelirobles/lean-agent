@@ -242,13 +242,15 @@ def _list(lines, i, out, depth) -> int:
 class Stream:
     """feed() takes deltas and returns HTML for the blocks that are finished; flush() renders the rest."""
 
-    def __init__(self):
+    def __init__(self, clean=None):
+        self.clean = clean
         self.buf = ""
         self.lines = []
         self.fence = None
 
     def _take(self):
-        html_out = render(self.lines) if self.lines else ""
+        lines = [self.clean(ln) for ln in self.lines] if self.clean else self.lines
+        html_out = render(lines) if lines else ""
         self.lines = []
         self.fence = None
         return html_out
@@ -375,6 +377,12 @@ def _self_test() -> int:
     s = Stream()
     s.feed("```\nx\n")
     check("flush mid fence", s.flush(), "<pre><code>x</code></pre>")
+    seen = []
+    cs = Stream(clean=lambda ln: (seen.append(ln), ln.replace("SECRET", "[x]"))[1])
+    check("clean runs on finished lines", cs.feed("a SECRET\n\n") + cs.flush(), "<p>a [x]</p>")
+    cs = Stream(clean=str.upper)
+    check("clean covers the flushed tail", cs.feed("ab") + cs.flush(), "<p>AB</p>")
+    check("no clean leaves text alone", Stream().feed("a SECRET\n\n"), "<p>a SECRET</p>")
     check("closing fence renders at once", Stream().feed("```\nx\n```\n"), "<pre><code>x</code></pre>")
 
     t0 = time.monotonic()

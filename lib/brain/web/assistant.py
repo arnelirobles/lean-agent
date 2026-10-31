@@ -452,6 +452,10 @@ def _chart_result(block, say):
         spec = charts.validate(getattr(block, "input", None))
     except ValueError as ex:
         return {**res, "content": f"the chart was refused: {ex}", "is_error": True}
+    try:
+        charts.svg(spec)
+    except Exception:
+        return {**res, "content": "the chart was refused: it cannot be drawn", "is_error": True}
     say("chart", spec)
     return {**res, "content": "drawn"}
 
@@ -925,6 +929,15 @@ def _self_test():
     client, chat, res, got = ask([chart_turn({**good, "series": [{"name": "n", "values": [1, float("nan")]}]}), {"content": [txt("ok")]}])
     sent = client.seen[1]["messages"][2]["content"][0]
     check("bad chart is an error result", ([k for k, t in got if k == "chart"], sent.get("is_error"), "refused" in sent["content"], res["reason"]),
+          ([], True, True, "done"))
+    real_svg = charts.svg
+    charts.svg = lambda spec: (_ for _ in ()).throw(ZeroDivisionError())
+    try:
+        client, chat, res, got = ask([chart_turn(good), {"content": [txt("ok")]}])
+    finally:
+        charts.svg = real_svg
+    sent = client.seen[1]["messages"][2]["content"][0]
+    check("undrawable chart is a refusal", ([k for k, t in got if k == "chart"], sent.get("is_error"), "cannot be drawn" in sent["content"], res["reason"]),
           ([], True, True, "done"))
     client, chat, res, got = ask([chart_turn("junk"), {"content": [txt("ok")]}])
     check("non-dict chart input refused", client.seen[1]["messages"][2]["content"][0].get("is_error"), True)

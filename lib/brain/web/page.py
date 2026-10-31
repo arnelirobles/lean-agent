@@ -438,6 +438,10 @@ def _self_test() -> int:
     check("activity section drawn", ("<h2>Activity</h2>" in page, page.count("<figure"), "Tests failed today" in page), (True, 5, True))
     broken = rall({**data, "activity": {"days": ["2026-01-01"]}}, "k", 1)
     check("activity failure keeps the page", ("could not draw" in broken, "<h2>Needs you</h2>" in broken), (True, True))
+    bad_entry = {"at": "x", "model": "m", "usd": 0, "blocks": [{"t": "text", "s": "<script>"}]}
+    sp = render(data, "k", 1, summ={"entries": {"today": bad_entry}, "error": "The automatic summary failed (X)."})
+    check("a summary that cannot draw is a note", ("could not draw the today summary: " in sp, "<script>" in sp, "<h2>Summary</h2>" in sp), (True, False, True))
+    check("an automatic error is shown", "The automatic summary failed (X)." in sp, True)
     check("legend swatches match the chart colours", all(f".sw.s{i}{{background:{c}}}" in CSS for i, c in enumerate(activity.charts.COLORS)), True)
     check("tab row styles", all(x in CSS for x in ("header{position:sticky", "nav.tabs{display:flex", "overflow-x:auto", "nav.tabs a[aria-current]{background:var(--leaf);color:#fff}",
                                                    ".actions{display:flex;flex-wrap:wrap;gap:8px")), True)
