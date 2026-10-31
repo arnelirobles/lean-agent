@@ -529,6 +529,12 @@ def bypasses(calls, touching, assigned):
 
 def bash_check(command, cwd):
     """None when the command may run, else the message that blocks it."""
+    found = bash_verdict(command, cwd)
+    return found[1] if found else None
+
+
+def bash_verdict(command, cwd):
+    """None, or (what standard does, the message, the standard note): note, nothing or block."""
     calls, odd, assigned = find_calls(command, cwd)
     touching = []
     for c in calls:
@@ -544,22 +550,24 @@ def bash_check(command, cwd):
     skip_note = f"Put {SKIP}=1 in front of the command to skip the scan on purpose."
     found = bypasses(calls, touching, assigned)
     if found:
-        return ("Blocked by lean-agent: this command commits or pushes without the git hooks that scan "
-                f"for keys ({', '.join(found)}). Run it without that. " + skip_note)
+        return "note", ("Blocked by lean-agent: this command commits or pushes without the git hooks that scan "
+                        f"for keys ({', '.join(found)}). Run it without that. " + skip_note), (
+            f"This command commits or pushes with the git hooks that scan for keys turned off ({', '.join(found)}). "
+            "A key in the commit would not be caught.")
     scan = os.path.join(hookkit.TOOLS, "secret-scan")
     if any(c.sub in ("init", "clone") for c in calls):
-        return ("Blocked by lean-agent: this command makes a repository and commits or pushes in it in one go, "
-                "before the secret-scan git hooks can be installed. Run git init or git clone on its own, then "
-                f"python3 '{scan}' install DIR, then the rest. " + skip_note)
+        return "nothing", ("Blocked by lean-agent: this command makes a repository and commits or pushes in it in one go, "
+                           "before the secret-scan git hooks can be installed. Run git init or git clone on its own, then "
+                           f"python3 '{scan}' install DIR, then the rest. " + skip_note), None
     tool = scanner()
     seen = set()
     for c in touching:
         repo = tool.Repo(c.base) if c.dynamic else tool.Repo(c.cwd, c.git_dir, c.work_tree)
         if not tool.is_repo(repo):
             if c.dynamic:
-                return ("Blocked by lean-agent: cannot tell which repository this command commits or pushes in "
-                        "(a path is a variable or a command, or a cd target does not exist yet), and "
-                        f"{c.base} is not a git repository. Use a literal path that exists. " + skip_note)
+                return "nothing", ("Blocked by lean-agent: cannot tell which repository this command commits or pushes in "
+                                   "(a path is a variable or a command, or a cd target does not exist yet), and "
+                                   f"{c.base} is not a git repository. Use a literal path that exists. " + skip_note), None
             continue
         key = (repo.cwd, repo.git_dir, repo.work_tree)
         if key in seen:
@@ -568,9 +576,11 @@ def bash_check(command, cwd):
         ok, why = tool.hooks_installed(repo)
         if not ok:
             note = tool.install_note(repo)
-            return (f"Blocked by lean-agent: {tool.toplevel(repo)} cannot scan this commit or push for keys: {why}. "
-                    f"Install the git hooks, then run the command again:\n  {tool.install_command(repo)}\n"
-                    + (note + "\n" if note else "") + skip_note)
+            return "note", (f"Blocked by lean-agent: {tool.toplevel(repo)} cannot scan this commit or push for keys: {why}. "
+                            f"Install the git hooks, then run the command again:\n  {tool.install_command(repo)}\n"
+                            + (note + "\n" if note else "") + skip_note), (
+                f"{tool.toplevel(repo)} has no key-scanning git hooks ({why}), so a key in this commit or push would "
+                f"not be caught. To add them, run:\n  {tool.install_command(repo)}")
     return None
 
 
@@ -630,10 +640,10 @@ def write_findings(name, data, cwd, tool):
 
 
 def blocked(reason):
-    print(f"Blocked by lean-agent: the secret scan check could not run ({reason}), so nothing was checked. "
-          f"Fix that, or set {SKIP}=1 in front of the command or in the env block of Claude Code settings.",
-          file=sys.stderr)
-    return 2
+    return hookkit.refuse(
+        "PreToolUse", f"Blocked by lean-agent: the secret scan check could not run ({reason}), so nothing was checked. "
+        f"Fix that, or set {SKIP}=1 in front of the command or in the env block of Claude Code settings.",
+        standard="nothing")
 
 
 def main():
@@ -650,12 +660,11 @@ def main():
         if "git" not in command and not GIT_WORD.search(command):
             return 0
         try:
-            text = bash_check(command, cwd)
+            found = bash_verdict(command, cwd)
         except Exception as exc:
             return blocked(f"{type(exc).__name__}: {exc}")
-        if text:
-            print(text, file=sys.stderr)
-            return 2
+        if found:
+            return hookkit.refuse("PreToolUse", found[1], standard=found[0], note=found[2])
         return 0
     if name not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         return 0
@@ -666,14 +675,15 @@ def main():
     except Exception as exc:
         return blocked(f"{type(exc).__name__}: {exc}")
     if found:
-        print(tool.message(found, what)
-              + f"\n{SKIP}=1 in front of the command, or in the env block of Claude Code settings, turns this check off.",
-              file=sys.stderr)
-        return 2
+        return hookkit.refuse(
+            "PreToolUse", tool.message(found, what)
+            + f"\n{SKIP}=1 in front of the command, or in the env block of Claude Code settings, turns this check off.",
+            standard="block")
     return 0
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     import json
     import shutil
     import sqlite3
@@ -1081,6 +1091,23 @@ def self_test():
         rows = conn.execute("SELECT hook, outcome FROM hook_fires WHERE hook = 'secret-scan.py'").fetchall()
         conn.close()
         check("blocks are recorded in hook_fires", bool(rows) and all(r == ("secret-scan.py", "block") for r in rows), True)
+        # standard: the key rule still blocks, the git hook checks become notes or nothing
+        std = {"LEAN_PROFILE": "standard"}
+        bare = make("stdbare")
+        put(bare, "a.txt", "a\n")
+        commit(bare, "base")
+        p = hook("Write", {"file_path": os.path.join(bare, "k.txt"), "content": "k = " + google + "\n"}, bare, std)
+        check("standard: a key in a Write still blocks", (p.returncode, "allow-secret" in p.stderr, SKIP in p.stderr), (2, True, True))
+        p = bash("git commit -m x", bare, std)
+        check("standard: no hooks is a note", (p.returncode, "additionalContext" in p.stdout, p.stderr), (0, True, ""))
+        p = bash("git init -q d && git -C d commit -m x", tmp, std)
+        check("standard: init and commit passes silently", (p.returncode, p.stdout, p.stderr), (0, "", ""))
+        p = bash("git -c core.hooksPath=/x commit -m x", bare, std)
+        check("standard: a bypass is a note", (p.returncode, "additionalContext" in p.stdout, p.stderr), (0, True, ""))
+        p = bash('git -C "$WT" commit -m x', nogl, std)
+        check("standard: an unknown repo passes silently", (p.returncode, p.stdout, p.stderr), (0, "", ""))
+        check("standard: strict still blocks no hooks", bash("git commit -m x", bare, {"LEAN_PROFILE": "strict"}).returncode, 2)
+        check("standard: an unknown value counts as strict", bash("git commit -m x", bare, {"LEAN_PROFILE": "loose"}).returncode, 2)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")

@@ -77,18 +77,29 @@ def verdict(tool_input):
             f"{wrapped(command)}\nLEAN_BG_GUARD=off turns this check off.")
 
 
+def inline_off(tool_input):
+    """True when LEAN_BG_GUARD=off is in the env prefix of the command."""
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return False
+    return any((s.env.get("LEAN_BG_GUARD") or "").lower() == "off" for s in hookkit.segments(command))
+
+
 def main():
     if (os.environ.get("LEAN_BG_GUARD") or "").lower() == "off":
         return 0
     event = hookkit.read_event()
-    text = verdict(hookkit.tool_input(event))
+    tool_input = hookkit.tool_input(event)
+    if inline_off(tool_input):
+        return 0
+    text = verdict(tool_input)
     if not text:
         return 0
-    print(text, file=sys.stderr)
-    return 2
+    return hookkit.refuse("PreToolUse", text, standard="nothing")
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     failures = 0
 
     def check(label, tool_input, want_deny):
@@ -132,6 +143,19 @@ def self_test():
     if proc.returncode != 7 or proc.stdout.strip() != "it ran":
         print(f"FAIL wrapped command: rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}")
         failures += 1
+
+    def std(event, **env):
+        return hookkit.probe(os.path.realpath(__file__), event, LEAN_PROFILE="standard", **env)
+
+    def want(label, got, rc, out=False):
+        nonlocal failures
+        if got[0] != rc or bool(got[1]) != out or got[2]:
+            print(f"FAIL standard {label}: {got!r}")
+            failures += 1
+
+    want("background command passes silently", std({"tool_input": bg("sleep 9")}), 0)
+    want("inline off passes", hookkit.probe(os.path.realpath(__file__), {"tool_input": bg("LEAN_BG_GUARD=off sleep 9")},
+                                          LEAN_PROFILE="strict"), 0)
 
     if failures:
         return 1

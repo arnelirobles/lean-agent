@@ -48,6 +48,9 @@ TURN_OFF = " LEAN_WAIT_GUARD=off turns this check off."
 NOTE_TEST = (
     "This runs tests outside the lane lock, and its failures never reach brain. Queue it: "
     "`{brain} queue add <repo> <project> --filter ...`. LEAN_WAIT_GUARD=off turns this note off.")
+NOTE_WAIT = (
+    "This waits by sleeping, polling or pgrep, which holds the turn. If you can, end the turn and wait for "
+    "the notification, or run the wait in the background. LEAN_WAIT_GUARD=off turns this note off.")
 
 
 def fill(text):
@@ -167,13 +170,13 @@ def main():
         return 0
     kind, text = found
     if kind == "deny":
-        print(text, file=sys.stderr)
-        return 2
+        return hookkit.refuse("PreToolUse", text, standard="note", note=NOTE_WAIT)
     hookkit.note("PreToolUse", text)
     return 0
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     import contextlib
     import io
     import json
@@ -311,6 +314,27 @@ def self_test():
     BRAIN = real_brain
     tmp.cleanup()
     lane_tmp.cleanup()
+    def std(event, **env):
+        return hookkit.probe(os.path.realpath(__file__), event, LEAN_PROFILE="standard", **env)
+
+    def want(label, got, rc, out=False):
+        nonlocal failures
+        if got[0] != rc or bool(got[1]) != out or got[2]:
+            print(f"FAIL standard {label}: {got!r}")
+            failures += 1
+
+    wait = {"tool_input": {"command": "sleep 5; cat out.log"}, "cwd": "/"}
+    got = std(wait)
+    want("sleep then read is a note", got, 0, True)
+    if "brain" in got[1] or "Blocked" in got[1]:
+        print(f"FAIL standard wait note should not name brain or say Blocked: {got[1]!r}")
+        failures += 1
+    sln_dir = tempfile.mkdtemp(prefix="wait-loop-sln-")
+    open(os.path.join(sln_dir, "App.sln"), "w").close()
+    direct = {"tool_input": {"command": "dotnet test App.sln"}, "cwd": sln_dir}
+    want("a direct test run gets no wait-loop note", std(direct, LEAN_DIRECT_TEST=None), 0)
+    want("with LEAN_DIRECT_TEST=allow the one existing note stays", std(direct, LEAN_DIRECT_TEST="allow"), 0, True)
+
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

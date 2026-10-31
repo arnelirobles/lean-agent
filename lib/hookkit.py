@@ -85,8 +85,47 @@ def tool_path(name, base=None):
     return shlex.quote(os.path.join(base or TOOLS, name))
 
 
+PROFILES = ("strict", "standard", "off")
+
+
+def profile():
+    """LEAN_PROFILE: standard when unset, and anything unrecognised counts as strict."""
+    raw = (os.environ.get("LEAN_PROFILE") or "").strip().lower()
+    if not raw:
+        return "standard"
+    return raw if raw in PROFILES else "strict"
+
+
+def refuse(event_name, text, *, standard="note", note=None):
+    """Refuse a tool call the way the profile says. Strict prints TEXT and returns 2, as ever.
+
+    Standard: "block" is the same as strict, "note" gives Claude NOTE (or TEXT) and lets the call run,
+    "nothing" lets it run silently. Returns the hook's exit code.
+    """
+    if profile() == "strict" or standard == "block":
+        print(text, file=sys.stderr)
+        return 2
+    if standard == "note":
+        globals()["note"](event_name, note or text)
+    return 0
+
+
+def probe(script, event, **env):
+    """Self-test helper: run a hook script on EVENT with env overrides (None removes). Returns (code, stdout, stderr)."""
+    full = dict(os.environ)
+    for key, value in env.items():
+        if value is None:
+            full.pop(key, None)
+        else:
+            full[key] = value
+    p = subprocess.run([sys.executable, script], input=json.dumps(event), capture_output=True, text=True, env=full)
+    return p.returncode, p.stdout, p.stderr
+
+
 def run(main):
     """Run a hook's main and exit with its code; an internal error exits 0."""
+    if profile() == "off":
+        sys.exit(0)
     try:
         code = main()
     except SystemExit as exc:
