@@ -46,4 +46,4 @@ Costs are estimates from a price table in `lib/brain/web/assistant.py` (per mill
 
 ## Page security
 
-The page has no JavaScript and its content security policy is unchanged. The answer is an HTML document streamed over the same connection, with every piece of model output escaped. No markdown or links are rendered. The Host, Origin, content type and per-start key checks apply to `/ask` and the key routes like the other actions.
+The page has no JavaScript and its content security policy is unchanged. The answer is an HTML document streamed over the same connection, with every piece of model output escaped. Answers render as formatted text (headings, lists, tables, code) a block at a time, and links in answers are shown as plain text and never clickable, because answers can quote text stored in the brain. The Host, Origin, content type and per-start key checks apply to `/ask` and the key routes like the other actions.

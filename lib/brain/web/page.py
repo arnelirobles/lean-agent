@@ -26,9 +26,10 @@ h3{margin:24px 0 8px;font-size:15px}
 table{border-collapse:separate;border-spacing:0;width:100%;border:1px solid var(--line);border-radius:14px;overflow:hidden;
 box-shadow:0 1px 2px rgba(28,35,33,.04)}
 td,th{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word}
-td:nth-child(n+4){overflow-wrap:anywhere}
-@media(max-width:800px){table,tbody,tr,td{display:block}tr:has(th){display:none}td{border:0;padding:4px 14px;min-width:0}
-tr{padding:8px 0;border-bottom:1px solid var(--line)}tr:last-child{border-bottom:0}
+table:not(.md) td:nth-child(n+4){overflow-wrap:anywhere}
+@media(max-width:800px){table:not(.md),table:not(.md) tbody,table:not(.md) tr,table:not(.md) td{display:block}
+table:not(.md) tr:has(th){display:none}table:not(.md) td{border:0;padding:4px 14px;min-width:0}
+table:not(.md) tr{padding:8px 0;border-bottom:1px solid var(--line)}table:not(.md) tr:last-child{border-bottom:0}
 td form,td textarea,td button{display:block;margin:6px 0}}
 tr:last-child td{border-bottom:0}
 th{background:var(--sand);color:var(--body);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
@@ -51,7 +52,16 @@ form[action="/ask"] button{color:var(--ink);background:var(--sun);padding:12px 2
 form[action="/ask"] button:hover{filter:brightness(.97)}
 pre,code{font-family:var(--mono);font-size:13px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0;padding:12px 14px;background:var(--sand);border:1px solid var(--line);border-radius:12px}
-summary{cursor:pointer;font-weight:600}"""
+summary{cursor:pointer;font-weight:600}
+.answer{line-height:1.6}.answer p,.answer ul,.answer ol,.answer blockquote{margin:0 0 12px}
+.answer ul,.answer ol{padding-left:24px}.answer li{margin:3px 0}.answer li>ul,.answer li>ol{margin:3px 0}
+.answer h3,.answer h4{margin:20px 0 6px;color:var(--ink);line-height:1.3}.answer h4{font-size:14px}
+.answer blockquote{padding:2px 0 2px 14px;border-left:3px solid var(--leaf);color:var(--body)}
+.answer hr{border:0;border-top:1px solid var(--line);margin:18px 0}
+.answer :not(pre)>code{padding:1px 5px;background:var(--sand);border-radius:6px}
+.scroll{overflow-x:auto;margin:0 0 12px}.scroll table.md{width:auto;min-width:100%;overflow:visible}
+table.md td,table.md th{overflow-wrap:normal}
+details.tool{margin:8px 0;font-size:13px;color:var(--muted)}details.tool summary{font-weight:500}details.tool pre{font-size:12px}"""
 
 
 def e(v) -> str:
@@ -260,6 +270,12 @@ def _self_test() -> int:
         if got != want:
             fails.append(name)
             print(f"FAIL {name}: got {got!r}, want {want!r}")
+
+    media = CSS[CSS.index("@media(max-width:800px)"):]
+    media = media[:media.index("}}") + 2].split("{", 1)[1]
+    sels = [x.strip() for g in re.findall(r"([^{}@]+)\{", media) for x in g.split(",")]
+    loose = [x for x in sels if not x.startswith(("table:not(.md)", "td form", "td textarea", "td button"))]
+    check("stacking rule skips answer tables", (loose, "table:not(.md) td:nth-child(n+4)" in CSS, ".scroll{overflow-x:auto" in CSS), ([], True, True))
 
     sys.path.insert(0, os.path.join(HERE, "..", ".."))
     import forges

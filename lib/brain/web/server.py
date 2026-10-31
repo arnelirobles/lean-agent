@@ -23,6 +23,7 @@ sys.path.insert(0, HERE)
 
 import assistant  # noqa: E402
 import forges  # noqa: E402
+import mdlite  # noqa: E402
 import page  # noqa: E402
 import sections  # noqa: E402
 import session  # noqa: E402
@@ -324,13 +325,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(text.encode("utf-8"))
             self.wfile.flush()
 
+        md = mdlite.Stream()
+
         def emit(kind, text):
             if kind == "text":
-                out(e(text))
-            elif kind == "tool":
-                out(f'\n<span class="muted">query: {e(text[:500])}</span>\n')
+                out(md.feed(text))
+                return
+            out(md.flush())
+            if kind == "tool":
+                out(f'<details class="tool"><summary>Ran a query</summary><pre>{e(text[:500])}</pre></details>\n')
             else:
-                out(f'\n<strong class="note">{e(text)}</strong>\n')
+                out(f'<p class="note">{e(text)}</p>\n')
 
         try:
             self.send_response(200)
@@ -342,7 +347,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f'<title>lean brain</title><style>{page.CSS}</style>'
                 f'</head><body><h1>lean brain</h1><p><a href="/">Back to the page</a></p><h2>Question</h2>'
                 f'<pre>{e(question)}</pre><!-- {" " * 1024} --><h2>Answer</h2>'
-                '<div style="white-space:pre-wrap">')
+                '<div class="answer">')
             try:
                 client, _source = asst.client()
                 if chat is None:
@@ -356,6 +361,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             res = assistant.run_question(client, asst.sdk_loader(), chat, question, model, effort, emit)
             if res["reason"] == "disconnected":
                 return
+            out(md.flush())
             total, n = assistant.usage_total()
             out(f'</div><p class="muted">This question cost about ${res["usd"]:.4f} (estimate). '
                 f'Total so far about ${total:.2f} over {n} questions.</p>'
@@ -579,7 +585,7 @@ def _self_test() -> int:
     # the assistant routes, with a fake SDK and a fake keychain
     import types
     fake_key = "sk-" + "ant-" + "api03-" + "B" * 30
-    vault, argvs, seen = {}, [], []
+    vault, argvs, seen, turns = {}, [], [], []
 
     class Done:
         def __init__(self, rc=0, out=""):
@@ -605,10 +611,15 @@ def _self_test() -> int:
             return False
 
         def __iter__(self):
-            yield types.SimpleNamespace(type="text", text="<script>alert(1)</script> & done")
+            self.turn = turns.pop(0) if turns else None
+            for d in (self.turn or {}).get("text", ["<script>alert(1)</script> & done\n\nA **bo", "ld** word"]):
+                yield types.SimpleNamespace(type="text", text=d)
 
         def get_final_message(self):
             u = types.SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+            if self.turn and self.turn.get("sql"):
+                tu = types.SimpleNamespace(type="tool_use", id="t1", name="run_sql", input={"sql": self.turn["sql"]})
+                return types.SimpleNamespace(content=[tu], stop_reason="tool_use", usage=u)
             return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text="x")], stop_reason="end_turn", usage=u)
 
     class Boom(Exception):
@@ -650,6 +661,8 @@ def _self_test() -> int:
     s, h, b = post("/ask", {**ask_form, "question": "<b>hi</b>"})
     check("stream ok", (s, "content-length" in h, h.get("content-security-policy")), (200, False, _CSP))
     check("model text escaped", ("<script>alert(1)</script>" in b, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; done" in b), (False, True))
+    check("bold split across deltas", "<strong>bold</strong>" in b and "**" not in b.split("<h2>Answer</h2>")[1], True)
+    check("answer div, no pre-wrap", ('<div class="answer">' in b, "white-space:pre-wrap" in b.split("<h2>Answer</h2>")[1]), (True, False))
     check("question escaped", ("<b>hi</b>" in b, "&lt;b&gt;hi&lt;/b&gt;" in b), (False, True))
     check("stream has cost and follow-up", ("estimate" in b, 'name="chat"' in b, b.rstrip().endswith("</html>")), (True, True, True))
     tok = b.split('name="chat" value="')[1].split('"')[0]
@@ -657,6 +670,13 @@ def _self_test() -> int:
     seen.clear()
     post("/ask", {"key": key, "question": "and then?", "chat": tok})
     check("follow-up carries history", len(seen[0]["messages"]), 3)
+    seen.clear()
+    turns.extend([{"text": ["looking **now"], "sql": "SELECT '<b>x</b>' AS q WHERE 1 < 2"}, {"text": ["done"]}])
+    s, h, b = post("/ask", ask_form)
+    a = b.split("<h2>Answer</h2>")[1]
+    check("tool call shows a details block", ("<details class=\"tool\"><summary>Ran a query</summary><pre>SELECT &#x27;&lt;b&gt;x&lt;/b&gt;&#x27; AS q WHERE 1 &lt; 2</pre></details>" in a,
+                                              "<b>x</b>" in a), (True, False))
+    check("text before a tool is flushed first", a.index("looking") < a.index("<details"), True)
     for _ in range(assistant.MAX_RUNNING):
         asst.slots.acquire()
     status = post("/ask", {"key": key, "question": "hi", "model": "claude-opus-5-5", "effort": "high"})[0]
