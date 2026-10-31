@@ -32,6 +32,8 @@ Two tools, `run_sql` and `chart`. It runs a single SELECT on a read-only connect
 
 ## Activity and summaries
 
+Activity and the summary buttons sit on the Overview tab. The Ask form is on the Ask tab, and a streamed answer links back to it.
+
 The Activity section shows 14 local days of counts from `brain.db` (test runs and failures, items opened and closed, things agents created) and from `lean.db` when it exists (agent runs and cost). A day with no data shows as zero. If `lean.db` is missing, those charts are left out.
 
 With a key ready, the section has two buttons, Summarise today and Last 7 days. Each asks the assistant the same fixed question (what shipped, what failed, what got worse against the prior period, what needs you) and streams the answer like any question, so follow-ups work. The result is saved in `summaries.json` next to `brain.db`, one entry per range, mode 0600. It holds the answer text and chart specs, never HTML, and the page draws them again on each load. The text comes from the brain and is masked the same way as rows, but it can still hold work item text, so treat the file like the brain itself. A corrupt or oversized file is ignored. The newest summaries show at the top of the section.
