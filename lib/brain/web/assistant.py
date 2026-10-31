@@ -685,8 +685,9 @@ def _self_test():
     check("pgp key body masked", mask(pgp), "[secret removed]\nafter")
     check("wide row refused", refused("SELECT " + ",".join("1" for _ in range(65))), True)
     check("error text masked", "aaaaaaaaaaaa" in err, False)
-    for big in ("SELECT zeroblob(2000000000)", "SELECT randomblob(2000000000)"):
-        check("huge blob refused", refused(big), True)
+    for fn in ("SELECT zeroblob(8)", "SELECT randomblob(8)"):
+        check("blob functions refused", refused(fn), True)
+    check("huge blob refused", refused("SELECT hex(zeroblob(2000000))"), True)
     check("huge string refused", refused("SELECT printf('%.*c', 2000000000, 'x')"), True)
     check("big rows stop early", "characters" in run_sql(
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<190)"
