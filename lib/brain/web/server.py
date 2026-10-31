@@ -21,6 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+import assistant  # noqa: E402
 import forges  # noqa: E402
 import page  # noqa: E402
 import sections  # noqa: E402
@@ -28,7 +29,10 @@ import session  # noqa: E402
 
 HOSTS = ("leanagent.localhost", "localhost", "127.0.0.1", "[::1]")
 MAX_BODY = 16 * 1024
+MAX_ASK_BODY = 96 * 1024
 MAX_ANSWER = 4000
+ITEM_ROUTES = ("/session", "/answer", "/dismiss")
+KEY_ROUTES = ("/assistant-key", "/assistant-key-remove")
 SESSION_KINDS = ("question", "blocker", "pending", "risk")
 _LENGTH = re.compile(r"[0-9]{1,6}")
 _ID = re.compile(r"[1-9][0-9]{0,9}")
@@ -85,6 +89,7 @@ class App:
         self.roots = roots or []
         self.cache = forges.Cache()
         self.flash = Flash()
+        self.assistant = assistant.Assistant()
         self.start_session = session.start_session
         self.recent = {}
         self.recent_lock = threading.Lock()
@@ -206,7 +211,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as ex:
             data = {"errors": {"needs_you": f"could not read: {type(ex).__name__}"}}
         try:
-            html = page.render(data, self.app.key, self.app.port)
+            try:
+                ask = self.app.assistant.state()
+            except Exception:
+                ask = None
+            html = page.render(data, self.app.key, self.app.port, ask)
         except Exception as ex:
             return self._send(500, f"could not render the page: {page.e(type(ex).__name__)}\n")
         if flash:
@@ -219,7 +228,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not origin_ok(self.headers.get("Origin"), self.app.port):
             return self._send(403, "forbidden\n")
         route = urllib.parse.urlsplit(self.path).path
-        if route not in ("/session", "/answer", "/dismiss"):
+        if route not in ITEM_ROUTES + KEY_ROUTES + ("/ask",):
             return self._send(404, "not found\n")
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/x-www-form-urlencoded":
@@ -230,12 +239,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not _LENGTH.fullmatch(raw_length.strip()):
             return self._send(400, "bad request\n")
         length = int(raw_length)
-        if length > MAX_BODY:
+        if length > (MAX_ASK_BODY if route == "/ask" else MAX_BODY):
             return self._send(413, "too large\n")
         raw = self.rfile.read(length).decode("utf-8", "replace")
         form = {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
         if not hmac.compare_digest(str(form.get("key", "")).encode("utf-8"), self.app.key.encode("utf-8")):
             return self._send(403, "wrong or missing key, reload the page\n")
+        if route == "/ask":
+            return self._ask(form)
+        if route in KEY_ROUTES:
+            return self._redirect(self._key_result(route, form))
         item_id = str(form.get("id", ""))
         if not _ID.fullmatch(item_id):
             return self._send(400, "bad id\n")
@@ -254,8 +267,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 con.close()
         except Exception as ex:
             text = f"Failed: {type(ex).__name__}"
-        token = self.app.flash.put(text)
-        self._send(303, b"", extra={"Location": "/?r=" + token})
+        self._redirect(text)
+
+    def _redirect(self, text):
+        self._send(303, b"", extra={"Location": "/?r=" + self.app.flash.put(text)})
+
+    def _key_result(self, route, form):
+        """Fixed messages only; nothing from the request is echoed."""
+        asst = self.app.assistant
+        if not asst.mac:
+            return "Saving a key needs macOS. Set ANTHROPIC_API_KEY instead."
+        if route == "/assistant-key-remove":
+            return "Removed the saved key." if asst.key_delete() else "There was no saved key to remove."
+        if not assistant.KEY_RX.fullmatch(str(form.get("apikey", "")).strip()):
+            return "That does not look like an Anthropic API key."
+        return "Saved the key in the macOS Keychain." if asst.key_set(str(form["apikey"]).strip()) else "Could not save the key."
+
+    def _ask(self, form):
+        asst = self.app.assistant
+        question = (form.get("question") or "").strip()
+        if not question:
+            return self._send(400, "empty question\n")
+        if len(question) > assistant.MAX_QUESTION:
+            return self._send(413, "question too long\n")
+        token = form.get("chat") or ""
+        if not token:
+            model, effort = form.get("model"), form.get("effort")
+            if model not in assistant.MODELS:
+                return self._send(400, "bad model\n")
+            if effort not in assistant.EFFORTS:
+                return self._send(400, "bad effort\n")
+        chat = None
+        if token:
+            chat = asst.chats.take(token)
+            if chat is None:
+                return self._send(409, "that conversation is gone or still running, ask again from the page\n")
+            model, effort = chat["model"], chat["effort"]
+        else:
+            token = asst.chats.new_token()
+        self._stream_answer(token, chat, question, model, effort)
+
+    def _stream_answer(self, token, chat, question, model, effort):
+        """Answer as one HTML document on this connection: no Content-Length, closed at the end. The
+        write timeout is per send, so the 10 second handler timeout does not cut a long answer; it is
+        raised for a slow reader."""
+        asst = self.app.assistant
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        self.connection.settimeout(60)
+        e = page.e
+
+        def out(text):
+            self.wfile.write(text.encode("utf-8"))
+            self.wfile.flush()
+
+        def emit(kind, text):
+            if kind == "text":
+                out(e(text))
+            elif kind == "tool":
+                out(f'\n<span class="muted">query: {e(text[:500])}</span>\n')
+            else:
+                out(f'\n<strong class="note">{e(text)}</strong>\n')
+
+        try:
+            out(f'<!doctype html><html><head><meta charset="utf-8"><title>lean brain</title><style>{page.CSS}</style>'
+                f'</head><body><h1>lean brain</h1><p><a href="/">Back to the page</a></p><h2>Question</h2>'
+                f'<pre>{e(question)}</pre><!-- {" " * 1024} --><h2>Answer</h2>'
+                '<div style="white-space:pre-wrap">')
+            try:
+                client, _source = asst.client()
+                if chat is None:
+                    chat = {"system": assistant.build_system(), "messages": [], "model": model, "effort": effort}
+            except assistant.Setup as ex:
+                out(f'<p class="note">{e(ex)}</p></div></body></html>')
+                return
+            except Exception as ex:
+                out(f'<p class="note">Could not start the assistant ({e(type(ex).__name__)}).</p></div></body></html>')
+                return
+            res = assistant.run_question(client, asst.sdk_loader(), chat, question, model, effort, emit)
+            if res["reason"] == "disconnected":
+                return
+            total, n = assistant.usage_total()
+            out(f'</div><p class="muted">This question cost about ${res["usd"]:.4f} (estimate). '
+                f'Total so far about ${total:.2f} over {n} questions.</p>'
+                f'<form method="post" action="/ask">{page._key(self.app.key)}'
+                f'<input type="hidden" name="chat" value="{e(token)}">'
+                '<textarea name="question" placeholder="Ask a follow-up"></textarea><button>Ask</button></form>'
+                '</body></html>')
+        except OSError:
+            pass
+        finally:
+            if chat is not None:
+                asst.chats.put(token, chat)
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -463,6 +569,114 @@ def _self_test() -> int:
     c.close()
     p = followed(post("/dismiss", {"id": 99, "key": key}))
     check("missing notice reported", "not found" in p, True)
+
+    # the assistant routes, with a fake SDK and a fake keychain
+    import types
+    fake_key = "sk-" + "ant-" + "api03-" + "B" * 30
+    vault, argvs, seen = {}, [], []
+
+    class Done:
+        def __init__(self, rc=0, out=""):
+            self.returncode, self.stdout = rc, out
+
+    def sec(argv, input=None, **kw):
+        argvs.append(argv)
+        if argv[1] == "-i":
+            vault["key"] = input.split("-w ")[1].strip()
+            return Done()
+        if argv[1] == "find-generic-password":
+            return Done(0, vault["key"]) if "key" in vault else Done(44)
+        return Done(0) if vault.pop("key", None) else Done(44)
+
+    class St:
+        def __init__(self, kw):
+            seen.append(kw)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            yield types.SimpleNamespace(type="text", text="<script>alert(1)</script> & done")
+
+        def get_final_message(self):
+            u = types.SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+            return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text="x")], stop_reason="end_turn", usage=u)
+
+    class Boom(Exception):
+        pass
+
+    class Fake:
+        def __init__(self, **kw):
+            if boom:
+                raise Boom(fake_key)
+            self.beta = types.SimpleNamespace(messages=types.SimpleNamespace(stream=lambda **k: St(k)))
+
+    boom = False
+    sdk = types.SimpleNamespace(Anthropic=Fake)
+    asst = assistant.Assistant(run=sec, sdk_loader=lambda: None, platform="darwin", env={})
+    srv.app.assistant = asst
+    p = req("GET", "/")[2]
+    check("setup command shown", "assistant-setup" in p and 'name="question"' not in p, True)
+    asst.sdk_loader = lambda: sdk
+    boom = True
+    p = req("GET", "/")[2]
+    check("key form when no credentials", ('name="apikey"' in p, 'type="password"' in p, "ant auth login" in p, 'name="question"' in p),
+          (True, True, True, False))
+    boom = False
+    p = req("GET", "/")[2]
+    check("ask form when ready", ('name="question"' in p, 'name="model"' in p, "sent to Anthropic" in p), (True, True, True))
+    ask_form = {"key": key, "question": "how many items?", "model": "claude-opus-5-5", "effort": "high"}
+    check("ask bad key 403", post("/ask", {**ask_form, "key": "wrong"})[0], 403)
+    check("ask no origin 403", post("/ask", ask_form, origin=False)[0], 403)
+    check("ask evil origin 403", post("/ask", ask_form, origin="https://evil.example")[0], 403)
+    check("ask evil host 421", post("/ask", ask_form, host="evil.example")[0], 421)
+    check("ask json 415", req("POST", "/ask", "{}", headers={"Content-Type": "application/json"})[0], 415)
+    check("ask empty 400", post("/ask", {**ask_form, "question": "  "})[0], 400)
+    check("ask too long 413", post("/ask", {**ask_form, "question": "x" * 8001})[0], 413)
+    check("ask 8000 fits", post("/ask", {**ask_form, "question": "x" * 8000})[0], 200)
+    check("ask bad model 400", post("/ask", {**ask_form, "model": "claude-evil"})[0], 400)
+    check("ask bad effort 400", post("/ask", {**ask_form, "effort": "ludicrous"})[0], 400)
+    check("ask unknown chat 409", post("/ask", {"key": key, "question": "q", "chat": "nope"})[0], 409)
+    seen.clear()
+    s, h, b = post("/ask", {**ask_form, "question": "<b>hi</b>"})
+    check("stream ok", (s, "content-length" in h, h.get("content-security-policy")), (200, False, _CSP))
+    check("model text escaped", ("<script>alert(1)</script>" in b, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; done" in b), (False, True))
+    check("question escaped", ("<b>hi</b>" in b, "&lt;b&gt;hi&lt;/b&gt;" in b), (False, True))
+    check("stream has cost and follow-up", ("estimate" in b, 'name="chat"' in b, b.rstrip().endswith("</html>")), (True, True, True))
+    tok = b.split('name="chat" value="')[1].split('"')[0]
+    check("request used the picked model", (seen[0]["model"], seen[0]["output_config"]), ("claude-opus-5-5", {"effort": "high"}))
+    seen.clear()
+    post("/ask", {"key": key, "question": "and then?", "chat": tok})
+    check("follow-up carries history", len(seen[0]["messages"]), 3)
+    check("chat token reusable once taken and put back", asst.chats.count() >= 1, True)
+    boom = True
+    s, h, b = post("/ask", ask_form)
+    check("no credentials message", ("No Anthropic credentials" in b, fake_key in b), (True, False))
+    boom = False
+
+    check("key save 303", post("/assistant-key", {"key": key, "apikey": fake_key})[0], 303)
+    check("key saved", vault.get("key"), fake_key)
+    check("key not in argv", any(fake_key in " ".join(a) for a in argvs), False)
+    s, h, b = post("/assistant-key", {"key": key, "apikey": fake_key})
+    flash_page = req("GET", h["location"])[2]
+    check("key not in flash page", fake_key in flash_page, False)
+    check("key not in redirect", fake_key in h["location"], False)
+    check("key not in main page", fake_key in req("GET", "/")[2], False)
+    check("saved key source shown", "Keychain" in req("GET", "/")[2], True)
+    s, h, b = post("/assistant-key", {"key": key, "apikey": "sk-ant-short<script>"})
+    page_ = req("GET", h["location"])[2]
+    check("bad key refused, input not echoed", ("does not look like" in page_, "short" in page_), (True, False))
+    check("key form needs the page key", post("/assistant-key", {"key": "wrong", "apikey": fake_key})[0], 403)
+    s, h, b = post("/assistant-key-remove", {"key": key})
+    check("key removed", (s, "key" in vault), (303, False))
+    asst.platform = "linux"
+    s, h, b = post("/assistant-key", {"key": key, "apikey": fake_key})
+    page_ = req("GET", h["location"])[2]
+    check("no key form off mac", ("needs macOS" in page_, "key" in vault, 'name="apikey"' in req("GET", "/")[2]), (True, False, False))
+    check("item routes still need an id", post("/answer", {"key": key})[0], 400)
 
     srv.shutdown()
     srv.server_close()

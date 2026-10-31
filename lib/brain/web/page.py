@@ -4,6 +4,7 @@
 """
 import html
 import os
+import re
 import sys
 import time
 
@@ -144,12 +145,54 @@ def _decided(data):
     return _table(["#", "Kind", "Project", "Item", "Answer"], rows)
 
 
-def render(data: dict, key: str, port: int) -> str:
+def _options(pairs, chosen):
+    return "".join(f'<option value="{e(v)}"{" selected" if v == chosen else ""}>{e(t)}</option>' for v, t in pairs)
+
+
+def _ask(st, key):
+    """The Ask section. st comes from Assistant.state(); it holds no key."""
+    out = ["<h2>Ask</h2>"]
+    if not st.get("sdk"):
+        out.append('<p class="note">The assistant is not set up. Run this once, then reload:</p>'
+                   f'<pre>{e(st.get("setup"))}</pre>')
+        return "".join(out)
+    sources = {"env": "an Anthropic key from the environment", "keychain": "the key saved in the macOS Keychain",
+               "default": "the Anthropic SDK default credentials"}
+    if st.get("source"):
+        models = [(m, st["labels"].get(m, m)) for m in st["models"]]
+        spent, cap = f'{st["usd"]:.2f}', f'{st["limit"]:g}'
+        out.append(f'<form method="post" action="/ask">{_key(key)}<textarea name="question" maxlength="{e(st["max_question"])}"'
+                   ' placeholder="Ask about your brain"></textarea>'
+                   f'<select name="model">{_options(models, st["default_model"])}</select> '
+                   f'<select name="effort">{_options([(x, x) for x in st["efforts"]], st["default_effort"])}</select> '
+                   '<button>Ask</button></form>')
+        out.append(f'<p class="muted">Using {e(sources.get(st["source"], st["source"]))}. '
+                   f'Spent so far: about ${e(spent)} (estimate) over {e(st["questions"])} questions. '
+                   f'Cap per question: ${e(cap)}.</p>')
+        if st["source"] == "keychain":
+            out.append(_form("/assistant-key-remove", key, [], "Remove the saved key"))
+    else:
+        out.append('<p class="note">No Anthropic credentials found.</p>')
+    if st.get("source") in (None, "default"):
+        if st.get("mac"):
+            out.append(f'<form method="post" action="/assistant-key">{_key(key)}'
+                       '<input type="password" name="apikey" autocomplete="off" placeholder="sk-ant-..." size="40"> '
+                       '<button>Save key in the Keychain</button></form>')
+            out.append('<p class="muted">Or set ANTHROPIC_API_KEY, or run ant auth login, then restart brain serve.</p>')
+        else:
+            out.append('<p class="muted">Set ANTHROPIC_API_KEY in the environment brain serve runs in, '
+                       'or run ant auth login, then restart brain serve.</p>')
+    out.append('<p class="muted">Questions and the brain rows the assistant reads are sent to Anthropic under your own account.</p>')
+    return "".join(out)
+
+
+def render(data: dict, key: str, port: int, ask=None) -> str:
     err = data.get("errors") or {}
     parts = [
         '<!doctype html><html><head><meta charset="utf-8">',
         f"<title>lean brain</title><style>{CSS}</style></head><body><h1>lean brain</h1>"
         f'<p>updated {time.strftime("%H:%M")} <a href="/">Refresh</a></p>',
+        _ask(ask, key) if ask else "",
         _section("Needs you", err, "needs_you", _needs(data, key), "Nothing is waiting on you."),
         _section("Test queue", err, "queue", _queue(data), "The queue is empty."),
         _section("Created by agents", err, "created", _created(data), "Nothing created yet."),
@@ -251,6 +294,20 @@ def _self_test() -> int:
     check("gh note shown", "gh is not installed" in page, True)
     check("no auto refresh", "http-equiv" in page, False)
     check("refresh link", ('<a href="/">Refresh</a>' in page, "updated " in page), (True, True))
+    import assistant
+    off = {"sdk": False, "source": None, "mac": True, "setup": "python3 /x/brain assistant-setup", "usd": 0, "questions": 0,
+           "limit": 10, "labels": assistant.LABELS, "models": assistant.MODELS, "efforts": assistant.EFFORTS,
+           "default_model": assistant.DEFAULT_MODEL, "default_effort": assistant.DEFAULT_EFFORT, "max_question": 8000}
+    with_ask = render(data, "KEY123", 8770, off)
+    strip = lambda h: re.sub(r"updated \d\d:\d\d", "updated", h)
+    check("ask section when sdk missing", ("<h2>Ask</h2>" in with_ask, "assistant-setup" in with_ask), (True, True))
+    check("page otherwise unchanged", strip(re.sub(r"<h2>Ask</h2>.*?(?=<h2>Needs you</h2>)", "", with_ask)), strip(page))
+    ready = render(data, "KEY123", 8770, {**off, "sdk": True, "source": "keychain", "setup": "<b>x</b>"})
+    check("ask form and remove button", ('name="question"' in ready, "/assistant-key-remove" in ready, 'name="apikey"' in ready),
+          (True, True, False))
+    nokey = render(data, "KEY123", 8770, {**off, "sdk": True, "mac": False})
+    check("no key form off mac", ('name="apikey"' in nokey, "ANTHROPIC_API_KEY" in nokey), (False, True))
+    check("ask values escaped", "<b>x</b>" in render(data, "k", 1, {**off, "setup": "<b>x</b>"}), False)
     check("key in forms", page.count('name="key" value="KEY123"') >= 5, True)
     check("approve form", 'name="approve" value="1"' in page, True)
     check("approve only with marker", page.count('name="approve"'), 1)
