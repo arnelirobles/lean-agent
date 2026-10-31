@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import activity  # noqa: E402
+import summary  # noqa: E402
 
 CSS = """:root{--ink:#1c2321;--body:#4d5552;--muted:#6b736f;--leaf:#0b7a55;--leaf-dark:#075a3e;--sun:#ffcd3c;--cream:#fff8e8;
 --sand:#fbf7ee;--line:#ece4d0;--rust:#c2461a;--mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -258,7 +259,29 @@ def _activity(data, err):
         return ""
 
 
-def render(data: dict, key: str, port: int, ask=None) -> str:
+def _summary(summ, ask, key):
+    """Stored summaries, the buttons when a key is ready, and a muted note for a failed automatic one."""
+    summ = summ or {}
+    ready = bool(ask and ask.get("source"))
+    out = []
+    for rng in summary.RANGES:
+        entry = (summ.get("entries") or {}).get(rng)
+        if entry:
+            try:
+                out.append(summary.render(entry, rng))
+            except Exception as ex:
+                out.append(f'<p class="note">could not draw the {e(rng)} summary: {e(type(ex).__name__)}</p>')
+    if ready:
+        out.append("".join(_form("/summary", key, [("range", r)], label) for r, label in
+                           (("today", "Summarise today"), ("week", "Last 7 days"))))
+    elif not out:
+        out.append('<p class="muted">Set up an Anthropic key under Ask to get daily summaries.</p>')
+    if summ.get("error"):
+        out.append(f'<p class="muted">{e(summ["error"])}</p>')
+    return "".join(out)
+
+
+def render(data: dict, key: str, port: int, ask=None, summ=None) -> str:
     err = dict(data.get("errors") or {})
     parts = [
         '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -266,7 +289,7 @@ def render(data: dict, key: str, port: int, ask=None) -> str:
         f'<p>updated {time.strftime("%H:%M")} <a href="/">Refresh</a></p>',
         _ask(ask, key) if ask else "",
         _section("Needs you", err, "needs_you", _needs(data, key), "Nothing is waiting on you."),
-        _section("Activity", err, "activity", _activity(data, err), "No activity yet."),
+        _section("Activity", err, "activity", _summary(summ, ask, key) + _activity(data, err), "No activity yet."),
         _section("Test queue", err, "queue", _queue(data), "The queue is empty."),
         _section("Created by agents", err, "created", _created(data), "Nothing created yet."),
         _section("Pending tickets", err, "tickets", _tickets(data), "No open tickets assigned to you."),
@@ -369,6 +392,15 @@ def _self_test() -> int:
     check("activity section drawn", ("<h2>Activity</h2>" in page, page.count("<figure"), "Tests failed today" in page), (True, 5, True))
     broken = render({**data, "activity": {"days": ["2026-01-01"]}}, "k", 1)
     check("activity failure keeps the page", ("could not draw" in broken, "<h2>Needs you</h2>" in broken), (True, True))
+    nokey = render(data, "k", 1, {"source": None})
+    check("no key shows the hint, no buttons", ("daily summaries" in nokey, 'name="range"' in nokey), (True, False))
+    ready = render(data, "k", 1, {"source": "env"}, {"entries": {}, "error": "Failed <b>x</b>"})
+    check("key shows buttons and a muted error", ('name="range" value="today"' in ready, "daily summaries" in ready,
+                                                  "Failed &lt;b&gt;x&lt;/b&gt;" in ready), (True, False, True))
+    entry = {"at": time.time(), "model": "m<i>", "usd": 0.5, "blocks": [{"t": "text", "s": "## Shipped\n\n<script>x</script>"}]}
+    shown = render(data, "k", 1, {"source": "env"}, {"entries": {"today": entry}})
+    check("stored summary rendered and escaped", ("<h3>Shipped</h3>" in shown, "<script>x" in shown, "m&lt;i&gt;" in shown, "daily summaries" in shown),
+          (True, False, True, False))
     check("script escaped", "<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page, True)
     check("notice escaped", "&lt;b&gt;note&lt;/b&gt;" in page, True)
     check("flaky lines", page.count("flaky items in"), 2)
