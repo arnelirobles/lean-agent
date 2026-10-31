@@ -316,14 +316,17 @@ def run_command(cmd, timeout=600):
     return result.stdout if result.returncode == 0 else None
 
 
-def fetch_changes(repo, since, run=run_command, orgs=()):
+def fetch_changes(repo, since, run=run_command, orgs=(), cut=None):
     """Rows for the changes table for one repository, or None when gh (az for Azure) fails.
 
     Azure rows leave fix rounds, failed checks and escaped refs empty: retro-signals reads GitHub only.
     """
-    merged = forge.for_repo(repo, run, orgs).merged_prs(repo, since)
+    provider = forge.for_repo(repo, run, orgs)
+    merged = provider.merged_prs(repo, since)
     if merged is None:
         return None
+    if cut is not None and getattr(provider, "cut", False):
+        cut.append(repo)
     signals = {}
     azure = forge.repo_kind(repo, orgs) == "azure"
     for line in ([] if azure else (run(["bash", RETRO, "--since", since, repo]) or "").splitlines()[1:]):
@@ -497,9 +500,10 @@ def collect_changes(conn, repos, since, run=run_command, which=shutil.which, org
     if azure_count:
         print(f"changes: reading {azure_count} Azure repositories through az, this can take a minute")
     stored = 0
+    cut = []
     for repo in repos:
         try:
-            rows = fetch_changes(repo, since, run, orgs)
+            rows = fetch_changes(repo, since, run, orgs, cut)
         except forge.Unsupported as e:
             print(f"changes: skipped {repo}: {e}")
             continue
@@ -509,6 +513,8 @@ def collect_changes(conn, repos, since, run=run_command, which=shutil.which, org
         with leanstats.tx(conn):
             conn.executemany("INSERT OR REPLACE INTO changes VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
         stored += len(rows)
+    for repo in cut:
+        print(f"changes: {repo} is partial, only the newest 200 merged pull requests were stored")
     print(f"changes: {stored} stored from {len(repos)} repositories")
     return stored
 
@@ -1257,6 +1263,16 @@ def test_changes(check, tmp):
                "o/r\t7\tunknown\tunknown\t1\tunknown\tunknown\n")
     got = fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else unknown)
     check("unknown signals stay empty, not zero", [row[5:] for row in got if row[1] == 7], [(None, None, None)])
+    big = json.dumps([{"number": n, "headRefName": "b", "createdAt": "2026-09-30T01:00:00Z",
+                       "mergedAt": "2026-10-01T01:00:00Z"} for n in range(1, 202)])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        collect_changes(conn, ["o/big"], "2026-10-01", lambda cmd, timeout=600: big if cmd[0] == "gh" else None, present)
+    check("a cut listing is named in the collect output", "changes: o/big is partial, only the newest 200" in out.getvalue(), True)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        collect_changes(conn, ["o/r"], "2026-10-01", fake, present)
+    check("a full listing says nothing about partial", "partial" in out.getvalue(), False)
     check("retro-signals failing still stores the changes",
           len(fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else None)), 2)
     test_azure_changes(check, conn)
