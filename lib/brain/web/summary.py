@@ -180,7 +180,7 @@ def render(entry, rng):
     """HTML for one stored entry."""
     e = _esc
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["at"]))
-    out = [f'<div class="answer"><h3>{e(LABELS[rng])}</h3>']
+    out = [f'<div class="answer"><h3 class="lab">{e(LABELS[rng])}</h3>']
     for b in entry["blocks"]:
         if b["t"] == "text":
             md = mdlite.Stream()

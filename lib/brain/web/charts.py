@@ -79,7 +79,7 @@ def fmt(v) -> str:
         return f"{v / 1e9:.3g}G"
     if a >= 1e6:
         return f"{v / 1e6:.3g}M"
-    if a >= 1e4:
+    if a >= 1e3:
         return f"{v / 1e3:.3g}k"
     return f"{v:.4g}"
 
@@ -345,7 +345,7 @@ def _self_test() -> int:
     check("ticks small", _ticks(0, 1), [0, 0.5, 1])
     check("ticks include zero", _ticks(5, 9)[0], 0)
     check("fmt", (fmt(1234567), fmt(12000), fmt(0.5), fmt(42)), ("1.23M", "12k", "0.5", "42"))
-    check("fmt thresholds", (fmt(1e9), fmt(1e6), fmt(1e4), fmt(9999)), ("1G", "1M", "10k", "9999"))
+    check("fmt thresholds", (fmt(1e9), fmt(1e6), fmt(1e3), fmt(999)), ("1G", "1M", "1k", "999"))
     check("title limit", (bad(good(title="x" * MAX_TITLE)), bad(good(title="x" * (MAX_TITLE + 1)))), (False, True))
     check("label limit", (bad(good(labels=["x" * MAX_LABEL] * 3)), bad(good(labels=["x" * (MAX_LABEL + 1)] * 3))), (False, True))
     check("series name limit", (bad(good(series=[{"name": "x" * MAX_NAME, "values": [1, 2, 3]}])),

@@ -205,11 +205,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, f"lean-brain {version()}\n")
         if url.path != "/":
             return self._send(404, "not found\n")
-        flash = self.app.flash.pop(urllib.parse.parse_qs(url.query).get("r", [""])[0])
+        query = urllib.parse.parse_qs(url.query)
+        flash = self.app.flash.pop(query.get("r", [""])[0])
+        tab = page.tab_name(query.get("tab", [""])[0])
         try:
             con = _connect()
             try:
-                data = sections.collect(con, self.app.cache, self.app.roots)
+                data = sections.collect(con, self.app.cache, self.app.roots, only=page.sections_for(tab))
             finally:
                 con.close()
         except Exception as ex:
@@ -220,11 +222,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 ask = None
             summ = {"entries": summary.load(), "error": self.app.auto.error if self.app.auto else None}
-            html = page.render(data, self.app.key, self.app.port, ask, summ)
+            html = page.render(data, self.app.key, self.app.port, ask, summ, tab)
         except Exception as ex:
             return self._send(500, f"could not render the page: {page.e(type(ex).__name__)}\n")
         if flash:
-            html = html.replace("<h1>lean brain</h1>", "<h1>lean brain</h1>" + _banner(flash), 1)
+            html = html.replace("</header>", "</header>" + _banner(flash), 1)
         self._send(200, html, "text/html; charset=utf-8")
 
     def do_POST(self):
@@ -255,7 +257,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/summary":
             return self._summary(form)
         if route in KEY_ROUTES:
-            return self._redirect(self._key_result(route, form))
+            return self._redirect(self._key_result(route, form), form)
         item_id = str(form.get("id", ""))
         if not _ID.fullmatch(item_id):
             return self._send(400, "bad id\n")
@@ -274,10 +276,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 con.close()
         except Exception as ex:
             text = f"Failed: {type(ex).__name__}"
-        self._redirect(text)
+        self._redirect(text, form)
 
-    def _redirect(self, text):
-        self._send(303, b"", extra={"Location": "/?r=" + self.app.flash.put(text)})
+    def _redirect(self, text, form=None):
+        tab = page.tab_name((form or {}).get("tab"))
+        self._send(303, b"", extra={"Location": f"/?tab={tab}&r=" + self.app.flash.put(text)})
 
     def _key_result(self, route, form):
         """Fixed messages only; nothing from the request is echoed."""
@@ -346,6 +349,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         md = mdlite.Stream()
         col = summary.Collector() if rng else None
+        back = "/?tab=overview" if rng else "/?tab=ask"
 
         def emit(kind, text):
             if col:
@@ -369,7 +373,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.connection.settimeout(60)
             out(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
                 f'<title>lean brain</title><style>{page.CSS}</style>'
-                f'</head><body><h1>lean brain</h1><p><a href="/">Back to the page</a></p><h2>Question</h2>'
+                f'</head><body><h1>lean brain</h1><p><a href="{back}">Back to the page</a></p><h2>Question</h2>'
                 f'<pre>{e(question)}</pre><!-- {" " * 1024} --><h2>Answer</h2>'
                 '<div class="answer">')
             try:
@@ -511,6 +515,9 @@ def _self_test() -> int:
     def post(path, form, **kw):
         return req("POST", path, urllib.parse.urlencode(form), **kw)
 
+    def allp():
+        return "".join(req("GET", "/?tab=" + n)[2] for n in page.TAB_NAMES)
+
     def state(ref):
         c = store.connect(timeout=2)
         r = c.execute("SELECT status, resolution, body FROM items WHERE ref=?", (ref,)).fetchone()
@@ -524,7 +531,13 @@ def _self_test() -> int:
     check("healthz", (s, b.startswith("lean-brain ")), (200, True))
     s, h, b = req("GET", "/")
     check("page 200", s, 200)
-    check("page has key", f'value="{key}"' in b, True)
+    check("page has key", f'value="{key}"' in allp(), True)
+    check("default tab is overview", ('aria-current="page">Overview' in b, "<h2>Activity</h2>" in b, "<h2>Worktrees</h2>" in b), (True, True, False))
+    w = req("GET", "/?tab=work")[2]
+    check("work tab", ("<h2>Worktrees</h2>" in w, "<h2>Activity</h2>" in w), (True, False))
+    for bogus in ("bogus", "%3Cscript%3Ex", "log%00", ""):
+        bb = req("GET", "/?tab=" + bogus)
+        check("bad tab " + bogus + " falls back", (bb[0], "<h2>Activity</h2>" in bb[2], "bogus" in bb[2], "<script>x" in bb[2]), (200, True, False, False))
     check("csp", h.get("content-security-policy"), _CSP)
     check("xfo", h.get("x-frame-options"), "DENY")
     # no-referrer makes browsers send "Origin: null" on form POSTs, which origin_ok rejects
@@ -564,7 +577,7 @@ def _self_test() -> int:
         s, h, b = resp
         check("303", s, 303)
         loc = h.get("location", "")
-        check("redirect to /", loc.startswith("/?r="), True)
+        check("redirect to /", loc.startswith("/?tab=") and "&r=" in loc, True)
         check("no cors on redirect", "access-control-allow-origin" in h, False)
         page_ = req("GET", loc)[2]
         again = req("GET", loc)[2]
@@ -613,6 +626,11 @@ def _self_test() -> int:
     check("notice dismissed", bool(c.execute("SELECT dismissed_at FROM notices WHERE id=1").fetchone()[0]), True)
     c.close()
     p = followed(post("/dismiss", {"id": 99, "key": key}))
+    for tabv, want in (("work", "work"), ("log", "log"), ("evil", "overview"), ("<b>", "overview"), ("", "overview")):
+        loc = post("/dismiss", {"id": 99, "key": key, "tab": tabv})[1].get("location", "")
+        check("dismiss returns to tab " + repr(tabv), (loc.startswith(f"/?tab={want}&r="), "evil" in loc, "<b>" in loc), (True, False, False))
+    check("no tab goes to overview", post("/dismiss", {"id": 99, "key": key})[1].get("location", "").startswith("/?tab=overview&r="), True)
+    check("key route returns to ask", post("/assistant-key-remove", {"key": key, "tab": "ask"})[1].get("location", "").startswith("/?tab=ask&r="), True)
     check("missing notice reported", "not found" in p, True)
 
     # the assistant routes, with a fake SDK and a fake keychain
@@ -671,15 +689,15 @@ def _self_test() -> int:
     sdk = types.SimpleNamespace(Anthropic=Fake)
     asst = assistant.Assistant(run=sec, sdk_loader=lambda: None, platform="darwin", env={})
     srv.app.assistant = asst
-    p = req("GET", "/")[2]
+    p = allp()
     check("setup command shown", "assistant-setup" in p and 'name="question"' not in p, True)
     asst.sdk_loader = lambda: sdk
     boom = True
-    p = req("GET", "/")[2]
+    p = allp()
     check("key form when no credentials", ('name="apikey"' in p, 'type="password"' in p, "ant auth login" in p, 'name="question"' in p),
           (True, True, True, False))
     boom = False
-    p = req("GET", "/")[2]
+    p = allp()
     check("ask form when ready", ('name="question"' in p, 'name="model"' in p, "sent to Anthropic" in p), (True, True, True))
     ask_form = {"key": key, "question": "how many items?", "model": "claude-opus-5-5", "effort": "high"}
     check("ask bad key 403", post("/ask", {**ask_form, "key": "wrong"})[0], 403)
@@ -700,6 +718,7 @@ def _self_test() -> int:
     check("bold split across deltas", "<strong>bold</strong>" in b and "**" not in b.split("<h2>Answer</h2>")[1], True)
     check("answer div, no pre-wrap", ('<div class="answer">' in b, "white-space:pre-wrap" in b.split("<h2>Answer</h2>")[1]), (True, False))
     check("question escaped", ("<b>hi</b>" in b, "&lt;b&gt;hi&lt;/b&gt;" in b), (False, True))
+    check("ask answer goes back to the ask tab", 'href="/?tab=ask">Back' in b, True)
     check("stream has cost and follow-up", ("estimate" in b, 'name="chat"' in b, b.rstrip().endswith("</html>")), (True, True, True))
     tok = b.split('name="chat" value="')[1].split('"')[0]
     check("request used the picked model", (seen[0]["model"], seen[0]["output_config"]), ("claude-opus-5-5", {"effort": "high"}))
@@ -726,7 +745,7 @@ def _self_test() -> int:
     for _ in range(assistant.MAX_RUNNING):
         asst.slots.release()
     check("third question refused", status, 429)
-    p = req("GET", "/")[2]
+    p = allp()
     check("summary buttons when ready", ('name="range" value="today"' in p, 'name="range" value="week"' in p, "Summarise today" in p), (True, True, True))
     sform = {"key": key, "range": "today"}
     check("summary bad key 403", post("/summary", {**sform, "key": "wrong"})[0], 403)
@@ -751,11 +770,12 @@ def _self_test() -> int:
     s, h, b = post("/summary", sform)
     check("summary streams", (s, "content-length" in h, h.get("content-security-policy")), (200, False, _CSP))
     check("summary question sent", ("got worse" in str(seen[0]["messages"][0]), "today (" in str(seen[0]["messages"][0])), (True, True))
+    check("summary answer goes back to overview", 'href="/?tab=overview">Back' in b, True)
     check("summary has follow-up", ('name="chat"' in b, "Saved to the Activity section" in b), (True, True))
     check("summary file mode", oct(os.stat(summary.path()).st_mode & 0o777), "0o600")
     stored = open(summary.path()).read()
     check("summary file holds no html", ("<figure" in stored, "<svg" in stored, "<strong>" in stored), (False, False, False))
-    p = req("GET", "/")[2]
+    p = allp()
     check("summary shown on the page", ("Written " in p, p.count("<figure") >= 1, "One &lt;b&gt;PR&lt;/b&gt;." in p, "<b>PR</b>" in p), (True, True, True, False))
     check("summary sits in Activity", p.index("<h2>Activity</h2>") < p.index("Written ") < p.index("<h2>Test queue</h2>"), True)
     tok = b.split('name="chat" value="')[1].split('"')[0]
@@ -783,8 +803,8 @@ def _self_test() -> int:
     flash_page = req("GET", h["location"])[2]
     check("key not in flash page", fake_key in flash_page, False)
     check("key not in redirect", fake_key in h["location"], False)
-    check("key not in main page", fake_key in req("GET", "/")[2], False)
-    check("saved key source shown", "Keychain" in req("GET", "/")[2], True)
+    check("key not in main page", fake_key in allp(), False)
+    check("saved key source shown", "Keychain" in allp(), True)
     s, h, b = post("/assistant-key", {"key": key, "apikey": "sk-ant-short<script>"})
     page_ = req("GET", h["location"])[2]
     check("bad key refused, input not echoed", ("does not look like" in page_, "short" in page_), (True, False))
@@ -794,7 +814,7 @@ def _self_test() -> int:
     asst.platform = "linux"
     s, h, b = post("/assistant-key", {"key": key, "apikey": fake_key})
     page_ = req("GET", h["location"])[2]
-    check("no key form off mac", ("needs macOS" in page_, "key" in vault, 'name="apikey"' in req("GET", "/")[2]), (True, False, False))
+    check("no key form off mac", ("needs macOS" in page_, "key" in vault, 'name="apikey"' in allp()), (True, False, False))
     check("item routes still need an id", post("/answer", {"key": key})[0], 400)
 
     srv.shutdown()

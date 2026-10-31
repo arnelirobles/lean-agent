@@ -145,7 +145,13 @@ def _cli_notes(status):
     return "; ".join(notes)
 
 
-def collect(con, cache, roots, which=None, run=None) -> dict:
+def collect(con, cache, roots, which=None, run=None, only=None) -> dict:
+    """Every section, or only the named ones (plus what they depend on). only=None means all."""
+    if only is not None:
+        only = set(only)
+        if only & {"tested", "worktrees"}:
+            only.add("created")
+    want = (lambda n: True) if only is None else (lambda n: n in only)
     data = {s: [] for s in _SECTIONS}
     data["errors"] = {}
     state = {"locked": False}
@@ -176,17 +182,24 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
             hit = _REPOS[path] = (time.monotonic() + WORKTREE_TTL, worktrees.repo_of(path) if path else None)
         return hit[1]
 
-    guard("needs_you", lambda: _needs_you(con))
-    guard("flaky", lambda: _flaky(con))
-    guard("queue", lambda: _queue(con))
-    guard("created", lambda: _created(con, cache, run))
+    if want("needs_you"):
+        guard("needs_you", lambda: _needs_you(con))
+    if want("flaky"):
+        guard("flaky", lambda: _flaky(con))
+    if want("queue"):
+        guard("queue", lambda: _queue(con))
+    if want("created"):
+        guard("created", lambda: _created(con, cache, run))
     def tested():
         if "created" in data["errors"]:
             raise RuntimeError(data["errors"]["created"])
         return _tested(con, data["created"], repo_of)
-    guard("tested", tested)
-    guard("decided", lambda: _decided(con))
-    guard("notices", lambda: _notices(con))
+    if want("tested"):
+        guard("tested", tested)
+    if want("decided"):
+        guard("decided", lambda: _decided(con))
+    if want("notices"):
+        guard("notices", lambda: _notices(con))
 
     def tickets():
         def fetch():
@@ -204,7 +217,8 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
         if note:
             data["errors"]["tickets"] = note
         return rows
-    guard("tickets", tickets, db=False)
+    if want("tickets"):
+        guard("tickets", tickets, db=False)
 
     def trees():
         paths = worktrees.candidate_paths(None if state["locked"] else con, roots)
@@ -230,9 +244,12 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
         for w in rows:
             w["merged"] = bool(w["common"] and w["branch"] and (w["common"], w["branch"]) in keys)
         return rows
-    guard("worktrees", trees, db=False)
-    guard("usage", usage_rows, db=False)
-    guard("activity", lambda: activity.collect(con, stats=lean_stats))
+    if want("worktrees"):
+        guard("worktrees", trees, db=False)
+    if want("usage"):
+        guard("usage", usage_rows, db=False)
+    if want("activity"):
+        guard("activity", lambda: activity.collect(con, stats=lean_stats))
     return data
 
 
