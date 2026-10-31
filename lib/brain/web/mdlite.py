@@ -13,6 +13,8 @@ import time
 
 MAX_QUOTE = 8
 MAX_LIST_DEPTH = 10
+MAX_COLUMNS = 64
+MAX_CELLS = 10000
 
 _CODE = re.compile(r"`([^`\n]+)`")
 _LINK = re.compile(r"!?\[([^\[\]\n]*)\]\(((?:[^()\n]|\([^()\n]*\))*)\)")
@@ -99,7 +101,7 @@ def _is_table(lines, i) -> bool:
     sep = _split_row(lines[i + 1])
     if not all(_SEP_CELL.match(c) for c in sep):
         return False
-    return len(sep) == len(_split_row(lines[i]))
+    return len(sep) <= MAX_COLUMNS and len(sep) == len(_split_row(lines[i]))
 
 
 def _starts_block(lines, i, depth) -> bool:
@@ -168,6 +170,8 @@ def _table(lines, i, out, depth) -> int:
     rows = []
     while i < len(lines) and lines[i].strip():
         if fence_open(lines[i]) or _heading(lines[i]) or _is_hr(lines[i]) or _is_quote(lines[i], depth):
+            break
+        if width * (len(rows) + 2) > MAX_CELLS:
             break
         rows.append(_split_row(lines[i]))
         i += 1
@@ -309,6 +313,14 @@ def _self_test() -> int:
     check("table without outer pipes", md("a | b\n--|--\n1 | 2"),
           '<div class="scroll"><table class="md"><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table></div>')
     check("pipe line without separator is text", md("a | b\nc"), "<p>a | b c</p>")
+    cols = lambda n: "|" + "a|" * n
+    wide = md(cols(20000) + "\n" + "|-" * 20000 + "|\n" + "\n".join(["| x |"] * 200))
+    check("wide table is a paragraph", ("<table" in wide, len(wide) < 200000), (False, True))
+    edge = md(cols(64) + "\n" + "|-" * 64 + "|\n| x |")
+    check("64 columns still a table", (edge.count("<th>"), edge.count("<td>")), (64, 64))
+    rows = "\n".join(f"| r{i} | y |" for i in range(1000))
+    long = md(cols(20) + "\n" + "|-" * 20 + "|\n" + rows)
+    check("tall table stops at the cell cap", (long.count("<td>") <= MAX_CELLS, "<td>r0</td>" in long, "r999" in long, "</table>" in long), (True, True, True, True))
     check("quote", md("> a\n> b"), "<blockquote><p>a b</p></blockquote>")
     check("nested quote", md("> a\n>> b"), "<blockquote><p>a</p>\n<blockquote><p>b</p></blockquote></blockquote>")
     check("quote holds a list", md("> - a\n> - b"), "<blockquote><ul><li>a</li><li>b</li></ul></blockquote>")
