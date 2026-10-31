@@ -48,11 +48,13 @@ MAX_CHATS = 20
 SQL_SECONDS = 5
 MAX_ROWS = 200
 MAX_CHARS = 40000
+MAX_VALUE = 1_000_000
 SERVICE = "lean-brain-anthropic"
 ACCOUNT = "lean-brain"
 SECURITY = "/usr/bin/security"
 KEY_RX = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
 _SK = re.compile(r"sk-[A-Za-z0-9_-]{20,}")
+_KEY_BLOCK = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)
 
 TOOL = {
     "name": "run_sql",
@@ -186,7 +188,7 @@ def _scan_module():
 def mask(text):
     """The text with anything the secret scanner would flag replaced. Raises when the scanner cannot load."""
     mod = _scan_module()
-    text = _SK.sub("[secret removed]", text)
+    text = _KEY_BLOCK.sub("[secret removed]", _SK.sub("[secret removed]", text))
     for _name, rx in mod.PATTERNS:
         if callable(rx):
             text = "\n".join(mod.AZURE_RUN.sub("[secret removed]", ln) if rx(ln) else ln
@@ -202,8 +204,11 @@ _ALLOWED = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
             getattr(sqlite3, "SQLITE_RECURSIVE", 33)}
 
 
+_DENIED_FUNCTIONS = ("load_extension", "readfile", "writefile", "zeroblob", "randomblob")
+
+
 def _authorizer(code, arg1, arg2, db, source):
-    if code == sqlite3.SQLITE_FUNCTION and str(arg2).lower() in ("load_extension", "readfile", "writefile"):
+    if code == sqlite3.SQLITE_FUNCTION and str(arg2).lower() in _DENIED_FUNCTIONS:
         return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK if code in _ALLOWED else sqlite3.SQLITE_DENY
 
@@ -222,7 +227,14 @@ def _cell(v):
         return "NULL"
     if isinstance(v, (bytes, bytearray)):
         return f"<blob {len(v)} bytes>"
-    return str(v).replace("\r", "").replace("\n", "\\n").replace("\t", " ")
+    return mask(str(v)).replace("\r", "").replace("\n", "\\n").replace("\t", " ")
+
+
+def _safe_error(text):
+    try:
+        return mask(str(text))
+    except Exception:
+        return "the query failed"
 
 
 def run_sql(sql, path=None, seconds=SQL_SECONDS):
@@ -234,24 +246,32 @@ def run_sql(sql, path=None, seconds=SQL_SECONDS):
         con = _open_ro(path or store.db_path())
         con.set_authorizer(_authorizer)
         deadline = time.monotonic() + seconds
+        if hasattr(con, "setlimit"):
+            con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE)
         con.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 1000)
         cur = con.execute(sql)
         cols = [d[0] for d in (cur.description or [])]
-        rows = cur.fetchmany(MAX_ROWS + 1)
+        rows, size = [], 0
+        while len(rows) <= MAX_ROWS and size <= MAX_CHARS:
+            row = cur.fetchone()
+            if row is None:
+                break
+            rows.append(row)
+            size += sum(len(v) for v in row if isinstance(v, (str, bytes)))
     except sqlite3.OperationalError as ex:
         if "interrupted" in str(ex):
             raise SqlError(f"the query ran longer than {seconds} seconds and was stopped; narrow it with WHERE or LIMIT")
-        raise SqlError(str(ex))
+        raise SqlError(_safe_error(ex))
     except (sqlite3.Error, sqlite3.Warning) as ex:
-        raise SqlError(str(ex))
+        raise SqlError(_safe_error(ex))
     finally:
         if con is not None:
             con.close()
     if not cols:
         raise SqlError("that statement returns no rows; only SELECT is allowed")
     cut = len(rows) > MAX_ROWS
-    lines = ["\t".join(cols)] + ["\t".join(_cell(v) for v in r) for r in rows[:MAX_ROWS]]
     try:
+        lines = ["\t".join(cols)] + ["\t".join(_cell(v) for v in r) for r in rows[:MAX_ROWS]]
         text = mask("\n".join(lines))
     except Exception:
         raise SqlError("secret masking is unavailable, so no rows were returned")
@@ -648,6 +668,23 @@ def _self_test():
     check("row cap", (len(out.split("\n")) <= MAX_ROWS + 3, "cut at 200 rows" in out), (True, True))
     out = run_sql("SELECT body FROM items WHERE ref LIKE 'r%' LIMIT 200")
     check("char cap", (len(out) < MAX_CHARS + 200, "characters" in out), (True, True))
+    head, tail = "-----BEGIN RSA PRIVATE", " KEY-----"
+    pem = head + tail + "\nMIIEprivatebody\nmore\n-----END RSA PRIVATE" + tail + "\nafter"
+    check("private key body masked", (mask(pem), mask(head + tail + "\nMIIEcut")),
+          ("[secret removed]\nafter", "[secret removed]"))
+    check("key split across lines masked", "MIIE" in run_sql("SELECT " + repr(pem).replace("\\n", "' || char(10) || '")), False)
+    try:
+        run_sql("SELECT nosuch FROM items WHERE x = 'sk-" + "a" * 24 + "'")
+        err = ""
+    except SqlError as ex:
+        err = str(ex)
+    check("error text masked", "aaaaaaaaaaaa" in err, False)
+    for big in ("SELECT zeroblob(2000000000)", "SELECT randomblob(2000000000)"):
+        check("huge blob refused", refused(big), True)
+    check("huge string refused", refused("SELECT printf('%.*c', 2000000000, 'x')"), True)
+    check("big rows stop early", "characters" in run_sql(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<190)"
+        " SELECT printf('%.*c', 900000, 'x') FROM c"), True)
     out = run_sql("SELECT body FROM items WHERE ref='n1'")
     check("key masked", (fake_key in out, "[secret removed]" in out), (False, True))
     check("github token masked", "ghp_" + "a" * 36 in mask("x ghp_" + "a" * 36), False)
@@ -686,7 +723,7 @@ def _self_test():
     class Stream:
         def __init__(self, script, kw, seen):
             self.script, self.kw = script, kw
-            seen.append(kw)
+            seen.append({**kw, "messages": list(kw["messages"])})
 
         def __enter__(self):
             if isinstance(self.script, Exception):

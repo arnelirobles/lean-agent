@@ -26,7 +26,7 @@ One page, served from this machine, that shows:
 
 ## Anti-goals (a failure even if it works)
 
-- **Storing credentials.** The page never stores a token, key or password. GitHub goes through `gh`, Azure DevOps through `az`, Jira later through `twg`, each with the login it already has. If a CLI is missing or logged out, that section says so and the rest of the page works.
+- **Storing credentials.** The page never stores a token, key or password. GitHub goes through `gh`, Azure DevOps through `az`, Jira later through `twg`, each with the login it already has. If a CLI is missing or logged out, that section says so and the rest of the page works. The optional assistant (docs/assistant.md) is the one exception: its Anthropic key can be saved to the macOS Keychain, never to brain.db or any page file.
 - **A page any website can drive.** A local server that starts sessions can be triggered by any site open in the same browser. See Security.
 - **A new memory hog.** If the server holds more memory than the extension did, it failed its purpose.
 - **407 flaky items burying everything.** Flaky items are grouped into one count with a link, not listed one per row.

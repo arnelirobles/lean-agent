@@ -22,7 +22,7 @@ The key is never written to `brain.db`, logs, the page, a redirect or an error m
 
 ## What leaves your machine
 
-Your question, the table definitions of the brain database, and every row the assistant selects while answering go to Anthropic under your account. Anything that looks like a key or token (the patterns in `tools/secret-scan`, plus `sk-` keys) is replaced with `[secret removed]` before rows are sent. Row text is treated as data, never as instructions, but it is still text from your own work items, so do not ask about a brain you would not send to Anthropic.
+Your question, the table definitions of the brain database, and every row the assistant selects while answering go to Anthropic under your account. Anything that looks like a key or token (the patterns in `tools/secret-scan`, plus `sk-` keys) is replaced with `[secret removed]` before rows are sent. Masking matches whole values, so it catches accidents, not a query built to split or encode a value; do not rely on it to keep a secret stored in the brain. Row text is treated as data, never as instructions, but it is still text from your own work items, so do not ask about a brain you would not send to Anthropic.
 
 ## What it can do
 

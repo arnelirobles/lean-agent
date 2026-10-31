@@ -590,7 +590,7 @@ def _self_test() -> int:
 
     class St:
         def __init__(self, kw):
-            seen.append(kw)
+            seen.append({**kw, "messages": list(kw["messages"])})
 
         def __enter__(self):
             return self
