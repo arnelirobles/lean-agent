@@ -324,6 +324,38 @@ def _self_test():
         f.write(" " * (MAX_FILE + 1))
     check("oversized file", load(p), {})
 
+    # limits, one step either side
+    def ent(**kw):
+        e = {"at": base, "model": "m", "usd": 1.0, "blocks": [{"t": "text", "s": "x"}]}
+        e.update(kw)
+        return _clean(e)
+    check("text size limit", (ent(blocks=[{"t": "text", "s": "x" * MAX_TEXT}]) is not None,
+                              ent(blocks=[{"t": "text", "s": "x" * (MAX_TEXT + 1)}]) is None), (True, True))
+    check("text limit is a total", ent(blocks=[{"t": "text", "s": "x" * MAX_TEXT}, {"t": "text", "s": "y"}]), None)
+    check("block count limit", (ent(blocks=[{"t": "text", "s": "x"}] * 50) is not None, ent(blocks=[{"t": "text", "s": "x"}] * 51)), (True, None))
+    check("at limit", (ent(at=1e11) is not None, ent(at=1.0000001e11), ent(at=True), ent(at="1"), ent(at=float("nan"))), (True, None, None, None, None))
+    check("usd kept or zeroed", (ent(usd=0.5)["usd"], ent(usd=-1)["usd"], ent(usd=1e6)["usd"], ent(usd=999999)["usd"], ent(usd=float("nan"))["usd"],
+                                 ent(usd="9")["usd"], ent(usd=True)["usd"]), (0.5, 0.0, 0.0, 999999.0, 0.0, 0.0, 0.0))
+    check("model kept or dropped", (ent(model="m" * 79)["model"], ent(model="m" * 80)["model"], ent(model=5)["model"]), ("m" * 79, "", ""))
+    check("blocks must be a list", (ent(blocks="x"), ent(blocks=[5])), (None, None))
+    check("no model reads as the assistant", "by the assistant" in render(ent(model=""), "today"), True)
+    pad = json.dumps({"today": {"at": base, "model": "m", "usd": 0, "blocks": [{"t": "text", "s": "x"}]}})
+    with open(p, "w") as f:
+        f.write(pad + " " * (MAX_FILE - len(pad)))
+    check("file at the size limit loads", sorted(load(p)), ["today"])
+    with open(p, "w") as f:
+        f.write(pad + " " * (MAX_FILE - len(pad) + 1))
+    check("file over the size limit is ignored", load(p), {})
+    check("default question uses the clock", datetime.date.today().isoformat() in question("today"), True)
+
+    # the loop stops when told to, and the env switch
+    class Never(Auto):
+        def tick(self):
+            raise AssertionError("ticked")
+    gone = threading.Event()
+    gone.set()
+    Never(None).loop(gone)
+
     # collector
     c = Collector()
     key = "sk-" + "ant-" + "api03-" + "C" * 30
@@ -394,6 +426,8 @@ def _self_test():
     check("auto waits for a key", Auto(nokey, lambda: base, os.path.join(tmp, "n", "s.json")).tick(), "no key")
     check("env off by default", start_auto(asst, {}), None)
     check("env must be 1", start_auto(asst, {"LEAN_ASSISTANT_AUTO_SUMMARY": "yes"}), None)
+    check("env default reads the process environment", start_auto(asst), None)
+    check("env 1 starts it", isinstance(start_auto(asst, {"LEAN_ASSISTANT_AUTO_SUMMARY": "1"}), Auto), True)
 
     print("summary: ok" if not fails else f"summary: {len(fails)} failed")
     return 1 if fails else 0
