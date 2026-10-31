@@ -237,13 +237,13 @@ X
   # Files with no text hunk, odd names, and names with spaces.
   mkrepo "$t/f"
   printf 'x\n' > "$t/f/bin.dat"; printf 'a\n' > "$t/f/m.sh"; printf 'q\n' > "$t/f/sp ace.py"
-  printf 'q\n' > "$t/f/-dash.py"; printf 'q\n' > "$t/f/g[1].py"; printf 'q\n' > "$t/f/$(printf 'ta\tb.py')"
+  printf 'q\n' > "$t/f/-dash.py"; printf 'q\n' > "$t/f/:x.py"; printf 'q\n' > "$t/f/$(printf 'ta\tb.py')"
   git -C "$t/f" add -A; git -C "$t/f" commit -q -m base
   fbase=$(git -C "$t/f" rev-parse HEAD)
   printf '\000\001\002' > "$t/f/bin.dat"; chmod +x "$t/f/m.sh"
-  printf 'q2\n' > "$t/f/sp ace.py"; printf 'q2\n' > "$t/f/-dash.py"; printf 'q2\n' > "$t/f/g[1].py"; printf 'q2\n' > "$t/f/$(printf 'ta\tb.py')"
+  printf 'q2\n' > "$t/f/sp ace.py"; printf 'q2\n' > "$t/f/-dash.py"; printf 'q2\n' > "$t/f/:x.py"; printf 'q2\n' > "$t/f/$(printf 'ta\tb.py')"
   git -C "$t/f" commit -q -am change
-  all5='- untested: bin.dat\n  why: data\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: g[1].py\n  why: x\n'
+  all5='- untested: bin.dat\n  why: data\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: :x.py\n  why: x\n'
   printf "\`\`\`holdout\n$all5- untested: sp ace.py #1\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-all.md"
   printf '```holdout\nnone: x\n```\n' > "$t/f-none.md"
   runin "$t/f" "$fbase" depends.sh "$t/f-none.md"
@@ -254,17 +254,17 @@ X
   grep -q 'ta.b.py' "$t/out" || { echo "self-test failed: none run does not name the tab file"; fails=$((fails + 1)); }
   runin "$t/f" "$fbase" depends.sh "$t/f-all.md"
   want "every odd file claimed by name passes" 0
-  printf "\`\`\`holdout\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: g[1].py\n  why: x\n- untested: sp ace.py #1\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-nobin.md"
+  printf "\`\`\`holdout\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: :x.py\n  why: x\n- untested: sp ace.py #1\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-nobin.md"
   runin "$t/f" "$fbase" depends.sh "$t/f-nobin.md"
   want "a changed binary file with no claim is unclaimed" 2
   grep -q 'bin.dat has no text hunk' "$t/out" || { echo "self-test failed: binary file not reported as hunkless"; fails=$((fails + 1)); }
-  printf "\`\`\`holdout\n- untested: bin.dat\n  why: data\n- untested: -dash.py\n  why: x\n- untested: g[1].py\n  why: x\n- untested: sp ace.py #1\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-nomode.md"
+  printf "\`\`\`holdout\n- untested: bin.dat\n  why: data\n- untested: -dash.py\n  why: x\n- untested: :x.py\n  why: x\n- untested: sp ace.py #1\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-nomode.md"
   runin "$t/f" "$fbase" depends.sh "$t/f-nomode.md"
   want "a mode-only change with no claim is unclaimed" 2
-  printf "\`\`\`holdout\n- untested: bin.dat\n  why: data\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: g[1].py\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-nospace.md"
+  printf "\`\`\`holdout\n- untested: bin.dat\n  why: data\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: :x.py\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-nospace.md"
   runin "$t/f" "$fbase" depends.sh "$t/f-nospace.md"
   want "a name with a space is not claimed by other entries" 2
-  printf "\`\`\`holdout\n- test: T1\n  breaks: sp ace.py \"q2\"\n- untested: bin.dat\n  why: data\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: g[1].py\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-bindsp.md"
+  printf "\`\`\`holdout\n- test: T1\n  breaks: sp ace.py \"q2\"\n- untested: bin.dat\n  why: data\n- untested: m.sh\n  why: mode\n- untested: -dash.py\n  why: x\n- untested: :x.py\n  why: x\n- untested: ta\tb.py\n  why: x\n\`\`\`\n" > "$t/f-bindsp.md"
   runin "$t/f" "$fbase" depends.sh "$t/f-bindsp.md" --dry-run
   want "a binding to a name with a space resolves" 0
 
