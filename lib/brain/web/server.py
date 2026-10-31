@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
 import assistant  # noqa: E402
+import charts  # noqa: E402
 import forges  # noqa: E402
 import mdlite  # noqa: E402
 import page  # noqa: E402
@@ -332,7 +333,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 out(md.feed(text))
                 return
             out(md.flush())
-            if kind == "tool":
+            if kind == "chart":
+                out(charts.svg(text) + "\n")
+            elif kind == "tool":
                 out(f'<details class="tool"><summary>Ran a query</summary><pre>{e(text[:500])}</pre></details>\n')
             else:
                 out(f'<p class="note">{e(text)}</p>\n')
@@ -617,6 +620,9 @@ def _self_test() -> int:
 
         def get_final_message(self):
             u = types.SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+            if self.turn and self.turn.get("chart"):
+                tu = types.SimpleNamespace(type="tool_use", id="c1", name="chart", input=self.turn["chart"])
+                return types.SimpleNamespace(content=[tu], stop_reason="tool_use", usage=u)
             if self.turn and self.turn.get("sql"):
                 tu = types.SimpleNamespace(type="tool_use", id="t1", name="run_sql", input={"sql": self.turn["sql"]})
                 return types.SimpleNamespace(content=[tu], stop_reason="tool_use", usage=u)
@@ -677,6 +683,13 @@ def _self_test() -> int:
     check("tool call shows a details block", ("<details class=\"tool\"><summary>Ran a query</summary><pre>SELECT &#x27;&lt;b&gt;x&lt;/b&gt;&#x27; AS q WHERE 1 &lt; 2</pre></details>" in a,
                                               "<b>x</b>" in a), (True, False))
     check("text before a tool is flushed first", a.index("looking") < a.index("<details"), True)
+    seen.clear()
+    turns.extend([{"text": [], "chart": {"title": "<i>T</i>", "kind": "bar", "labels": ["a", "b"], "series": [{"name": "n", "values": [1, 2]}]}},
+                  {"text": ["after"]}])
+    s, h, b = post("/ask", ask_form)
+    a = b.split("<h2>Answer</h2>")[1]
+    check("chart drawn in the answer", (a.count("<figure"), "<svg" in a, "<i>T</i>" in a, "&lt;i&gt;T&lt;/i&gt;" in a), (1, True, False, True))
+    check("chart result sent back", seen[1]["messages"][-1]["content"][0]["content"], "drawn")
     for _ in range(assistant.MAX_RUNNING):
         asst.slots.acquire()
     status = post("/ask", {"key": key, "question": "hi", "model": "claude-opus-5-5", "effort": "high"})[0]
