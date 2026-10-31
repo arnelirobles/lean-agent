@@ -6,7 +6,7 @@ Claude.ai, Pro and Max logins cannot be used here. Anthropic does not allow them
 
 ## Setup
 
-1. Run `brain assistant-setup`. It creates a virtual environment named `assistant-venv` in the folder that holds `brain.db` (it follows `LEAN_BRAIN_DB`) and installs the `anthropic` package there. Nothing is written into the repository. Homebrew python refuses plain `pip install`, which is why it uses a venv. If you upgrade python to a new minor version, run the command again.
+1. Run `brain assistant-setup`. It creates a virtual environment named `assistant-venv` in the folder that holds `brain.db` (it follows `LEAN_BRAIN_DB`) and installs the `anthropic` package there. Nothing is written into the repository. Homebrew python refuses plain `pip install`, which is why it uses a venv. If you upgrade python to a new minor version, run the command again. The assistant needs Python 3.11 or later, because older versions cannot cap query size.
 2. Give it credentials (below).
 3. Restart `brain serve` if it was running, and reload the page.
 

@@ -49,12 +49,13 @@ SQL_SECONDS = 5
 MAX_ROWS = 200
 MAX_CHARS = 40000
 MAX_VALUE = 1_000_000
+MAX_COLUMNS = 64
 SERVICE = "lean-brain-anthropic"
 ACCOUNT = "lean-brain"
 SECURITY = "/usr/bin/security"
 KEY_RX = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
 _SK = re.compile(r"sk-[A-Za-z0-9_-]{20,}")
-_KEY_BLOCK = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)
+_KEY_BLOCK = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|\Z)", re.S)
 
 TOOL = {
     "name": "run_sql",
@@ -238,6 +239,8 @@ def _safe_error(text):
 
 
 def run_sql(sql, path=None, seconds=SQL_SECONDS):
+    if not hasattr(sqlite3.Connection, "setlimit"):
+        raise SqlError("the assistant needs Python 3.11 or later to bound query size")
     """Run one SELECT read-only and return the rows as masked text. Raises SqlError."""
     if not isinstance(sql, str) or not sql.strip():
         raise SqlError("sql must be a non-empty string")
@@ -246,8 +249,8 @@ def run_sql(sql, path=None, seconds=SQL_SECONDS):
         con = _open_ro(path or store.db_path())
         con.set_authorizer(_authorizer)
         deadline = time.monotonic() + seconds
-        if hasattr(con, "setlimit"):
-            con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE)
+        con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE)
+        con.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, MAX_COLUMNS)
         con.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 1000)
         cur = con.execute(sql)
         cols = [d[0] for d in (cur.description or [])]
@@ -678,6 +681,9 @@ def _self_test():
         err = ""
     except SqlError as ex:
         err = str(ex)
+    pgp = "-----BEGIN PGP PRIVATE KEY" + " BLOCK-----\nlQOYbody\n-----END PGP PRIVATE KEY" + " BLOCK-----\nafter"
+    check("pgp key body masked", mask(pgp), "[secret removed]\nafter")
+    check("wide row refused", refused("SELECT " + ",".join("1" for _ in range(65))), True)
     check("error text masked", "aaaaaaaaaaaa" in err, False)
     for big in ("SELECT zeroblob(2000000000)", "SELECT randomblob(2000000000)"):
         check("huge blob refused", refused(big), True)
