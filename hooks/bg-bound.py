@@ -77,22 +77,11 @@ def verdict(tool_input):
             f"{wrapped(command)}\nLEAN_BG_GUARD=off turns this check off.")
 
 
-def inline_off(tool_input):
-    """True when LEAN_BG_GUARD=off is in the env prefix of the command."""
-    command = tool_input.get("command")
-    if not isinstance(command, str):
-        return False
-    return any((s.env.get("LEAN_BG_GUARD") or "").lower() == "off" for s in hookkit.segments(command))
-
-
 def main():
     if (os.environ.get("LEAN_BG_GUARD") or "").lower() == "off":
         return 0
     event = hookkit.read_event()
-    tool_input = hookkit.tool_input(event)
-    if inline_off(tool_input):
-        return 0
-    text = verdict(tool_input)
+    text = verdict(hookkit.tool_input(event))
     if not text:
         return 0
     return hookkit.refuse("PreToolUse", text, standard="nothing")
@@ -154,8 +143,6 @@ def self_test():
             failures += 1
 
     want("background command passes silently", std({"tool_input": bg("sleep 9")}), 0)
-    want("inline off passes", hookkit.probe(os.path.realpath(__file__), {"tool_input": bg("LEAN_BG_GUARD=off sleep 9")},
-                                          LEAN_PROFILE="strict"), 0)
 
     if failures:
         return 1

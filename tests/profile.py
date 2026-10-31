@@ -137,10 +137,19 @@ def part_c():
         check("standard: a key in a Write blocks", (got[0], "allow-secret" in got[2]), (2, True))
 
 
+# Strict is compared with this release. Move the tag when a strict message changes on purpose.
+STRICT_TAG = "v1.21.0"
+
+
 def extract(dest, source_dir=None):
-    """Copy hooks, lib and tools: from origin/main when source_dir is None, else from the working tree."""
+    """Copy hooks, lib and tools: from STRICT_TAG when source_dir is None, else from the working tree."""
     if source_dir is None:
-        archive = subprocess.run(["git", "-C", ROOT, "archive", "refs/remotes/origin/main", "hooks", "lib", "tools"],
+        found = subprocess.run(["git", "-C", ROOT, "rev-parse", "--verify", "-q", f"refs/tags/{STRICT_TAG}^{{commit}}"],
+                               capture_output=True, text=True)
+        if found.returncode != 0:
+            print(f"FAIL tag {STRICT_TAG} is missing; fetch tags (git fetch --tags) before running this test")
+            sys.exit(1)
+        archive = subprocess.run(["git", "-C", ROOT, "archive", f"refs/tags/{STRICT_TAG}", "hooks", "lib", "tools"],
                                  capture_output=True, check=True).stdout
         subprocess.run(["tar", "-x", "-C", dest], input=archive, check=True)
     else:
@@ -157,6 +166,8 @@ def corpus(work, repo_hooks, db):
     em = "a " + chr(0x2014) + " b"
     cases = [
         ("bg-bound", "bg-bound.py", {"tool_input": {"command": "sleep 99", "run_in_background": True}}, {}),
+        ("bg-bound inline off", "bg-bound.py",
+         {"tool_input": {"command": "LEAN_BG_GUARD=off sleep 99", "run_in_background": True}}, {}),
         ("commit-author", "commit-author.py", bash("git -c user.email=nobody commit -m x"), {}),
         ("scratchpad-root", "scratchpad-root.py",
          {"tool_name": "Write", "tool_input": {"file_path": "/tmp/s/scratchpad/notes.md"}, "cwd": "/"}, {}),
@@ -171,6 +182,12 @@ def corpus(work, repo_hooks, db):
         ("secret-scan write key", "secret-scan.py",
          {"tool_name": "Write", "tool_input": {"file_path": os.path.join(work, "k.txt"), "content": "k = " + key() + "\n"},
           "cwd": work, "session_id": "p1"}, {}),
+        ("secret-scan edit key", "secret-scan.py",
+         {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(work, "k.txt"), "old_string": "a",
+                                              "new_string": "k = " + key() + "\n"}, "cwd": work, "session_id": "p1"}, {}),
+        ("secret-scan notebook key", "secret-scan.py",
+         {"tool_name": "NotebookEdit", "tool_input": {"notebook_path": os.path.join(work, "n.ipynb"),
+                                                      "new_source": "k = " + key() + "\n"}, "cwd": work, "session_id": "p1"}, {}),
         ("secret-scan bypass", "secret-scan.py", bash("git -c core.hooksPath=/x commit -m x"), {}),
         ("secret-scan init and commit", "secret-scan.py", bash("git init -q d && git -C d commit -m x"), {}),
         ("secret-scan unknown repo", "secret-scan.py", bash('git -C "$WT" commit -m x', repo_hooks["plain"]), {}),
@@ -227,18 +244,17 @@ def part_d():
             f.write(json.dumps({"type": "assistant", "message": {"id": "m1", "model": "claude-opus-5", "usage": {
                 "input_tokens": 90000, "output_tokens": 5}}}) + "\n")
         places["transcript"] = transcript
-        state = os.path.join(scratch, "ctx")
-        os.makedirs(state)
+        counted = os.path.join(home, "context-cost")
+        os.makedirs(counted, mode=0o700)
+        with open(os.path.join(counted, "ps-2.json"), "w") as f:
+            json.dump({"since_agent": 50}, f)
         cases = corpus(work, places, db)
         for variant in ("strict", "Loose"):
             for label, name, event, extra in cases:
-                if label == "context-cost lookup":
-                    continue  # needs a counted state; the image case covers the refuse call
                 results = []
                 for tree in (old, new):
                     # a scratch crash case: no scanner in either tree
                     env = clean_env(home, LEAN_PROFILE=variant, **extra)
-                    env["LEAN_STATE_DIR"] = state
                     results.append(run_cmd(f'python3 "{tree}/hooks/{name}"', json.dumps(event), env, cwd=work))
                 a, b = results
                 a = (a[0], normalise(a[1], [old]), normalise(a[2], [old]))
@@ -268,6 +284,17 @@ def part_d():
         env = clean_env(home, LEAN_PROFILE="standard")
         check("standard: secret-scan crash passes", run_cmd(f'python3 "{new}/hooks/secret-scan.py"', json.dumps(ev), env, cwd=work)[::2],
               (0, ""))
+        wev = {"tool_name": "Write", "tool_input": {"file_path": os.path.join(work, "w.txt"), "content": "hello\n"},
+               "cwd": work, "session_id": "p1"}
+        wr = {}
+        for tree in (old, new):
+            env = clean_env(home, LEAN_PROFILE="strict")
+            r = run_cmd(f'python3 "{tree}/hooks/secret-scan.py"', json.dumps(wev), env, cwd=work)
+            wr[tree] = (r[0], normalise(r[1], [tree]), normalise(r[2], [tree]))
+        check("strict identical: secret-scan crash on Write", wr[new], wr[old])
+        check("the Write crash blocks in strict", wr[new][0], 2)
+        r = run_cmd(f'python3 "{new}/hooks/secret-scan.py"', json.dumps(wev), clean_env(home, LEAN_PROFILE="standard"), cwd=work)
+        check("standard: Write crash is a note", (r[0], "did not run" in r[1]), (0, True))
 
 
 def self_test():

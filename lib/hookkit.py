@@ -90,19 +90,19 @@ PROFILES = ("strict", "standard", "off")
 
 def profile():
     """LEAN_PROFILE: standard when unset, and anything unrecognised counts as strict."""
-    raw = (os.environ.get("LEAN_PROFILE") or "").strip().lower()
-    if not raw:
+    if "LEAN_PROFILE" not in os.environ:
         return "standard"
+    raw = os.environ["LEAN_PROFILE"].strip().lower()
     return raw if raw in PROFILES else "strict"
 
 
 def refuse(event_name, text, *, standard="note", note=None):
     """Refuse a tool call the way the profile says. Strict prints TEXT and returns 2, as ever.
 
-    Standard: "block" is the same as strict, "note" gives Claude NOTE (or TEXT) and lets the call run,
-    "nothing" lets it run silently. Returns the hook's exit code.
+    Standard: "note" gives Claude NOTE (or TEXT) and lets the call run, "nothing" lets it run silently,
+    "block" or any other value is the same as strict. Returns the hook's exit code.
     """
-    if profile() == "strict" or standard == "block":
+    if profile() == "strict" or standard not in ("note", "nothing"):
         print(text, file=sys.stderr)
         return 2
     if standard == "note":
@@ -431,6 +431,7 @@ def self_test():
 
     global _RECORD, _EVENT
 
+    os.environ["LEAN_PROFILE"] = "strict"
     failures = 0
     saved_brain = os.environ.get("LEAN_BRAIN_DB")  # the scratch brain set at import
     saved_notices = os.environ.get("LEAN_NOTICES")
@@ -484,6 +485,34 @@ def self_test():
     check("time wrapper", git_call(segments("time git commit -m x")[0])[0], "commit")
     check("inline off switch", disabled("LEAN_NOT_SET_ANYWHERE", segments("LEAN_NOT_SET_ANYWHERE=1 git commit")[0]), True)
     check("off switch not set", disabled("LEAN_NOT_SET_ANYWHERE", segments("git commit")[0]), False)
+    def with_profile(value, standard, note_text=None):
+        saved_profile = os.environ.get("LEAN_PROFILE")
+        if value is None:
+            os.environ.pop("LEAN_PROFILE", None)
+        else:
+            os.environ["LEAN_PROFILE"] = value
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = refuse("PreToolUse", "T", standard=standard, note=note_text)
+            return code, out.getvalue(), err.getvalue(), profile()
+        finally:
+            if saved_profile is None:
+                os.environ.pop("LEAN_PROFILE", None)
+            else:
+                os.environ["LEAN_PROFILE"] = saved_profile
+
+    check("profile unset is standard", with_profile(None, "nothing")[3], "standard")
+    check("profile empty is strict", with_profile("", "nothing")[3], "strict")
+    check("profile blank is strict", with_profile("  ", "nothing")[3], "strict")
+    check("profile typo is strict", with_profile("stnadard", "nothing")[3], "strict")
+    check("profile is case-insensitive", with_profile(" OFF ", "nothing")[3], "off")
+    check("strict prints and returns 2", with_profile("strict", "nothing")[:3], (2, "", "T\n"))
+    check("standard nothing", with_profile("standard", "nothing")[:3], (0, "", ""))
+    check("standard block", with_profile("standard", "block")[:3], (2, "", "T\n"))
+    check("standard note uses the note", json.loads(with_profile("standard", "note", "N")[1])["hookSpecificOutput"]["additionalContext"], "N")
+    check("standard note falls back to the text", json.loads(with_profile("standard", "note")[1])["hookSpecificOutput"]["additionalContext"], "T")
+    check("a mistyped standard value blocks", with_profile("standard", "nothin")[:3], (2, "", "T\n"))
     want_note = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "hello"}}
 
     def noted():

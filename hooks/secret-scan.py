@@ -639,11 +639,15 @@ def write_findings(name, data, cwd, tool):
     return tool.scan_text(written_text(name, data), rel)
 
 
-def blocked(reason):
+def blocked(reason, standard="nothing"):
+    note = None
+    if standard == "note":
+        note = (f"The key scan did not run on this file ({reason}), so nothing was checked. "
+                "Reinstall or update the lean-agent plugin to restore it.")
     return hookkit.refuse(
         "PreToolUse", f"Blocked by lean-agent: the secret scan check could not run ({reason}), so nothing was checked. "
         f"Fix that, or set {SKIP}=1 in front of the command or in the env block of Claude Code settings.",
-        standard="nothing")
+        standard=standard, note=note)
 
 
 def main():
@@ -673,7 +677,7 @@ def main():
         tool = scanner()
         found = write_findings(name, data, cwd, tool)
     except Exception as exc:
-        return blocked(f"{type(exc).__name__}: {exc}")
+        return blocked(f"{type(exc).__name__}: {exc}", standard="note")
     if found:
         return hookkit.refuse(
             "PreToolUse", tool.message(found, what)

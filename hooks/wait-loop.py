@@ -177,9 +177,11 @@ def main():
 
 def self_test():
     os.environ["LEAN_PROFILE"] = "strict"
+    import atexit
     import contextlib
     import io
     import json
+    import shutil
     import tempfile
 
     global BRAIN
@@ -330,6 +332,7 @@ def self_test():
         print(f"FAIL standard wait note should not name brain or say Blocked: {got[1]!r}")
         failures += 1
     sln_dir = tempfile.mkdtemp(prefix="wait-loop-sln-")
+    atexit.register(shutil.rmtree, sln_dir, True)
     open(os.path.join(sln_dir, "App.sln"), "w").close()
     direct = {"tool_input": {"command": "dotnet test App.sln"}, "cwd": sln_dir}
     want("a direct test run gets no wait-loop note", std(direct, LEAN_DIRECT_TEST=None), 0)

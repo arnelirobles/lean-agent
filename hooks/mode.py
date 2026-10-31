@@ -89,8 +89,10 @@ def role(env, name):
 
 
 def profile_warning(env):
-    raw = (env.get("LEAN_PROFILE") or "").strip().lower()
-    if raw and raw not in hookkit.PROFILES:
+    if "LEAN_PROFILE" not in env:
+        return None
+    raw = env["LEAN_PROFILE"].strip().lower()
+    if raw not in hookkit.PROFILES:
         return f"LEAN_PROFILE={raw} is not one of {', '.join(hookkit.PROFILES)}; using strict."
     return None
 
@@ -160,7 +162,8 @@ def self_test():
     expect("both", {"LEAN_AGENTS": "one", "LEAN_MODELS": "one"},
            ("LEAN_AGENTS=one:", "LEAN_MODELS=one:"), ("/model",))
     expect("unknown profile", {"LEAN_PROFILE": "loose"}, ("LEAN_PROFILE=loose is not one of strict, standard, off; using strict.",))
-    for ok in ("Strict", " standard ", "OFF", ""):
+    expect("empty profile", {"LEAN_PROFILE": " "}, ("LEAN_PROFILE= is not one of strict, standard, off; using strict.",))
+    for ok in ("Strict", " standard ", "OFF"):
         if message({"LEAN_PROFILE": ok}) is not None:
             print(f"FAIL LEAN_PROFILE={ok!r} should print nothing")
             failures += 1
