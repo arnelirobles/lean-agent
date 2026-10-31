@@ -114,7 +114,8 @@ same install in the config's folder, then `playwright test --reporter=list` with
 filters. A failed test is named file > title, and the spec file is the class. The runner is chosen per job
 from the test path (runner_for); a path that is no dotnet project, package.json, Playwright config or Gradle build is
 refused by name, and so is a package.json that uses jest and not vitest (no Jest runner yet). A run that ran no
-tests, filtered or not, fails. TEST_PHASE_DOTNET_ARGS does not reach a Vitest or Playwright job; `args=` on
+tests, filtered or not, fails, and so does one that only skipped tests (ran no tests), or whose output has no test
+count. TEST_PHASE_DOTNET_ARGS does not reach a Vitest or Playwright job; `args=` on
 the job does. A remote lane runs them in the node_image container, which has no Playwright browsers; see
 docs/remote-lane.md.
 
@@ -158,6 +159,7 @@ try:
 except ImportError:  # without the helper a job takes the lane command by command, as before
     hl = None
 import gradle_args as ga
+from test_kinds import DOTNET_FILES, SUPPORTED_KINDS
 try:
     import test_needs as tn
 except ImportError:  # without the module no prerequisite or environment check runs
@@ -393,14 +395,24 @@ class Dotnet:
     def counts(text):
         """(passed, failed, skipped) from the run summary, zeros when there is none."""
         text = ANSI.sub("", text)
-        m = re.search(r"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+)", text)
-        if m:
-            return int(m.group(2)), int(m.group(1)), int(m.group(3))
-        blk = {k.lower(): int(v) for k, v in re.findall(r"^\s*(Total tests|Passed|Failed|Skipped):\s*(\d+)\s*$", text, re.M)}
-        if "total tests" in blk:  # the detailed VSTest logger leaves out the lines that are zero
-            failed, skipped = blk.get("failed", 0), blk.get("skipped", 0)
-            return blk.get("passed", blk["total tests"] - failed - skipped), failed, skipped
-        got = {k.lower(): int(v) for k, v in re.findall(r"^\s*(total|failed|succeeded|skipped):\s*(\d+)", text, re.M)}
+        found = re.findall(r"Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+)", text)
+        if found:  # a solution prints one summary per project
+            return (sum(int(p) for _, p, _ in found), sum(int(f) for f, _, _ in found), sum(int(k) for _, _, k in found))
+        groups = []
+        for k, v in re.findall(r"^\s*(Total tests|Passed|Failed|Skipped):\s*(\d+)\s*$", text, re.M):
+            if k == "Total tests":  # the detailed VSTest logger leaves out the lines that are zero
+                groups.append({"total": int(v)})
+            elif groups:
+                groups[-1][k.lower()] = int(v)
+        if groups:
+            passed = failed = skipped = 0
+            for g in groups:
+                f, k = g.get("failed", 0), g.get("skipped", 0)
+                passed, failed, skipped = passed + g.get("passed", g["total"] - f - k), failed + f, skipped + k
+            return passed, failed, skipped
+        got = {}
+        for k, v in re.findall(r"^\s*(total|failed|succeeded|skipped):\s*(\d+)", text, re.M):
+            got[k] = got.get(k, 0) + int(v)
         if got:
             return got.get("succeeded", 0), got.get("failed", 0), got.get("skipped", 0)
         return 0, 0, 0
@@ -515,10 +527,14 @@ class Vitest:
 
     @staticmethod
     def counts(text):
-        """(passed, failed, skipped) from the "Tests  N failed | M passed | K skipped (T)" line, else zeros."""
-        found = re.findall(r"^\s*Tests\s+(\d.*)$", ANSI.sub("", text), re.M)
-        if not found:
-            return 0, 0, 0
+        """(passed, failed, skipped) from the "Tests  N failed | M passed | K skipped (T)" line or node:test or TAP counts, else zeros."""
+        text = ANSI.sub("", text)
+        found = re.findall(r"^\s*Tests\s+(\d.*)$", text, re.M)
+        if not found:  # a "test" script that runs node --test prints its own counts, as node:test or TAP lines
+            n = {}
+            for k, v in re.findall(r"^\s*(?:\u2139|#)\s+(pass|fail|skipped|todo)\s+(\d+)\s*$", text, re.M):
+                n[k] = int(v)
+            return n.get("pass", 0), n.get("fail", 0), n.get("skipped", 0) + n.get("todo", 0)
         n = {k: int(v) for v, k in re.findall(r"(\d+) (failed|passed|skipped|todo)", found[-1])}
         return n.get("passed", 0), n.get("failed", 0), n.get("skipped", 0) + n.get("todo", 0)
 
@@ -901,11 +917,6 @@ def tp_name(path):
         or PLAYWRIGHT_CONFIG.match(base)) and os.path.dirname(path) else base
 
 
-DOTNET_FILES = (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".slnf")
-SUPPORTED_KINDS = ("a dotnet project or solution (.csproj, .fsproj, .vbproj, .sln, .slnx, .slnf) or a folder holding one, "
-                   "a package.json, a playwright.config.ts, .js, .mjs or .cjs, or a Gradle settings file or its folder")
-
-
 def is_dotnet(test_project, repo=None):
     if os.path.basename(test_project.rstrip("/")).lower().endswith(DOTNET_FILES):
         return True
@@ -987,6 +998,8 @@ def heavy(lane, cmd, cwd, log, stall, header=None, hold=None, fail_stall=0, prog
     else:
         env.pop("HEAVY_FAIL_STALL", None)
     env.pop("HEAVY_HELD", None)
+    if cmd and cmd[0] == "dotnet":  # the summary regexes read English
+        env["DOTNET_CLI_UI_LANGUAGE"], env["VSLANG"] = "en", "1033"
     if progress:
         env["HEAVY_PROGRESS"] = progress
     timing = log + ".wait"
@@ -1297,6 +1310,12 @@ def matched_none(rc, text):
         or bool(re.search(r"Failed:\s*\d+,\s*Passed:\s*\d+,\s*Skipped:\s*\d+", text))
 
 
+def explicit_zero(runner, text):
+    """The output says no test ran: only skipped ones, or a count of zero. Otherwise it just has no count."""
+    text = ANSI.sub("", text)
+    return runner.counts(text)[2] > 0 or bool(re.search(r"^\s*(?:Running 0 tests\b|Total tests:\s*0\s*$|Tests\s+0\b)", text, re.M))
+
+
 def lane_problem(rc, text):
     """Why a remote command never really ran, or "". No marker line means the test command never started."""
     if not re.search("^" + re.escape(lr.MARKER) + r"\s*$", text, re.M):
@@ -1598,10 +1617,17 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     elif runner is not Gradle and not failing and not row.get("env") \
             and (matched_none(rc, text) or (rc == 0 and not sum(runner.counts(text)[:2]))):
         row["result"] = "fail"
-        row["notes"].append("ran no tests")
-        add_item(row, "test-fail", f"ran-no-tests: {project}", "important",
-                 f"The run exited {rc} but passed or failed no test, so it proved nothing. A project with no tests "
-                 f"fails here: add a test, or leave it out of the plan. Log: {stem}.log", run_id, ctx)
+        if matched_none(rc, text) or explicit_zero(runner, text):
+            row["notes"].append("ran no tests")
+            add_item(row, "test-fail", f"ran-no-tests: {project}", "important",
+                     f"The run exited {rc} but passed or failed no test, so it proved nothing. A project with no tests "
+                     f"fails here: add a test, or leave it out of the plan. Log: {stem}.log", run_id, ctx)
+        else:
+            row["notes"].append("no test count was found in the output")
+            add_item(row, "test-fail", f"no-test-count: {project}", "important",
+                     f"The run exited {rc} but no test count was found in the output, so it proved nothing. test-phase reads "
+                     f"vitest, node:test, TAP, dotnet and playwright counts; make the test script print one, or run it "
+                     f"directly. Log: {stem}.log", run_id, ctx)
     elif runner is Gradle and rc == 0 and not failing and not sum(Gradle.counts(text)[:2]):
         row["result"] = "fail"
         row["notes"].append("ran no tests")
@@ -1650,7 +1676,7 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     for name in failing:
         by_class.setdefault(runner.class_of(name), []).append(name)
     row["failing"] = len(failing)
-    if rc == 0 and job["tier"] == "full" and not job["filter"] and not failing:
+    if rc == 0 and row["result"] == "pass" and job["tier"] == "full" and not job["filter"] and not failing:
         cleared = (brain(["flaky-clear", "--project", row["project"], "--test-project", tp_name(project)])
                    or "").splitlines()
         if cleared:
@@ -2152,6 +2178,8 @@ def vitest_checks(fails, fixture):
         fails.append("a vitest job gets a pnpm store volume and CI=true")
     if "mcr.microsoft.com/dotnet/sdk:10.0 sh -c" not in dn or "node:" in dn:
         fails.append("a dotnet job keeps the dotnet image")
+    if "-e DOTNET_CLI_UI_LANGUAGE=en -e VSLANG=1033" not in dn or "VSLANG" in sc:
+        fails.append("a remote dotnet job must run in English, and a vitest job needs no dotnet variables")
     if subprocess.run(["sh", "-n", "-c", sc]).returncode != 0:
         fails.append("the vitest remote script is not valid shell")
     r.cache_max_gb = 5
@@ -2771,7 +2799,7 @@ def needs_checks(fails):
         env.pop("LEAN_NEEDS_UNSET", None)
         needs_file = os.path.join(r_n, ".lean", "test-needs")
         open(needs_file, "w").write("env LEAN_NEEDS_SET  # present\nenv LEAN_NEEDS_UNSET\npath ../not-here\n")
-        output("Nn.csproj", "Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1\n", 0)
+        output("Nn.csproj", "Test Run Successful.\nTotal tests: 1\n     Passed: 1\n", 0)
         rc, out, calls = run(r_n, "Nn.csproj")
         nb = items("needrefuse", "blocker")
         body = show(nb[0][0]) if nb else ""
@@ -2792,6 +2820,11 @@ def needs_checks(fails):
         dr = subprocess.run([sys.executable, me, "--doctor", r_n], env=env, capture_output=True, text=True)
         if dr.returncode != 0:
             fails.append(f"--doctor must exit 0 when everything is met: {dr.returncode} {dr.stdout!r}")
+        output("Nn.csproj", "Build succeeded.\n", 0)  # a full run that ran no tests proved nothing: the blocker stays
+        rc, out, calls = run(r_n, "Nn.csproj")
+        if rc != 1 or not items("needrefuse", "blocker"):
+            fails.append(f"a full run that ran no tests must not close a blocker ({rc}): {items('needrefuse', 'blocker')} {out}")
+        output("Nn.csproj", "Test Run Successful.\nTotal tests: 1\n     Passed: 1\n", 0)
         rc, out, calls = run(r_n, "Nn.csproj")
         if rc != 0 or items("needrefuse", "blocker") or len(calls) != 1:
             fails.append(f"met prerequisites must run the tests and close the blocker ({rc}): {items('needrefuse', 'blocker')}")
@@ -2997,6 +3030,20 @@ def self_test():
             fails.append(f"detailed VSTest summary {name}: {Dotnet.counts(fixture(name))}, want {want}")
     if Dotnet.counts("Failed!  - Failed:     2, Passed:     1, Skipped:     0, Total:     3\n") != (1, 2, 0):
         fails.append("the one-line summary must still parse")
+    # A solution prints one summary per project: every one counts, not the first or the last.
+    two = ("Passed!  - Failed: 0, Passed: 0, Skipped: 3, Total: 3\nFailed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6\n")
+    if Dotnet.counts(two) != (5, 1, 3):
+        fails.append(f"a solution's summaries must be summed: {Dotnet.counts(two)}")
+    block = ("Test Run Successful.\nTotal tests: 3\n    Skipped: 3\nTest Run Successful.\nTotal tests: 6\n     Passed: 5\n     Failed: 1\n")
+    if Dotnet.counts(block) != (5, 1, 3):
+        fails.append(f"a solution's detailed summaries must be summed: {Dotnet.counts(block)}")
+    mtp = "total: 3\nfailed: 0\nsucceeded: 0\nskipped: 3\ntotal: 5\nfailed: 0\nsucceeded: 5\nskipped: 0\n"
+    if Dotnet.counts(mtp) != (5, 0, 3):
+        fails.append(f"a solution's MTP summaries must be summed: {Dotnet.counts(mtp)}")
+    if Vitest.counts("\u2139 tests 4\n\u2139 pass 3\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 1\n\u2139 todo 0\n") != (3, 0, 1):
+        fails.append("node:test counts must be read")
+    if Vitest.counts("1..4\n# tests 4\n# pass 2\n# fail 1\n# skipped 1\n# todo 0\n") != (2, 1, 1):
+        fails.append("TAP counts must be read")
 
     vitest_checks(fails, fixture)
     node_checks(fails, fixture)
@@ -3091,6 +3138,7 @@ def self_test():
             fh.write('''#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
 echo "${HEAVY_HELD:-none}" >> "$FAKE_DIR/held-env"
+echo "${DOTNET_CLI_UI_LANGUAGE:-unset} ${VSLANG:-unset}" >> "$FAKE_DIR/lang-env"
 : > "$FAKE_DIR/first-call"
 [ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
 for k in kill-once kill-always; do
@@ -3118,12 +3166,12 @@ case "$*" in
     if [ -f "$f.failstall" ]; then while :; do echo "failed $cls.T"; sleep 0.3; done; fi
     if [ -f "$f.kill" ]; then rm -f "${f:?}.kill"; kill -TERM $$; fi
     if [ -f "$f" ]; then cat "$f"; [ -f "$f.rc" ] && exit "$(cat "$f.rc")"; exit 0; fi
-    echo "passed $cls.Any (1ms)"; echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"; exit 0 ;;
+    echo "passed $cls.Any (1ms)"; echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 0 ;;
 esac
 pf=$FAKE_DIR/full-$(basename "$2")
 if [ -f "$pf" ]; then cat "$pf"; exit "$(cat "$pf.rc")"; fi
 if [ -f "$FAKE_DIR/full" ]; then cat "$FAKE_DIR/full"; exit "$(cat "$FAKE_DIR/full.rc")"; fi
-echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"; exit 0
+echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; exit 0
 ''')
         os.chmod(shim, 0o755)
         env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=BRAIN,
@@ -3261,7 +3309,7 @@ echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"; exit 0
             fails.append(f"one class needs no probe: {calls}")
 
         # A filter that matches no test is a failure, not a pass: VSTest exits 0 with no summary, MTP exits 8.
-        put("full", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        put("full", "Test Run Successful.\nTotal tests: 1\n     Passed: 1\n", 0)
         put("class-Empty", "No test matches the given testcase filter `FullyQualifiedName~Empty` in T.dll\n", 0)
         put("class-Good", "  Passed Acme.GoodTests.A [1 ms]\nPassed!  - Failed: 0, Passed: 3, Skipped: 0, Total: 3\n", 0)
         rc, out, calls = run(f"{repo_v} tests/T/T.csproj Empty\n")
@@ -3275,15 +3323,25 @@ echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"; exit 0
         rc, out, calls = run(f"{repo_v} tests/T/T.csproj Good\n")
         if rc != 0 or "filter matched no test" in out:
             fails.append(f"a filtered run with tests must still pass ({rc}): {out}")
-        for label, repo_x, text, code in (
-                ("a VSTest summary of zero tests", repo_v, "Passed!  - Failed: 0, Passed: 0, Skipped: 0, Total: 0\n", 0),
-                ("a VSTest run with no summary", repo_v, "Build succeeded.\n", 0),
-                ("an MTP exit 8", repo_m, "", 8)):
+        for label, repo_x, text, code, say in (
+                ("a VSTest summary of zero tests", repo_v, "Passed!  - Failed: 0, Passed: 0, Skipped: 0, Total: 0\n", 0, "ran no tests"),
+                ("a detailed summary of zero tests", repo_v, "Test Run Successful.\nTotal tests: 0\n", 0, "ran no tests"),
+                ("a VSTest run that only skipped", repo_v, "Test Run Successful.\nTotal tests: 3\n    Skipped: 3\n", 0, "ran no tests"),
+                ("a VSTest run with no summary", repo_v, "Build succeeded.\n", 0, "no test count was found in the output"),
+                ("an MTP exit 8", repo_m, "", 8, "ran no tests")):
             put("full", text, code)
             rc, out, calls = run(f"{repo_x} tests/T/T.csproj\n")
-            if rc != 1 or "ran no tests" not in out:
-                fails.append(f"an unfiltered dotnet run with {label} must fail as ran no tests ({rc}): {out}")
-        put("full", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+            if rc != 1 or say not in out:
+                fails.append(f"an unfiltered dotnet run with {label} must fail with {say!r} ({rc}): {out}")
+        if not os.path.exists(os.path.join(d, "lang-env")) \
+                or set(open(os.path.join(d, "lang-env")).read().split("\n")) - {"", "en 1033"}:
+            fails.append("a dotnet child must run with DOTNET_CLI_UI_LANGUAGE=en and VSLANG=1033: "
+                         + repr(open(os.path.join(d, "lang-env")).read() if os.path.exists(os.path.join(d, "lang-env")) else None))
+        put("full", "Test Run Successful.\nTotal tests: 3\n    Skipped: 3\nTest Run Successful.\nTotal tests: 4\n     Passed: 4\n", 0)
+        rc, out, calls = run(f"{repo_v} tests/T/T.csproj\n")
+        if rc != 0 or "ran no tests" in out:
+            fails.append(f"a later project that ran tests must make the solution pass ({rc}): {out}")
+        put("full", "Test Run Successful.\nTotal tests: 1\n     Passed: 1\n", 0)
 
         # A refused full add stops the plan loudly; again=REASON on the plan line goes through as --again.
         def gitrepo(name, dirty=False):
@@ -3297,7 +3355,7 @@ echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"; exit 0
                 with open(os.path.join(g, "f.txt"), "w") as fh:
                     fh.write("changed\n")
             return g
-        put("full", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
+        put("full", "Test Run Successful.\nTotal tests: 1\n     Passed: 1\n", 0)
         gclean, gdirty = gitrepo("gclean"), gitrepo("gdirty", dirty=True)
         rc, out, calls = run(f"{gdirty} tests/T/T.csproj Fast\n")
         if rc == 0 or "uncommitted" not in out or "again=" not in out or calls:
@@ -3626,7 +3684,7 @@ case "$mode" in
     esac ;;
   *) seq Acme.HangTests.Done Acme.HangTests.Sleeps; echo big > "$rd/hang.dmp"
      echo "  Passed Acme.HangTests.Done [1 ms]"
-     [ "$mode" = exit0 ] && echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"
+     [ "$mode" = exit0 ] && { echo "Test Run Successful."; echo "Total tests: 1"; echo "     Passed: 1"; }
      case "$mode" in term) kill -TERM $$ ;; exit1) exit 1 ;; exit0) exit 0 ;; *) exit 2 ;; esac ;;
 esac
 ''')
@@ -3835,17 +3893,20 @@ exit 0
             os.makedirs(os.path.join(repo_z, sub))
         for f in ("web/package.json", "web/pnpm-lock.yaml", "e2e/pnpm-lock.yaml", "e2e/playwright.config.ts", "notes.txt"):
             open(os.path.join(repo_z, f), "w").write("{}\n")
-        for label, tp, text in (("vitest, no test files", "web/package.json", "No test files found, exiting with code 0\n"),
-                                ("vitest, no output", "web/package.json", ""),
-                                ("playwright, zero tests", "e2e/playwright.config.ts", "Running 0 tests using 1 worker\n")):
+        for label, tp, text, say in (("vitest, no test files", "web/package.json", "No test files found, exiting with code 0\n", "ran no tests"),
+                                     ("vitest, no output", "web/package.json", "", "no test count was found in the output"),
+                                     ("node:test, only skipped", "web/package.json", "\u2139 pass 0\n\u2139 fail 0\n\u2139 skipped 2\n", "ran no tests"),
+                                     ("playwright, zero tests", "e2e/playwright.config.ts", "Running 0 tests using 1 worker\n", "ran no tests")):
             put("exec-zero", text)
             rc, out, calls = run(f"{repo_z} {tp}\n")
-            if rc == 0 or "ran no tests" not in out:
-                fails.append(f"an unfiltered {label} run must fail as ran no tests ({rc}): {out}")
-        put("exec-zero", "     Tests  3 passed (3)\n")
-        rc, out, calls = run(f"{repo_z} web/package.json\n")
-        if rc != 0 or "ran no tests" in out:
-            fails.append(f"an unfiltered vitest run with tests must pass ({rc}): {out}")
+            if rc == 0 or say not in out:
+                fails.append(f"an unfiltered {label} run must fail with {say!r} ({rc}): {out}")
+        for label, text in (("vitest", "     Tests  3 passed (3)\n"), ("node:test", "\u2139 tests 2\n\u2139 pass 2\n\u2139 fail 0\n"),
+                            ("TAP", "# tests 2\n# pass 2\n# fail 0\n")):
+            put("exec-zero", text)
+            rc, out, calls = run(f"{repo_z} web/package.json\n")
+            if rc != 0 or "ran no tests" in out or "no test count" in out:
+                fails.append(f"an unfiltered {label} run with tests must pass ({rc}): {out}")
         put("exec-zero", "No test files found, exiting with code 0\n")
         jz1 = qadd(repo_z, "web/package.json", "--cycle", "qz")
         jz2 = qadd(repo_z, "e2e/playwright.config.ts", "--after", jz1, "--cycle", "qz")

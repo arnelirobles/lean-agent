@@ -42,6 +42,10 @@ def reach(cwd, patterns):
     return any(glob.glob(os.path.join(glob.escape(os.path.abspath(cwd or ".")), "*", p)) for p in patterns)
 
 
+# A script that hands the run to other packages says nothing about which runner they use.
+DELEGATES = re.compile(r"(?:^|[\s;&|])(?:turbo|nx|lerna)\b|\s(?:-r|--recursive|--filter|-w|--workspaces?)\b|\bworkspaces?\s+(?:run|foreach)\b")
+
+
 def jest_only(package_json):
     """True when a package.json names jest and never vitest, so the queue cannot run its tests yet."""
     try:
@@ -57,7 +61,7 @@ def jest_only(package_json):
             deps.update(pkg[key])
     scripts = pkg.get("scripts") if isinstance(pkg.get("scripts"), dict) else {}
     test = scripts.get("test") if isinstance(scripts.get("test"), str) else ""
-    if "vitest" in deps or re.search(r"\bvitest\b", test):
+    if "vitest" in deps or re.search(r"\bvitest\b", test) or DELEGATES.search(test):
         return False
     return "jest" in deps or bool(re.search(r"\bjest\b", test))
 
@@ -127,12 +131,26 @@ def _self_test():
         want("pnpm test with jest and vitest", blocks(["pnpm test"], os.path.join(d, "both")), True)
         want("pnpm test with no package.json", blocks(["pnpm test"], os.path.join(d, "bare")), True)
         want("vitest run in a jest repo", blocks(["vitest run"], os.path.join(d, "jest")), True)
+        # A script that runs vitest is not jest only, even when vitest is not in this package.json's dependencies.
+        mk(d, {"vtest/pnpm-lock.yaml": "", "vtest/package.json": json.dumps(
+            {"scripts": {"test": "vitest run"}, "devDependencies": {"jest": "29"}})})
+        want("pnpm test whose script runs vitest", blocks(["pnpm test"], os.path.join(d, "vtest")), True)
+        # A workspace root that hands the run to its packages is not jest only.
+        for name, script in (("ws-r", "pnpm -r test"), ("ws-f", "pnpm --filter web test"), ("ws-t", "turbo run test"),
+                             ("ws-n", "nx run-many -t test"), ("ws-y", "yarn workspaces run test")):
+            mk(d, {f"{name}/pnpm-lock.yaml": "", f"{name}/package.json": json.dumps(
+                {"scripts": {"test": script}, "devDependencies": {"jest": "29"}})})
+            want(f"pnpm test with {script!r}", blocks(["pnpm test"], os.path.join(d, name)), True)
         # A lock file above the repository is not this project's.
         mk(d, {"outer/pnpm-lock.yaml": "", "outer/proj/.git/HEAD": "", "outer/proj/src/x.txt": "",
                "plain/pnpm-lock.yaml": "", "plain/proj/x.txt": "",
                "repo/.git/HEAD": "", "repo/pnpm-lock.yaml": "", "repo/pkg/x.txt": ""})
         want("a stray lock above the git root", blocks(["pnpm test"], os.path.join(d, "outer", "proj", "src")), False)
         want("a stray lock above the cwd, no git", blocks(["pnpm test"], os.path.join(d, "plain", "proj")), False)
+        # The package.json search stops at the git root too: a jest package.json above it is not this project's.
+        mk(d, {"outer2/package.json": jest, "outer2/proj/.git/HEAD": "", "outer2/proj/pnpm-lock.yaml": "",
+               "outer2/proj/src/x.txt": ""})
+        want("a jest package.json above the git root", blocks(["pnpm test"], os.path.join(d, "outer2", "proj", "src")), True)
         want("a lock at the git root", blocks(["pnpm test"], os.path.join(d, "repo", "pkg")), True)
         want("a lock in the cwd", blocks(["pnpm test"], os.path.join(d, "plain")), True)
     if old is not None:

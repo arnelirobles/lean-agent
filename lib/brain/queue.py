@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import gradle_args  # noqa: E402
+from test_kinds import DOTNET_FILES, SUPPORTED_KINDS  # noqa: E402
 
 from .items import infer_session, session_ok
 from .store import connect, now
@@ -133,10 +134,7 @@ def is_gradle(repo, test_project):
     return os.path.isdir(folder) and any(os.path.isfile(os.path.join(folder, n)) for n in GRADLE_SETTINGS)
 
 
-DOTNET_FILES = (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".slnf")
 PLAYWRIGHT_CONFIG = re.compile(r"^playwright\.config\.(?:ts|js|mjs|cjs)$")
-SUPPORTED_KINDS = ("a dotnet project or solution (.csproj, .fsproj, .vbproj, .sln, .slnx, .slnf) or a folder holding one, "
-                   "a package.json, a playwright.config.ts, .js, .mjs or .cjs, or a Gradle settings file or its folder")
 
 
 def unsupported_path(repo, test_project):
