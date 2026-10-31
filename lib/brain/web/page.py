@@ -11,6 +11,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import activity  # noqa: E402
+
 CSS = """:root{--ink:#1c2321;--body:#4d5552;--muted:#6b736f;--leaf:#0b7a55;--leaf-dark:#075a3e;--sun:#ffcd3c;--cream:#fff8e8;
 --sand:#fbf7ee;--line:#ece4d0;--rust:#c2461a;--mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
 html{overflow-x:clip}
@@ -53,6 +55,18 @@ form[action="/ask"] button:hover{filter:brightness(.97)}
 pre,code{font-family:var(--mono);font-size:13px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0;padding:12px 14px;background:var(--sand);border:1px solid var(--line);border-radius:12px}
 summary{cursor:pointer;font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:0 0 16px}
+.tile{padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:var(--cream);font-size:13px;color:var(--body)}
+.tile b{display:block;font-size:26px;line-height:1.2;color:var(--ink)}.tile span{display:block;margin-top:2px;color:var(--muted)}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:800px){.charts{grid-template-columns:1fr}}
+.chart{margin:0;padding:14px 16px;min-width:0;border:1px solid var(--line);border-radius:14px;background:#fff}
+.answer .chart{margin:0 0 12px}.chart figcaption{margin-bottom:6px;font-size:13px;font-weight:700;color:var(--ink)}
+.chart .plot{display:block}.chart .grid{stroke:var(--line);stroke-width:1}.chart .base{stroke:var(--muted);stroke-width:1}
+.chart .tick{fill:var(--muted);font-size:11px}.chart .lbl{fill:var(--ink);font-size:11px;font-weight:700}
+.chart .legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin:0 0 6px;padding:0;list-style:none;font-size:12px;color:var(--body)}
+.chart .sw{display:inline-block;width:10px;height:10px;margin-right:6px;border-radius:3px}
+.sw.s0{background:#0b7a55}.sw.s1{background:#c2461a}.sw.s2{background:#7b4fa8}
+.chart details{margin-top:8px;font-size:12px}.chart details table{font-size:12px}
 .answer{line-height:1.6}.answer p,.answer ul,.answer ol,.answer blockquote{margin:0 0 12px}
 .answer ul,.answer ol{padding-left:24px}.answer li{margin:3px 0}.answer li>ul,.answer li>ol{margin:3px 0}
 .answer h3,.answer h4{margin:20px 0 6px;color:var(--ink);line-height:1.3}.answer h4{font-size:14px}
@@ -234,14 +248,25 @@ def _ask(st, key):
     return "".join(out)
 
 
+def _activity(data, err):
+    if not data.get("activity"):
+        return ""
+    try:
+        return activity.render(data["activity"])
+    except Exception as ex:
+        err["activity"] = f"could not draw: {type(ex).__name__}"
+        return ""
+
+
 def render(data: dict, key: str, port: int, ask=None) -> str:
-    err = data.get("errors") or {}
+    err = dict(data.get("errors") or {})
     parts = [
         '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
         f"<title>lean brain</title><style>{CSS}</style></head><body><h1>lean brain</h1>"
         f'<p>updated {time.strftime("%H:%M")} <a href="/">Refresh</a></p>',
         _ask(ask, key) if ask else "",
         _section("Needs you", err, "needs_you", _needs(data, key), "Nothing is waiting on you."),
+        _section("Activity", err, "activity", _activity(data, err), "No activity yet."),
         _section("Test queue", err, "queue", _queue(data), "The queue is empty."),
         _section("Created by agents", err, "created", _created(data), "Nothing created yet."),
         _section("Pending tickets", err, "tickets", _tickets(data), "No open tickets assigned to you."),
@@ -340,6 +365,10 @@ def _self_test() -> int:
     check("usage error not crash", "usage" in data["errors"], True)
     check("usage error is no data, not a missing script", "no data yet" in data["errors"].get("usage", ""), True)
     page = render(data, "KEY123", 8770)
+    check("activity collected", (len(data["activity"]["days"]), "activity" in data["errors"]), (14, False))
+    check("activity section drawn", ("<h2>Activity</h2>" in page, page.count("<figure"), "Tests failed today" in page), (True, 5, True))
+    broken = render({**data, "activity": {"days": ["2026-01-01"]}}, "k", 1)
+    check("activity failure keeps the page", ("could not draw" in broken, "<h2>Needs you</h2>" in broken), (True, True))
     check("script escaped", "<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page, True)
     check("notice escaped", "&lt;b&gt;note&lt;/b&gt;" in page, True)
     check("flaky lines", page.count("flaky items in"), 2)

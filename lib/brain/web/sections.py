@@ -17,6 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+import activity  # noqa: E402
 import forges  # noqa: E402
 import session  # noqa: E402
 import worktrees  # noqa: E402
@@ -25,7 +26,7 @@ NEEDS_KINDS = ("question", "blocker", "pending", "risk")
 _RECOMMEND = re.compile(r"recommend(?:ed|ation)?\s*:", re.I)
 WORKTREE_TTL = 90
 _REPOS = {}  # folder to (expiry, repo_of), kept across page loads so git runs once per folder per TTL
-_SECTIONS = ("needs_you", "flaky", "queue", "created", "tickets", "worktrees", "tested", "notices", "usage", "decided")
+_SECTIONS = ("needs_you", "flaky", "queue", "created", "tickets", "worktrees", "tested", "notices", "usage", "decided", "activity")
 
 
 def recommendation(body) -> str:
@@ -112,7 +113,8 @@ def _notices(con):
                       "WHERE dismissed_at='' ORDER BY id DESC LIMIT 200")
 
 
-def usage_rows():
+def lean_stats():
+    """The lean-stats module and an open connection to its database. FileNotFoundError when it has no data."""
     root = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
     path = os.path.join(root, "tools", "lean-stats")
     loader = importlib.machinery.SourceFileLoader("lean_stats_cli", path)
@@ -122,7 +124,11 @@ def usage_rows():
     ls = mod.leanstats
     if not os.path.exists(ls.db_path()):
         raise FileNotFoundError("lean-stats has no data yet")
-    conn = ls.connect()
+    return mod, ls.connect()
+
+
+def usage_rows():
+    mod, conn = lean_stats()
     try:
         return [{"label": a, "value": b, "basis": c} for a, b, c in mod.measures(conn, "")]
     finally:
@@ -226,6 +232,7 @@ def collect(con, cache, roots, which=None, run=None) -> dict:
         return rows
     guard("worktrees", trees, db=False)
     guard("usage", usage_rows, db=False)
+    guard("activity", lambda: activity.collect(con, stats=lean_stats))
     return data
 
 
