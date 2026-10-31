@@ -1253,6 +1253,10 @@ def test_changes(check, tmp):
         check("no gh stores nothing", collect_changes(conn, ["o/r"], "2026-10-01", fake, lambda tool: None), 0)
     check("says which repository failed", "skipped o/broken" in out.getvalue(), True)
     check("says which tool is missing", "gh and jq not found" in out.getvalue(), True)
+    unknown = ("repo\tpr\tfix_rounds\tfailed_checks\tdays_to_merge\tescaped_refs\tlogged_review\n"
+               "o/r\t7\tunknown\tunknown\t1\tunknown\tunknown\n")
+    got = fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else unknown)
+    check("unknown signals stay empty, not zero", [row[5:] for row in got if row[1] == 7], [(None, None, None)])
     check("retro-signals failing still stores the changes",
           len(fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else None)), 2)
     test_azure_changes(check, conn)

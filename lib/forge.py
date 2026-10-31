@@ -6,6 +6,7 @@
   forge.py commits-after REPO N ISO   commits on pull request N committed after ISO, not counting merges
   forge.py failed-checks REPO SHA     failed check runs on SHA
   forge.py escaped-refs REPO N ISO    issues and pull requests created after ISO whose body says #N and fix
+  (the three counts print unknown when the call failed, never 0)
   forge.py --self-test
 
 REPO is owner/name (always GitHub) or a clone URL. A host other than GitHub prints one line and exits 2.
@@ -35,6 +36,8 @@ To add a provider, write the class, add its kind to CI_PROVIDERS and give it a t
 CLI (see github_ci_test and azure_ci_test). Commands run as argument lists, never through a shell, and
 what they print is untrusted.
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -162,11 +165,12 @@ def azure_slug(repo):
 
 
 def count(out):
-    """The sum of the integers gh printed, one per line, or 0 when it failed."""
+    """The sum of the integers gh printed, one per line, or None when the call failed or printed nothing usable."""
     try:
-        return sum(int(line) for line in (out or "").split())
+        parts = (out or "").split()
+        return sum(int(line) for line in parts) if parts else None
     except ValueError:
-        return 0
+        return None
 
 
 class GitHub:
@@ -182,6 +186,9 @@ class GitHub:
             prs = json.loads(listing)
         except ValueError:
             return None
+        if len(prs) >= limit:
+            print(f"forge: stopped at {limit} merged pull requests of {slug(repo)}, older ones are not counted",
+                  file=sys.stderr)
         return [{"number": pr["number"], "head_ref": pr.get("headRefName") or "", "head_sha": pr.get("headRefOid") or "",
                  "created_at": pr.get("createdAt") or "", "merged_at": pr.get("mergedAt") or ""} for pr in prs]
 
@@ -193,7 +200,7 @@ class GitHub:
                                '| select(.commit.message | startswith("Merge") | not)] | length']))
 
     def failed_checks(self, repo, sha):
-        return count(self.run(["gh", "api", f"repos/{slug(repo)}/commits/{sha}/check-runs", "-q",
+        return count(self.run(["gh", "api", f"repos/{slug(repo)}/commits/{sha}/check-runs?per_page=100", "--paginate", "-q",
                                '[.check_runs[] | select(.conclusion=="failure")] | length']))
 
     def escaped_refs(self, repo, number, merged_at):
@@ -223,7 +230,7 @@ class Azure:
     listing questions lean-stats needs; each gives None when az fails. commits_after counts the commits on a
     pull request committed after a time, merges not counted, from the first 500; nothing calls it yet.
     failed_checks and escaped_refs return None: check runs cannot be found by commit through az, and az has
-    no search over work item text. A failed az call gives None (merged_prs) or 0 (commits_after).
+    no search over work item text. A failed az call gives None (merged_prs) or None (commits_after).
     """
 
     def __init__(self, run=run_command, cap=AZURE_CAP, page=AZURE_PAGE):
@@ -323,7 +330,7 @@ class Azure:
                        if azure_time(c["committer"]["date"]) > azure_time(after)
                        and not (c.get("comment") or "").startswith("Merge"))
         except (ValueError, KeyError, TypeError, AttributeError):
-            return 0
+            return None
 
     def failed_checks(self, repo, sha):
         return None
@@ -504,12 +511,14 @@ def main(argv):
             return 1
         for pr in prs:
             print(f"{pr['number']}\t{pr['created_at']}\t{pr['merged_at']}\t{pr['head_sha']}")
-    elif cmd == "commits-after":
-        print(gh.commits_after(repo, rest[0], rest[1]))
-    elif cmd == "failed-checks":
-        print(gh.failed_checks(repo, rest[0]))
     else:
-        print(gh.escaped_refs(repo, rest[0], rest[1]))
+        if cmd == "commits-after":
+            got = gh.commits_after(repo, rest[0], rest[1])
+        elif cmd == "failed-checks":
+            got = gh.failed_checks(repo, rest[0])
+        else:
+            got = gh.escaped_refs(repo, rest[0], rest[1])
+        print("unknown" if got is None else got)
     return 0
 
 
@@ -817,7 +826,7 @@ def azure_test(check, root):
           Azure(fake(json.dumps(commits))).commits_after("org/p/r", 7, "2026-10-01T12:00:00Z"), 1)
     check("azure commits_after argv", calls[-1][:8], ["az", "devops", "invoke", "--area", "git", "--resource",
           "pullRequestCommits", "--org"])
-    check("azure commits_after on a failed az", Azure(fake(None)).commits_after("org/p/r", 7, "x"), 0)
+    check("azure commits_after on a failed az", Azure(fake(None)).commits_after("org/p/r", 7, "x"), None)
     check("azure failed_checks is unknown", Azure(fake("1")).failed_checks("org/p/r", "abc"), None)
     check("azure escaped_refs is unknown", Azure(fake("1")).escaped_refs("org/p/r", 7, "x"), None)
 
@@ -954,6 +963,21 @@ def azure_cli_test(check, root):
     check("the refusal never calls az", os.path.exists(os.path.join(d, "az-called")), False)
 
 
+def unknown_cli_test(check, root):
+    import tempfile
+    with tempfile.TemporaryDirectory() as bindir:
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(gh, 0o755)
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"])
+        me = os.path.abspath(__file__)
+        for cmd, rest in (("failed-checks", ["abc"]), ("commits-after", ["7", "2026-10-01T00:00:00Z"]),
+                          ("escaped-refs", ["7", "2026-10-01T00:00:00Z"])):
+            r = subprocess.run([sys.executable, "-I", me, cmd, "o/r"] + rest, capture_output=True, text=True, env=env)
+            check(f"{cmd} prints unknown when gh fails", (r.returncode, r.stdout), (0, "unknown\n"))
+
+
 def self_test():
     fails = []
 
@@ -997,9 +1021,29 @@ def self_test():
 
     for name in ("failed_checks", "commits_after", "escaped_refs"):
         args = ("o/r", "abc") if name == "failed_checks" else ("o/r", 7, "2026-10-01T00:00:00Z")
-        check(f"{name} on a failed gh", getattr(GitHub(fake(None)), name)(*args), 0)
+        check(f"{name} on a failed gh is unknown", getattr(GitHub(fake(None)), name)(*args), None)
+        check(f"{name} on odd output is unknown", getattr(GitHub(fake("oops")), name)(*args), None)
         check(f"{name} parses a count", getattr(GitHub(fake("3\n")), name)(*args), 3)
+        check(f"{name} keeps a real zero", getattr(GitHub(fake("0\n")), name)(*args), 0)
     check("commits_after sums pages", GitHub(fake("2\n1\n")).commits_after("o/r", 7, "x"), 3)
+    check("failed_checks sums pages", GitHub(fake("2\n1\n")).failed_checks("o/r", "abc"), 3)
+    GitHub(fake("0\n")).failed_checks("o/r", "abc")
+    check("failed_checks reads every page", "--paginate" in calls[-1], True)
+    check("count of nothing is unknown", count(""), None)
+
+    full = json.dumps([{"number": n, "headRefName": "b", "headRefOid": "a", "createdAt": "x", "mergedAt": "y"}
+                       for n in range(3)])
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        check("merged_prs at the limit still returns", len(GitHub(fake(full)).merged_prs("o/r", "2026-10-01", limit=3)), 3)
+    check("merged_prs says it was cut", err.getvalue(),
+          "forge: stopped at 3 merged pull requests of o/r, older ones are not counted\n")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        GitHub(fake(full)).merged_prs("o/r", "2026-10-01", limit=4)
+    check("merged_prs under the limit is silent", err.getvalue(), "")
+
+    guarded(check, "unknown on the command line", 60, unknown_cli_test, None)
 
     import tempfile
     with tempfile.TemporaryDirectory() as root:

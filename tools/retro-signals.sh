@@ -40,6 +40,14 @@ if [ "${1:-}" = "--self-test" ]; then
   out=$(row BaryoDev/demo 42 2026-09-20T00:00:00Z 2026-09-23T12:00:00Z 2026-09-21T00:00:00Z 2 1)
   want=$(printf 'BaryoDev/demo\t42\t2\t1\t3')
   [ "$out" = "$want" ] || { echo "self-test failed: got '$out', want '$want'"; exit 1; }
+  # A gh that lists one merged pull request and fails every other call must give unknown, never 0.
+  bindir=$(mktemp -d)
+  printf '%s\n' '#!/bin/sh' 'case "$*" in "pr list"*) echo "[{\"number\":5,\"headRefName\":\"b\",\"headRefOid\":\"abc\",\"createdAt\":\"2026-09-20T00:00:00Z\",\"mergedAt\":\"2026-09-22T00:00:00Z\"}]" ;; *) exit 1 ;; esac' > "$bindir/gh"
+  chmod +x "$bindir/gh"
+  out=$(PATH="$bindir:$PATH" "$0" --since 2026-09-01 o/r 2>/dev/null | sed -n 2p)
+  rm -rf "$bindir"
+  want=$(printf 'o/r\t5\tunknown\tunknown\t2\tunknown\tunknown')
+  [ "$out" = "$want" ] || { echo "self-test failed: failed gh calls gave '$out', want '$want'"; exit 1; }
   fixture=$(mktemp -d)
   mkdir -p "$fixture/proj"
   printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pgrep -f vitest"}}]}}' > "$fixture/proj/s.jsonl"
