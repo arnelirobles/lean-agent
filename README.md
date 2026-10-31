@@ -158,6 +158,10 @@ Three modes, set with the plugin's `serve_mode` setting:
 
 The session button on an item starts Claude Code on it. On macOS it opens Terminal. On Windows it opens a Windows Terminal tab; if that fails, or `claude` is a `.cmd` shim, the page shows the command to copy, with a note to paste it into Command Prompt. On Linux the page shows the `claude` command to copy.
 
+### Ask the brain (optional)
+
+The page has an Ask section for questions about your brain database, answered by Claude with your own Anthropic credentials. It is off until you run `brain assistant-setup` and give it a key. Without that the page is unchanged. The assistant can only run read-only SELECT queries. Your question and the rows it reads are sent to Anthropic. Setup, credentials, limits and cost are in [docs/assistant.md](docs/assistant.md).
+
 The VS Code panel is deprecated. It shows a notice once per version and `Lean Brain: Open brain page` opens the page.
 
 ## Settings
