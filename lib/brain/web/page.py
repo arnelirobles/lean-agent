@@ -439,6 +439,9 @@ def _self_test() -> int:
     broken = rall({**data, "activity": {"days": ["2026-01-01"]}}, "k", 1)
     check("activity failure keeps the page", ("could not draw" in broken, "<h2>Needs you</h2>" in broken), (True, True))
     check("legend swatches match the chart colours", all(f".sw.s{i}{{background:{c}}}" in CSS for i, c in enumerate(activity.charts.COLORS)), True)
+    check("tab row styles", all(x in CSS for x in ("header{position:sticky", "nav.tabs{display:flex", "overflow-x:auto", "nav.tabs a[aria-current]{background:var(--leaf);color:#fff}",
+                                                   ".actions{display:flex;flex-wrap:wrap;gap:8px")), True)
+    check("summary label style", ".answer h3.lab{" in CSS and "color:var(--rust)" in CSS.split(".answer h3.lab{")[1].split("}")[0], True)
     check("chart and tile styles", all(x in CSS for x in (".tiles{", ".tile{", ".charts{", ".chart .plot", ".chart details")), True)
     heads = {"overview": ("Activity", "Summary"), "needs": ("Needs you",), "ask": ("Ask",), "tests": ("Test queue", "Tested or not"),
              "work": ("Created by agents", "Pending tickets", "Worktrees"), "log": ("Notices", "Usage", "Decided")}

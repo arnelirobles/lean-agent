@@ -306,6 +306,7 @@ def _self_test():
     html = render(got["today"], "today")
     check("render", ("<strong>there</strong>" in html, "<figure" in html, "Written 2026-10-31 10:00" in html), (True, True, True))
     evil = {"at": base, "model": "<script>", "usd": 0, "blocks": [{"t": "text", "s": "<script>x</script>"}]}
+    check("entry label is a styled heading", '<h3 class="lab">Today</h3>' in html, True)
     check("evil text escaped", "<script>" in render(_clean(evil), "today"), False)
     check("evil model escaped", "&lt;script&gt;" in render(_clean(evil), "today"), True)
     for name, text in (("corrupt", "{not json"), ("array", "[]"), ("deep", "[" * 100000), ("empty", "")):
