@@ -166,7 +166,7 @@ it to the agents that worked on the change. Logging the same pull request again 
 there, which is how `escaped` gets filled in later.
 
 The log row is the last step of every review. Log it by pull request number before marking the
-pull request ready or merging it. The `review-log-check` hook refuses `gh pr ready`, `gh pr merge`
+pull request ready or merging it. With `LEAN_PROFILE=strict` the `review-log-check` hook refuses `gh pr ready`, `gh pr merge`
 and `az repos pr update --draft false` (or `--status completed`) when `lean.db` has no row in
 `reviews` for that pull request, once the repo has a logged review. If the change was deliberately not reviewed, set
 `LEAN_SKIP_REVIEW_LOG_CHECK=1` for that command.
