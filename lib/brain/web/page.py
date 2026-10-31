@@ -24,7 +24,7 @@ a{color:var(--leaf);font-weight:600;text-underline-offset:2px}a:hover{color:var(
 header{position:sticky;top:0;z-index:2;margin:0 -100vmax 20px;padding:0 100vmax;background:rgba(255,255,255,.94);
 border-bottom:1px solid var(--line)}
 h1{margin:0;padding:14px 0 8px;font-size:19px;font-weight:700;letter-spacing:-.01em;line-height:1.3}
-nav.tabs{display:flex;gap:6px;padding:0 0 10px;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+nav.tabs{display:flex;gap:6px;padding:0 14px 10px 0;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
 nav.tabs::-webkit-scrollbar{display:none}
 nav.tabs a{flex:none;padding:7px 14px;border-radius:999px;color:var(--body);font-size:13px;font-weight:600;text-decoration:none}
 nav.tabs a:hover{background:var(--sand);color:var(--ink)}
@@ -36,7 +36,7 @@ h3{margin:24px 0 8px;font-size:15px}
 table{border-collapse:separate;border-spacing:0;width:100%;border:1px solid var(--line);border-radius:14px;overflow:hidden;
 box-shadow:0 1px 2px rgba(28,35,33,.04)}
 td,th{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word}
-table:not(.md) td:nth-child(n+4){overflow-wrap:anywhere}
+table:not(.md) td:nth-child(n+4){overflow-wrap:anywhere;min-width:6.5rem}
 @media(max-width:800px){table:not(.md),table:not(.md) tbody,table:not(.md) tr,table:not(.md) td{display:block}
 table:not(.md) tr:has(th){display:none}table:not(.md) td{border:0;padding:4px 14px;min-width:0}
 table:not(.md) tr{padding:8px 0;border-bottom:1px solid var(--line)}table:not(.md) tr:last-child{border-bottom:0}
