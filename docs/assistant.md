@@ -1,6 +1,6 @@
 # Ask the brain
 
-An optional section at the top of the brain page. You ask a question about your local brain database and get a streamed answer from Claude. It uses your own Anthropic credentials. If it is not set up, the page behaves as before.
+An optional section at the top of the brain page. You ask a question about your local brain database and get a streamed answer from Claude. It uses your own Anthropic credentials. If it is not set up, the section only shows the setup command.
 
 Claude.ai, Pro and Max logins cannot be used here. Anthropic does not allow them in third-party apps, so this needs an API key or an `ant auth login` profile.
 
@@ -36,7 +36,10 @@ Opus 5.5 (default), Fable 5.1, Sonnet 5.5 and Haiku 5.5. Effort is medium, high 
 
 - At most 30 tool turns per question.
 - A dollar cap per question, `LEAN_ASSISTANT_MAX_USD`, default 10. It is checked between turns, so one turn can pass it. Hitting a limit ends the answer with a line that says which.
-- Closing the tab stops the question, so no more is spent.
+- Closing the tab stops the question at the next line written to it. The turn in progress finishes and is paid for.
+- Each API request times out after 120 seconds of silence, with two retries. A question stops after 30 minutes.
+- Two questions can run at once. A third gets a refusal.
+- A conversation holds 150 messages, then refuses follow-ups.
 - Follow-ups keep their history in memory only, for the last 20 conversations. Restarting `brain serve` clears them.
 
 Costs are estimates from a price table in `lib/brain/web/assistant.py` (per million tokens: Opus 4/20, Fable 10/50, Sonnet 2/10, Haiku 0.10/0.50, cache writes 1.25x input). After each question one line is appended to `assistant-usage.jsonl` next to `brain.db`: time, model, token counts and estimated dollars. It never holds the question or the answer. The page shows the running total.

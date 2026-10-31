@@ -152,6 +152,9 @@ def _options(pairs, chosen):
 def _ask(st, key):
     """The Ask section. st comes from Assistant.state(); it holds no key."""
     out = ["<h2>Ask</h2>"]
+    if st.get("too_old"):
+        out.append('<p class="note">The assistant needs Python 3.11 or later.</p>')
+        return "".join(out)
     if not st.get("sdk"):
         out.append('<p class="note">The assistant is not set up. Run this once, then reload:</p>'
                    f'<pre>{e(st.get("setup"))}</pre>')
@@ -300,6 +303,7 @@ def _self_test() -> int:
            "default_model": assistant.DEFAULT_MODEL, "default_effort": assistant.DEFAULT_EFFORT, "max_question": 8000}
     with_ask = render(data, "KEY123", 8770, off)
     strip = lambda h: re.sub(r"updated \d\d:\d\d", "updated", h)
+    check("ask hidden on old python", 'name="question"' in render(data, "k", 1, {**off, "sdk": True, "source": "env", "too_old": True}), False)
     check("ask section when sdk missing", ("<h2>Ask</h2>" in with_ask, "assistant-setup" in with_ask), (True, True))
     check("page otherwise unchanged", strip(re.sub(r"<h2>Ask</h2>.*?(?=<h2>Needs you</h2>)", "", with_ask)), strip(page))
     ready = render(data, "KEY123", 8770, {**off, "sdk": True, "source": "keychain", "setup": "<b>x</b>"})

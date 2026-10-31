@@ -297,27 +297,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(400, "bad model\n")
             if effort not in assistant.EFFORTS:
                 return self._send(400, "bad effort\n")
-        chat = None
-        if token:
-            chat = asst.chats.take(token)
-            if chat is None:
-                return self._send(409, "that conversation is gone or still running, ask again from the page\n")
-            model, effort = chat["model"], chat["effort"]
-        else:
-            token = asst.chats.new_token()
-        self._stream_answer(token, chat, question, model, effort)
+        if not asst.slots.acquire(blocking=False):
+            return self._send(429, "two questions are already running, wait for one to finish\n")
+        try:
+            chat = None
+            if token:
+                chat = asst.chats.take(token)
+                if chat is None:
+                    return self._send(409, "that conversation is gone or still running, ask again from the page\n")
+                model, effort = chat["model"], chat["effort"]
+            else:
+                token = asst.chats.new_token()
+            self._stream_answer(token, chat, question, model, effort)
+        finally:
+            asst.slots.release()
 
     def _stream_answer(self, token, chat, question, model, effort):
         """Answer as one HTML document on this connection: no Content-Length, closed at the end. The
         write timeout is per send, so the 10 second handler timeout does not cut a long answer; it is
         raised for a slow reader."""
         asst = self.app.assistant
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Connection", "close")
-        self.end_headers()
         self.close_connection = True
-        self.connection.settimeout(60)
         e = page.e
 
         def out(text):
@@ -333,6 +333,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 out(f'\n<strong class="note">{e(text)}</strong>\n')
 
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.connection.settimeout(60)
             out(f'<!doctype html><html><head><meta charset="utf-8"><title>lean brain</title><style>{page.CSS}</style>'
                 f'</head><body><h1>lean brain</h1><p><a href="/">Back to the page</a></p><h2>Question</h2>'
                 f'<pre>{e(question)}</pre><!-- {" " * 1024} --><h2>Answer</h2>'
@@ -651,6 +656,12 @@ def _self_test() -> int:
     seen.clear()
     post("/ask", {"key": key, "question": "and then?", "chat": tok})
     check("follow-up carries history", len(seen[0]["messages"]), 3)
+    for _ in range(assistant.MAX_RUNNING):
+        asst.slots.acquire()
+    status = post("/ask", {"key": key, "question": "hi", "model": "claude-opus-5-5", "effort": "high"})[0]
+    for _ in range(assistant.MAX_RUNNING):
+        asst.slots.release()
+    check("third question refused", status, 429)
     check("chat token reusable once taken and put back", asst.chats.count() >= 1, True)
     boom = True
     s, h, b = post("/ask", ask_form)

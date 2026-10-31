@@ -9,9 +9,11 @@ import collections
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -50,6 +52,11 @@ MAX_ROWS = 200
 MAX_CHARS = 40000
 MAX_VALUE = 1_000_000
 MAX_COLUMNS = 64
+MAX_MESSAGES = 150
+MAX_SECONDS = 1800
+MAX_RUNNING = 2
+LIMITS = {"timeout": 120.0, "max_retries": 2}
+NEEDS_PYTHON = "The assistant needs Python 3.11 or later, because older versions cannot cap query size."
 SERVICE = "lean-brain-anthropic"
 ACCOUNT = "lean-brain"
 SECURITY = "/usr/bin/security"
@@ -117,7 +124,7 @@ def venv_site():
     root = venv_dir()
     try:
         with open(os.path.join(root, "pyvenv.cfg"), encoding="utf-8") as f:
-            cfg = dict(line.split("=", 1) for line in f.read().splitlines() if "=" in line)
+            cfg = {k.strip(): v.strip() for k, v in (ln.split("=", 1) for ln in f.read().splitlines() if "=" in ln)}
     except OSError:
         return None
     ver = (cfg.get("version") or cfg.get("version_info") or "").strip().split(".")
@@ -155,6 +162,9 @@ def setup(run=subprocess.run, out=print):
     root = venv_dir()
     os.makedirs(data_dir(), exist_ok=True)
     cmd = [sys.executable, "-m", "venv"]
+    if os.path.exists(root) and not os.path.isfile(os.path.join(root, "pyvenv.cfg")):
+        out(f"{root} exists and is not a virtual environment. Move it away and run this again.")
+        return 1
     if os.path.isdir(root) and not venv_site():
         cmd.append("--clear")
     out(f"creating {root}")
@@ -251,7 +261,7 @@ def _fetch(cur):
 
 def run_sql(sql, path=None, seconds=SQL_SECONDS):
     if not hasattr(sqlite3.Connection, "setlimit"):
-        raise SqlError("the assistant needs Python 3.11 or later to bound query size")
+        raise SqlError(NEEDS_PYTHON)
     """Run one SELECT read-only and return the rows as masked text. Raises SqlError."""
     if not isinstance(sql, str) or not sql.strip():
         raise SqlError("sql must be a non-empty string")
@@ -314,7 +324,7 @@ def cost(model, inp, out, cache_read=0, cache_write=0):
 def max_usd(env=None):
     try:
         v = float((env if env is not None else os.environ).get("LEAN_ASSISTANT_MAX_USD") or 10)
-        return v if v > 0 else 10.0
+        return v if v > 0 and math.isfinite(v) else 10.0
     except ValueError:
         return 10.0
 
@@ -365,6 +375,8 @@ def describe_error(sdk, ex):
     def is_(name):
         cls = getattr(sdk, name, None)
         return isinstance(cls, type) and isinstance(ex, cls)
+    if isinstance(ex, TypeError) and "authentication" in str(ex).lower():
+        return "No Anthropic credentials found. Paste a key on the page or set ANTHROPIC_API_KEY."
     if is_("AuthenticationError"):
         return "Anthropic rejected the credentials."
     if is_("PermissionDeniedError"):
@@ -417,8 +429,23 @@ def _request(model, effort, system, messages):
     return kw
 
 
+def _partial_usage(stream):
+    """Usage so far from a stream that broke off, or None."""
+    try:
+        return stream.current_message_snapshot.usage
+    except Exception:
+        return None
+
+
+def _count(tally, u):
+    tally["in"] += getattr(u, "input_tokens", 0) or 0
+    tally["out"] += getattr(u, "output_tokens", 0) or 0
+    tally["read"] += getattr(u, "cache_read_input_tokens", 0) or 0
+    tally["write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
+
+
 def run_question(client, sdk, chat, question, model, effort, emit, limit_usd=None, max_turns=MAX_TURNS,
-                 db_path=None, usage_file=None):
+                 db_path=None, usage_file=None, max_seconds=MAX_SECONDS):
     """Run one question to its end. emit(kind, text) gets "text" deltas, "tool" lines and "note" lines; it may
     raise BrokenPipeError or ConnectionResetError, which stops the loop. chat["messages"] ends up holding the
     history up to the last consistent point. Returns {"reason", "usd", "turns"}."""
@@ -427,6 +454,7 @@ def run_question(client, sdk, chat, question, model, effort, emit, limit_usd=Non
     safe = len(chat["messages"])
     tally = {"in": 0, "out": 0, "read": 0, "write": 0}
     reason, turns, bad_json = "done", 0, 0
+    deadline = time.monotonic() + max_seconds
 
     def say(kind, text):
         try:
@@ -435,7 +463,10 @@ def run_question(client, sdk, chat, question, model, effort, emit, limit_usd=Non
             raise _Gone()
 
     try:
-        while True:
+        if len(chat["messages"]) >= MAX_MESSAGES:
+            reason = "full"
+            say("note", "This conversation is full. Start a new question from the page.")
+        while reason != "full":
             usd = cost(model, tally["in"], tally["out"], tally["read"], tally["write"])
             if turns >= max_turns:
                 reason = "turns"
@@ -445,24 +476,28 @@ def run_question(client, sdk, chat, question, model, effort, emit, limit_usd=Non
                 reason = "cap"
                 say("note", f"Stopped: this question reached the cost cap of ${limit_usd:g} (LEAN_ASSISTANT_MAX_USD).")
                 break
+            if time.monotonic() >= deadline:
+                reason = "time"
+                say("note", f"Stopped after {max_seconds // 60} minutes.")
+                break
             turns += 1
+            stream = None
             try:
                 with client.beta.messages.stream(**_request(model, effort, chat["system"], msgs)) as stream:
                     for event in stream:
                         if event.type == "text":
                             say("text", event.text)
                     response = stream.get_final_message()
-            except ValueError:
+            except Exception as ex:
+                _count(tally, _partial_usage(stream))
+                if not isinstance(ex, ValueError):
+                    raise
                 bad_json += 1
                 if bad_json > 2:
                     raise
+                say("note", "The response broke off, so it restarts here.")
                 continue
-            bad_json = 0
-            u = response.usage
-            tally["in"] += getattr(u, "input_tokens", 0) or 0
-            tally["out"] += getattr(u, "output_tokens", 0) or 0
-            tally["read"] += getattr(u, "cache_read_input_tokens", 0) or 0
-            tally["write"] += getattr(u, "cache_creation_input_tokens", 0) or 0
+            _count(tally, response.usage)
             content = _echo(response.content)
             uses = [b for b in content if getattr(b, "type", "") == "tool_use"]
             stop = response.stop_reason
@@ -551,6 +586,7 @@ class Assistant:
         self.platform = platform or sys.platform
         self.env = os.environ if env is None else env
         self.chats = Chats()
+        self.slots = threading.BoundedSemaphore(MAX_RUNNING)
 
     @property
     def mac(self):
@@ -591,13 +627,15 @@ class Assistant:
         sdk = self.sdk_loader()
         if sdk is None:
             raise Setup("The anthropic package is not installed. Run: " + setup_command())
+        if not hasattr(sqlite3.Connection, "setlimit"):
+            raise Setup(NEEDS_PYTHON)
         if self.env.get("ANTHROPIC_API_KEY") or self.env.get("ANTHROPIC_AUTH_TOKEN"):
-            return sdk.Anthropic(), "env"
+            return sdk.Anthropic(**LIMITS), "env"
         key = self.key_get()
         if key:
-            return sdk.Anthropic(api_key=key), "keychain"
+            return sdk.Anthropic(api_key=key, **LIMITS), "keychain"
         try:
-            return sdk.Anthropic(), "default"
+            return sdk.Anthropic(**LIMITS), "default"
         except Exception:
             raise Setup("No Anthropic credentials found.")
 
@@ -605,7 +643,8 @@ class Assistant:
         """What the Ask section needs. Never holds a key."""
         sdk = self.sdk_loader()
         usd, n = usage_total()
-        st = {"sdk": sdk is not None, "source": None, "mac": self.mac, "setup": setup_command(), "usd": usd,
+        st = {"sdk": sdk is not None, "source": None, "mac": self.mac,
+              "too_old": not hasattr(sqlite3.Connection, "setlimit"), "setup": setup_command(), "usd": usd,
               "questions": n, "limit": max_usd(self.env), "labels": LABELS, "models": MODELS, "efforts": EFFORTS,
               "default_model": DEFAULT_MODEL, "default_effort": DEFAULT_EFFORT, "max_question": MAX_QUESTION}
         if sdk is not None:
@@ -754,6 +793,13 @@ def _self_test():
         def __iter__(self):
             for t in self.script.get("text", []):
                 yield types.SimpleNamespace(type="text", text=t)
+            if "raise" in self.script:
+                raise self.script["raise"]
+
+        @property
+        def current_message_snapshot(self):
+            u = types.SimpleNamespace(input_tokens=1000000, output_tokens=0)
+            return types.SimpleNamespace(usage=u)
 
         def get_final_message(self):
             s = self.script
@@ -797,6 +843,34 @@ def _self_test():
     check("system cached", kw["system"][0]["cache_control"], {"type": "ephemeral"})
     check("schema in system", "CREATE TABLE items" in kw["system"][0]["text"], True)
     check("untrusted line", "untrusted data" in kw["system"][0]["text"], True)
+    client, chat, res, got = ask([{"text": ["half"], "raise": ValueError("bad json")},
+                                  {"text": ["whole"], "content": [txt("whole")], "usage": (0, 0, 0, 0)}])
+    check("broken stream counted and flagged", (res["usd"], res["reason"], ("note", "The response broke off, so it restarts here.") in got),
+          (4.0, "done", True))
+    client, chat, res, got = ask([{"text": ["a"], "raise": ValueError("bad json")}])
+    check("retries are per question", (res["reason"], len(client.seen)), ("error", 3))
+    client, chat, res, got = ask([{"content": [txt("hi")]}], max_seconds=0)
+    check("time limit", (res["reason"], len(client.seen)), ("time", 0))
+    full = {"system": build_system(), "messages": [{"role": "user", "content": "x"}] * MAX_MESSAGES}
+    client = FakeClient([{"content": [txt("hi")]}])
+    res = run_question(client, sdk, full, "more", "claude-opus-5-5", "high", lambda k, t: None, db_path=dbfile, usage_file=usage_file)
+    check("full conversation refused", (res["reason"], len(client.seen), len(full["messages"])), ("full", 0, MAX_MESSAGES))
+    check("no credentials is plain", "No Anthropic credentials" in describe_error(sdk, TypeError("Could not resolve authentication method")), True)
+    check("infinite cap ignored", max_usd({"LEAN_ASSISTANT_MAX_USD": "inf"}), 10.0)
+    check("authorizer refuses attach and pragma", (_authorizer(sqlite3.SQLITE_ATTACH, "x", None, None, None),
+                                                   _authorizer(sqlite3.SQLITE_PRAGMA, "query_only", "OFF", None, None)),
+          (sqlite3.SQLITE_DENY, sqlite3.SQLITE_DENY))
+    os.makedirs(venv_dir())
+    ran = []
+    fake_run = lambda cmd, **k: (ran.append(cmd), types.SimpleNamespace(returncode=0))[1]
+    check("setup leaves a foreign folder alone", (setup(run=fake_run, out=lambda s: None), ran), (1, []))
+    ver = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    site = os.path.join(venv_dir(), "lib", "python" + ver, "site-packages")
+    os.makedirs(site)
+    with open(os.path.join(venv_dir(), "pyvenv.cfg"), "w", encoding="utf-8") as f:
+        f.write(f"home = /x\nversion = {ver}.1\n")
+    check("real pyvenv.cfg read", venv_site(), site)
+    shutil.rmtree(venv_dir())
     client, *_ = ask([{"content": [txt("hi")]}], model="claude-haiku-5-5")
     check("no fallback for haiku", ("fallbacks" in client.seen[0], "betas" in client.seen[0]), (False, False))
 
@@ -881,16 +955,16 @@ def _self_test():
         nocreds = "client built"
     except Setup:
         nocreds = "setup"
-    check("default client when nothing set", (nocreds, made), ("client built", [{}]))
+    check("default client when nothing set", (nocreds, made), ("client built", [LIMITS]))
     check("key shape refused", (a.key_set("sk-ant-short"), a.key_set("x; delete"), a.key_set("")), (False, False, False))
     check("key saved", a.key_set(fake_key), True)
     check("key never in argv", any(fake_key in " ".join(argv) for argv, _ in calls), False)
     check("key sent on stdin", any(i and fake_key in i for _, i in calls), True)
     made.clear()
-    check("keychain beats default", (a.client()[1], made), ("keychain", [{"api_key": fake_key}]))
+    check("keychain beats default", (a.client()[1], made), ("keychain", [{"api_key": fake_key, **LIMITS}]))
     a.env = {"ANTHROPIC_API_KEY": "from-env"}
     made.clear()
-    check("env beats keychain", (a.client()[1], made), ("env", [{}]))
+    check("env beats keychain", (a.client()[1], made), ("env", [LIMITS]))
     a.env = {"ANTHROPIC_AUTH_TOKEN": "t"}
     check("auth token counts", a.client()[1], "env")
     a.env = {}
