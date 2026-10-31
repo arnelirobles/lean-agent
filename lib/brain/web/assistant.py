@@ -238,6 +238,17 @@ def _safe_error(text):
         return "the query failed"
 
 
+def _fetch(cur):
+    rows, size = [], 0
+    while len(rows) <= MAX_ROWS and size <= MAX_CHARS:
+        row = cur.fetchone()
+        if row is None:
+            break
+        rows.append(row)
+        size += sum(len(v) for v in row if isinstance(v, (str, bytes)))
+    return rows
+
+
 def run_sql(sql, path=None, seconds=SQL_SECONDS):
     if not hasattr(sqlite3.Connection, "setlimit"):
         raise SqlError("the assistant needs Python 3.11 or later to bound query size")
@@ -254,13 +265,7 @@ def run_sql(sql, path=None, seconds=SQL_SECONDS):
         con.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 1000)
         cur = con.execute(sql)
         cols = [d[0] for d in (cur.description or [])]
-        rows, size = [], 0
-        while len(rows) <= MAX_ROWS and size <= MAX_CHARS:
-            row = cur.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-            size += sum(len(v) for v in row if isinstance(v, (str, bytes)))
+        rows = _fetch(cur)
     except sqlite3.OperationalError as ex:
         if "interrupted" in str(ex):
             raise SqlError(f"the query ran longer than {seconds} seconds and was stopped; narrow it with WHERE or LIMIT")
@@ -689,9 +694,15 @@ def _self_test():
         check("blob functions refused", refused(fn), True)
     check("huge blob refused", refused("SELECT hex(zeroblob(2000000))"), True)
     check("huge string refused", refused("SELECT printf('%.*c', 2000000000, 'x')"), True)
-    check("big rows stop early", "characters" in run_sql(
-        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<190)"
-        " SELECT printf('%.*c', 900000, 'x') FROM c"), True)
+    class Cursor:
+        calls = 0
+
+        def fetchone(self):
+            self.calls += 1
+            return ("x" * 900000,)
+
+    cursor = Cursor()
+    check("big rows stop fetching", (len(_fetch(cursor)), cursor.calls), (1, 1))
     out = run_sql("SELECT body FROM items WHERE ref='n1'")
     check("key masked", (fake_key in out, "[secret removed]" in out), (False, True))
     check("github token masked", "ghp_" + "a" * 36 in mask("x ghp_" + "a" * 36), False)
