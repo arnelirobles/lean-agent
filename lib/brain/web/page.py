@@ -392,6 +392,8 @@ def _self_test() -> int:
     check("activity section drawn", ("<h2>Activity</h2>" in page, page.count("<figure"), "Tests failed today" in page), (True, 5, True))
     broken = render({**data, "activity": {"days": ["2026-01-01"]}}, "k", 1)
     check("activity failure keeps the page", ("could not draw" in broken, "<h2>Needs you</h2>" in broken), (True, True))
+    check("legend swatches match the chart colours", all(f".sw.s{i}{{background:{c}}}" in CSS for i, c in enumerate(activity.charts.COLORS)), True)
+    check("chart and tile styles", all(x in CSS for x in (".tiles{", ".tile{", ".charts{", ".chart .plot", ".chart details")), True)
     nokey = render(data, "k", 1, {"source": None})
     check("no key shows the hint, no buttons", ("daily summaries" in nokey, 'name="range"' in nokey), (True, False))
     ready = render(data, "k", 1, {"source": "env"}, {"entries": {}, "error": "Failed <b>x</b>"})
