@@ -26,8 +26,12 @@
 # 1. A held-out tree that does not compile is INCONCLUSIVE, never a pass. Reverting one hunk of a
 #    typed language usually breaks the build, and a tree that does not build runs no tests. Score
 #    that as success and the gate is green forever over a check that never ran.
-# 2. An unclaimed production hunk fails. Bind it to a test or write "untested: ... why: ...". An
-#    omission becomes a written claim next to the diff instead of silence.
+# 2. An unclaimed production hunk fails, and is named by file and line. One binding or untested
+#    entry claims the one hunk its anchor names, not the whole file. "untested: path" with no
+#    anchor exempts every hunk of that file. An untested anchor that matches nothing is unresolved.
+#    Production is every changed file that is not a test, doc or lockfile (NOT_PRODUCTION below);
+#    HOLDOUT_PRODUCTION narrows it, and a narrowing that leaves code unchecked fails.
+#    The base is HOLDOUT_BASE, else origin/HEAD, origin/main, origin/master.
 # 3. Anchors are line content, not line numbers, so a binding survives a rebase.
 # 4. Distinct exit codes, so a caller cannot collapse them into "non-zero, whatever":
 #      0 pass          held out, the test failed, restored, the test passed again
@@ -103,6 +107,99 @@ X
   run depends.sh "$self" "$t/none.md"
   want "spec without a block is refused" 2
 
+  # runin <dir> <base or empty> <fake test> <spec> [args]; empty base leaves HOLDOUT_BASE unset so
+  # the default branch detection runs. Sets rc.
+  runin() {
+    local d="$1" b="$2" tc="$3" spec="$4"; shift 4
+    ( cd "$d" && env -u HOLDOUT_BASE ${b:+HOLDOUT_BASE="$b"} HOLDOUT_BUILD_CMD=true \
+        HOLDOUT_TEST_CMD="sh $t/bin/$tc" bash "$self" --spec "$spec" "$@" >"$t/out" 2>&1 )
+    rc=$?
+  }
+  mkrepo() {
+    mkdir -p "$1"; git -C "$1" init -q
+    git -C "$1" config user.email self-test@example.com
+    git -C "$1" config user.name self-test
+  }
+
+  # A file with two separate hunks, and a test that needs both changes.
+  mkrepo "$t/m"; mkdir "$t/m/src"
+  seq 1 20 | sed 's/^/l/' > "$t/m/src/m.txt"
+  git -C "$t/m" add -A; git -C "$t/m" commit -q -m base
+  mbase=$(git -C "$t/m" rev-parse HEAD)
+  sed -e 's/^l2$/A on/' -e 's/^l18$/B on/' "$t/m/src/m.txt" > "$t/m/x" && mv "$t/m/x" "$t/m/src/m.txt"
+  git -C "$t/m" commit -q -am change
+  cat > "$t/bin/both.sh" <<'X'
+#!/bin/sh
+if grep -q 'A on' src/m.txt && grep -q 'B on' src/m.txt; then echo "Total: 1"; echo "Failed: 0"; else echo "Total: 1"; echo "Failed: 1"; fi
+X
+  printf '```holdout\n- test: T1\n  breaks: src/m.txt "A on"\n```\n' > "$t/one-bind.md"
+  printf '```holdout\n- test: T1\n  breaks: src/m.txt "A on"\n- test: T2\n  breaks: src/m.txt "B on"\n```\n' > "$t/two-bind.md"
+  printf '```holdout\n- test: T1\n  breaks: src/m.txt "A on"\n- untested: src/m.txt #2\n  why: wiring\n```\n' > "$t/bind-untested.md"
+  printf '```holdout\n- test: T1\n  breaks: src/m.txt "A on"\n- untested: src/m.txt #9\n  why: wiring\n```\n' > "$t/untested-ord.md"
+  printf '```holdout\n- test: T1\n  breaks: src/m.txt "A on"\n- untested: src/m.txt "no such text"\n  why: wiring\n```\n' > "$t/untested-text.md"
+  printf '```holdout\n- untested: src/m.txt\n  why: whole file is data\n```\n' > "$t/untested-file.md"
+  runin "$t/m" "$mbase" both.sh "$t/one-bind.md"
+  want "two hunks, one binding fails" 2
+  grep -q 'src/m.txt line 18' "$t/out" || { echo "self-test failed: unclaimed hunk not named by file and line"; sed 's/^/  /' "$t/out"; fails=$((fails + 1)); }
+  runin "$t/m" "$mbase" both.sh "$t/two-bind.md"
+  want "two hunks, two bindings passes" 0
+  runin "$t/m" "$mbase" both.sh "$t/bind-untested.md"
+  want "one binding and one untested hunk passes" 0
+  runin "$t/m" "$mbase" both.sh "$t/untested-ord.md"
+  want "untested ordinal past the last hunk is unresolved" 2
+  runin "$t/m" "$mbase" both.sh "$t/untested-text.md"
+  want "untested anchor that matches nothing is unresolved" 2
+  runin "$t/m" "$mbase" both.sh "$t/untested-file.md"
+  want "untested with no anchor exempts the whole file" 0
+
+  # Code in lib/, not src/.
+  mkrepo "$t/lib"; mkdir "$t/lib/lib" "$t/lib/tests"
+  printf 'def f():\n    return 1\n' > "$t/lib/lib/x.py"
+  git -C "$t/lib" add -A; git -C "$t/lib" commit -q -m base
+  lbase=$(git -C "$t/lib" rev-parse HEAD)
+  printf 'def f():\n    return 2\n' > "$t/lib/lib/x.py"
+  printf 'x\n' > "$t/lib/tests/test_x.py"
+  git -C "$t/lib" add -A; git -C "$t/lib" commit -q -m change
+  printf '```holdout\nnone: nothing to hold out\n```\n' > "$t/none-reason.md"
+  printf '```holdout\n- untested: tests/test_x.py #1\n  why: wrong file\n```\n' > "$t/lib-wrong.md"
+  printf '```holdout\n- untested: lib/x.py #1\n  why: data\n```\n' > "$t/lib-right.md"
+  runin "$t/lib" "$lbase" depends.sh "$t/none-reason.md"
+  want "lib/ change with a none declaration is caught" 2
+  runin "$t/lib" "$lbase" depends.sh "$t/lib-wrong.md"
+  want "lib/ change with the hunk unclaimed is caught" 2
+  runin "$t/lib" "$lbase" depends.sh "$t/lib-right.md"
+  want "lib/ change claimed as untested passes" 0
+  ( cd "$t/lib" && HOLDOUT_PRODUCTION='src/**' HOLDOUT_BASE="$lbase" bash "$self" --spec "$t/none-reason.md" >"$t/out" 2>&1 ); rc=$?
+  want "narrow HOLDOUT_PRODUCTION cannot hide a changed code file" 2
+
+  # Default branch detection.
+  git -C "$t/lib" update-ref refs/remotes/origin/main "$lbase"
+  runin "$t/lib" "" depends.sh "$t/lib-right.md"
+  want "origin/main without origin/HEAD is the base" 0
+  git -C "$t/lib" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  runin "$t/lib" "" depends.sh "$t/lib-right.md"
+  want "origin/HEAD names the base" 0
+  git -C "$t/lib" symbolic-ref --delete refs/remotes/origin/HEAD
+  git -C "$t/lib" update-ref -d refs/remotes/origin/main
+  git -C "$t/lib" update-ref refs/remotes/origin/master "$lbase"
+  runin "$t/lib" "" depends.sh "$t/lib-right.md"
+  want "origin/master is the last fallback" 0
+  git -C "$t/lib" update-ref -d refs/remotes/origin/master
+  runin "$t/lib" "" depends.sh "$t/lib-right.md"
+  want "no default branch stops the run" 2
+  grep -q 'HOLDOUT_BASE' "$t/out" || { echo "self-test failed: no-base message does not name HOLDOUT_BASE"; fails=$((fails + 1)); }
+
+  # A diff of docs, a lockfile and tests only needs no bindings.
+  mkrepo "$t/docs"; mkdir "$t/docs/docs"
+  printf 'a\n' > "$t/docs/README.md"; printf '{}\n' > "$t/docs/package-lock.json"
+  git -C "$t/docs" add -A; git -C "$t/docs" commit -q -m base
+  dbase=$(git -C "$t/docs" rev-parse HEAD)
+  printf 'b\n' > "$t/docs/README.md"; printf '{"a":1}\n' > "$t/docs/package-lock.json"
+  printf 'c\n' > "$t/docs/docs/g.md"
+  git -C "$t/docs" add -A; git -C "$t/docs" commit -q -m change
+  runin "$t/docs" "$dbase" depends.sh "$t/none-reason.md"
+  want "docs and lockfile only diff passes as none" 0
+
   # With the revert step removed the held-out tree equals the clean one, so even the test that
   # depends on its hunk passes there and the run must report it as caught.
   sed 's/git apply -R --unidiff-zero "\$patch_file"/true/' "$self" > "$t/no-revert.sh"
@@ -139,9 +236,47 @@ done
 [ -n "$spec" ] || { echo "holdout: --spec is required"; exit 2; }
 [ -f "$spec" ] || { echo "holdout: spec file not found: $spec"; exit 2; }
 
-base_ref="${HOLDOUT_BASE:-origin/master}"
+# HOLDOUT_BASE wins. Otherwise the remote's default branch: origin/HEAD, then origin/main, then
+# origin/master. Full ref names, so a local branch called origin/main cannot shadow the remote one.
+base_ref="${HOLDOUT_BASE:-}"
+if [ -z "$base_ref" ]; then
+  for cand in "$(git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)" \
+      refs/remotes/origin/main refs/remotes/origin/master; do
+    if [ -n "$cand" ] && git rev-parse --verify -q "$cand^{commit}" >/dev/null 2>&1; then
+      base_ref="$cand"; break
+    fi
+  done
+  [ -n "$base_ref" ] || {
+    echo "holdout: no base branch found: origin/HEAD is unset and there is no origin/main or origin/master."
+    echo "         Set HOLDOUT_BASE to the branch this change started from."
+    exit 2; }
+fi
 base=$(git merge-base "$base_ref" HEAD 2>/dev/null) || {
   echo "holdout: cannot find merge base with $base_ref"; exit 2; }
+
+# Paths that are not production code: tests, docs, lockfiles. The one place to edit them.
+# Production is every other changed file unless HOLDOUT_PRODUCTION (a pathspec list) narrows it.
+NOT_PRODUCTION=(
+  ':(exclude)*[Tt]ests/**' ':(exclude)*[Tt]est/**' ':(exclude)*__tests__/**' ':(exclude)*.test.*'
+  ':(exclude)*.spec.*' ':(exclude)*_test.*' ':(exclude)test_*.py' ':(exclude)*/test_*.py'
+  ':(exclude)*.md' ':(exclude)*.mdx' ':(exclude)*.rst' ':(exclude)docs/**' ':(exclude)LICENSE*'
+  ':(exclude)*.lock' ':(exclude)*lock.json' ':(exclude)*-lock.yaml' ':(exclude)go.sum'
+)
+changed_files() {  # changed_files <pathspec words>; one path per line
+  set -f
+  # shellcheck disable=SC2086
+  git diff --name-only "$base" -- $1 "${NOT_PRODUCTION[@]}" 2>/dev/null
+  set +f
+}
+all_changed=$(changed_files .)
+prod_files=$(changed_files "${HOLDOUT_PRODUCTION:-.}")
+# A production setting that matches nothing while code changed would let the run pass over it.
+if [ -z "$prod_files" ] && [ -n "$all_changed" ]; then
+  echo "holdout: no production hunks matched, but these changed files are not tests or docs:"
+  printf '%s\n' "$all_changed" | sed 's/^/         /'
+  echo "         HOLDOUT_PRODUCTION='${HOLDOUT_PRODUCTION:-}' covers none of them."
+  exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # Parse the ```holdout block. Two directives: "test:/breaks:" pairs and
@@ -205,11 +340,10 @@ fi
 if [ "$none" -eq 1 ]; then
   # Still check the diff: a change claiming no production hunks must actually have none, or the
   # declaration is just a way of opting out.
-  declared_none_files=$(git diff --name-only "$base" -- \
-    ${HOLDOUT_PRODUCTION:-'src/**'} ':(exclude)*[Tt]ests/**' ':(exclude)**/*.md' 2>/dev/null || true)
+  declared_none_files="$prod_files"
   if [ -n "$declared_none_files" ]; then
     echo "holdout: the block says none, but this change touches production files:"
-    for f in $declared_none_files; do echo "         $f"; done
+    printf '%s\n' "$declared_none_files" | sed 's/^/         /'
     exit 2
   fi
   echo "holdout: none declared ($none_reason), and the diff touches no production file"
@@ -222,6 +356,40 @@ if [ ${#bindings[@]} -eq 0 ] && [ ${#untested[@]} -eq 0 ]; then
 fi
 
 echo "holdout: $((${#bindings[@]})) binding(s), $((${#untested[@]})) untested hunk(s), base ${base:0:8}"
+
+# hunk_ordinal <path> <anchor>: prints the 1-based hunk ordinal the anchor names in that file's
+# diff against the base. Works for added files too (one hunk). Non-zero means unresolved.
+hunk_ordinal() {
+  local path="$1" anchor="$2" diff_file count
+  diff_file=$(mktemp)
+  git diff --unified=3 "$base" -- "$path" > "$diff_file" 2>/dev/null
+  if [ ! -s "$diff_file" ]; then
+    rm -f "$diff_file"; echo "holdout: no diff for $path against the base" >&2; return 1
+  fi
+  count=$(grep -c '^@@' "$diff_file" || true)
+  if [[ "$anchor" == \#* ]]; then
+    local want="${anchor#\#}"
+    if ! [[ "$want" =~ ^[0-9]+$ ]] || [ "$want" -lt 1 ] || [ "$want" -gt "$count" ]; then
+      rm -f "$diff_file"; echo "holdout: $path has $count hunk(s), no $anchor" >&2; return 1
+    fi
+    rm -f "$diff_file"; echo "$want"; return 0
+  fi
+  local needle="${anchor%\"}"; needle="${needle#\"}"
+  [ -n "$needle" ] || { rm -f "$diff_file"; echo "holdout: empty anchor for $path" >&2; return 1; }
+  local i=0 hits=0 first=0 l
+  while IFS= read -r l; do
+    case "$l" in
+      @@*) i=$((i+1)) ;;
+      +*|-*) if [ "$i" -gt 0 ] && [[ "$l" != "+++"* ]] && [[ "$l" != "---"* ]] && [[ "$l" == *"$needle"* ]]; then
+            if [ "$first" -ne "$i" ]; then hits=$((hits+1)); first="$i"; fi
+          fi ;;
+    esac
+  done < "$diff_file"
+  rm -f "$diff_file"
+  if [ "$hits" -eq 0 ]; then echo "holdout: anchor $anchor matches no changed line in $path" >&2; return 1; fi
+  if [ "$hits" -gt 1 ]; then echo "holdout: anchor $anchor is ambiguous, matches $hits hunks in $path" >&2; return 1; fi
+  echo "$first"
+}
 
 # ---------------------------------------------------------------------------
 # Resolve an anchor to exactly one hunk of one file's diff against the base.
@@ -291,26 +459,48 @@ resolve_hunk() {
 # Every production hunk must be claimed: bound to a test, or listed as untested.
 # An unclaimed hunk is a silent gap; naming it makes the omission a written claim.
 # ---------------------------------------------------------------------------
-prod_files=$(git diff --name-only "$base" -- \
-  ${HOLDOUT_PRODUCTION:-'src/**'} ':(exclude)*[Tt]ests/**' ':(exclude)**/*.md' 2>/dev/null || true)
+# Claims are per hunk. A binding or untested entry claims the one hunk its anchor names. An
+# untested entry with no anchor claims every hunk of its file, as a written whole-file exemption.
+claims=""   # lines "path<TAB>ordinal"
+bad=0
+for b in ${bindings[@]+"${bindings[@]}"}; do
+  p=$(printf '%s' "$b" | cut -f2); a=$(printf '%s' "$b" | cut -f3)
+  if o=$(hunk_ordinal "$p" "$a"); then claims="$claims$p	$o
+"; else bad=$((bad+1)); fi
+done
+for u in ${untested[@]+"${untested[@]}"}; do
+  p=$(printf '%s' "$u" | cut -f1); a=$(printf '%s' "$u" | cut -f2)
+  if [ -z "$a" ]; then
+    n=$(git diff --unified=3 "$base" -- "$p" 2>/dev/null | grep -c '^@@' || true)
+    if [ "$n" -gt 0 ]; then
+      k=1; while [ "$k" -le "$n" ]; do claims="$claims$p	$k
+"; k=$((k+1)); done
+    else
+      echo "holdout: no diff for $p against the base" >&2; bad=$((bad+1))
+    fi
+  elif o=$(hunk_ordinal "$p" "$a"); then claims="$claims$p	$o
+"; else bad=$((bad+1)); fi
+done
+[ "$bad" -eq 0 ] || { echo "holdout: $bad anchor(s) unresolved, so nothing was proven for them"; exit 2; }
 
 unclaimed=0
-for f in $prod_files; do
-  total=$(git diff --unified=3 "$base" -- "$f" 2>/dev/null | grep -c '^@@' || echo 0)
-  [ "$total" -gt 0 ] || continue
-  claimed=0
-  for b in ${bindings[@]+"${bindings[@]}"}; do
-    [ "$(printf '%s' "$b" | cut -f2)" = "$f" ] && claimed=$((claimed+1))
-  done
-  for u in ${untested[@]+"${untested[@]}"}; do
-    [ "$(printf '%s' "$u" | cut -f1)" = "$f" ] && claimed=$((claimed+1))
-  done
-  if [ "$claimed" -eq 0 ]; then
-    echo "holdout: UNCLAIMED  $f ($total hunk(s)) is bound to no test and not listed untested:"
-    unclaimed=$((unclaimed+1))
-  fi
-done
-[ "$unclaimed" -eq 0 ] || { echo "holdout: $unclaimed production file(s) unclaimed"; exit 2; }
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  hdrs=$(git diff --unified=3 "$base" -- "$f" 2>/dev/null | awk '
+    /^@@/ { n++; split($3, a, ","); ln = substr(a[1], 2) + 0; seen = 0; next }
+    n && !seen && /^[-+]/ && !/^(\+\+\+|---)/ { print ln; seen = 1; next }
+    n && !seen && /^ / { ln++ }')
+  [ -n "$hdrs" ] || continue
+  k=0
+  while IFS= read -r line; do
+    k=$((k+1))
+    if ! printf '%s' "$claims" | grep -qxF "$f	$k"; then
+      echo "holdout: UNCLAIMED  $f line $line (hunk $k) is bound to no test and not listed untested:"
+      unclaimed=$((unclaimed+1))
+    fi
+  done <<< "$hdrs"
+done <<< "$prod_files"
+[ "$unclaimed" -eq 0 ] || { echo "holdout: $unclaimed production hunk(s) unclaimed"; exit 2; }
 
 if [ "$dry_run" -eq 1 ]; then
   echo "holdout: --dry-run, resolving anchors without running tests"
