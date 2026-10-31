@@ -133,6 +133,28 @@ def is_gradle(repo, test_project):
     return os.path.isdir(folder) and any(os.path.isfile(os.path.join(folder, n)) for n in GRADLE_SETTINGS)
 
 
+DOTNET_FILES = (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".slnf")
+PLAYWRIGHT_CONFIG = re.compile(r"^playwright\.config\.(?:ts|js|mjs|cjs)$")
+SUPPORTED_KINDS = ("a dotnet project or solution (.csproj, .fsproj, .vbproj, .sln, .slnx, .slnf) or a folder holding one, "
+                   "a package.json, a playwright.config.ts, .js, .mjs or .cjs, or a Gradle settings file or its folder")
+
+
+def unsupported_path(repo, test_project):
+    """Why test-phase cannot run this test path, or "". A path that does not exist yet is not judged."""
+    base = os.path.basename(test_project.rstrip("/"))
+    if base.lower().endswith(DOTNET_FILES) or base == "package.json" or PLAYWRIGHT_CONFIG.match(base) \
+            or base in GRADLE_SETTINGS:
+        return ""
+    full = os.path.join(repo, test_project)
+    if os.path.isdir(full):
+        names = os.listdir(full)
+        if any(n.lower().endswith(DOTNET_FILES) or n in GRADLE_SETTINGS for n in names):
+            return ""
+    elif not os.path.exists(full):
+        return ""
+    return f"{test_project} is not a test path test-phase can run. It runs {SUPPORTED_KINDS}."
+
+
 def gradle_ios(args):
     """True when the job's args name an iOS test task (gradle_args.ios_test_tasks), which needs a Mac."""
     try:
@@ -244,6 +266,9 @@ def cmd_queue(a):
         commit = git_out(repo, "rev-parse", "HEAD") or ""
         # Everything that runs git or reads files happens before the write lock is taken.
         project = a.project or project_of(repo)
+        bad = unsupported_path(repo, a.test_project)
+        if bad:
+            sys.exit("brain: " + bad)
         if a.platform == "none" and is_gradle(repo, a.test_project):
             sys.exit("brain: a Gradle job runs on the local lane only, so --platform none is refused")
         platform = detect_platform(repo, a.test_project, a.args) if a.platform == "auto" else ("apple" if a.platform == "apple" else "")

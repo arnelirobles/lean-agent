@@ -112,7 +112,9 @@ folder; yarn.lock is refused, and with no lockfile pnpm install runs), then runs
 rerun is per file. Playwright runs a job whose test path ends in playwright.config.ts, .js, .mjs or .cjs: the
 same install in the config's folder, then `playwright test --reporter=list` with the filter pieces as file
 filters. A failed test is named file > title, and the spec file is the class. The runner is chosen per job
-from the test path (runner_for). TEST_PHASE_DOTNET_ARGS does not reach a Vitest or Playwright job; `args=` on
+from the test path (runner_for); a path that is no dotnet project, package.json, Playwright config or Gradle build is
+refused by name, and so is a package.json that uses jest and not vitest (no Jest runner yet). A run that ran no
+tests, filtered or not, fails. TEST_PHASE_DOTNET_ARGS does not reach a Vitest or Playwright job; `args=` on
 the job does. A remote lane runs them in the node_image container, which has no Playwright browsers; see
 docs/remote-lane.md.
 
@@ -164,6 +166,10 @@ try:
     import lean_remote as lr
 except ImportError:  # a copy of test-phase without its module still drains the local lane
     lr = None
+try:
+    import direct_test as dt
+except ImportError:  # without it no jest package is recognised
+    dt = None
 LaneProblem = lr.LaneProblem if lr else type("LaneProblem", (Exception,), {})
 HEAVY = os.path.join(HERE, "heavy.sh")
 BRAIN = os.path.join(HERE, "brain")
@@ -895,9 +901,21 @@ def tp_name(path):
         or PLAYWRIGHT_CONFIG.match(base)) and os.path.dirname(path) else base
 
 
+DOTNET_FILES = (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx", ".slnf")
+SUPPORTED_KINDS = ("a dotnet project or solution (.csproj, .fsproj, .vbproj, .sln, .slnx, .slnf) or a folder holding one, "
+                   "a package.json, a playwright.config.ts, .js, .mjs or .cjs, or a Gradle settings file or its folder")
+
+
+def is_dotnet(test_project, repo=None):
+    if os.path.basename(test_project.rstrip("/")).lower().endswith(DOTNET_FILES):
+        return True
+    folder = os.path.join(repo, test_project) if repo else ""
+    return bool(folder) and os.path.isdir(folder) and any(n.lower().endswith(DOTNET_FILES) for n in os.listdir(folder))
+
+
 def runner_for(test_project, repo=None):
     """Gradle for a settings.gradle(.kts) or a folder holding one, Vitest for a package.json, Playwright for a
-    playwright.config file, Dotnet for everything else."""
+    playwright.config file, Dotnet for a dotnet project, solution or a folder holding one, else None."""
     base = os.path.basename(test_project)
     if base in GRADLE_SETTINGS:
         return Gradle
@@ -906,7 +924,9 @@ def runner_for(test_project, repo=None):
         return Gradle
     if PLAYWRIGHT_CONFIG.match(base):
         return Playwright
-    return Vitest if base == "package.json" else Dotnet
+    if base == "package.json":
+        return Vitest
+    return Dotnet if is_dotnet(test_project, repo) else None
 
 
 class Lane:
@@ -1308,8 +1328,38 @@ def run_job(job, a, run_dir, runner, lane=LOCAL):
             clean_remote(lane.remote, job["id"])
 
 
+def refused_row(job, why):
+    """A job test-phase will not run: it fails with the reason, and nothing is started."""
+    return {"job": job["id"], "project": job["project"], "test": job["test_project"], "tier": job["tier"],
+            "filtered": bool(job["filter"]), "result": "fail", "failing": 0, "real": 0, "flaky": 0, "notes": [why],
+            "run_id": None, "rc": 1, "host": "", "session": job.get("session_id", ""),
+            "session_cwd": job.get("session_cwd", "")}
+
+
+JEST_WORDS = ("this package uses jest, and the queue does not run jest yet, so nothing ran; "
+              "run the tests directly with the repo's own test command.")
+
+
+def refusal(job, runner):
+    """Why this job cannot run, or "": a path of no known kind, or a package.json that uses jest and not vitest."""
+    project = job["test_project"]
+    if runner is None:
+        return f"cannot run {project}: test-phase runs {SUPPORTED_KINDS}"
+    if runner is Vitest and dt and dt.jest_only(os.path.join(job["repo_dir"], project)):
+        return f"cannot run {project}: {JEST_WORDS}"
+    return ""
+
+
 def _run_job(job, a, run_dir, runner, lane, hold):
     repo, project = job["repo_dir"], job["test_project"]
+    why = refusal(job, runner)
+    if why:
+        row = refused_row(job, why)
+        ctx = {"repo": repo, "cycle": job["cycle"], "runner": runner,
+               "branch": a.branch if a.branch is not None else current_branch(repo)} if os.path.isdir(repo) else None
+        if ctx:
+            add_item(row, "test-fail", f"run-failed: {project}", "important", why, None, ctx)
+        return row
     remote = lane.remote
     cfg = lane.repos.get(job["project"].lower()) if remote else None
     row = {"job": job["id"], "project": job["project"], "test": project, "tier": job["tier"],
@@ -1545,6 +1595,13 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         row["notes"].append("filter matched no test")
         add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
                  f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
+    elif runner is not Gradle and not failing and not row.get("env") \
+            and (matched_none(rc, text) or (rc == 0 and not sum(runner.counts(text)[:2]))):
+        row["result"] = "fail"
+        row["notes"].append("ran no tests")
+        add_item(row, "test-fail", f"ran-no-tests: {project}", "important",
+                 f"The run exited {rc} but passed or failed no test, so it proved nothing. A project with no tests "
+                 f"fails here: add a test, or leave it out of the plan. Log: {stem}.log", run_id, ctx)
     elif runner is Gradle and rc == 0 and not failing and not sum(Gradle.counts(text)[:2]):
         row["result"] = "fail"
         row["notes"].append("ran no tests")
@@ -1833,7 +1890,7 @@ def drain(a, run_dir, lanes=None):
                     rows.append(row)
                 reason = "; ".join(row["notes"])
                 brain(["queue", "finish", str(job["id"]), "--status",
-                       "done" if row["rc"] == 0 or only_flaky(row) else "failed"]
+                       "done" if (row["rc"] == 0 and row["result"] == "pass") or only_flaky(row) else "failed"]
                       + (["--run-id", str(row["run_id"])] if row["run_id"] else [])
                       + (["--reason", reason] if reason else []))
                 job = None
@@ -2064,8 +2121,20 @@ def vitest_checks(fails, fixture):
         pass
     pick = globals().get("runner_for")
     if not pick or pick("web/package.json") is not V or pick("package.json") is not V \
-            or pick("tests/T/T.csproj") is not Dotnet or pick("tests/T") is not Dotnet:
-        fails.append("a test path ending in package.json uses Vitest, everything else Dotnet")
+            or pick("tests/T/T.csproj") is not Dotnet or pick("T.fsproj") is not Dotnet:
+        fails.append("a test path ending in package.json uses Vitest, a dotnet project file Dotnet")
+    for odd in ("tests/T", "notes.txt", "Makefile", "playwright.config.json"):
+        if pick(odd) is not None:
+            fails.append(f"runner_for must return None for {odd!r}, not guess Dotnet")
+    for sln in ("A.sln", "A.slnx", "A.slnf", "A.vbproj"):
+        if pick(sln) is not Dotnet:
+            fails.append(f"runner_for must pick Dotnet for {sln}")
+    with tempfile.TemporaryDirectory() as rd:
+        os.makedirs(os.path.join(rd, "tests", "T"))
+        os.makedirs(os.path.join(rd, "tests", "Empty"))
+        open(os.path.join(rd, "tests", "T", "T.csproj"), "w").close()
+        if pick("tests/T", rd) is not Dotnet or pick("tests/Empty", rd) is not None:
+            fails.append("a folder holding a project file is Dotnet, a folder without one is not")
     r = lr.Remote(name="dev", host="devbox") if lr else None
     if r is None or getattr(r, "node_image", "") != "node:22-bookworm-slim":
         fails.append("the remote default node image is node:22-bookworm-slim")
@@ -2429,8 +2498,8 @@ def node_checks(fails, fixture):
     for cfg in ("playwright.config.ts", "e2e/playwright.config.js", "x/playwright.config.mjs", "playwright.config.cjs"):
         if not pick or pick(cfg) is not P:
             fails.append(f"a test path ending in {cfg} must use Playwright")
-    if pick("web/package.json") is not V or pick("tests/T.csproj") is not Dotnet or pick("playwright.config.json") is not Dotnet:
-        fails.append("package.json stays Vitest and an unknown path stays Dotnet")
+    if pick("web/package.json") is not V or pick("tests/T.csproj") is not Dotnet or pick("playwright.config.json") is not None:
+        fails.append("package.json stays Vitest, a csproj stays Dotnet and an unknown path is None")
     tp = globals().get("tp_name")
     if tp("e2e/playwright.config.ts") != "e2e/playwright.config.ts" or tp("a/playwright.config.ts") == tp("b/playwright.config.ts"):
         fails.append("a playwright config is named by folder and file")
@@ -3049,12 +3118,12 @@ case "$*" in
     if [ -f "$f.failstall" ]; then while :; do echo "failed $cls.T"; sleep 0.3; done; fi
     if [ -f "$f.kill" ]; then rm -f "${f:?}.kill"; kill -TERM $$; fi
     if [ -f "$f" ]; then cat "$f"; [ -f "$f.rc" ] && exit "$(cat "$f.rc")"; exit 0; fi
-    echo "passed $cls.Any (1ms)"; exit 0 ;;
+    echo "passed $cls.Any (1ms)"; echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"; exit 0 ;;
 esac
 pf=$FAKE_DIR/full-$(basename "$2")
 if [ -f "$pf" ]; then cat "$pf"; exit "$(cat "$pf.rc")"; fi
 if [ -f "$FAKE_DIR/full" ]; then cat "$FAKE_DIR/full"; exit "$(cat "$FAKE_DIR/full.rc")"; fi
-echo "Passed!  - Failed: 0"; exit 0
+echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"; exit 0
 ''')
         os.chmod(shim, 0o755)
         env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"], FAKE_DIR=d, FAKE_BRAIN=BRAIN,
@@ -3176,7 +3245,7 @@ echo "Passed!  - Failed: 0"; exit 0
 
         # xunit v3 ORs repeated --filter-class, so one run covers every named class. It also hides a class that
         # matches nothing while another matches, so each class is listed alone and exit 8 fails the job naming it.
-        put("full", "Test run summary: Passed!\n  total: 5\n", 0)
+        put("full", "Test run summary: Passed!\n  total: 5\n  failed: 0\n  succeeded: 5\n  skipped: 0\n", 0)
         rc, out, calls = run(f"{repo_m} tests/T/T.csproj Acme.ATests|Acme.BTests\n")
         if rc != 0 or calls[0] != "test --project tests/T/T.csproj -- --filter-class *Acme.ATests* --filter-class *Acme.BTests* --output Detailed":
             fails.append(f"two classes must run in one command ({rc}): {calls} {out}")
@@ -3206,6 +3275,15 @@ echo "Passed!  - Failed: 0"; exit 0
         rc, out, calls = run(f"{repo_v} tests/T/T.csproj Good\n")
         if rc != 0 or "filter matched no test" in out:
             fails.append(f"a filtered run with tests must still pass ({rc}): {out}")
+        for label, repo_x, text, code in (
+                ("a VSTest summary of zero tests", repo_v, "Passed!  - Failed: 0, Passed: 0, Skipped: 0, Total: 0\n", 0),
+                ("a VSTest run with no summary", repo_v, "Build succeeded.\n", 0),
+                ("an MTP exit 8", repo_m, "", 8)):
+            put("full", text, code)
+            rc, out, calls = run(f"{repo_x} tests/T/T.csproj\n")
+            if rc != 1 or "ran no tests" not in out:
+                fails.append(f"an unfiltered dotnet run with {label} must fail as ran no tests ({rc}): {out}")
+        put("full", "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1\n", 0)
 
         # A refused full add stops the plan loudly; again=REASON on the plan line goes through as --again.
         def gitrepo(name, dirty=False):
@@ -3548,6 +3626,7 @@ case "$mode" in
     esac ;;
   *) seq Acme.HangTests.Done Acme.HangTests.Sleeps; echo big > "$rd/hang.dmp"
      echo "  Passed Acme.HangTests.Done [1 ms]"
+     [ "$mode" = exit0 ] && echo "Passed!  - Failed: 0, Passed: 1, Skipped: 0, Total: 1"
      case "$mode" in term) kill -TERM $$ ;; exit1) exit 1 ;; exit0) exit 0 ;; *) exit 2 ;; esac ;;
 esac
 ''')
@@ -3679,11 +3758,14 @@ esac
             fh.write('''#!/bin/sh
 echo "pnpm $* in $(basename "$PWD")" >> "$FAKE_LOG"
 case "$*" in
+  *exec*) [ -f "$FAKE_DIR/exec-zero" ] && { cat "$FAKE_DIR/exec-zero"; exit 0; } ;;
+esac
+case "$*" in
   *"src/cart/cart.test.tsx"*) echo "     Tests  2 passed (2)"; exit 0 ;;
   *none?.test.ts*) echo "No test files found, exiting with code $(cat "$FAKE_DIR/nofiles.rc")"; exit "$(cat "$FAKE_DIR/nofiles.rc")" ;;
   *"exec vitest"*)
     if [ -f "$FAKE_DIR/vitest-stream" ]; then
-      for i in 1 2 3 4 5 6 7 8 9 10; do echo " \u2713 src/a.test.ts > t$i 1ms"; sleep 0.5; done; exit 0
+      for i in 1 2 3 4 5 6 7 8 9 10; do echo " \u2713 src/a.test.ts > t$i 1ms"; sleep 0.5; done; echo "     Tests  10 passed (10)"; exit 0
     fi
     cat "$FAKE_DIR/vitest-full"; exit 1 ;;
 esac
@@ -3746,6 +3828,54 @@ exit 0
         os.remove(os.path.join(d, "vitest-stream"))
         if rc != 0 or "stalled" in out:
             fails.append(f"vitest result marks are progress, a streaming run is not stalled ({rc}): {out}")
+
+        # A run that ran no tests proves nothing, filtered or not: the job fails, and a job chained after it is cancelled.
+        repo_z = os.path.join(d, "zrepo")
+        for sub in ("web", "e2e", "empty"):
+            os.makedirs(os.path.join(repo_z, sub))
+        for f in ("web/package.json", "web/pnpm-lock.yaml", "e2e/pnpm-lock.yaml", "e2e/playwright.config.ts", "notes.txt"):
+            open(os.path.join(repo_z, f), "w").write("{}\n")
+        for label, tp, text in (("vitest, no test files", "web/package.json", "No test files found, exiting with code 0\n"),
+                                ("vitest, no output", "web/package.json", ""),
+                                ("playwright, zero tests", "e2e/playwright.config.ts", "Running 0 tests using 1 worker\n")):
+            put("exec-zero", text)
+            rc, out, calls = run(f"{repo_z} {tp}\n")
+            if rc == 0 or "ran no tests" not in out:
+                fails.append(f"an unfiltered {label} run must fail as ran no tests ({rc}): {out}")
+        put("exec-zero", "     Tests  3 passed (3)\n")
+        rc, out, calls = run(f"{repo_z} web/package.json\n")
+        if rc != 0 or "ran no tests" in out:
+            fails.append(f"an unfiltered vitest run with tests must pass ({rc}): {out}")
+        put("exec-zero", "No test files found, exiting with code 0\n")
+        jz1 = qadd(repo_z, "web/package.json", "--cycle", "qz")
+        jz2 = qadd(repo_z, "e2e/playwright.config.ts", "--after", jz1, "--cycle", "qz")
+        rc, out, calls = drain()
+        ql = qlist("--cycle", "qz")
+        if f"job #{jz1} failed" not in ql or f"job #{jz2} cancelled" not in ql or rc != 1:
+            fails.append(f"a job that ran no tests must finish failed and cancel its dependents ({rc}): {ql} {out}")
+        os.remove(os.path.join(d, "exec-zero"))
+
+        # A path that is no dotnet project, no package.json and no playwright config is refused by name, never
+        # handed to dotnet.
+        for bad in ("notes.txt", "empty"):
+            r = subprocess.run([sys.executable, BRAIN, "queue", "add", repo_z, bad, "--cycle", "qu"], env=env,
+                               capture_output=True, text=True)
+            if r.returncode == 0 or bad not in r.stderr or ".csproj" not in r.stderr:
+                fails.append(f"queue add of {bad!r} must be refused naming the path and the kinds: {r.returncode} {r.stderr!r}")
+        qadd(repo_z, "ghost/Thing", "--cycle", "qg")
+        rc, out, calls = drain()
+        if rc == 0 or calls or "ghost/Thing" not in out or ".csproj" not in out or "build error" in out:
+            fails.append(f"a path of no known kind must fail the job by name and run nothing ({rc}): {calls} {out}")
+
+        # Jest has no runner yet: a jest-only package.json fails, naming jest, and runs nothing.
+        repo_j = os.path.join(d, "jrepo")
+        os.makedirs(os.path.join(repo_j, "web"))
+        open(os.path.join(repo_j, "web", "pnpm-lock.yaml"), "w").write("{}\n")
+        open(os.path.join(repo_j, "web", "package.json"), "w").write(
+            '{"scripts": {"test": "jest"}, "devDependencies": {"jest": "29.0.0"}}\n')
+        rc, out, calls = run(f"{repo_j} web/package.json\n")
+        if rc == 0 or calls or "jest" not in out or "run the tests directly" not in out:
+            fails.append(f"a jest package must fail naming jest and run nothing ({rc}): {calls} {out}")
 
         gradle_job_checks(fails, d, env, fixture)
 
