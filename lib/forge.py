@@ -6,6 +6,7 @@
   forge.py commits-after REPO N ISO   commits on pull request N committed after ISO, not counting merges
   forge.py failed-checks REPO SHA     failed check runs on SHA
   forge.py escaped-refs REPO N ISO    issues and pull requests created after ISO whose body says #N and fix
+  (the three counts print unknown when the call failed, never 0)
   forge.py --self-test
 
 REPO is owner/name (always GitHub) or a clone URL. A host other than GitHub prints one line and exits 2.
@@ -35,6 +36,8 @@ To add a provider, write the class, add its kind to CI_PROVIDERS and give it a t
 CLI (see github_ci_test and azure_ci_test). Commands run as argument lists, never through a shell, and
 what they print is untrusted.
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -162,26 +165,34 @@ def azure_slug(repo):
 
 
 def count(out):
-    """The sum of the integers gh printed, one per line, or 0 when it failed."""
+    """The sum of the integers gh printed, one per line, or None when the call failed or printed nothing usable."""
     try:
-        return sum(int(line) for line in (out or "").split())
+        parts = (out or "").split()
+        return sum(int(line) for line in parts) if parts else None
     except ValueError:
-        return 0
+        return None
 
 
 class GitHub:
     def __init__(self, run=run_command):
         self.run = run
+        self.cut = False
 
     def merged_prs(self, repo, since, limit=200):
+        self.cut = False
         listing = self.run(["gh", "pr", "list", "-R", slug(repo), "--state", "merged", "--search", f"merged:>={since}",
-                            "--limit", str(limit), "--json", "number,headRefName,headRefOid,createdAt,mergedAt"])
+                            "--limit", str(limit + 1), "--json", "number,headRefName,headRefOid,createdAt,mergedAt"])
         if listing is None:
             return None
         try:
             prs = json.loads(listing)
         except ValueError:
             return None
+        if len(prs) > limit:
+            prs = prs[:limit]
+            self.cut = True
+            print(f"forge: stopped at {limit} merged pull requests of {slug(repo)}, older ones are not counted",
+                  file=sys.stderr)
         return [{"number": pr["number"], "head_ref": pr.get("headRefName") or "", "head_sha": pr.get("headRefOid") or "",
                  "created_at": pr.get("createdAt") or "", "merged_at": pr.get("mergedAt") or ""} for pr in prs]
 
@@ -193,12 +204,17 @@ class GitHub:
                                '| select(.commit.message | startswith("Merge") | not)] | length']))
 
     def failed_checks(self, repo, sha):
-        return count(self.run(["gh", "api", f"repos/{slug(repo)}/commits/{sha}/check-runs", "-q",
+        return count(self.run(["gh", "api", f"repos/{slug(repo)}/commits/{sha}/check-runs?per_page=100", "--paginate", "-q",
                                '[.check_runs[] | select(.conclusion=="failure")] | length']))
 
-    def escaped_refs(self, repo, number, merged_at):
-        return count(self.run(["gh", "search", "issues", f'repo:{slug(repo)} "#{number}" fix in:body created:>{merged_at}',
-                               "--json", "number", "-q", "length"]))
+    def escaped_refs(self, repo, number, merged_at, limit=100):
+        found = count(self.run(["gh", "search", "issues", f'repo:{slug(repo)} "#{number}" fix in:body created:>{merged_at}',
+                                "--limit", str(limit + 1), "--json", "number", "-q", "length"]))
+        if found is not None and found > limit:
+            print(f"forge: escaped_refs for {slug(repo)}#{number} stopped at {limit} issues, more were not counted",
+                  file=sys.stderr)
+            return limit
+        return found
 
 
 AZURE_PAGE = 100
@@ -223,7 +239,7 @@ class Azure:
     listing questions lean-stats needs; each gives None when az fails. commits_after counts the commits on a
     pull request committed after a time, merges not counted, from the first 500; nothing calls it yet.
     failed_checks and escaped_refs return None: check runs cannot be found by commit through az, and az has
-    no search over work item text. A failed az call gives None (merged_prs) or 0 (commits_after).
+    no search over work item text. A failed az call gives None.
     """
 
     def __init__(self, run=run_command, cap=AZURE_CAP, page=AZURE_PAGE):
@@ -323,7 +339,7 @@ class Azure:
                        if azure_time(c["committer"]["date"]) > azure_time(after)
                        and not (c.get("comment") or "").startswith("Merge"))
         except (ValueError, KeyError, TypeError, AttributeError):
-            return 0
+            return None
 
     def failed_checks(self, repo, sha):
         return None
@@ -504,12 +520,14 @@ def main(argv):
             return 1
         for pr in prs:
             print(f"{pr['number']}\t{pr['created_at']}\t{pr['merged_at']}\t{pr['head_sha']}")
-    elif cmd == "commits-after":
-        print(gh.commits_after(repo, rest[0], rest[1]))
-    elif cmd == "failed-checks":
-        print(gh.failed_checks(repo, rest[0]))
     else:
-        print(gh.escaped_refs(repo, rest[0], rest[1]))
+        if cmd == "commits-after":
+            got = gh.commits_after(repo, rest[0], rest[1])
+        elif cmd == "failed-checks":
+            got = gh.failed_checks(repo, rest[0])
+        else:
+            got = gh.escaped_refs(repo, rest[0], rest[1])
+        print("unknown" if got is None else got)
     return 0
 
 
@@ -817,7 +835,7 @@ def azure_test(check, root):
           Azure(fake(json.dumps(commits))).commits_after("org/p/r", 7, "2026-10-01T12:00:00Z"), 1)
     check("azure commits_after argv", calls[-1][:8], ["az", "devops", "invoke", "--area", "git", "--resource",
           "pullRequestCommits", "--org"])
-    check("azure commits_after on a failed az", Azure(fake(None)).commits_after("org/p/r", 7, "x"), 0)
+    check("azure commits_after on a failed az", Azure(fake(None)).commits_after("org/p/r", 7, "x"), None)
     check("azure failed_checks is unknown", Azure(fake("1")).failed_checks("org/p/r", "abc"), None)
     check("azure escaped_refs is unknown", Azure(fake("1")).escaped_refs("org/p/r", 7, "x"), None)
 
@@ -954,6 +972,21 @@ def azure_cli_test(check, root):
     check("the refusal never calls az", os.path.exists(os.path.join(d, "az-called")), False)
 
 
+def unknown_cli_test(check, root):
+    import tempfile
+    with tempfile.TemporaryDirectory() as bindir:
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(gh, 0o755)
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"])
+        me = os.path.abspath(__file__)
+        for cmd, rest in (("failed-checks", ["abc"]), ("commits-after", ["7", "2026-10-01T00:00:00Z"]),
+                          ("escaped-refs", ["7", "2026-10-01T00:00:00Z"])):
+            r = subprocess.run([sys.executable, "-I", me, cmd, "o/r"] + rest, capture_output=True, text=True, env=env)
+            check(f"{cmd} prints unknown when gh fails", (r.returncode, r.stdout), (0, "unknown\n"))
+
+
 def self_test():
     fails = []
 
@@ -991,15 +1024,48 @@ def self_test():
             "created_at": "2026-10-01T00:00:00Z", "merged_at": "2026-10-02T00:00:00Z"}])
     check("merged_prs argv", calls[-1],
           ["gh", "pr", "list", "-R", "o/r", "--state", "merged", "--search", "merged:>=2026-10-01",
-           "--limit", "200", "--json", "number,headRefName,headRefOid,createdAt,mergedAt"])
+           "--limit", "201", "--json", "number,headRefName,headRefOid,createdAt,mergedAt"])
     check("merged_prs on a failed gh", GitHub(fake(None)).merged_prs("o/r", "2026-10-01"), None)
     check("merged_prs on bad JSON", GitHub(fake("not json")).merged_prs("o/r", "2026-10-01"), None)
 
     for name in ("failed_checks", "commits_after", "escaped_refs"):
         args = ("o/r", "abc") if name == "failed_checks" else ("o/r", 7, "2026-10-01T00:00:00Z")
-        check(f"{name} on a failed gh", getattr(GitHub(fake(None)), name)(*args), 0)
+        check(f"{name} on a failed gh is unknown", getattr(GitHub(fake(None)), name)(*args), None)
+        check(f"{name} on odd output is unknown", getattr(GitHub(fake("oops")), name)(*args), None)
         check(f"{name} parses a count", getattr(GitHub(fake("3\n")), name)(*args), 3)
+        check(f"{name} keeps a real zero", getattr(GitHub(fake("0\n")), name)(*args), 0)
     check("commits_after sums pages", GitHub(fake("2\n1\n")).commits_after("o/r", 7, "x"), 3)
+    check("failed_checks sums pages", GitHub(fake("2\n1\n")).failed_checks("o/r", "abc"), 3)
+    GitHub(fake("0\n")).failed_checks("o/r", "abc")
+    check("failed_checks reads every page", "--paginate" in calls[-1], True)
+    check("count of nothing is unknown", count(""), None)
+
+    full = json.dumps([{"number": n, "headRefName": "b", "headRefOid": "a", "createdAt": "x", "mergedAt": "y"}
+                       for n in range(3)])
+    err = io.StringIO()
+    more = GitHub(fake(full))
+    with contextlib.redirect_stderr(err):
+        check("merged_prs past the limit is trimmed", len(more.merged_prs("o/r", "2026-10-01", limit=2)), 2)
+    check("merged_prs asks for one more than the limit", calls[-1][calls[-1].index("--limit") + 1], "3")
+    check("merged_prs says it was cut", err.getvalue(),
+          "forge: stopped at 2 merged pull requests of o/r, older ones are not counted\n")
+    check("merged_prs remembers the cut", more.cut, True)
+    for exact in (3, 4):
+        err = io.StringIO()
+        quiet = GitHub(fake(full))
+        with contextlib.redirect_stderr(err):
+            check(f"merged_prs with limit {exact} returns all", len(quiet.merged_prs("o/r", "2026-10-01", limit=exact)), 3)
+        check(f"merged_prs with exactly the limit or fewer is silent ({exact})", (err.getvalue(), quiet.cut), ("", False))
+
+    seen = GitHub(fake("2\n"))
+    check("escaped_refs asks for a bounded list", (seen.escaped_refs("o/r", 7, "x"), "--limit" in calls[-1]), (2, True))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        check("escaped_refs past its limit is capped", GitHub(fake("101\n")).escaped_refs("o/r", 7, "x"), 100)
+    check("escaped_refs says it was cut", err.getvalue(),
+          "forge: escaped_refs for o/r#7 stopped at 100 issues, more were not counted\n")
+
+    guarded(check, "unknown on the command line", 60, unknown_cli_test, None)
 
     import tempfile
     with tempfile.TemporaryDirectory() as root:

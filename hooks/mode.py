@@ -11,6 +11,7 @@ env block of Claude Code settings. The defaults add nothing to the one line that
   LEAN_AGENTS=one    everything in this session, no subagents or workflows
   LEAN_MODELS=mixed  default: cheap model drafts, expensive model escalates
   LEAN_MODELS=one    every step on the session's model, no switching
+  LEAN_PROFILE       standard (default), strict or off; see the README. An unknown value counts as strict
   LEAN_MODEL_CHEAP   default sonnet: drafts, spec review, the critic's hunt and refute
   LEAN_MODEL_STRONG  default opus: takes what the cheap model did not close in one round
   LEAN_MODEL_FAST    default haiku: search, gate and retro agents, which read and report
@@ -87,10 +88,19 @@ def role(env, name):
     return default, f"{name}={raw} is not one of {', '.join(ALIASES)}; using {default}."
 
 
+def profile_warning(env):
+    if "LEAN_PROFILE" not in env:
+        return None
+    raw = env["LEAN_PROFILE"].strip().lower()
+    if raw not in hookkit.PROFILES:
+        return f"LEAN_PROFILE={raw} is not one of {', '.join(hookkit.PROFILES)}; using strict."
+    return None
+
+
 def message(env):
     agents, bad_agents = setting(env, "LEAN_AGENTS")
     models, bad_models = setting(env, "LEAN_MODELS")
-    parts = [w for w in (bad_agents, bad_models) if w]
+    parts = [w for w in (bad_agents, bad_models, profile_warning(env)) if w]
     if agents == "one":
         parts.append(ONE_AGENT)
     if models == "one":
@@ -151,6 +161,12 @@ def self_test():
     expect("one model", {"LEAN_MODELS": "one"}, ("LEAN_MODELS=one",), ("LEAN_AGENTS=one", "/model"))
     expect("both", {"LEAN_AGENTS": "one", "LEAN_MODELS": "one"},
            ("LEAN_AGENTS=one:", "LEAN_MODELS=one:"), ("/model",))
+    expect("unknown profile", {"LEAN_PROFILE": "loose"}, ("LEAN_PROFILE=loose is not one of strict, standard, off; using strict.",))
+    expect("empty profile", {"LEAN_PROFILE": " "}, ("LEAN_PROFILE= is not one of strict, standard, off; using strict.",))
+    for ok in ("Strict", " standard ", "OFF"):
+        if message({"LEAN_PROFILE": ok}) is not None:
+            print(f"FAIL LEAN_PROFILE={ok!r} should print nothing")
+            failures += 1
     expect("case and spaces", {"LEAN_AGENTS": " One "}, ("LEAN_AGENTS=one:",))
     expect("unknown value", {"LEAN_AGENTS": "single"}, ("LEAN_AGENTS=single is not one of many, one",),
            ("LEAN_AGENTS=one:",))

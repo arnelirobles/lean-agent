@@ -239,12 +239,12 @@ def main():
         return 0
     text = message(command, event.get("cwd") or os.getcwd())
     if text:
-        print(text, file=sys.stderr)
-        return 2
+        return hookkit.refuse("PreToolUse", text, standard="nothing")
     return 0
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     import stat
     import tempfile
 
@@ -377,6 +377,13 @@ def self_test():
         check("az help allows", message("az repos pr update --id 6 --draft false --help", repo), False)
         check("az create allows", message("az repos pr create --title t", repo), False)
         check("az skip inline allows", message(SKIP + "=1 az repos pr update --id 6 --draft false", repo), False)
+        fake_gh("exit 1")
+        os.environ["LEAN_PROFILE"] = "standard"
+        try:
+            check("standard: unlogged merge passes", message_via_main("gh pr merge 6", repo), True)
+        finally:
+            os.environ["LEAN_PROFILE"] = "strict"
+        check("strict: unlogged merge still refused", message_via_main("gh pr merge 6", repo), False)
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

@@ -84,11 +84,11 @@ def main():
     text = verdict(hookkit.tool_input(event))
     if not text:
         return 0
-    print(text, file=sys.stderr)
-    return 2
+    return hookkit.refuse("PreToolUse", text, standard="nothing")
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     failures = 0
 
     def check(label, tool_input, want_deny):
@@ -132,6 +132,17 @@ def self_test():
     if proc.returncode != 7 or proc.stdout.strip() != "it ran":
         print(f"FAIL wrapped command: rc={proc.returncode} out={proc.stdout!r} err={proc.stderr!r}")
         failures += 1
+
+    def std(event, **env):
+        return hookkit.probe(os.path.realpath(__file__), event, LEAN_PROFILE="standard", **env)
+
+    def want(label, got, rc, out=False):
+        nonlocal failures
+        if got[0] != rc or bool(got[1]) != out or got[2]:
+            print(f"FAIL standard {label}: {got!r}")
+            failures += 1
+
+    want("background command passes silently", std({"tool_input": bg("sleep 9")}), 0)
 
     if failures:
         return 1

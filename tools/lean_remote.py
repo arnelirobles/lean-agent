@@ -436,7 +436,7 @@ def run_script(r, cfg, job_id, cmd, dest=None, build=None, mark=None, kind="dotn
     tools = ("-e HOME=/tmp -e CI=true -e COREPACK_HOME=/cache/corepack -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 "
              + (f"-e LEAN_PNPM_VERSION={shlex.quote(pnpm)} " if pnpm else "")
              + f"-e npm_config_store_dir=/cache/store -e npm_config_cache=/cache/npm -v {nuget}:/cache") if node else \
-        f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -v {nuget}:/nuget"
+        f"-e HOME=/tmp -e NUGET_PACKAGES=/nuget -e DOTNET_CLI_UI_LANGUAGE=en -e VSLANG=1033 -v {nuget}:/nuget"
     out.append(f'docker run --rm --name {net}-run --label {label} --network {net} {caps} --user "$(id -u):$(id -g)" '
                f"{tools} -v {jd}:/work -w /work{env}{denv} "
                f"{shlex.quote(r.node_image if node else r.image)} sh -c {shlex.quote(inner)}")
