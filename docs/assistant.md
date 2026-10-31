@@ -26,7 +26,17 @@ Your question, the table definitions of the brain database, and every row the as
 
 ## What it can do
 
-One tool, `run_sql`. It runs a single SELECT on a read-only connection with the sqlite authorizer set to allow only reads. INSERT, UPDATE, ATTACH, PRAGMA and stacked statements are refused. A query stops after 5 seconds. A result is cut at 200 rows or 40,000 characters, and the cut is reported so the model can narrow the query. The assistant never writes to `brain.db`.
+Two tools, `run_sql` and `chart`. It runs a single SELECT on a read-only connection with the sqlite authorizer set to allow only reads. INSERT, UPDATE, ATTACH, PRAGMA and stacked statements are refused. A query stops after 5 seconds. A result is cut at 200 rows or 40,000 characters, and the cut is reported so the model can narrow the query. The assistant never writes to `brain.db`.
+
+`chart` draws a bar, line or horizontal bar chart from numbers the model gives it, as inline SVG with a table under it. The spec is checked before drawing (at most 3 series, 60 labels, finite numbers only) and a refused spec is reported back to the model. No JavaScript runs on the page.
+
+## Activity and summaries
+
+The Activity section shows 14 local days of counts from `brain.db` (test runs and failures, items opened and closed, things agents created) and from `lean.db` when it exists (agent runs and cost). A day with no data shows as zero. If `lean.db` is missing, those charts are left out.
+
+With a key ready, the section has two buttons, Summarise today and Last 7 days. Each asks the assistant the same fixed question (what shipped, what failed, what got worse against the prior period, what needs you) and streams the answer like any question, so follow-ups work. The result is saved in `summaries.json` next to `brain.db`, one entry per range, mode 0600. It holds the answer text and chart specs, never HTML, and the page draws them again on each load. The text comes from the brain and is masked the same way as rows, but it can still hold work item text, so treat the file like the brain itself. A corrupt or oversized file is ignored. The newest summaries show at the top of the section.
+
+Set `LEAN_ASSISTANT_AUTO_SUMMARY=1` before `brain serve` to write the daily summary on its own. A thread checks every 10 minutes. If no summary has been written since local midnight and a key is ready, it makes one, but only when a question slot is free. A failure shows as a muted line on the page and is retried at most once an hour. It is off by default, and each summary costs a normal question.
 
 ## Models and effort
 
