@@ -171,6 +171,7 @@ def problems(command, cwd="."):
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     import tempfile
 
     blocked = [
@@ -257,6 +258,19 @@ def self_test():
         if problems("gh api graphql -F query=@read.graphql", cwd=tmp):
             print("FAIL a graphql query read from a file was treated as a write")
             failures += 1
+    def std(event, **env):
+        return hookkit.probe(os.path.realpath(__file__), event, LEAN_PROFILE="standard", **env)
+
+    def want(label, got, rc, out=False):
+        nonlocal failures
+        if got[0] != rc or bool(got[1]) != out or got[2]:
+            print(f"FAIL standard {label}: {got!r}")
+            failures += 1
+
+    with tempfile.TemporaryDirectory() as there:
+        slop = {"tool_input": {"command": 'git commit -m "a rob' + 'ust retry"'}, "cwd": there}
+        want("slop is a note", std(slop), 0, True)
+
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 
@@ -270,14 +284,16 @@ def main():
     command = hookkit.tool_input(event).get("command") or ""
     found = problems(command, event.get("cwd") or os.getcwd())
     if found:
-        print("Blocked by lean-agent, public text needs fixing:\n  "
-              + "\n  ".join(found)
-              + "\nRewrite it plainly (commas, periods or parentheses for dashes, "
-              "words for arrows, no attribution) and run the command again. If the text is "
-              "right as it is, LEAN_ALLOW_SLOP=1 or LEAN_ALLOW_ATTRIBUTION=1 in front of the "
-              "command, or in the env block of Claude Code settings, turns that check off.",
-              file=sys.stderr)
-        return 2
+        text = ("Blocked by lean-agent, public text needs fixing:\n  "
+                + "\n  ".join(found)
+                + "\nRewrite it plainly (commas, periods or parentheses for dashes, "
+                "words for arrows, no attribution) and run the command again. If the text is "
+                "right as it is, LEAN_ALLOW_SLOP=1 or LEAN_ALLOW_ATTRIBUTION=1 in front of the "
+                "command, or in the env block of Claude Code settings, turns that check off.")
+        note = ("This public text may read badly:\n  " + "\n  ".join(found)
+                + "\nConsider rewriting it plainly (commas, periods or parentheses for dashes, "
+                "words for arrows, no attribution) before it goes out.")
+        return hookkit.refuse("PreToolUse", text, standard="note", note=note)
     return 0
 
 

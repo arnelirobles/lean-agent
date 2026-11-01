@@ -127,6 +127,7 @@ def note_for(event):
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     fails = []
 
     def case(label, event, want, env=None):

@@ -47,13 +47,15 @@ def main():
         return 0
     found = problem(path, event.get("cwd") or os.getcwd(), os.environ.get("CLAUDE_SCRATCHPAD"))
     if found:
-        print("Blocked by lean-agent: " + found
-              + " LEAN_ALLOW_SCRATCHPAD_ROOT=1 in the env block of Claude Code settings turns this check off.", file=sys.stderr)
-        return 2
+        return hookkit.refuse(
+            "PreToolUse", "Blocked by lean-agent: " + found
+            + " LEAN_ALLOW_SCRATCHPAD_ROOT=1 in the env block of Claude Code settings turns this check off.",
+            standard="nothing")
     return 0
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     failures = 0
     cases = [
         ("/tmp/s/scratchpad/pr-body.md", "/", None, True),
@@ -74,6 +76,18 @@ def self_test():
         if bool(problem(path, cwd, pad)) != want:
             print(f"FAIL {path!r} cwd={cwd!r} pad={pad!r}: want blocked={want}")
             failures += 1
+    def std(event, **env):
+        return hookkit.probe(os.path.realpath(__file__), event, LEAN_PROFILE="standard", **env)
+
+    def want(label, got, rc, out=False):
+        nonlocal failures
+        if got[0] != rc or bool(got[1]) != out or got[2]:
+            print(f"FAIL standard {label}: {got!r}")
+            failures += 1
+
+    want("scratchpad root passes silently",
+         std({"tool_name": "Write", "tool_input": {"file_path": "/tmp/s/scratchpad/notes.md"}, "cwd": "/"}), 0)
+
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

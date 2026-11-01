@@ -198,8 +198,7 @@ def main():
         return 0
     cwd = event.get("cwd") or os.getcwd()
     if direct_test(command, cwd):
-        print(block_message(cwd), file=sys.stderr)
-        return 2
+        return hookkit.refuse("PreToolUse", block_message(cwd), standard="nothing")
     if os.environ.get("LEAN_SCRIPT_NOTE", "").lower() == "off":
         return 0
     found = candidates(command)
@@ -212,6 +211,7 @@ def main():
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     import contextlib
     import io
     import subprocess
@@ -487,6 +487,12 @@ def self_test():
     check("no bytecode written next to tools/script-repeats",
           not [f for f in os.listdir(os.path.dirname(os.path.realpath(REPEATS))) if f.endswith(".pyc")])
 
+    os.environ["LEAN_PROFILE"] = "standard"
+    try:
+        rc, text, err = fire("npm test", "dt-standard")
+        check("standard: direct test run passes silently", rc == 0 and text == "" and not err, repr((rc, text, err)))
+    finally:
+        os.environ["LEAN_PROFILE"] = "strict"
     print("self-test: ok" if failures == 0 else "self-test: %d failed" % failures)
     return 1 if failures else 0
 

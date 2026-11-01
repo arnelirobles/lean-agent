@@ -242,8 +242,8 @@ def pre(event, sid):
         limit = setting("LEAN_IMAGE_CONTEXT", IMAGE_DEFAULT)
         last = leanstats.last_usage(event["transcript_path"]) if limit is not None else None
         if last and leanstats.prompt_size(last) > limit:
-            print(REFUSE_IMAGE.format(k=leanstats.prompt_size(last) // 1000), file=sys.stderr)
-            return 2
+            return hookkit.refuse("PreToolUse", REFUSE_IMAGE.format(k=leanstats.prompt_size(last) // 1000),
+                                  standard="block")
     if lookups and leanstats.is_search(name, tool_input):
         limit = setting("LEAN_LOOKUP_WARN", LOOKUP_DEFAULT)
         if limit is None:
@@ -252,8 +252,7 @@ def pre(event, sid):
         if last and "opus" in last["model"]:
             count = load(sid).get("since_agent", 0)
             if count > limit:
-                print(REFUSE_LOOKUP.format(n=count), file=sys.stderr)
-                return 2
+                return hookkit.refuse("PreToolUse", REFUSE_LOOKUP.format(n=count), standard="block")
     return 0
 
 
