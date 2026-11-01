@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import gradle_args  # noqa: E402
-from test_kinds import DOTNET_FILES, SUPPORTED_KINDS  # noqa: E402
+from test_kinds import DOTNET_FILES, GO_PATTERN, SUPPORTED_KINDS  # noqa: E402
 
 from .items import infer_session, session_ok
 from .store import connect, now
@@ -140,6 +140,8 @@ PLAYWRIGHT_CONFIG = re.compile(r"^playwright\.config\.(?:ts|js|mjs|cjs)$")
 def unsupported_path(repo, test_project):
     """Why test-phase cannot run this test path, or "". A path that does not exist yet is not judged."""
     base = os.path.basename(test_project.rstrip("/"))
+    if GO_PATTERN.match(test_project) and os.path.isfile(os.path.join(repo, "go.mod")):
+        return ""
     if base.lower().endswith(DOTNET_FILES) or base == "package.json" or PLAYWRIGHT_CONFIG.match(base) \
             or base in GRADLE_SETTINGS:
         return ""
@@ -163,7 +165,8 @@ def gradle_ios(args):
 
 def detect_platform(repo, test_project, args=None):
     """'apple' when the job may need an Apple platform, 'private' when an npm job needs a private feed or the job is
-    a Gradle build (local only, its publishing credentials never leave this machine), else ''.
+    a Gradle build (local only, its publishing credentials never leave this machine) or a Go job (a remote
+    lane has no Go runner), else ''.
 
     Conservative: the project file, Directory.Build.props from its folder up to the repo root, and every
     project it references (transitively) are checked. A project that cannot be found or read, or a folder
@@ -172,6 +175,8 @@ def detect_platform(repo, test_project, args=None):
     base = os.path.basename(test_project)
     if is_gradle(repo, test_project):
         return "apple" if gradle_ios(args) else "private"
+    if GO_PATTERN.match(test_project) and os.path.isfile(os.path.join(repo, "go.mod")):
+        return "private"
     if base == "package.json" or base.startswith("playwright.config"):
         return "private" if private_npm_feed(repo, test_project) else ""
     try:
