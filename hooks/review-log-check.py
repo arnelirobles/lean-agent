@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Refuse to mark a pull request ready or merge it when no review is logged for it.
 
-PreToolUse hook on Bash, for gh pr ready, gh pr merge, and az repos pr update with
---draft false or --status completed. The retro reads the reviews table in lean.db, which
+PreToolUse hook on Bash, for the commands the table in lib/hookkit.py calls "merge" or "ready": gh pr ready|merge,
+glab mr merge and glab mr update --ready, az repos pr update with --draft false or --status completed. The retro reads the reviews table in lean.db, which
 log-review.sh fills by pull request number. A review that was done but never logged leaves
 the retro with no data for that change.
 
 The pull request number comes from the argument (a number, #number or URL). With no argument,
-or a branch name, the hook asks `gh pr view --json number,url` once (5 seconds; any failure
-allows). For az it is --id. The hook then looks in the reviews table of lean.db for that number.
+or a branch name, the hook asks the host once through lib/forge.py (gh pr view, or glab api for GitLab;
+5 seconds; any failure or missing CLI allows). For az it is --id. The hook then looks in the reviews table of lean.db for that number.
 
 The repo column is not consistent in practice (BaryoDev/barakoCMS, barakoCMS and barakocms
 all exist), so the repo is compared loosely: the last path part, case-insensitive, against the
@@ -25,7 +25,7 @@ az repos pr update has no repository argument and az pull request ids are organi
 so for az the rule is: allow when any reviews row has that number, whatever the repo; deny only
 when the origin repo has logged reviews and none has that number.
 
-Best effort: wrappers (`bash -c`, `sudo`) and `gh api` merges are not caught.
+Best effort: wrappers (`bash -c`, `sudo`) and `api` merges are not caught.
 
 The database is LEAN_DB (default ~/.lean/lean.db), as in lean-stats. LEAN_STATS=off, no
 database file, no reviews table, or any error allows. --help and -h allow.
@@ -42,12 +42,19 @@ import sys
 import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import forge  # noqa: E402
 import hookkit  # noqa: E402
 
 SKIP = "LEAN_SKIP_REVIEW_LOG_CHECK"
-GH_GLOBAL_VALUE = {"-R", "--repo", "--hostname"}
-GH_VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--subject",
-                  "-A", "--author-email", "--match-head-commit"}
+# Flags before the command word that take a value, and flags after it that take a value, per CLI. -R/--repo
+# names the repository on gh and glab.
+GLOBAL_VALUE = {"gh": {"-R", "--repo", "--hostname"}, "glab": {"-R", "--repo"}}
+VALUE_FLAGS = {
+    "gh": {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--subject", "-A", "--author-email",
+           "--match-head-commit"},
+    "glab": {"-R", "--repo", "-m", "--message", "--squash-message", "--sha", "-t", "--title", "-d", "--description",
+             "-a", "--assignee", "-l", "--label", "--unlabel", "--milestone", "--target-branch", "--reviewer"},
+}
 AZ_VALUE_FLAGS = {"--id", "--status", "--draft", "--organization", "--org", "--detect", "--title",
                   "--description", "--auto-complete", "--squash", "--delete-source-branch",
                   "--bypass-policy", "--bypass-policy-reason", "--merge-commit-message",
@@ -77,12 +84,14 @@ def full_name(url):
     return found.group(1) if found else ""
 
 
-def parse_gh(words):
-    """(action, argument, repo flag, help) for gh pr ready|merge, else None."""
+def split_global(cli, words):
+    """(repo from a flag before the command, the words from the command on) for a gh or glab call. A flag that
+    is not a repo or host flag is skipped; a bare word before the command means it is not one we read."""
+    noun = {"gh": "pr", "glab": "mr"}[cli]
     i, repo = 0, None
-    while i < len(words) and words[i] != "pr":
+    while i < len(words) and words[i] != noun:
         w = words[i]
-        if w in GH_GLOBAL_VALUE and i + 1 < len(words):
+        if w in GLOBAL_VALUE[cli] and i + 1 < len(words):
             if w in ("-R", "--repo"):
                 repo = words[i + 1]
             i += 2
@@ -94,34 +103,40 @@ def parse_gh(words):
             i += 1
         else:
             return None
-    if i + 1 >= len(words) or words[i] != "pr" or words[i + 1] not in ("ready", "merge"):
-        return None
-    action, arg, helped = words[i + 1], None, False
-    j = i + 2
+    return repo, words[i:]
+
+
+def parse_flags(call, repo):
+    """(argument, repo, help) of a gh or glab merge or ready call: the first word that is not a flag or a flag's
+    value, the -R/--repo value, and whether it only asks for help (or, for gh pr ready, --undo)."""
+    cli, words = call.cli, call.rest
+    arg, helped, j = None, False, 0
+    value_flags = VALUE_FLAGS[cli]
+    if cli == "glab" and call.command == ("mr", "merge"):
+        value_flags = value_flags - {"-d", "--description"}
     while j < len(words):
         w = words[j]
-        if w in ("-h", "--help", "--undo"):
+        if w in ("-h", "--help") or (w == "--undo" and cli == "gh"):
             helped = True
         elif w in ("-R", "--repo") and j + 1 < len(words):
             repo, j = words[j + 1], j + 1
         elif w.startswith("--repo="):
             repo = w.split("=", 1)[1]
-        elif w in GH_VALUE_FLAGS:
+        elif w in value_flags:
             j += 1
         elif w.startswith("-"):
             pass
         elif arg is None:
             arg = w
         j += 1
-    return action, arg, repo, helped
+    return arg, repo, helped
 
 
-def parse_az(words):
-    """(id, help) for az repos pr update that completes or undrafts, else None."""
-    if words[:3] != ["repos", "pr", "update"]:
-        return None
-    pairs, flags, helped = {}, set(), False
-    j = 3
+def parse_az(call):
+    """(id, help) for an az repos pr update the table calls merge or ready."""
+    words = call.rest
+    pairs, helped = {}, False
+    j = 0
     while j < len(words):
         w = words[j]
         if w in ("-h", "--help"):
@@ -132,52 +147,42 @@ def parse_az(words):
         elif w in AZ_VALUE_FLAGS and j + 1 < len(words):
             pairs[w] = words[j + 1]
             j += 1
-        elif w.startswith("-"):
-            flags.add(w)
         j += 1
-    if pairs.get("--draft", "").lower() != "false" and pairs.get("--status", "").lower() != "completed":
-        return None
     return pairs.get("--id"), helped
 
 
-def view(cwd, arg, repo):
-    """(number, url) from gh pr view, else None. Runs with the hook's own environment, never the
-    command's inline one: the hook runs before the command is approved, so an inline PATH must not
-    pick which gh runs."""
-    cmd = ["gh", "pr", "view"] + ([arg] if arg else []) + (["-R", repo] if repo else []) + ["--json", "number,url"]
-    try:
-        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
-        if out.returncode != 0:
-            return None
-        data = json.loads(out.stdout)
-        return int(data["number"]), str(data.get("url") or "")
-    except Exception:
-        return None
+def view(call, arg, repo):
+    """(number, url) from the host's own pull request lookup (lib/forge.py), else None. Runs with the hook's own
+    environment, never the command's inline one: the hook runs before the command is approved, so an inline PATH
+    must not pick which CLI runs."""
+    info = forge.pr_info(call.kind, call.cwd, arg or "", repo=repo, timeout=5)
+    return (info["number"], info["url"]) if info else None
 
 
-def target(seg, kind, parsed):
+def target(seg, call, parsed):
     """(number, repo name as owner/repo or '') for the pull request this command acts on, else None."""
-    if kind == "az":
+    if call.kind == "azure":
         number = parsed[0]
         if not number or not number.isdigit():
             return None
         return int(number), full_name(hookkit.git(seg.cwd, "remote", "get-url", "origin") or "")
-    action, arg, repo, helped = parsed
-    repo = repo or seg.env.get("GH_REPO") or os.environ.get("GH_REPO") or None
+    arg, repo, _helped = parsed
+    if call.kind == "github":
+        repo = repo or seg.env.get("GH_REPO") or os.environ.get("GH_REPO") or None
     if arg:
         found = re.fullmatch(r"#?(\d+)", arg)
         if found:
             return int(found.group(1)), repo or full_name(hookkit.git(seg.cwd, "remote", "get-url", "origin") or "")
-        found = re.search(r"([^/]+/[^/]+)/pull/(\d+)", arg)
-        if found:
-            return int(found.group(2)), found.group(1)
-    got = view(seg.cwd, arg, repo)
+        shown = forge.pr_url(arg)
+        if shown:
+            return shown[1], shown[0]
+    got = view(call, arg, repo)
     if not got:
         return None
-    return got[0], full_name(got[1]) or repo or ""
+    return got[0], (forge.pr_url(got[1]) or ("",))[0] or repo or ""
 
 
-def logged(number, repo, kind="gh"):
+def logged(number, repo, kind="github"):
     """False only when the database has a reviews table, the repo has logged reviews, and none is for the pull request."""
     import leanstats
     if leanstats.off():
@@ -192,7 +197,7 @@ def logged(number, repo, kind="gh"):
         rows = [(r[0], r[1]) for r in conn.execute("SELECT repo, pr FROM reviews")]
     finally:
         conn.close()
-    if kind == "az" and any(pr == number for _, pr in rows):
+    if kind == "azure" and any(pr == number for _, pr in rows):
         return True
     want = last_part(repo)
     mine = [(r, pr) for r, pr in rows if not want or last_part(r) == want]
@@ -206,22 +211,26 @@ def message(command, cwd):
     for seg in hookkit.segments(command, cwd):
         if hookkit.disabled(SKIP, seg) or not seg.words:
             continue
-        prog = os.path.basename(seg.words[0])
         try:
-            if prog == "gh":
-                parsed = parse_gh(seg.words[1:])
-                if not parsed or parsed[3]:
-                    continue
-                kind = "gh"
-            elif prog == "az":
-                parsed = parse_az(seg.words[1:])
-                if not parsed or parsed[1]:
-                    continue
-                kind = "az"
-            else:
+            repo = None
+            call = hookkit.forge_call(seg)
+            if call and call.kind != "azure" and not call.command:
+                # Flags before the command word: `gh -R o/r pr merge 6`.
+                split = split_global(call.cli, call.args)
+                if split:
+                    repo, call = split[0], hookkit.ForgeCall(call.cli, split[1], seg.cwd)
+            if not call or hookkit.forge_action(call) not in ("merge", "ready"):
                 continue
-            found = target(seg, kind, parsed)
-            if not found or logged(*found, kind):
+            if call.kind == "azure":
+                parsed = parse_az(call)
+                if parsed[1]:
+                    continue
+            else:
+                parsed = parse_flags(call, repo)
+                if parsed[2]:
+                    continue
+            found = target(seg, call, parsed)
+            if not found or logged(*found, call.kind):
                 continue
         except Exception:
             continue
@@ -235,7 +244,8 @@ def main():
         return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command")
-    if not isinstance(command, str) or "pr" not in command or not any(w in command for w in ("ready", "merge", "update")):
+    if not isinstance(command, str) or not any(cli in command for cli in hookkit.FORGE_CLIS) \
+            or not any(w in command for w in ("ready", "merge", "update")):
         return 0
     text = message(command, event.get("cwd") or os.getcwd())
     if text:
@@ -377,6 +387,43 @@ def self_test():
         check("az help allows", message("az repos pr update --id 6 --draft false --help", repo), False)
         check("az create allows", message("az repos pr create --title t", repo), False)
         check("az skip inline allows", message(SKIP + "=1 az repos pr update --id 6 --draft false", repo), False)
+        check("az status Completed denies", message("az repos pr update --id 6 --status Completed", repo), True)
+        # GitLab: glab mr merge and glab mr update --ready, through the same table and the same lookup.
+        check("glab merge unlogged denies", message("glab mr merge 6 --squash", repo), True)
+        check("glab merge logged allows", message("glab mr merge 5", repo), False)
+        check("glab update --ready denies", message("glab mr update 6 --ready", repo), True)
+        check("glab update title allows", message("glab mr update 6 --title t", repo), False)
+        check("glab update --draft allows", message("glab mr update 6 --draft", repo), False)
+        check("glab merge --help allows", message("glab mr merge --help", repo), False)
+        check("glab merge message is not the number", message("glab mr merge -m 5 6", repo), True)
+        check("glab global -R denies", message("glab -R g/r mr merge 6", repo), True)
+        check("glab --repo denies", message("glab mr merge 6 --repo g/r", repo), True)
+        check("glab other repo with no reviews allows", message("glab mr merge 6 -R g/nobody", repo), False)
+        check("glab url form denies", message("glab mr merge https://gitlab.example.com/g/r/-/merge_requests/6", repo), True)
+        check("glab url form logged allows", message("glab mr merge https://gitlab.example.com/g/r/-/merge_requests/5", repo), False)
+        check("glab skip inline allows", message(SKIP + "=1 glab mr merge 6", repo), False)
+        check("glab create allows", message("glab mr create --fill", repo), False)
+        check("glab list allows", message("glab mr list", repo), False)
+        glab = os.path.join(bindir, "glab")
+
+        def fake_glab(body):
+            with open(glab, "w") as fh:
+                fh.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(glab, os.stat(glab).st_mode | stat.S_IXUSR)
+
+        gl_mr = '[{"iid": %d, "state": "opened", "web_url": "https://gitlab.example.com/g/r/-/merge_requests/%d"}]'
+        fake_glab("echo '" + gl_mr % (6, 6) + "'")
+        check("glab branch form denies", message("glab mr merge feat/x", repo), True)
+        check("glab no argument denies", message("glab mr merge", repo), True)
+        fake_glab("echo '" + gl_mr % (5, 5) + "'")
+        check("glab branch form logged allows", message("glab mr merge feat/x", repo), False)
+        fake_glab("exit 1")
+        check("glab failure allows", message("glab mr merge feat/x", repo), False)
+        fake_glab("echo not json")
+        check("glab garbage allows", message("glab mr merge feat/x", repo), False)
+        os.remove(glab)
+        check("glab missing allows", message("glab mr merge feat/x", repo), False)
+        check("glab unrelated api allows", message("glab api projects/1/merge_requests/6/merge", repo), False)
         fake_gh("exit 1")
         os.environ["LEAN_PROFILE"] = "standard"
         try:

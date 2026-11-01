@@ -2,9 +2,11 @@
 """Block agent attribution and AI slop in commits, pull requests, issues and releases.
 
 Runs as a Claude Code PreToolUse hook on Bash. Reads the hook JSON on stdin,
-and when the command is a git commit, tag or notes write, a gh pr/issue/release
-write, or a gh api write, checks the text it would publish. Exit 2 blocks the
-call and tells the agent what to fix.
+and when the command is a git commit, tag or notes write, a pull request, merge
+request, issue or release write on any host (gh, glab, az), or a gh or glab api
+write, checks the text it would publish. Exit 2 blocks the call and tells the
+agent what to fix. The commands and flags of each host are one table in
+lib/hookkit.py.
 
 What is checked:
   attribution  the whole command, plus every message it publishes
@@ -39,10 +41,6 @@ import hookkit  # noqa: E402
 from house_style import scan  # noqa: E402
 
 GIT_WRITES = {"commit", "tag", "notes"}
-GH_GROUPS = {"pr", "issue", "release"}
-GH_WRITES = {"create", "edit", "comment", "review", "merge"}
-GH_TEXT_FLAGS = {"--title", "-t", "--body", "-b", "--notes", "-n", "--subject"}
-GH_FILE_FLAGS = {"--body-file", "-F", "--notes-file"}
 API_FIELD_FLAGS = {"-f", "-F", "--field", "--raw-field"}
 FENCE = re.compile(r"(```|~~~).*?(\1|\Z)", re.S)
 INLINE_CODE = re.compile(r"`[^`\n]*`")
@@ -97,9 +95,11 @@ def git_texts(args, seg):
     return texts
 
 
-def gh_texts(args, seg):
-    texts = [("the " + flag.lstrip("-"), value) for flag, value in flag_values(args, GH_TEXT_FLAGS)]
-    for _flag, value in flag_values(args, GH_FILE_FLAGS):
+def forge_texts(call, seg):
+    """Texts a pull request, merge request, issue or release command of any host would publish."""
+    flags = hookkit.FORGE_FLAGS[call.cli]
+    texts = [("the " + flag.lstrip("-"), value) for flag, value in hookkit.forge_flag_values(call, flags["text"])]
+    for _flag, value in hookkit.forge_flag_values(call, flags["file"]):
         text = read_text(value, seg)
         if text is not None:
             texts.append((value if value != "-" else "the heredoc", text))
@@ -137,14 +137,13 @@ def published(seg):
     call = hookkit.git_call(seg)
     if call and call[0] in GIT_WRITES:
         return git_texts(call[1], seg)
-    gh = hookkit.gh_call(seg)
-    if not gh:
+    call = hookkit.forge_call(seg)
+    if not call:
         return None
-    args = gh[0]
-    if args[:1] and args[0] in GH_GROUPS and args[1:2] and args[1] in GH_WRITES:
-        return gh_texts(args[2:], seg)
-    if args[:1] == ["api"]:
-        return api_texts(args[1:], seg)
+    if call.is_api:
+        return api_texts(call.args[1:], seg)
+    if call.action and call.action != "ready":
+        return forge_texts(call, seg)
     return None
 
 
@@ -199,6 +198,24 @@ def self_test():
         "LEAN_ALLOW_ATTRIBUTION=1 git commit -m 'a rob" + "ust retry'",
         "LEAN_ALLOW_SLOP=1 git commit -m 'x' -m 'Claude-" + "Session: x'",
         "gh pr create --title t --body 'a rob" + "ust fix, see `code`'",
+        "gh pr merge 4 --squash --body 'a rob" + "ust retry'",
+        'glab mr create --title t --description "fast \u2014 and safe"',
+        'glab mr create --title t -d "done\n\nGenerated with [Claude Co' + 'de](https://x)"',
+        "glab mr create --title=t --description='a rob" + "ust retry'",
+        "glab mr update 3 --description 'old \u2192 new'",
+        "glab mr note 3 -m 'see https://claude.ai/code/" + "session_abc'",
+        "glab mr note create 3 --message 'Done. Addition" + "ally, it logs.'",
+        "glab issue create --title t --description 'a seam" + "less fix'",
+        "glab release create v1 --notes 'a compre" + "hensive release'",
+        "glab api projects/1/merge_requests/2/notes -f body='a seam" + "less fix'",
+        "glab api -X PUT projects/1/merge_requests/2 --raw-field 'description=old \u2192 new'",
+        'az repos pr create --title t --description "fast \u2014 and safe"',
+        "az repos pr create --title t --description 'one line' 'a rob" + "ust retry' --auto-complete true",
+        "az repos pr create --title 'a seam" + "less fix' --description ok",
+        "az repos pr update --id 3 --description 'old \u2192 new'",
+        "az repos pr update --id 3 --status completed --description 'a compre" + "hensive fix'",
+        "az repos pr create --description='a rob" + "ust retry' --title t",
+        "az boards work-item create --title t --description 'a rob" + "ust retry'",
     ]
     allowed = [
         'git commit -m "wait for database health before the integration suite"',
@@ -220,6 +237,16 @@ def self_test():
         "git add . # a rob" + "ust comment\ngit commit -m x",
         "git tag -l 'rob" + "ust*'",
         "gh api repos/o/r/issues -F per_page=100 --jq '.[].title | select(test(\"rob" + "ust\"))'",
+        "glab mr create --title t --description 'the hook blocks a `Claude-Session:` trailer'",
+        "glab mr list --search 'rob" + "ust'",
+        "glab api -X GET projects/1/issues -f search='rob" + "ust'",
+        "glab api projects/1/merge_requests",
+        "az repos pr list --status active",
+        "az repos pr create --title t --description 'wait for the database before the suite'",
+        "az repos pr update --id 3 --auto-complete true",
+        "az repos pr show --id 3 --query title",
+        "LEAN_ALLOW_SLOP=1 glab mr create --description 'a rob" + "ust retry'",
+        "echo glab mr create --description 'a rob" + "ust retry'",
     ]
     failures = 0
     for cmd in blocked:
@@ -250,6 +277,8 @@ def self_test():
                     f"gh api repos/o/r/issues/1/comments --input {slop}",
                     "gh api repos/o/r/issues/1/comments --input=notes.md",
                     "cd sub && git commit -F msg.txt",
+                    f"glab mr create --notes-file {slop}", f"glab release create v1 --notes-file={slop}",
+                    "glab api projects/1/notes -F body=@body.md",
                     "gh api graphql -F query=@q.graphql",
                     "gh api graphql --input q.graphql"):
             if not problems(cmd, cwd=tmp):

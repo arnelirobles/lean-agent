@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lists every reason a pull request cannot merge, in one call.
 #
-#   pr-blockers.sh <pr-number> [-R owner/repo]
+#   pr-blockers.sh <pr-number> [-R REPO]
 #   pr-blockers.sh --self-test
 #
 # Why this exists. A refused merge used to be diagnosed one blocker at a time: read the checks, then
@@ -11,7 +11,12 @@
 # waiting at action_required (so the required checks can never report), and a ruleset that wants an
 # extra approval because the head commit's author matches no account.
 #
-# What it reads: the pull request, its check rollup, the branch's classic protection and ruleset
+# Hosts. REPO is what lib/forge.py takes: owner/name (GitHub), HOST/group/project (GitLab), or an Azure DevOps
+# clone URL. Without -R it comes from the origin remote. The reads go through lib/forge.py, which writes
+# them as GitHub-shaped files; GitLab and Azure fill the same fields from their own data (approvals,
+# discussions, pipeline jobs; policy evaluations, threads), so one analysis serves all three.
+#
+# What it reads on GitHub: the pull request, its check rollup, the branch's classic protection and ruleset
 # rules, workflow runs waiting for approval on the head commit, review threads (GraphQL), the head
 # commit's author, how far behind the base the head is, and the repository's merge settings.
 #
@@ -27,6 +32,10 @@ analyze_py=$(cat <<'PY'
 import json, os, re, sys
 
 d = sys.argv[1]
+kind = sys.argv[2] if len(sys.argv) > 2 else "github"
+sys.path.insert(0, sys.argv[3] if len(sys.argv) > 3 else ".")
+import forge
+host = forge.PROVIDERS.get(kind, forge.GitHub)()
 blockers, notes, errors = [], [], []
 
 def load(name):
@@ -49,18 +58,18 @@ if pr is None:
     if not errors:
         errors.append("could not read pr: no data")
     for e in errors:
-        print("ERROR    " + e)
+        print("ERROR    " + forge.CONTROL.sub("", e))
     print("0 blockers, %d read errors. Treat this as unknown, not clear." % len(errors))
     sys.exit(2)
 
 base = pr.get("baseRefName", "?")
 if "UNKNOWN" in (pr.get("mergeable"), pr.get("mergeStateStatus")) and pr.get("state", "OPEN") == "OPEN":
-    errors.append("GitHub has not computed mergeability yet (still UNKNOWN after a retry); run this again in a minute")
+    errors.append("%s has not computed mergeability yet (still UNKNOWN after a retry); run this again in a minute" % host.host_name)
 state = pr.get("state")
 if state and state != "OPEN":
     blockers.append("the pull request is %s" % state.lower())
 if pr.get("isDraft"):
-    blockers.append("it is a draft; mark it ready with: gh pr ready %s" % pr.get("number", ""))
+    blockers.append("it is a draft; mark it ready with: %s" % host.ready_command(pr.get("number", "")))
 if pr.get("mergeable") == "CONFLICTING" or pr.get("mergeStateStatus") == "DIRTY":
     blockers.append("it conflicts with %s; merge the base and resolve" % base)
 
@@ -180,7 +189,7 @@ if isinstance(commit, dict):
     ca = (commit.get("commit") or {}).get("author") or {}
     ident = "%s <%s>" % (ca.get("name", "?"), ca.get("email", "?"))
     if commit.get("author") is None:
-        msg = "head commit author %s matches no GitHub account" % ident
+        msg = "head commit author %s matches no %s account" % (ident, host.host_name)
         if unattributed_rule:
             blockers.append(msg + ", and the ruleset requires an extra approval for unattributed changes. Set git user.name and user.email to your account and amend, or get the approval")
         else:
@@ -215,7 +224,7 @@ elif not merge_queue:
 # How to merge.
 repo = load("repo")
 if merge_queue:
-    notes.append("merge queue is on for %s: use `gh pr merge %s` with no strategy flag (a strategy flag is refused) and no --delete-branch" % (base, pr.get("number", "<n>")))
+    notes.append("merge queue is on for %s: use `%s` with no strategy flag (a strategy flag is refused) and no --delete-branch" % (base, host.merge_command(pr.get("number", "<n>"))))
 else:
     methods = []
     if isinstance(repo, dict):
@@ -225,17 +234,20 @@ else:
     allowed = pr_rule.get("allowed_merge_methods")
     if isinstance(allowed, list) and allowed:
         methods = [m for m in methods if m.lstrip("-") in allowed] or ["--" + a for a in allowed]
-    notes.append("no merge queue on %s: use `gh pr merge %s %s`" % (base, pr.get("number", "<n>"), methods[0] if methods else "--squash"))
+    notes.append("no merge queue on %s: use `%s`" % (base, host.merge_command(pr.get("number", "<n>"), methods[0] if methods else "--squash")))
 
 if pr.get("mergeStateStatus") == "BLOCKED" and not blockers:
-    blockers.append("GitHub reports BLOCKED but none of the reads above explains it; read the rulesets with: gh api repos/OWNER/REPO/rulesets")
+    blockers.append("%s reports BLOCKED but none of the reads above explains it; %s" % (host.host_name, host.unexplained))
+
+def clean(text):
+    return forge.CONTROL.sub("", text)
 
 for b in blockers:
-    print("BLOCKER  " + b)
+    print("BLOCKER  " + clean(b))
 for e in errors:
-    print("ERROR    " + e)
+    print("ERROR    " + clean(e))
 for n in notes:
-    print("NOTE     " + n)
+    print("NOTE     " + clean(n))
 print("%d blockers, %d read errors (merge state %s)" % (len(blockers), len(errors), pr.get("mergeStateStatus", "?")))
 if errors:
     sys.exit(2)
@@ -243,7 +255,9 @@ sys.exit(1 if blockers else 0)
 PY
 )
 
-analyze() { python3 -c "$analyze_py" "$1"; }
+lib="$(cd "$(dirname "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")")/../lib" && pwd)"
+forge() { python3 "$lib/forge.py" "$@"; }
+analyze() { python3 -c "$analyze_py" "$1" "${2:-github}" "$lib"; }
 
 self_test() {
   # timeout caps a hang; macOS has it only as coreutils' gtimeout, and without either the call runs uncapped.
@@ -324,22 +338,70 @@ J
   $to bash "$(readlink -f "$0")" 9 -R >/dev/null 2>&1; rc=$?
   [ "$rc" = 2 ] || { echo "self-test failed: -R with no value gave exit $rc, want 2"; fails=$((fails + 1)); }
 
+  # The host's own words and commands: the same analysis, a different provider.
+  mkdir -p "$t/glab" "$t/az"
+  cp "$t/clean/"*.json "$t/glab/"; cp "$t/clean/"*.json "$t/az/"
+  for k in glab az; do
+    sed 's/"isDraft":false/"isDraft":true/; s/"number":7/"number":7,"x":"\u001b[31m"/' "$t/clean/pr.json" > "$t/$k/pr.json"
+  done
+  out=$(analyze "$t/glab" gitlab); grep -q 'mark it ready with: glab mr update 7 --ready' <<<"$out" && grep -q 'glab mr merge 7' <<<"$out" \
+    || { echo "self-test failed: gitlab hints in:"; echo "$out"; fails=$((fails + 1)); }
+  out=$(analyze "$t/az" azure); grep -q 'mark it ready with: az repos pr update --id 7 --draft false' <<<"$out" && grep -q 'az repos pr update --id 7 --status completed' <<<"$out" \
+    || { echo "self-test failed: azure hints in:"; echo "$out"; fails=$((fails + 1)); }
+  out=$(analyze "$t/clean"); grep -q 'gh pr merge 7 --squash' <<<"$out" || { echo "self-test failed: github hints changed"; fails=$((fails + 1)); }
+  mkdir -p "$t/ctl"; cp "$t/clean/"*.json "$t/ctl/"
+  printf '%s' '{"number":7,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"bad\u001b[2Jname","status":"COMPLETED","conclusion":"FAILURE"}]}' > "$t/ctl/pr.json"
+  out=$(analyze "$t/ctl")
+  if grep -q "$(printf '\033')" <<<"$out"; then echo "self-test failed: a control character reached the output"; fails=$((fails + 1)); fi
+  grep -q 'check failing: bad\[2Jname' <<<"$out" || { echo "self-test failed: check name not printed without its control character: $out"; fails=$((fails + 1)); }
+
   local me; me=$(readlink -f "$0")
+  # A fake glab on PATH: a draft merge request with a failing job, an unresolved thread and a missing approval.
+  mkdir -p "$t/fakeglab"
+  cat > "$t/fakeglab/glab" <<'G'
+#!/bin/sh
+for last; do :; done
+D=$(dirname "$0")
+echo "$*" >> "$D/calls"
+case "$last" in
+  */merge_requests/5/approvals) cat "$D/approvals.json" ;;
+  */merge_requests/5/discussions*) cat "$D/discussions.json" ;;
+  */merge_requests/5) cat "$D/mr.json" ;;
+  */pipelines/9/jobs*) cat "$D/jobs.json" ;;
+  projects/g%2Fr) cat "$D/project.json" ;;
+  *) echo "404 not found" >&2; exit 1 ;;
+esac
+G
+  chmod +x "$t/fakeglab/glab"
+  echo '{"iid":5,"state":"opened","draft":true,"detailed_merge_status":"discussions_not_resolved","head_pipeline":{"id":9},"sha":"cafe","target_branch":"main","title":"$(id)"}' > "$t/fakeglab/mr.json"
+  echo '{"approvals_required":1,"approvals_left":1,"approved_by":[]}' > "$t/fakeglab/approvals.json"
+  echo '[{"notes":[{"resolvable":true,"resolved":false,"author":{"username":"bot"},"position":{"new_path":"a.py","new_line":3}}]}]' > "$t/fakeglab/discussions.json"
+  echo '[{"id":1,"name":"build","status":"success"},{"id":2,"name":"lint$(id)","status":"failed"}]' > "$t/fakeglab/jobs.json"
+  echo '{"only_allow_merge_if_all_discussions_are_resolved":true,"merge_method":"merge","squash_option":"default_off"}' > "$t/fakeglab/project.json"
+  rm -rf "$t/clone"; git init -q "$t/clone"; git -C "$t/clone" remote add origin https://gitlab.com/g/r.git
+  out=$(cd "$t/clone" && PATH="$t/fakeglab:$PATH" $to bash "$me" 5); rc=$?
+  [ "$rc" = 1 ] || { echo "self-test failed: a fake gitlab merge request gave exit $rc, want 1: $out"; fails=$((fails + 1)); }
+  for pat in 'BLOCKER  it is a draft; mark it ready with: glab mr update 5 --ready' 'check failing: lint\$\(id\)' \
+             'BLOCKER  1 unresolved review thread.*a.py:3 by bot' 'BLOCKER  an approving review is still required' \
+             'wants 1 approving review' 'use `glab mr merge 5 --squash`'; do
+    grep -qE "$pat" <<<"$out" || { echo "self-test failed: gitlab output lacks '$pat':"; echo "$out"; fails=$((fails + 1)); }
+  done
+  # The same through -R, from a folder that is no clone.
+  out=$(cd "$t" && PATH="$t/fakeglab:$PATH" $to bash "$me" 5 -R gitlab.com/g/r); rc=$?
+  [ "$rc" = 1 ] || { echo "self-test failed: -R on gitlab gave exit $rc, want 1"; fails=$((fails + 1)); }
+  # A host whose CLI is missing: one line, exit 2, nothing else.
+  mkdir -p "$t/empty"
+  out=$(cd "$t/clone" && PATH="$t/empty:$(dirname "$(command -v python3)"):$(dirname "$(command -v git)"):/usr/bin:/bin" $to bash "$me" 5 2>&1); rc=$?
+  case "$out" in *"glab is not installed; install glab"*) [ "$rc" = 2 ] && [ "$(wc -l <<<"$out")" -le 2 ] || { echo "self-test failed: missing glab gave exit $rc and '$out'"; fails=$((fails + 1)); } ;;
+    *) command -v glab >/dev/null && : || { echo "self-test failed: missing glab said '$out'"; fails=$((fails + 1)); } ;;
+  esac
   # A gh that knows the repository (as with a github remote or GH_REPO) and fails every other read.
   mkdir -p "$t/fakegh"
   printf '#!/bin/sh\ncase "$1 $2" in "repo view") echo o/r ;; *) echo "HTTP 404" >&2; exit 1 ;; esac\n' > "$t/fakegh/gh"
   chmod +x "$t/fakegh/gh"
-  mkdir -p "$t/nogh"; printf '#!/bin/sh\nexit 1\n' > "$t/nogh/gh"; chmod +x "$t/nogh/gh"
-  for forge in "gitlab https://gitlab.com/g/r.git" "azure https://dev.azure.com/o/p/_git/r"; do
-    rm -rf "$t/clone"; git init -q "$t/clone"; git -C "$t/clone" remote add origin "${forge#* }"
-    out=$(cd "$t/clone" && PATH="$t/nogh:$PATH" $to bash "$me" 3 2>&1 >/dev/null); rc=$?
-    want="pr-blockers: this repository is on ${forge%% *}; pr-blockers reads GitHub pull requests only"
-    [ "$rc" = 2 ] && [ "$out" = "$want" ] || { echo "self-test failed: ${forge%% *} clone gave exit $rc and '$out'"; fails=$((fails + 1)); }
-  done
-  # A GitLab-first clone that gh still maps to GitHub (another remote, GH_REPO) keeps going to GitHub.
   git -C "$t/clone" remote add github https://github.com/o/r.git
   out=$(cd "$t/clone" && PATH="$t/fakegh:$PATH" $to bash "$me" 3 2>&1 >/dev/null)
-  case "$out" in *"this repository is on"*) echo "self-test failed: a clone gh maps to GitHub was refused: '$out'"; fails=$((fails + 1)) ;; esac
+  case "$out" in *"not installed"*|*"not in a repository"*) echo "self-test failed: a clone gh maps to GitHub was refused: '$out'"; fails=$((fails + 1)) ;; esac
 
   [ "$fails" = 0 ] && echo "self-test passed" && return 0
   return 1
@@ -355,54 +417,19 @@ while [ $# -gt 0 ]; do
     *) pr=$1; shift ;;
   esac
 done
-case "$pr" in ''|*[!0-9]*) echo "usage: pr-blockers.sh <pr-number> [-R owner/repo]" >&2; exit 2 ;; esac
-command -v gh >/dev/null || { echo "pr-blockers: gh is not installed" >&2; exit 2; }
+case "$pr" in ''|*[!0-9]*) echo "usage: pr-blockers.sh <pr-number> [-R REPO]" >&2; exit 2 ;; esac
 
 if [ -z "$repo" ]; then
-  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || repo=""
-  if [ -z "$repo" ]; then
-    # Rulesets, merge queues and branch protection are GitHub's, so a clone of another host gets one plain line.
-    kind=$(python3 "$(dirname "$(readlink -f "$0")")/../lib/forge.py" kind . 2>/dev/null) || kind=unknown
-    case "$kind" in github|unknown) ;; *) echo "pr-blockers: this repository is on $kind; pr-blockers reads GitHub pull requests only" >&2; exit 2 ;; esac
-    echo "pr-blockers: not in a GitHub repository; pass -R owner/repo" >&2; exit 2
-  fi
+  repo=$(forge repo . 2>/dev/null) || repo=""
+  [ -n "$repo" ] || { echo "pr-blockers: not in a repository on GitHub, GitLab or Azure DevOps; pass -R REPO" >&2; exit 2; }
 fi
-owner=${repo%%/*}; name=${repo#*/}
+kind=$(forge repo-kind "$repo" 2>/dev/null) || kind=github
 
 w=$(mktemp -d)
 trap 'rm -rf "$w"' EXIT
 
-get() { # $1 file stem, rest: gh args
-  local stem=$1; shift
-  gh "$@" > "$w/$stem.json" 2> "$w/$stem.err" || { [ -s "$w/$stem.err" ] || echo "gh exited nonzero" > "$w/$stem.err"; : > "$w/$stem.json"; rm -f "$w/$stem.json"; }
-}
-
-fields=number,state,isDraft,mergeable,mergeStateStatus,reviewDecision,baseRefName,headRefOid,latestReviews,statusCheckRollup
-get pr pr view "$pr" -R "$repo" --json "$fields"
-if [ ! -s "$w/pr.json" ]; then analyze "$w"; exit $?; fi
-# GitHub computes mergeability lazily; the first read after a push often says UNKNOWN. One retry.
-if python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(0 if p.get("state")=="OPEN" and "UNKNOWN" in (p.get("mergeable"), p.get("mergeStateStatus")) else 1)' "$w/pr.json"; then
-  sleep "${PR_BLOCKERS_RETRY_SLEEP:-5}"
-  get pr pr view "$pr" -R "$repo" --json "$fields"
-  if [ ! -s "$w/pr.json" ]; then analyze "$w"; exit $?; fi
-fi
-base=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$w/pr.json")
-sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' "$w/pr.json")
-
-get branch  api "repos/$repo/branches/$base"
-get rules   api "repos/$repo/rules/branches/$base"
-get runs    api "repos/$repo/actions/runs?head_sha=$sha&status=action_required&per_page=50"
-get commit  api "repos/$repo/commits/$sha"
-get compare api "repos/$repo/compare/$base...$sha"
-get repo    api "repos/$repo"
-get threads api graphql -F owner="$owner" -F name="$name" -F number="$pr" -f query='
-query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
-  reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated path line comments(first:1){nodes{author{login}}}}}}}}'
-
-get mq api graphql -F owner="$owner" -F name="$name" -F branch="$base" -f query='
-query($owner:String!,$name:String!,$branch:String!){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){id}}}'
-
-# The branch endpoint 404s on an unprotected branch with no rules; that is an answer, not a failure.
-if [ -s "$w/branch.err" ] && grep -q 'HTTP 404' "$w/branch.err"; then rm -f "$w/branch.err"; fi
-
-analyze "$w"
+# Every read goes through lib/forge.py, which writes NAME.json or NAME.err for the analysis. A missing host CLI
+# stops it with one line and exit 2.
+forge blockers-data "$repo" "$pr" "$w"; rc=$?
+[ "$rc" = 0 ] || exit "$rc"
+analyze "$w" "$kind"

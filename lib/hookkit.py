@@ -421,6 +421,114 @@ def gh_call(seg):
     return words[1:], seg.cwd
 
 
+# The one table of code host commands the hooks care about. Each host's CLI maps to the words that name a
+# command, and what the command does: "create" opens a pull request, "merge" merges one, "ready" takes one out of
+# draft, "update" edits one (an Azure update that completes the pull request counts as a merge and one that sets
+# --draft false, or a glab update with --ready, counts as ready, see forge_action), "text" writes public
+# text without opening or merging anything (comments, reviews, issues, releases).
+# To add a host: add its CLI to FORGE_CLIS, its commands to FORGE_COMMANDS, its flags to FORGE_FLAGS.
+FORGE_CLIS = {"gh": "github", "glab": "gitlab", "az": "azure"}
+FORGE_COMMANDS = {
+    "gh": {
+        ("pr", "create"): "create", ("pr", "merge"): "merge", ("pr", "ready"): "ready", ("pr", "edit"): "update",
+        ("pr", "comment"): "text", ("pr", "review"): "text",
+        ("issue", "create"): "text", ("issue", "edit"): "text", ("issue", "comment"): "text",
+        ("release", "create"): "text", ("release", "edit"): "text",
+    },
+    "glab": {
+        ("mr", "create"): "create", ("mr", "merge"): "merge", ("mr", "update"): "update",
+        ("mr", "note"): "text", ("mr", "note", "create"): "text",
+        ("issue", "create"): "text", ("issue", "update"): "text", ("issue", "note"): "text",
+        ("issue", "note", "create"): "text", ("release", "create"): "text", ("release", "update"): "text",
+    },
+    "az": {
+        ("repos", "pr", "create"): "create", ("repos", "pr", "update"): "update",
+        ("boards", "work-item", "create"): "text", ("boards", "work-item", "update"): "text",
+    },
+}
+# Flags that carry public text (value follows), and flags that name a file holding it. "multi" hosts take
+# several words after one flag (az: --description "line one" "line two").
+FORGE_FLAGS = {
+    "gh": {"text": {"--title", "-t", "--body", "-b", "--notes", "-n", "--subject"},
+           "file": {"--body-file", "-F", "--notes-file"}, "multi": False},
+    "glab": {"text": {"--title", "-t", "--description", "-d", "--message", "-m", "--notes", "-N"},
+             "file": {"--notes-file", "-F"}, "multi": False},
+    "az": {"text": {"--title", "--description", "-d", "--discussion"}, "file": set(), "multi": True},
+}
+FORGE_API = {"gh", "glab"}  # CLIs with an `api` command that takes -f/-F/--field/--raw-field/--input
+
+
+class ForgeCall:
+    """One code host command: `cli` (gh, glab or az), `kind` (github, gitlab, azure), `args` (the words after the
+    CLI), `command` (the table key that matched, or None), `action` (create, merge, update, text or None), `rest`
+    (the words after the matched command) and `cwd`."""
+
+    def __init__(self, cli, args, cwd):
+        self.cli, self.kind, self.args, self.cwd = cli, FORGE_CLIS[cli], args, cwd
+        self.command = next((key for key in sorted(FORGE_COMMANDS[cli], key=len, reverse=True)
+                             if tuple(args[:len(key)]) == key), None)
+        self.action = FORGE_COMMANDS[cli].get(self.command) if self.command else None
+        self.rest = args[len(self.command):] if self.command else args
+
+    @property
+    def is_api(self):
+        return self.cli in FORGE_API and self.args[:1] == ["api"]
+
+
+def forge_call(seg):
+    """A ForgeCall for a gh, glab or az segment, or None."""
+    words = seg.words
+    if not words or os.path.basename(words[0]) not in FORGE_CLIS:
+        return None
+    return ForgeCall(os.path.basename(words[0]), words[1:], seg.cwd)
+
+
+def forge_action(call):
+    """create, merge, ready, update, text or None. An Azure `repos pr update` that completes the pull request
+    (--status completed) is a merge, one that sets --draft false is ready; a glab `mr update --ready` is ready."""
+    if call is None or call.action is None:
+        return None
+    if call.action == "update" and call.kind in ("azure", "gitlab"):
+        found = set()
+        for i, word in enumerate(call.rest):
+            key, _, value = word.partition("=")
+            value = value or (call.rest[i + 1] if i + 1 < len(call.rest) else "")
+            value = value.lower()
+            if call.kind == "azure" and key == "--status" and value == "completed":
+                found.add("merge")
+            elif call.kind == "azure" and key == "--draft" and value == "false":
+                found.add("ready")
+            elif call.kind == "gitlab" and word == "--ready":
+                found.add("ready")
+        for action in ("merge", "ready"):
+            if action in found:
+                return action
+    return call.action
+
+
+def forge_flag_values(call, flags, args=None):
+    """(flag, value) for `--flag value`, `--flag=value` and `-f value` in the call's words, up to `--`.
+    For a host whose flags take several words (az), the value is all the words up to the next flag."""
+    words = call.rest if args is None else args
+    multi = FORGE_FLAGS[call.cli]["multi"]
+    for i, word in enumerate(words):
+        if word == "--":
+            return
+        if word in flags:
+            if i + 1 >= len(words):
+                continue
+            if multi:
+                j = i + 1
+                while j < len(words) and not words[j].startswith("-") and words[j] not in SEPARATORS:
+                    j += 1
+                if j > i + 1:
+                    yield word, "\n".join(words[i + 1:j])
+            else:
+                yield word, words[i + 1]
+        elif word.startswith("--") and "=" in word and word.split("=", 1)[0] in flags:
+            yield tuple(word.split("=", 1))
+
+
 def self_test():
     import contextlib
     import io
@@ -468,6 +576,33 @@ def self_test():
     check("echo is not git", git_call(segments('echo "git commit"')[0]), None)
     check("grep is not git", [git_call(s) for s in segments("git log --grep 'git commit'")][0][0], "log")
     check("gh call", gh_call(segments("gh pr create --fill | cat")[0])[0][:2], ["pr", "create"])
+    for cmd, kind, action in (("gh pr create --fill", "github", "create"), ("gh pr merge 3", "github", "merge"),
+                              ("glab mr create -d x", "gitlab", "create"), ("glab mr merge 3", "gitlab", "merge"),
+                              ("az repos pr create --title t", "azure", "create"),
+                              ("az repos pr update --id 3 --status completed", "azure", "merge"),
+                              ("az repos pr update --id 3 --status=completed", "azure", "merge"),
+                              ("az repos pr update --id 3 --title t", "azure", "update"),
+                              ("az repos pr update --id 3 --status Completed", "azure", "merge"),
+                              ("az repos pr update --id 3 --draft false", "azure", "ready"),
+                              ("az repos pr update --id 3 --draft=false", "azure", "ready"),
+                              ("az repos pr update --id 3 --draft true", "azure", "update"),
+                              ("gh pr ready 3", "github", "ready"), ("glab mr update 3 --ready", "gitlab", "ready"),
+                              ("glab mr update 3 --title t", "gitlab", "update"),
+                              ("glab mr note 3 -m hi", "gitlab", "text"), ("glab mr note create 3 -m hi", "gitlab", "text"),
+                              ("/usr/bin/glab mr merge 3", "gitlab", "merge"), ("GITLAB_HOST=x glab mr merge 3", "gitlab", "merge")):
+        fc = forge_call(segments(cmd)[0])
+        check(f"forge table {cmd}", (fc.kind, forge_action(fc)) if fc else None, (kind, action))
+    for cmd in ("glab mr list", "az repos pr list", "az repos list", "gh pr view 3", "glab api projects/1", "echo glab mr merge 3",
+                "az account show"):
+        fc = forge_call(segments(cmd)[0])
+        check(f"forge table ignores {cmd}", forge_action(fc), None)
+    check("forge call on git", forge_call(segments("git status")[0]), None)
+    check("note create keeps its rest", forge_call(segments("glab mr note create 3 -m hi")[0]).rest, ["3", "-m", "hi"])
+    az = forge_call(segments("az repos pr create --title 'a b' --description 'one' 'two words' --auto-complete true")[0])
+    check("az description takes every word", list(forge_flag_values(az, FORGE_FLAGS["az"]["text"])),
+          [("--title", "a b"), ("--description", "one\ntwo words")])
+    glab = forge_call(segments("glab mr create --title=t -d 'body here'")[0])
+    check("glab flag forms", list(forge_flag_values(glab, FORGE_FLAGS["glab"]["text"])), [("--title", "t"), ("-d", "body here")])
     check("unbalanced quote falls back", len(segments('git commit -m "oops')) >= 1, True)
     check("resolve relative", resolve("a/b", "/x"), "/x/a/b")
     check("comment ends at the newline", [s.words for s in segments("git add . # stage\ngit commit -m x")],

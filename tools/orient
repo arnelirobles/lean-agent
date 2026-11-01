@@ -10,8 +10,9 @@ for the branch with a summary of its checks. With --all, one line per worktree: 
 dirty count, ahead and behind the same two refs, and the age of the last commit. More than 20
 worktrees are cut off with a count.
 
-The pull request comes from `gh pr view`, with a 10 second limit. Without gh, without a
-login, or without a pull request, that line says so and the rest still prints. Read only:
+The pull request comes from lib/forge.py, with a 10 second limit: gh on GitHub, glab on GitLab, az
+on Azure DevOps (picked from the origin URL, or LEAN_FORGE). Without the CLI, without a login, or
+without a pull request, that line says so and the rest still prints. Read only:
 nothing is fetched, so ahead and behind are as of the last fetch.
 
 Exit 2 outside a git repository.
@@ -24,6 +25,9 @@ import subprocess
 import sys
 import tempfile
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import forge  # noqa: E402
 
 MAX_WORKTREES = 20
 
@@ -107,16 +111,18 @@ def summarize_checks(rollup):
 def pull_request(cwd, branch):
     if not branch:
         return "none (detached HEAD)"
-    code, out = run(["gh", "pr", "view", branch, "--json", "number,state,statusCheckRollup"], cwd)
-    if code != 0:
-        return "none, or gh is not available"
-    try:
-        data = json.loads(out)
-    except ValueError:
-        return "gh answered with something unreadable"
-    if data.get("state") not in (None, "OPEN"):
+    kind = forge.detect(forge.remote_url(cwd))
+    kind = "github" if kind == "unknown" else kind
+    if forge.missing_cli(kind):
+        return "none, or %s is not available" % forge.CLI_OF[kind]
+    info = forge.pr_info(kind, cwd, branch, checks=True, timeout=10)
+    if info is None:
+        return "none, or %s is not available" % forge.CLI_OF[kind]
+    if not info["open"]:
         return "none open"
-    return "#%s, checks: %s" % (data.get("number"), summarize_checks(data.get("statusCheckRollup")))
+    if info["rollup"] is None:
+        return "#%s, checks: unavailable" % info["number"]
+    return "#%s, checks: %s" % (info["number"], summarize_checks(info["rollup"]))
 
 
 def current_branch(cwd):
@@ -216,6 +222,39 @@ def self_test():
                 "{\"state\":\"SUCCESS\"}]}';; *) exit 1;; esac\n")
     os.chmod(gh, 0o755)
     os.environ["PATH"] = fake + os.pathsep + os.environ["PATH"]
+
+    # A GitLab origin asks glab, an Azure origin asks az, and neither asks gh (the gh above would answer #42).
+    mr = ('{"iid":7,"state":"opened","web_url":"https://gitlab.example.com/g/r/-/merge_requests/7",'
+          '"head_pipeline":{"id":9}}')
+    with open(os.path.join(fake, "glab"), "w") as f:
+        f.write("#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n"
+                "*merge_requests?source_branch=feat%2Fx*) echo '[" + mr + "]';;\n"
+                "*/merge_requests/7) echo '" + mr + "';;\n"
+                "*/pipelines/9/jobs*) echo '[{\"id\":1,\"name\":\"a\",\"status\":\"success\"},"
+                "{\"id\":2,\"name\":\"b\",\"status\":\"failed\"},{\"id\":3,\"name\":\"c\",\"status\":\"running\"}]';;\n"
+                "*) exit 1;; esac\n")
+    with open(os.path.join(fake, "az"), "w") as f:
+        f.write("#!/bin/sh\ncase \"$3\" in\nlist) echo '[{\"pullRequestId\":4,\"status\":\"active\"}]';;\n"
+                "policy) echo '[{\"status\":\"approved\",\"configuration\":{\"isBlocking\":true,\"isEnabled\":true,"
+                "\"type\":{\"displayName\":\"Reviewers\"}}}]';;\n*) exit 1;; esac\n")
+    os.chmod(os.path.join(fake, "glab"), 0o755)
+    os.chmod(os.path.join(fake, "az"), 0o755)
+    for name, url, want in (("gl", "https://gitlab.example.com/g/r.git", "pr: #7, checks: 1 pass, 1 fail, 1 pending"),
+                            ("azr", "https://dev.azure.com/o/p/_git/r", "pr: #4, checks: 1 pass, 0 fail, 0 pending")):
+        other = os.path.join(tmp, name)
+        subprocess.run(["git", "init", "-q", "-b", "feat/x", other], check=True)
+        g(other, "remote", "add", "origin", url)
+        check("%s origin asks its own CLI" % name, "pr: %s" % pull_request(other, "feat/x") == want,
+              pull_request(other, "feat/x"))
+    other = os.path.join(tmp, "gl")
+    os.remove(os.path.join(fake, "glab"))
+    saved = os.environ["PATH"]
+    only_git = os.path.join(tmp, "only-git")
+    os.mkdir(only_git)
+    os.symlink(subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip(), os.path.join(only_git, "git"))
+    os.environ["PATH"] = only_git
+    check("missing glab says so", pull_request(other, "feat/x") == "none, or glab is not available", pull_request(other, "feat/x"))
+    os.environ["PATH"] = saved
 
     text = report(repo, False)
     check("one repo, no --all", text and "worktrees" not in text and "branch: main" in text, text)
