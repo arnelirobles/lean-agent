@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Collect the numbers a retro needs for one batch, without reasoning, so the retro starts from facts.
 #
-#   retro-signals.sh --since 2026-09-24 owner/repo [owner/repo ...]   one TSV row per merged pull request
+#   retro-signals.sh --since 2026-09-24 REPO [REPO ...]   one TSV row per merged pull request
 #   retro-signals.sh --self-test                                       checks the parsing on a fixture
 #
 # After the rows it prints a script repeats section (tools/script-repeats): the families of commands agents
@@ -14,8 +14,11 @@
 # If REVIEW_LOG points at the adversarial review log, rows for pull requests with no log entry are
 # counted, because a review nobody logged is a loop that is not running.
 #
-# It reports and never writes anywhere but stdout. Needs gh, and jq for the day count. The gh reads go
-# through lib/forge.py, so a repository on another host stops with one line naming it.
+# REPO is owner/name (GitHub), HOST/group/project or a clone URL (GitLab), or an Azure DevOps clone URL
+# (lib/forge.py explains the names). It reports and never writes anywhere but stdout. Needs the CLI of the
+# host (gh, glab or az) and jq for the day count. Every read goes through lib/forge.py; a host whose CLI is not
+# installed stops with one line naming the CLI to install, and exit 2. On Azure DevOps the failed check and
+# escaped counts print unknown, because az cannot find them.
 set -euo pipefail
 lib="$(cd "$(dirname "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")")/../lib" && pwd)"
 
@@ -48,6 +51,31 @@ if [ "${1:-}" = "--self-test" ]; then
   rm -rf "$bindir"
   want=$(printf 'o/r\t5\tunknown\tunknown\t2\tunknown\tunknown')
   [ "$out" = "$want" ] || { echo "self-test failed: failed gh calls gave '$out', want '$want'"; exit 1; }
+  # A fake GitLab repository: a glab that answers the merge request reads. Rows, not exit 2.
+  bindir=$(mktemp -d)
+  cat > "$bindir/glab" <<'G'
+#!/bin/sh
+for last; do :; done
+case "$last" in
+  */merge_requests?state=merged*) echo '[{"iid":5,"source_branch":"b","sha":"abcd1234","created_at":"2026-09-20T00:00:00Z","merged_at":"2026-09-22T00:00:00Z","updated_at":"2026-09-22T00:00:00Z"}]' ;;
+  */merge_requests/5/commits*) echo '[{"title":"fix","committed_date":"2026-09-21T00:00:00Z"},{"title":"Merge branch main","committed_date":"2026-09-21T01:00:00Z"},{"title":"early","committed_date":"2026-09-19T00:00:00Z"}]' ;;
+  */repository/commits/abcd1234/statuses*) echo '[{"status":"failed"},{"status":"success"}]' ;;
+  */issues?*|*/merge_requests?search*) echo '[]' ;;
+  *) echo "404" >&2; exit 1 ;;
+esac
+G
+  chmod +x "$bindir/glab"
+  out=$(PATH="$bindir:$PATH" "$0" --since 2026-09-01 gitlab.example.com/g/r 2>/dev/null; echo "rc=$?")
+  rm -rf "$bindir"
+  want=$(printf 'gitlab.example.com/g/r\t5\t1\t1\t2\t0\tunknown')
+  case "$out" in *"$want"*"rc=0"*) ;; *) echo "self-test failed: a fake GitLab repository gave '$out', want a row '$want'"; exit 1 ;; esac
+  # No glab on PATH: one line naming it, exit 2.
+  bindir=$(mktemp -d)
+  out=$(PATH="$bindir:$(dirname "$(command -v python3)"):/usr/bin:/bin" "$0" --since 2026-09-01 gitlab.example.com/g/r 2>&1 >/dev/null) && rc=0 || rc=$?
+  rm -rf "$bindir"
+  if ! command -v glab >/dev/null 2>&1; then
+    case "$out" in *"glab is not installed"*) [ "$rc" = 2 ] || { echo "self-test failed: missing glab gave exit $rc"; exit 1; } ;; *) echo "self-test failed: missing glab said '$out'"; exit 1 ;; esac
+  fi
   fixture=$(mktemp -d)
   mkdir -p "$fixture/proj"
   printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"pgrep -f vitest"}}]}}' > "$fixture/proj/s.jsonl"
@@ -59,9 +87,9 @@ if [ "${1:-}" = "--self-test" ]; then
   exit 0
 fi
 
-[ "${1:-}" = "--since" ] && [ -n "${2:-}" ] || { echo "usage: retro-signals.sh --since YYYY-MM-DD owner/repo ..."; exit 2; }
+[ "${1:-}" = "--since" ] && [ -n "${2:-}" ] || { echo "usage: retro-signals.sh --since YYYY-MM-DD REPO ..."; exit 2; }
 since=$2; shift 2
-[ "$#" -gt 0 ] || { echo "name at least one owner/repo"; exit 2; }
+[ "$#" -gt 0 ] || { echo "name at least one REPO"; exit 2; }
 
 printf 'repo\tpr\tfix_rounds\tfailed_checks\tdays_to_merge\tescaped_refs\tlogged_review\n'
 for repo in "$@"; do

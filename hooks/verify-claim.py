@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Ask for the claim to be checked before a public review or comment posts.
 
-PreToolUse hook on Bash, for gh issue comment, gh pr comment and gh pr review.
+PreToolUse hook on Bash, for issue comments and pull request comments and reviews on any host
+(gh issue comment, gh pr comment, gh pr review, glab mr note, glab issue note).
 The costly public mistakes are confident claims nobody traced: recommending an
 endpoint change without reading its auth config, or saying a background task
 can crash startup when its caller swallows the error. Someone may act on the
 comment. It never blocks, and it stays quiet for a short body (under 30 words
-passed with --body/-b or --body-file/-F), since an acknowledgement makes no case.
+passed with --body/-b or --body-file/-F, or glab's --message/-m), since an acknowledgement makes no case.
 
   LEAN_SKIP_VERIFY_CLAIM=1   turn it off (environment, settings env, or inline)
   verify-claim.py --self-test
@@ -18,6 +19,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import hookkit  # noqa: E402
 
 SHORT_WORDS = 30
+# Commands that post a comment or review, from the table in lib/hookkit.py, and the flags that hold the body.
+COMMENTS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"),
+            ("mr", "note"), ("mr", "note", "create"), ("issue", "note"), ("issue", "note", "create")}
+BODY_FLAGS = {"gh": ({"--body", "-b"}, {"--body-file", "-F"}), "glab": ({"--message", "-m"}, set())}
 NOTE = ("Before this posts: is every claim in it checked? If it says something fails, blocks or "
         "is slow, find the caller (is it awaited, is the error swallowed?). If it recommends a "
         "change, read the config that governs it (auth, flags, defaults) first. Anything not "
@@ -25,16 +30,14 @@ NOTE = ("Before this posts: is every claim in it checked? If it says something f
         "LEAN_SKIP_VERIFY_CLAIM=1, inline or in settings env, turns this note off.")
 
 
-def body_text(args, cwd):
-    for i, word in enumerate(args):
-        value = args[i + 1] if i + 1 < len(args) else None
-        if word.startswith(("--body=", "--body-file=")):
-            word, value = word.split("=", 1)
-        if word in ("--body", "-b") and value is not None:
+def body_text(call):
+    text_flags, file_flags = BODY_FLAGS[call.cli]
+    for _flag, value in hookkit.forge_flag_values(call, text_flags | file_flags):
+        if _flag in text_flags:
             return value
-        if word in ("--body-file", "-F") and value and value != "-":
+        if value != "-":
             try:
-                with open(hookkit.resolve(value, cwd), encoding="utf-8", errors="replace") as fh:
+                with open(hookkit.resolve(value, call.cwd), encoding="utf-8", errors="replace") as fh:
                     return fh.read()
             except OSError:
                 return None
@@ -43,13 +46,11 @@ def body_text(args, cwd):
 
 def message(command, cwd):
     for seg in hookkit.segments(command, cwd):
-        gh = hookkit.gh_call(seg)
-        if not gh or hookkit.disabled("LEAN_SKIP_VERIFY_CLAIM", seg):
+        call = hookkit.forge_call(seg)
+        if not call or call.command not in COMMENTS or call.cli not in BODY_FLAGS \
+                or hookkit.disabled("LEAN_SKIP_VERIFY_CLAIM", seg):
             continue
-        args = gh[0]
-        if args[:2] not in (["issue", "comment"], ["pr", "comment"], ["pr", "review"]):
-            continue
-        body = body_text(args[2:], seg.cwd)
+        body = body_text(call)
         if body is not None and len(body.split()) < SHORT_WORDS:
             continue
         return NOTE
@@ -61,7 +62,7 @@ def main():
         return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command") or ""
-    if "gh" not in command:
+    if not any(cli in command for cli in hookkit.FORGE_CLIS):
         return 0
     text = message(command, event.get("cwd") or os.getcwd())
     if text:
@@ -81,10 +82,14 @@ def self_test():
             fh.write("Thanks, merged.")
         noted = [f"gh pr comment 4 --body '{long_body}'", "gh pr review 4 --approve",
                  "gh issue comment 9 --body-file long.md", f"gh pr review 4 --comment -b '{long_body}'",
-                 "gh pr comment 4 --body-file=long.md", "gh issue comment 9 --body-file missing.md"]
+                 "gh pr comment 4 --body-file=long.md", "gh issue comment 9 --body-file missing.md",
+                 f"glab mr note 4 -m '{long_body}'", f"glab mr note create 4 --message '{long_body}'",
+                 f"glab issue note 9 --message='{long_body}'", "glab mr note 4"]
         quiet = ["gh pr comment 4 --body 'Thanks, merged.'", "gh issue comment 9 -F short.md",
                  "gh pr view 4 --comments", "gh issue list", "echo gh pr comment",
-                 "gh pr create --body 'x'", "LEAN_SKIP_VERIFY_CLAIM=1 gh pr review 4 --approve"]
+                 "gh pr create --body 'x'", "LEAN_SKIP_VERIFY_CLAIM=1 gh pr review 4 --approve",
+                 "glab mr note 4 -m 'Thanks, merged.'", "glab mr view 4 --comments", "glab mr create -d 'x'",
+                 "az repos pr create --description 'x'", "echo glab mr note 4"]
         for command in noted:
             if not message(command, tmp):
                 print(f"FAIL no note: {command[:60]!r}")

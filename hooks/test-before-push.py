@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Warn before pushing source that changed after the last passing test run.
 
-PreToolUse hook on Bash, for git push, gh pr create and gh pr merge. A suite
+PreToolUse hook on Bash, for git push and for creating or merging a pull request on any host
+(gh pr create|merge, glab mr create|merge, az repos pr create, az repos pr update --status completed). A suite
 that passed before a change is not evidence about the change. The usual way
 this goes wrong: the fix is verified, then changed after review, then pushed
 after re-running only the fast suite, or nothing at all.
@@ -30,8 +31,7 @@ def is_push(seg):
     call = hookkit.git_call(seg)
     if call and call[0] == "push":
         return True
-    gh = hookkit.gh_call(seg)
-    return bool(gh) and gh[0][:1] == ["pr"] and gh[0][1:2] in (["create"], ["merge"])
+    return hookkit.forge_action(hookkit.forge_call(seg)) in ("create", "merge")
 
 
 def changed_source(root):
@@ -84,7 +84,7 @@ def main():
         return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command") or ""
-    if "push" not in command and "gh" not in command:
+    if "push" not in command and not any(cli in command for cli in hookkit.FORGE_CLIS):
         return 0
     text = message(command, event.get("cwd") or os.getcwd())
     if text:
@@ -137,6 +137,12 @@ def self_test():
         stale = message("gh pr merge 3 --squash", tmp)
         check("edit after the run warns", stale, True)
         check("stale file is named", stale and "app.py" in stale, True)
+        for cmd in ("glab mr create --fill", "glab mr merge 3 --squash", "az repos pr create --title t",
+                    "az repos pr update --id 3 --status completed", "cd . && glab mr merge 3"):
+            check(f"edit after the run warns on {cmd}", message(cmd, tmp), True)
+        for cmd in ("glab mr list", "glab mr note 3 -m hi", "az repos pr update --id 3 --title t",
+                    "az repos pr list", "echo glab mr merge 3", "LEAN_SKIP_TEST_BEFORE_PUSH=1 glab mr merge 3"):
+            check(f"edit after the run is quiet on {cmd}", message(cmd, tmp), False)
         check("inline off switch", message("LEAN_SKIP_TEST_BEFORE_PUSH=1 git push", tmp), False)
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0

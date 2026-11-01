@@ -144,6 +144,15 @@ Waiting without polling. `brain queue wait ID...` blocks until every named job e
 
 Adding a pr-wait provider. A provider is one class in `lib/forge.py` with `label`, `checks()` (one CLI call, returns checks with a `name` and a `state` of `pass`, `fail` or `pending`) and `failed_log(check, tail)`, taking its CLI options in the constructor and a `capture(argv)` function for the CLI call. Register it in `CI_PROVIDERS` under the name `kind_of` returns, and add `<name>_ci_test` next to `github_ci_test` in the same file: a fake CLI in a temp folder on PATH, no network, and a check that the other providers' tools are never called. The interface is written out in the `forge.py` docstring.
 
+Add a code host. Every script and hook reaches a host through `lib/forge.py` (reads) or the command table in `lib/hookkit.py` (the commands hooks recognise). The host comes from the origin URL (`gitlab` must be a whole label of the host name, so `gitlab.mycorp.com` is GitLab and `mygitlabfoo.com` is unknown), or from `LEAN_FORGE=github|gitlab|azure`. `tools/orient` and `hooks/review-log-check.py` read through the same module; if `forge.py` cannot be imported the hook still handles `gh`. User info in a remote URL is dropped before anything is printed, and an Azure remote prints as `https://dev.azure.com/ORG/PROJECT/_git/REPO`. A host whose CLI is not installed gives one line naming the CLI and exit 2. To add one:
+
+1. Provider class in `lib/forge.py`, next to `GitHub`, `GitLab` and `Azure`, with `merged_prs`, `commits_after`, `failed_checks` and `escaped_refs`. They return the same TSV rows for every host; a value the host cannot give is `None`, printed as `unknown`. Page every list and stop at a cap, saying so on stderr. Pass host text (titles, bodies, logs) only inside argument lists, never to a shell. Register it in `PROVIDERS` and teach `detect` its URL.
+2. Fake CLI fixture: a shell script in the same file (see `FAKE_GH`, `FAKE_GLAB`, `FAKE_AZ`) that answers the calls with canned JSON, used through `make_scene` so it sits first on PATH. No network.
+3. Self-test: extend `hosts_test` so the new host returns the row shape the others return, include a title holding `$(id)`, and check the other hosts' CLIs are never called.
+4. For hooks, add its create, merge and note commands and body flags to `FORGE_COMMANDS` and `FORGE_FLAGS` in `lib/hookkit.py`, and a slop-body case to the `public-text.py` self-test.
+
+Azure DevOps cannot list failed checks or escaped references through `az`, so those two columns print `unknown` for it.
+
 Known limits:
 
 - The watchdog's orphan cleanup records a process group only when `HEAVY_STALL` is on, so a killed caller without the watchdog leaves its command running.
@@ -160,7 +169,7 @@ What goes where:
 
 Brain never holds secrets, tokens or passwords.
 
-brain's code lives in `lib/brain/`, and `tools/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub; GitLab and Azure DevOps come with tracker support. `lean-stats collect` also counts merged Azure DevOps pull requests through `az` (they are stored as `ORG/PROJECT/REPO`), for the Azure repositories your transcripts already name. Naming repositories on the command line collects only those, and a line says when Azure ones were skipped. Fix rounds, failed checks and escaped refs stay empty for Azure rows. `forge.py` can also count the commits on an Azure pull request, but nothing calls it yet. Once a day `collect` rewrites old `_git/NAME` and `org/project` repo names to `ORG/PROJECT/REPO` from what `az repos list` shows for your default organization, so cost joins the changes. A three-part name counts as Azure only when its organization is your az default or one seen in an Azure remote.
+brain's code lives in `lib/brain/`, and `tools/brain` only starts it. Reads of merged pull requests (`lean-stats collect` and `retro-signals.sh`) go through `lib/forge.py`, which supports GitHub (`gh`), GitLab (`glab`) and Azure DevOps (`az` with the azure-devops extension). `lean-stats collect` also counts merged Azure DevOps pull requests through `az` (they are stored as `ORG/PROJECT/REPO`), for the Azure repositories your transcripts already name. Naming repositories on the command line collects only those, and a line says when Azure ones were skipped. Fix rounds, failed checks and escaped refs stay empty for Azure rows. `forge.py` can also count the commits on an Azure pull request, but nothing calls it yet. Once a day `collect` rewrites old `_git/NAME` and `org/project` repo names to `ORG/PROJECT/REPO` from what `az repos list` shows for your default organization, so cost joins the changes. A three-part name counts as Azure only when its organization is your az default or one seen in an Azure remote.
 
 ## Brain page
 
@@ -355,6 +364,7 @@ lean-agent has no service of its own and keeps nothing off your machine. What it
 It sends data to other services only through tools you already run, and only where you point them:
 
 - GitHub, through your `gh` login: the adversarial review posts review threads, `lean-stats` and `pr-blockers` read pull requests and checks. The hooks only read the command an agent is about to run; they call nothing.
+- GitLab, through your `glab` login: `lean-stats`, `retro-signals.sh`, `pr-blockers.sh` and `pr-wait` read merge requests and pipelines the same way they read GitHub's.
 - GitHub and Azure DevOps, from the brain page, through your own `gh` and `az` logins. The page stores no credentials. A CLI that is missing or logged out shows as such in its section.
 - Your own SSH hosts, when `~/.config/lean/remotes.ini` names any: `test-phase` copies the repository there with rsync and runs the tests in Docker. Without that file, no code is copied off the machine.
 - A URL you pass to `check-deployed-sha.sh`, which it fetches with curl.
@@ -364,7 +374,7 @@ It sends data to other services only through tools you already run, and only whe
 ## Requirements
 
 - Claude Code with plugin support.
-- `python3`, `git` and `gh` on PATH.
+- `python3` and `git` on PATH, and the CLI of your code host: `gh`, `glab`, or `az` with the azure-devops extension.
 - Linux, or macOS with its stock bash 3.2. `heavy.sh` uses util-linux `flock` on Linux. On macOS it takes the lock with python3 and names holders with `lsof`.
 
 ## Contributing
