@@ -32,6 +32,8 @@ With mixed models, the hunter and the refuter both start on the cheap model: `so
 model the session-start note names. The hunter and the refuter never run on the fast model (`LEAN_MODEL_FAST`): a small model that wrongly refutes a finding drops a real defect with no trace. The strong model is not a second critic. It gets the branch
 and the surviving list only when a finding is not fixed in one round, or a tier 2 answer is unsure.
 
+With `LEAN_CREDIT_RUNS=on`, run the hunter and the refuter through `credit-run --read-only --role hunt` (or `refute`) in place of an Agent, on the same model, each with its own brief. Put the diff in the brief: a read-only job has no Bash. Stay on an Agent when credit-run refuses or the review needs a command run.
+
 ## Inputs
 
 - A target: a PR number or URL, a branch, or `--wip` for an agent's uncommitted work.

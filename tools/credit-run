@@ -1,834 +1,828 @@
 #!/usr/bin/env python3
-"""Run a ticket as a headless `claude -p` job paid by API credits, with a dollar cap.
+"""Run one brief as a headless Claude Agent SDK job paid by an API key, with a dollar cap.
 
   credit-run --brief FILE --worktree DIR --budget USD [--model sonnet] [--minutes N]
-             [--allow TOOL ...] [--out FILE]
-  credit-run --key-help
-  credit-run --spent
+             [--allow TOOL ...] [--read-only] [--role NAME] [--out FILE] [--resume SESSION]
+             [--advisor opus|off] [--cache-ttl 5m|1h] [--fast]
+  credit-run --setup       install the pinned SDKs (agent and batch) under ~/.lean/credit-sdk
+  credit-run --key-help    print the command that stores the key, for you to run
+  credit-run --spent       spent, reserved and remaining against LEAN_CREDIT_TOTAL_USD
+  credit-run --pace        spend per day against LEAN_CREDIT_UNTIL, and the next move; needs no key
   credit-run --self-test
 
-`claude -p` bills the account behind ANTHROPIC_API_KEY when that variable is set. This tool
-reads the key from the OS keychain (macOS `security`, Linux `secret-tool`; item name from
-LEAN_CREDIT_KEY_ITEM, default lean-api-credit) and sets it in the job's environment, never in
-argv. It never takes the key as an argument: run `credit-run --key-help` and type the printed
-command yourself. The child does not get ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL,
-CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX, CLAUDE_CODE_OAUTH_TOKEN or any GIT_*
-variable; the worktree checks run without GIT_* too.
+A job starts only when all of these hold:
+  LEAN_CREDIT_RUNS=on            master switch, default off
+  LEAN_CREDIT_TOTAL_USD=N        total cap, required
+  the key is in the keychain     LEAN_CREDIT_KEY_ITEM (default lean-api-credit); read
+                                 with `security` on macOS, `secret-tool` on Linux
+The key goes into the SDK worker's environment only, never argv, stdin, the ledger or
+a file. ANTHROPIC_AUTH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN are removed from that
+environment because the auth token outranks the key, and so are ANTHROPIC_BASE_URL and
+the Bedrock, Vertex and Foundry switches, so the key only goes to the Claude API.
 
-Redaction is best effort. The job's stdout and stderr go to private temp files, and the exact
-key and its whitespace-split, base64 and urlencoded forms are removed from them before they
-reach the terminal, the --out file, the ledger line or a message. A form this does not know
-(hex, rot13, one character per line with other text between) gets through. If the run is
-interrupted (Ctrl-C, SIGTERM) the output and the ledger line are still written, redacted.
+Cap: the SDK stops a job only after a turn, so a job can overshoot its budget. Each job
+reserves budget plus LEAN_CREDIT_TURN_USD (default 0.50) in ~/.lean/credit-runs.jsonl
+before it starts, under a file lock. A reservation with no final line (a killed job, a
+worker crash) counts at its reserved amount. Refused with exit 2 when spent plus reserved
+plus this reservation would pass the total. The figures are a local estimate from
+total_cost_usd. A cost figure does not prove which balance paid; the Console workspace
+spend limit is the only hard limit.
 
-What this does not cover:
-  - An allowed tool can print its environment into claude's own transcript under
-    ~/.claude/projects. This tool does not read or change that.
-  - `git commit` runs the repository's hooks with the key in their environment, and a
-    program the job writes and runs through an allowed tool holds the key too. The tool
-    guard limits what the job may ask for. It is not a sandbox. Run jobs only in a
-    repository you trust.
+Tools: Read, Glob, Grep, Edit, Write and git status, diff, log, add, commit. Anything
+else is denied (permission mode dontAsk). git push is refused, also through --allow.
+--read-only keeps Read, Glob and Grep only: no Bash, no edits. Put any diff in the brief.
+It needs no clean worktree. Read(/proc/**) is denied on every job. --role (spec, hunt,
+refute, analyze, draft-doc) is recorded on the ledger line. Without --read-only the worktree must be a clean linked git
+worktree, not the main checkout. The job runs under `bounded`.
 
-The budget is required, at least 0.01, and is passed unrounded as `--max-budget-usd`, so a
-job with no cap does not start. --minutes must be above 0 (default 60); the job runs under
-the sibling `bounded`, and without it no job starts. The worktree must be a clean linked git
-worktree, not a main checkout.
-
-Tools. Default: Read, Edit, Write (new files need it), Glob, Grep and Bash for git status,
-diff, log, add, commit. --allow adds items, each one of:
-  - a tool name with no parentheses (not Bash), letters, digits, _ . -
-  - Bash(word [word ...]:*) or Bash(exact command), built only from ASCII letters, digits,
-    . _ - / = and single spaces
-No commas, no wildcard except the one trailing :*. A first word that runs code or reaches the
-network (sh, bash, env, sudo, xargs, find, python*, node, npm, gh, curl, ssh, make, eval and
-similar) is refused. Any item whose first word is git must equal a default entry, so more git
-needs a new default. These are also passed as --disallowedTools: git push, git * push,
-and --output and --ext-diff on git diff and git log. Everything else follows claude's own
-permission rules, which this tool does not check.
-
-Each run appends one line to ~/.lean/credit-runs.jsonl (time, branch, model, budget, cost,
-cost_known, turns, state, session). Cost is null when the output has none. `--spent` sums it,
-counts runs with unknown cost, and counts lines it had to skip. A cap hit (budget or turns) is
-reported on stderr with the session id so it can be resumed with `claude --resume ID`. The
-output JSON goes to --out (a file that does not exist yet; default
-~/.lean/credit-out/<time>-<pid>-<random>.json, mode 0600); stdout gets the result text and the
-cost.
-
-A headless job gets no later turn and no notice, so its brief must say to run everything in the
-foreground, each command under 10 minutes, and a commit hook that needs a person can refuse the
-job's commit. When that happens the work stays in the worktree: commit it from your session.
-
-Limit: the cost in `-p` output is what the run cost. It does not prove which balance paid,
-and this tool does not claim credit was used. Check the console billing page.
-
-Exit: 0 done, 3 cap hit, 2 bad input or no key or unsupported platform, 130 interrupted,
-else the job's code (124 for the time limit).
-Python 3 standard library, macOS and Linux.
+stdout: the result text, then the cost. The full result JSON goes to --out (default
+~/.lean/credit-out/RUN.json). Exit 0 done, 3 budget cap hit (the session id is printed so
+the job can be resumed with --resume), 1 any other failure, 2 refused or bad input.
+Python standard library only. The worker is credit-run-worker.mjs and needs node.
 """
 import argparse
-import base64
 import json
-import math
 import os
 import re
-import secrets
-import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
+import uuid
 
-DEFAULT_ITEM = "lean-api-credit"
-DEFAULT_ALLOW = ["Read", "Edit", "Write", "Glob", "Grep",
-                 "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
-                 "Bash(git add:*)", "Bash(git commit:*)"]
-DENY = ["Bash(git push:*)", "Bash(git * push:*)",
-        "Bash(git diff --output:*)", "Bash(git log --output:*)",
-        "Bash(git diff --ext-diff:*)", "Bash(git log --ext-diff:*)"]
-STRIP_ENV = {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
-             "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_OAUTH_TOKEN"}
-RUNS_CODE = {"sh", "bash", "zsh", "dash", "fish", "env", "sudo", "xargs", "find", "node", "npm",
-             "npx", "ruby", "perl", "php", "gh", "curl", "wget", "ssh", "scp", "rsync", "nc",
-             "make", "eval", "exec",
-             "ksh", "csh", "tcsh", "doas", "su", "command", "nohup", "timeout", "time", "busybox",
-             "awk", "gawk", "bun", "deno", "pwsh", "powershell", "osascript", "socat", "ncat",
-             "telnet", "ftp"}
-TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
-BASH_WORDS = re.compile(r"[A-Za-z0-9._/=-]+(?: [A-Za-z0-9._/=-]+)*")
-MIN_BUDGET = 0.01
-REDACTED = "[redacted]"
-# Between two characters of the key: whitespace, or a JSON escape for it.
-SPLIT = r"(?:\s|\\[nrtbf/]|\\u[0-9a-fA-F]{4})*"
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+from credit_common import (append_line, child_env, die, home, key_command, key_item, ledger_path,  # noqa: E402
+                           money, pace_report, read_key, reserve, scrub, sdk_dir, spent_report)
 
-
-def die(msg, code=2):
-    print(f"credit-run: {msg}", file=sys.stderr)
-    sys.exit(code)
+SDK_VERSION = "0.3.316"
+SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk"
+BATCH_SDK_VERSION = "1.3.0"
+BATCH_SDK_PACKAGE = "@anthropic-ai/sdk"
+ROLES = ("spec", "hunt", "refute", "analyze", "draft-doc")
+READ_TOOLS = ["Read", "Glob", "Grep"]
+EDIT_TOOLS = READ_TOOLS + ["Edit", "Write"]
+# The allowlist matches "git log", not "git -C DIR log", and models reach for -C.
+GIT_NOTE = "\n\nYou are already in the job's directory. Run git as plain `git log`, never `git -C`, one command per Bash call with no && chains.\n"
+GIT_EDIT = ["status", "diff", "log", "add", "commit"]
+RUNNERS = {"sh", "bash", "zsh", "env", "xargs", "python", "python3", "node", "perl", "ruby", "eval", "exec"}
+PUSH_DENY = "Bash(git push:*)"
+DENY_ALWAYS = ["Read(/proc/**)"]
+DENY_EDIT = [PUSH_DENY, "Bash(git -C:*)", "Bash(git -c:*)", "Bash(git * --out*)"]
 
 
-def home():
-    return os.path.join(os.path.expanduser("~"), ".lean")
-
-
-def ledger_path():
-    return os.path.join(home(), "credit-runs.jsonl")
-
-
-def item_name():
-    return os.environ.get("LEAN_CREDIT_KEY_ITEM") or DEFAULT_ITEM
-
-
-def platform():
-    if sys.platform == "darwin":
-        return "mac"
-    if sys.platform.startswith("linux"):
-        return "linux"
-    die(f"unsupported platform {sys.platform}, macOS and Linux only")
-
-
-def clean_env():
-    return {k: v for k, v in os.environ.items() if k not in STRIP_ENV and not k.startswith("GIT_")}
+def sdk_entry():
+    return os.path.join(sdk_dir(), "node_modules", "@anthropic-ai", "claude-agent-sdk", "sdk.mjs")
 
 
 def key_help():
-    q = shlex.quote(item_name())
-    if platform() == "mac":
-        print(f'security add-generic-password -U -s {q} -a "$USER" -w')
+    item = key_item()
+    if sys.platform == "darwin":
+        print("Run this yourself. It asks for the key without echoing it:")
+        print(f'  security add-generic-password -U -a "$USER" -s {item} -w')
+    elif sys.platform.startswith("linux"):
+        print("Run this yourself. It asks for the key without echoing it:")
+        print(f"  secret-tool store --label={item} service {item}")
     else:
-        print(f"secret-tool store --label={q} service {q}")
-    print("Run it yourself; it prompts for the key. credit-run never takes the key as an argument.",
-          file=sys.stderr)
+        die("only macOS and Linux are supported")
+    print("credit-run never takes the key as an argument.")
+    return 0
 
 
-def read_key():
-    item = item_name()
-    if platform() == "mac":
-        cmd = ["security", "find-generic-password", "-s", item, "-w"]
-    else:
-        cmd = ["secret-tool", "lookup", "service", item]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        die(f"cannot read keychain item {item}; run: credit-run --key-help")
-    key = r.stdout.strip()
-    if r.returncode != 0 or not key:
-        die(f"no keychain item {item}; run: credit-run --key-help")
-    return key
+# checks
 
-
-class Redactor:
-    """Best effort removal of the key and its common re-encodings from text."""
-
-    def __init__(self, key):
-        raw = key.encode()
-        forms = {key: 0, urllib.parse.quote(key, safe=""): re.I,
-                 urllib.parse.quote_plus(key): re.I}
-        # Base64 at each of the three byte alignments, keeping only characters fully
-        # decided by the key bytes.
-        for lead, skip in ((0, 0), (1, 2), (2, 3)):
-            n = lead + len(raw)
-            enc = base64.b64encode(b"\0" * lead + raw).decode()
-            frag = enc[skip:(n // 3) * 4 + (0, 1, 2)[n % 3]]
-            for f in (frag, frag.translate(str.maketrans("+/", "-_"))):
-                if len(f) >= 8:
-                    forms[f] = 0
-        self.rxs = [re.compile(SPLIT.join(re.escape(c) for c in f), flags) for f, flags in forms.items()]
-        self.key = key
-
-    def text(self, s):
-        for rx in self.rxs:
-            s = rx.sub(REDACTED, s)
-        return s.replace(self.key, REDACTED)
-
-    def walk(self, obj):
-        if isinstance(obj, str):
-            return self.text(obj)
-        if isinstance(obj, list):
-            return [self.walk(x) for x in obj]
-        if isinstance(obj, dict):
-            return {self.text(str(k)): self.walk(v) for k, v in obj.items()}
-        return obj
-
-
-def allow_problem(item):
-    """Why an --allow item is refused, or None."""
-    if "," in item:
-        return "commas split the list"
-    m = re.fullmatch(r"Bash\((.*)\)", item, re.S)
-    if m is None:
-        if item.lower() == "bash":
-            return "bare Bash allows every command"
-        if not TOOL_NAME.fullmatch(item):
-            return "not a plain tool name or Bash(word ...:*)"
-        return None
-    inner = m.group(1)
-    body = inner[:-2] if inner.endswith(":*") else inner
-    if not BASH_WORDS.fullmatch(body):
-        return "only ASCII letters, digits, . _ - / =, single spaces and one trailing :* are allowed"
-    first = body.split(" ")[0]
-    base = first.rsplit("/", 1)[-1].lower()
-    if "=" in first:
-        return "the first word must be a command"
-    if base == "git":
-        return None if item in DEFAULT_ALLOW else "extra git commands need a new default, not --allow"
-    if base in RUNS_CODE or base.startswith("python"):
-        return f"{base} runs code or reaches the network"
-    return None
-
-
-def check_allow(items):
-    for t in items:
-        why = allow_problem(t)
-        if why:
-            die(f"refused --allow {t!r}: {why}")
-    return [t for t in items if t not in DEFAULT_ALLOW]
+def refused_allow(entry):
+    e = entry.strip()
+    if re.fullmatch(r"Bash(\(\s*(\*|:\*)?\s*\))?", e):
+        return True
+    if re.fullmatch(r"Bash\(\s*git\s*(:\*|\s\*|\*)?\s*\)", e):
+        return True
+    if re.search(r"git\b.*\bpush\b", e):
+        return True
+    m = re.fullmatch(r"Bash\((.*)\)", e, re.S)
+    if m:
+        words = [w for w in re.split(r"[\s:]+", m.group(1).strip()) if w]
+        if not words:
+            return True
+        if os.path.basename(words[0]) in RUNNERS:
+            return True
+        if words[0] == "git":
+            sub = words[1] if len(words) > 1 else ""
+            if not sub or sub.startswith("-") or any(c in sub for c in "*?[]"):
+                return True
+    return False
 
 
 def git(worktree, *args):
-    r = subprocess.run(["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "-C", worktree, *args], capture_output=True, text=True, env=clean_env())
-    return r.returncode, r.stdout.strip()
+    try:
+        r = subprocess.run(["git", "-C", worktree, *args], capture_output=True, text=True)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
 
 
 def check_worktree(worktree):
-    if not os.path.isdir(worktree):
-        die(f"worktree {worktree} is not a directory")
-    rc, gd = git(worktree, "rev-parse", "--absolute-git-dir")
-    rc2, cd = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if rc or rc2:
+    if git(worktree, "rev-parse", "--is-inside-work-tree") != "true":
         die(f"{worktree} is not a git worktree")
-    if os.path.realpath(gd) == os.path.realpath(cd):
-        die(f"{worktree} is not a linked worktree, use one made with git worktree add")
-    rc, dirty = git(worktree, "status", "--porcelain")
-    if rc or dirty:
-        die(f"worktree {worktree} is not clean")
-    return git(worktree, "rev-parse", "--abbrev-ref", "HEAD")[1]
+    gd = git(worktree, "rev-parse", "--git-dir")
+    cd = git(worktree, "rev-parse", "--git-common-dir")
+    real = lambda p: os.path.realpath(os.path.join(worktree, p))
+    if gd is None or cd is None or real(gd) == real(cd):
+        die(f"{worktree} is the main checkout; use a linked worktree (git worktree add)")
+    if git(worktree, "status", "--porcelain"):
+        die(f"{worktree} has uncommitted changes; commit or stash them first")
 
 
-def money(x):
-    """A finite cost of 0 or more, else None."""
-    if isinstance(x, bool):
-        return None
-    if isinstance(x, str):
-        try:
-            x = float(x)
-        except ValueError:
-            return None
-    if isinstance(x, (int, float)) and math.isfinite(x) and x >= 0:
-        return float(x)
-    return None
+def write_rules(worktree):
+    """Edit and Write only inside the worktree, never in git metadata: a planted hook would run with the key."""
+    real = os.path.realpath(worktree)
+    common = git(worktree, "rev-parse", "--git-common-dir") or ".git"
+    common = os.path.realpath(os.path.join(real, common))
+    # A leading // is an absolute path in a permission rule.
+    allow = [f"{t}(/{real}/**)" for t in ("Edit", "Write")]
+    deny = [f"{t}({p})" for t in ("Edit", "Write")
+            for p in (f"/{real}/.git", f"/{real}/.git/**", f"/{common}/**", "**/.git/**")]
+    return allow, deny
 
 
-def result_entry(data):
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, list):
-        for e in reversed(data):
-            if isinstance(e, dict) and e.get("type") == "result":
-                return e
-    return None
+def build_options(a, worktree, model):
+    if a.read_only:
+        tools = ["Read", "Glob", "Grep"]
+        allowed = ["Read", "Glob", "Grep"]
+        denied = list(DENY_ALWAYS)
+    else:
+        allow = a.allow or []
+        names = [re.split(r"\(", x.strip(), 1)[0] for x in allow]
+        tools = list(dict.fromkeys(EDIT_TOOLS + ["Bash"] + names))
+        write_allow, write_deny = write_rules(worktree)
+        allowed = READ_TOOLS + write_allow + [f"Bash(git {g}:*)" for g in GIT_EDIT] + allow
+        denied = DENY_EDIT + DENY_ALWAYS + write_deny
+    opts = {
+        "model": model,
+        "maxBudgetUsd": a.budget_value,
+        "settingSources": [],
+        "tools": tools,
+        "allowedTools": allowed,
+        "disallowedTools": denied,
+        "permissionMode": "dontAsk",
+        "plugins": [{"type": "local", "path": ROOT}],
+        "cwd": worktree,
+    }
+    settings = {"attribution": False}  # no agent trailers on commits or pull requests
+    if a.advisor_value == "opus":
+        settings["advisorModel"] = "opus"
+    if a.fast:
+        settings["fastMode"] = True
+    opts["settings"] = settings
+    if a.resume:
+        opts["resume"] = a.resume
+    return opts
 
 
-def state_of(entry, code, interrupted):
-    sub = str((entry or {}).get("subtype") or "")
-    if interrupted:
-        return "interrupted"
-    if code == 124:
-        return "timeout"
-    if "budget" in sub:
-        return "budget_cap"
-    if "max_turns" in sub:
-        return "turns_cap"
-    if code == 0 and entry and not entry.get("is_error"):
-        return "ok"
-    return "error"
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        die(message.splitlines()[0])
 
 
-def spent():
-    total, runs, unknown, skipped = 0.0, 0, 0, 0
-    try:
-        with open(ledger_path(), errors="replace") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    skipped += 1
-                    continue
-                if not isinstance(row, dict):
-                    skipped += 1
-                    continue
-                raw = row.get("cost")
-                if raw is None:
-                    runs += 1
-                    unknown += 1
-                    continue
-                c = money(raw)
-                if c is None:
-                    skipped += 1
-                    continue
-                runs += 1
-                total += c
-    except OSError:
-        pass
-    print(f"spent ${total:.4f} over {runs} runs")
-    if unknown:
-        print(f"{unknown} runs with unknown cost")
-    if skipped:
-        print(f"{skipped} unreadable lines skipped", file=sys.stderr)
+def parser():
+    p = Parser(prog="credit-run", add_help=True)
+    p.add_argument("--brief")
+    p.add_argument("--worktree")
+    p.add_argument("--budget")
+    p.add_argument("--model", default="sonnet")
+    p.add_argument("--minutes")
+    p.add_argument("--allow", nargs="+", action="extend")
+    p.add_argument("--read-only", action="store_true")
+    p.add_argument("--role", choices=ROLES)
+    p.add_argument("--out")
+    p.add_argument("--resume")
+    p.add_argument("--advisor")
+    p.add_argument("--cache-ttl")
+    p.add_argument("--fast", action="store_true")
+    p.add_argument("--setup", action="store_true")
+    p.add_argument("--key-help", action="store_true")
+    p.add_argument("--spent", action="store_true")
+    p.add_argument("--pace", action="store_true")
+    p.add_argument("--self-test", action="store_true")
+    return p
 
 
-def stop(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=20)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-
-
-def slurp(path):
-    try:
-        with open(path, errors="replace") as f:
-            return f.read()
-    except OSError:
-        return ""
-
-
-def on_signal(_signum, _frame):
-    raise KeyboardInterrupt
-
-
-def run(a):
-    if not math.isfinite(a.budget) or a.budget < MIN_BUDGET:
-        die(f"--budget must be at least {MIN_BUDGET} dollars")
-    if not math.isfinite(a.minutes) or a.minutes <= 0:
-        die("--minutes must be above 0")
-    if not os.path.isfile(a.brief):
-        die(f"brief {a.brief} is not a file")
-    allow = DEFAULT_ALLOW + check_allow(a.allow or [])
-    bounded = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bounded")
-    if not os.path.isfile(bounded):
-        die(f"bounded not found next to credit-run ({bounded}), not starting a job")
-    platform()
-    branch = check_worktree(a.worktree)
-    out = a.out or os.path.join(home(), "credit-out",
-                                f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(4)}.json")
-    if os.path.lexists(out):
-        die(f"{out} exists, give --out a file that does not exist yet")
-    key = read_key()
-    rd = Redactor(key)
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    try:
-        os.close(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-    except FileExistsError:
-        die(f"{out} exists, give --out a file that does not exist yet")
-    argv = [sys.executable, bounded, "--minutes", repr(a.minutes), "--",
-            "claude", "-p", "--output-format", "json", "--model", a.model,
-            "--max-budget-usd", repr(a.budget),
-            "--allowedTools", ",".join(allow), "--disallowedTools", ",".join(DENY)]
-    env = dict(clean_env(), ANTHROPIC_API_KEY=key)
-    out_fd, out_raw = tempfile.mkstemp(prefix="credit-run-out-")
-    err_fd, err_raw = tempfile.mkstemp(prefix="credit-run-err-")
-    proc, code, interrupted, result = None, None, False, 1
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGHUP, on_signal)
-    try:
-        try:
-            with open(a.brief) as brief:
-                proc = subprocess.Popen(argv, stdin=brief, stdout=out_fd, stderr=err_fd,
-                                        env=env, cwd=a.worktree)
-            code = proc.wait()
-        except KeyboardInterrupt:
-            interrupted = True
-            for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                signal.signal(s, signal.SIG_IGN)
-            stop(proc)
-            code = 130
-        except OSError as e:
-            print(f"credit-run: cannot start the job: {e.strerror or e}", file=sys.stderr)
-            code = 127
-        finally:
-            for fd in (out_fd, err_fd):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                signal.signal(s, signal.SIG_IGN)
-            result = finish(a, rd, branch, out, slurp(out_raw), slurp(err_raw), code, interrupted)
-    finally:
-        for p in (out_raw, err_raw):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-    return result
-
-
-def finish(a, rd, branch, out, raw, err, code, interrupted):
-    """Write redacted output and the ledger line, print, and return the exit code."""
-    text, entry = rd.text(raw), None
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        data = None
-    if data is not None:
-        clean = rd.walk(data)
-        if clean != data:
-            text = json.dumps(clean)
-        entry = result_entry(clean)
-    try:
-        with open(out, "w") as f:
-            f.write(text)
-    except OSError as e:
-        print(f"credit-run: cannot write {out}: {e.strerror or e}", file=sys.stderr)
-    state = state_of(entry, code, interrupted)
-    cost = money((entry or {}).get("total_cost_usd"))
-    turns = (entry or {}).get("num_turns")
-    turns = turns if isinstance(turns, int) and not isinstance(turns, bool) else None
-    sid = (entry or {}).get("session_id")
-    sid = rd.text(sid) if isinstance(sid, str) and sid else None
-    row = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "branch": branch, "model": a.model,
-           "budget": a.budget, "cost": cost, "cost_known": cost is not None, "turns": turns,
-           "state": state, "session": sid}
-    try:
-        os.makedirs(home(), exist_ok=True)
-        with open(ledger_path(), "a") as f:
-            f.write(rd.text(json.dumps(row)) + "\n")
-    except OSError as e:
-        print(f"credit-run: cannot write the ledger: {e.strerror or e}", file=sys.stderr)
-
-    if err:
-        sys.stderr.write(rd.text(err) + ("" if err.endswith("\n") else "\n"))
-    res = (entry or {}).get("result")
-    if isinstance(res, str) and res:
-        print(rd.text(res))
-    spent_txt = f"${cost:.4f}" if cost is not None else "unknown"
-    print(f"cost {spent_txt} of ${a.budget!r} budget, state {state}, output {out}")
-    where = f"session {sid}" if sid else "no session id"
-    if state in ("budget_cap", "turns_cap"):
-        resume = f"; resume with: claude --resume {sid}" if sid else ""
-        print(f"credit-run: cap hit ({state}), {where}{resume}", file=sys.stderr)
-        return 3
-    if state == "timeout":
-        print(f"credit-run: stopped by the time limit, {where}", file=sys.stderr)
-    if state == "interrupted":
-        print(f"credit-run: interrupted, {where}", file=sys.stderr)
-    return 0 if state == "ok" else (code or 1)
+def setup():
+    npm = shutil.which("npm")
+    if not npm:
+        die("npm not found; install node first")
+    os.makedirs(sdk_dir(), mode=0o700, exist_ok=True)
+    r = subprocess.run([npm, "install", "--prefix", sdk_dir(), f"{SDK_PACKAGE}@{SDK_VERSION}",
+                        f"{BATCH_SDK_PACKAGE}@{BATCH_SDK_VERSION}"])
+    return r.returncode
 
 
 def main(argv):
-    p = argparse.ArgumentParser(prog="credit-run", description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter,
-                                allow_abbrev=False)
-    p.add_argument("--brief")
-    p.add_argument("--worktree")
-    p.add_argument("--budget", type=float)
-    p.add_argument("--model", default="sonnet")
-    p.add_argument("--minutes", type=float, default=60)
-    p.add_argument("--allow", action="append", nargs="+")
-    p.add_argument("--out")
-    p.add_argument("--key-help", action="store_true")
-    p.add_argument("--spent", action="store_true")
-    a = p.parse_args(argv)
-    a.allow = [t for group in (a.allow or []) for t in group]
+    a = parser().parse_args(argv)
+    if a.self_test:
+        return self_test()
     if a.key_help:
         return key_help()
     if a.spent:
-        return spent()
-    if a.budget is None or not a.brief or not a.worktree:
-        p.error("--brief, --worktree and --budget are required")
-    return run(a)
+        return spent_report()
+    if a.pace:
+        return pace_report()
+    if a.setup:
+        return setup()
+
+    if os.environ.get("LEAN_CREDIT_RUNS", "").strip().lower() != "on":
+        die("credit runs are off; set LEAN_CREDIT_RUNS=on to allow them")
+    total_text = os.environ.get("LEAN_CREDIT_TOTAL_USD")
+    if not total_text:
+        die("LEAN_CREDIT_TOTAL_USD is not set; set the total you allow to spend")
+    total = money(total_text, "LEAN_CREDIT_TOTAL_USD")
+    turn = money(os.environ.get("LEAN_CREDIT_TURN_USD") or "0.50", "LEAN_CREDIT_TURN_USD")
+    if not a.brief or not a.worktree:
+        die("--brief and --worktree are required")
+    if a.budget is None:
+        die("--budget is required")
+    a.budget_value = money(a.budget, "--budget")
+    a.advisor_value = (a.advisor or os.environ.get("LEAN_CREDIT_ADVISOR") or "off").strip().lower()
+    if a.advisor_value not in ("opus", "off"):
+        die(f"advisor must be opus or off, got {a.advisor_value!r}")
+    ttl = (a.cache_ttl or os.environ.get("LEAN_CREDIT_CACHE_TTL") or "5m").strip()
+    if ttl not in ("5m", "1h"):
+        die(f"cache ttl must be 5m or 1h, got {ttl!r}")
+    if a.fast:
+        if os.environ.get("LEAN_CREDIT_FAST", "").strip().lower() != "on":
+            die("--fast needs LEAN_CREDIT_FAST=on")
+        if "opus" not in a.model.lower():
+            die("--fast switches any other model to Opus at double Opus rates; use an Opus model")
+    if a.read_only and a.allow:
+        die("--allow cannot be used with --read-only")
+    for entry in a.allow or []:
+        if refused_allow(entry):
+            die(f"refused: {entry!r} would allow git push")
+    minutes = None
+    if a.minutes is not None:
+        try:
+            minutes = float(a.minutes)
+        except ValueError:
+            minutes = -1
+        if not (minutes >= 0) or minutes == float("inf"):
+            die(f"--minutes must be 0 or more, got {a.minutes!r}")
+    if key_command() is None:
+        die("only macOS and Linux are supported")
+    if not os.path.isfile(a.brief):
+        die(f"brief file not found: {a.brief}")
+    worktree = os.path.realpath(a.worktree)
+    if not os.path.isdir(worktree):
+        die(f"worktree not found: {a.worktree}")
+    if not shutil.which("node"):
+        die("node not found; install node, then run credit-run --setup")
+    if not os.path.isfile(sdk_entry()):
+        die("the Agent SDK is not installed; run credit-run --setup")
+    if not a.read_only:
+        tool = os.path.realpath(ROOT)
+        if os.path.commonpath([tool, worktree]) in (tool, worktree):
+            die(f"{worktree} holds this tool; an edit job there could change its own limits")
+        check_worktree(worktree)
+    key = read_key()
+    with open(a.brief) as f:
+        prompt = f.read() + ("" if a.read_only else GIT_NOTE)
+
+    run = uuid.uuid4().hex[:12]
+    out = os.path.realpath(a.out) if a.out else os.path.join(home(), ".lean", "credit-out", f"{run}.json")
+    os.makedirs(os.path.dirname(out), mode=0o700, exist_ok=True)
+    meta = {
+        "run": run,
+        "branch": git(worktree, "rev-parse", "--abbrev-ref", "HEAD") or "",
+        "model": a.model,
+        "budget": a.budget_value,
+        "role": a.role,
+        "read_only": a.read_only,
+        "advisor": a.advisor_value,
+        "speed": "fast" if a.fast else "standard",
+        "cache_ttl": ttl,
+    }
+    reserve(dict(meta, time=time.strftime("%Y-%m-%dT%H:%M:%S%z"), phase="reserve",
+                 reserved=round(a.budget_value + turn, 6)), total)
+
+    job = json.dumps({"prompt": prompt, "options": build_options(a, worktree, a.model), "out": out})
+    cmd = [sys.executable, os.path.join(HERE, "bounded")]
+    if minutes is not None:
+        cmd += ["--minutes", str(minutes)]
+    cmd += ["--", shutil.which("node"), os.path.join(HERE, "credit-run-worker.mjs"), sdk_dir()]
+    r = subprocess.run(cmd, input=job, capture_output=True, text=True, env=child_env(key, ttl))
+    err = scrub(r.stderr, key).strip()
+    try:
+        with open(out) as f:
+            text = f.read()
+        if key in text:
+            with open(out, "w") as f:
+                f.write(scrub(text, key))
+    except OSError:
+        pass
+
+    summary = None
+    for line in reversed(scrub(r.stdout, key).splitlines()):
+        try:
+            summary = json.loads(line)
+            break
+        except ValueError:
+            continue
+    if r.returncode == 124:
+        err = (err + "\n" if err else "") + "stopped at the time limit"
+    if err:
+        print(err.splitlines()[-1], file=sys.stderr)
+    if not isinstance(summary, dict) or "subtype" not in summary:
+        print(f"credit-run: job {run} gave no result; its reservation stays counted", file=sys.stderr)
+        return 1
+
+    sub = summary["subtype"]
+    state = "cap" if sub == "error_max_budget_usd" else "ok" if sub == "success" and not summary.get("is_error") else sub
+    append_line(dict(meta, time=time.strftime("%Y-%m-%dT%H:%M:%S%z"), phase="final", state=state,
+                     cost=summary.get("cost"), turns=summary.get("turns"),
+                     session_id=summary.get("session_id")))
+    print(summary.get("result") or "")
+    cost = summary.get("cost")
+    print(f"cost ${cost:.4f}" if cost is not None else "cost unknown")
+    if state == "cap":
+        print(f"credit-run: budget cap hit; resume with --resume {summary.get('session_id')}", file=sys.stderr)
+        return 3
+    return 0 if state == "ok" else 1
 
 
-FAKE_CLAUDE = r'''
-import base64, json, os, signal, sys, time, urllib.parse
-key = os.environ.get("ANTHROPIC_API_KEY", "")
+# self-test
+
+KEY = "sk-ant-FAKEKEY1234567890"
+
+FAKE_NODE = r'''#!/usr/bin/env python3
+import json, os, sys, time
 mode = os.environ.get("FAKE_MODE", "ok")
-stdin = sys.stdin.read()
-with open(os.environ["FAKE_LOG"], "a") as f:
-    f.write(json.dumps({"argv": sys.argv[1:], "env": sorted(os.environ), "key_set": bool(key),
-                        "cwd": os.getcwd(), "stdin": stdin}) + "\n")
-
-
-def forms():
-    b = base64.b64encode(key.encode()).decode()
-    return [key, key[:10] + "\n" + key[10:], key[:8] + " " + key[8:], b, b[:12] + "\n" + b[12:],
-            urllib.parse.quote(key, safe="")]
-
-
-# env >&2, and the key in other shapes
-sys.stderr.write("FAKE-STDERR-MARKER\n")
-for k, v in os.environ.items():
-    sys.stderr.write(k + "=" + v + "\n")
-for s in forms():
-    sys.stderr.write("form: " + s + "\n")
-sys.stderr.flush()
-
-
-def payload(sub, cost, sid, is_error=False):
-    obj = {"type": "result", "subtype": sub, "is_error": is_error, "total_cost_usd": cost,
-           "num_turns": 3, "session_id": sid, "result": "done " + " | ".join(forms()),
-           "env": dict(os.environ), "esc": key}
-    # the first character of the key as a JSON unicode escape
-    return json.dumps(obj).replace('"esc": "' + key[0], '"esc": "\\u%04x' % ord(key[0]))
-
-
-if mode == "ok":
-    print(payload("success", 0.25, "sess-ok"))
-elif mode == "cap":
-    print(payload("error_max_budget_usd", 1.5, "sess-cap"))
-elif mode == "err":
-    print(payload("error_during_execution", 0.1, "sess-err", True))
+raw = sys.stdin.read()
+job = json.loads(raw)
+key = "%s"
+rec = {"argv": sys.argv, "stdin": raw, "pid": os.getpid(),
+       "env_names": sorted(os.environ),
+       "cache_ttl": os.environ.get("CLAUDE_CODE_PROMPT_CACHE_TTL"),
+       "scrub": os.environ.get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"),
+       "key_ok": os.environ.get("ANTHROPIC_API_KEY") == key}
+open(os.environ["FAKE_REC"], "w").write(json.dumps(rec))
+if mode == "sleep":
+    time.sleep(40)
+if mode == "crash":
     sys.exit(1)
-elif mode == "array":
-    print(json.dumps([{"type": "system"}, json.loads(payload("success", 0.5, "sess-arr"))]))
-elif mode == "badcost":
-    print(payload("success", "abc", "sess-bad"))
-elif mode == "nojson":
-    print("plain output " + key)
-elif mode == "kill":
-    sys.stdout.write("partial " + key)
-    sys.stdout.flush()
-    os.kill(os.getpid(), signal.SIGKILL)
-elif mode == "sleep":
-    time.sleep(30)
-elif mode == "hang":
-    sys.stdout.write('{"result": "' + key)
-    sys.stdout.flush()
-    open(os.environ["FAKE_READY"], "w").close()
-    time.sleep(60)
-'''
-FAKE_SECURITY = '#!/bin/sh\nif [ "$FAKE_NOKEY" = 1 ]; then exit 44; fi\necho "$FAKE_KEY"\n'
+text = "done"
+if mode == "leak":
+    text = "leaked " + key
+    sys.stderr.write("oops " + key + "\n")
+    open(job["out"], "w").write(json.dumps({"result": text}))
+else:
+    open(job["out"], "w").write(json.dumps({"result": text}))
+sub = "error_max_budget_usd" if mode == "cap" else "success"
+cost = 0.09 if mode == "cap" else 0.01
+print(json.dumps({"subtype": sub, "is_error": False, "result": text, "cost": cost,
+                  "turns": 2, "session_id": "sess-1"}))
+''' % KEY
 
-BAD_ALLOW = [
-    "Bash(git push:*)", "Bash(git push origin main)", "Bash", "Bash(git:*)",
-    "Bash(git -C x push:*)", "Bash(git -c k=v push:*)", "Bash(git --no-pager push:*)",
-    "Bash(git pu*)", "Bash(git\tpush:*)", "Bash(git pu\u200bsh:*)", "Read,Bash(git:*)",
-    "Bash(g*)", "Bash(sh:*)", "Bash(python3:*)", "Bash(python3.12:*)", "Bash(gh:*)",
-    "Bash(curl:*)", "bash(env:*)", "Bash(env:*)", "Bash(npm test)", "Bash(make:*)",
-    "Bash(/usr/bin/git status --short:*)", "Bash(git diff --output=x:*)", "Bash(FOO=1 ls:*)",
-    "Bash(ls  -l)", "Bash(ls:*:*)", "Bash()", "Bash(ls $(id))", "Bash(ls;id)", "Read(x)", "*", "",
-]
-GOOD_ALLOW = ["Bash(ls:*)", "Bash(wc -l:*)", "Bash(cat README.md)", "WebFetch", "Bash(git status:*)"]
+FAKE_KEY_TOOL = '''#!/bin/sh
+case "$FAKE_KEY_MODE" in
+  empty) echo "" ;;
+  missing) exit 44 ;;
+  *) echo "%s" ;;
+esac
+''' % KEY
 
 
 def self_test():
-    import shutil
     fails = []
     me = os.path.realpath(__file__)
-    secret = "sk-ant-SELFTEST-0123456789+/abcdefghij"
-    b64 = base64.b64encode(secret.encode()).decode()
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = os.path.realpath(tmp)
+
+    def check(ok, msg):
+        if not ok:
+            fails.append(msg)
+
+    tmp = tempfile.mkdtemp(prefix="credit-run-test-")
+    try:
         bindir = os.path.join(tmp, "bin")
-        tmpdir = os.path.join(tmp, "tmpdir")
+        nonode = os.path.join(tmp, "nonode")
         os.makedirs(bindir)
-        os.makedirs(tmpdir)
-        for name, body in (("claude", "#!" + sys.executable + "\n" + FAKE_CLAUDE),
-                           ("security", FAKE_SECURITY), ("secret-tool", FAKE_SECURITY)):
-            path = os.path.join(bindir, name)
-            with open(path, "w") as f:
+        os.makedirs(nonode)
+        for name, body in (("node", FAKE_NODE), ("security", FAKE_KEY_TOOL), ("secret-tool", FAKE_KEY_TOOL),
+                           ("npm", '#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_NPM_REC"\n')):
+            p = os.path.join(bindir, name)
+            with open(p, "w") as f:
                 f.write(body)
-            os.chmod(path, 0o755)
+            os.chmod(p, 0o755)
+        gitpath = shutil.which("git")
+        os.symlink(gitpath, os.path.join(nonode, "git"))
+        for name in ("security", "secret-tool"):
+            os.symlink(os.path.join(bindir, name), os.path.join(nonode, name))
         fake_home = os.path.join(tmp, "home")
-        os.makedirs(fake_home)
-        ledger_file = os.path.join(fake_home, ".lean", "credit-runs.jsonl")
-        credit_out = os.path.join(fake_home, ".lean", "credit-out")
-        log = os.path.join(tmp, "claude.log")
+        os.makedirs(os.path.join(fake_home, ".lean", "credit-sdk", "node_modules", "@anthropic-ai",
+                                 "claude-agent-sdk"))
+        open(os.path.join(fake_home, ".lean", "credit-sdk", "node_modules", "@anthropic-ai",
+                          "claude-agent-sdk", "sdk.mjs"), "w").close()
+        ledger = os.path.join(fake_home, ".lean", "credit-runs.jsonl")
+        rec = os.path.join(tmp, "rec.json")
+
+        # a repo, a clean linked worktree, and a dirty one
         main_repo = os.path.join(tmp, "main")
-        wt = os.path.join(tmp, "wt")
-        g = lambda *x: subprocess.run(["git", "-C", main_repo, *x], capture_output=True, check=True)
         os.makedirs(main_repo)
-        g("init", "-q", "-b", "main")
-        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i")
-        g("worktree", "add", "-q", "-b", "feat/x", wt)
+        g = ["git", "-C", main_repo, "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(g + ["init", "-q", "-b", "main"], check=True)
+        subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        wt = os.path.join(tmp, "wt")
+        wt_dirty = os.path.join(tmp, "wt-dirty")
+        subprocess.run(g + ["worktree", "add", "-q", "-b", "a", wt], check=True)
+        subprocess.run(g + ["worktree", "add", "-q", "-b", "b", wt_dirty], check=True)
+        open(os.path.join(wt_dirty, "junk"), "w").write("x")
         brief = os.path.join(tmp, "brief.md")
-        with open(brief, "w") as f:
-            f.write("fix the ticket")
-        base_env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "ANTHROPIC_", "LEAN_CREDIT"))}
-        base_env.update(PATH=bindir + os.pathsep + os.environ["PATH"], HOME=fake_home, TMPDIR=tmpdir,
-                        FAKE_KEY=secret, FAKE_LOG=log)
+        open(brief, "w").write("do the thing")
 
-        def cr(*args, **env):
-            r = subprocess.run([sys.executable, me, *args], capture_output=True, text=True,
-                               env=dict(base_env, **env))
-            if "Traceback" in r.stderr:
-                fails.append(f"traceback for {args[:3]}: {r.stderr[-200:]!r}")
-            return r
+        base = {"PATH": bindir + os.pathsep + os.environ.get("PATH", ""), "HOME": fake_home,
+                "FAKE_REC": rec, "FAKE_NPM_REC": os.path.join(tmp, "npm.txt")}
 
-        def started():
-            return os.path.exists(log)
+        def env(**kw):
+            e = dict(base)
+            e.update(kw)
+            return e
 
-        def fresh():
-            if started():
-                os.remove(log)
+        on = {"LEAN_CREDIT_RUNS": "on", "LEAN_CREDIT_TOTAL_USD": "2.0"}
 
-        def records():
-            return [json.loads(x) for x in open(log)] if started() else []
+        def run(args, e, **kw):
+            for f in (rec,):
+                if os.path.exists(f):
+                    os.remove(f)
+            return subprocess.run([sys.executable, me] + args, capture_output=True, text=True, env=e, **kw)
 
-        def rows():
-            return [json.loads(x) for x in open(ledger_file)] if os.path.exists(ledger_file) else []
+        def job_args(*extra, wtree=wt, budget="0.5"):
+            return ["--brief", brief, "--worktree", wtree, "--budget", budget] + list(extra)
 
-        def leaks(text):
-            squashed = re.sub(r"\\[nrt]|\s", "", text)
-            hits = []
-            for name, needle in (("key", secret), ("base64", b64), ("urlencoded", urllib.parse.quote(secret, safe=""))):
-                if needle in text or needle in squashed:
-                    hits.append(name)
-            return hits
+        def rec_json():
+            return json.load(open(rec)) if os.path.exists(rec) else None
 
-        def case(label, mode, want_rc, *extra, **env):
-            """One run with the fake claude in `mode`; the key must be in none of the channels."""
-            fresh()
-            o = os.path.join(tmp, f"out-{label}.json")
-            r = cr("--brief", brief, "--worktree", wt, "--budget", "2", "--out", o, *extra,
-                   FAKE_MODE=mode, **env)
-            if r.returncode != want_rc:
-                fails.append(f"{label}: rc={r.returncode}, want {want_rc}, err={r.stderr[-200:]!r}")
-            outtext = open(o).read() if os.path.exists(o) else ""
-            for chan, text in (("stdout", r.stdout), ("stderr", r.stderr), ("output file", outtext),
-                               ("ledger", open(ledger_file).read())):
-                if leaks(text):
-                    fails.append(f"{label}: key leaked into {chan} as {leaks(text)}")
-            if "FAKE-STDERR-MARKER" not in r.stderr:
-                fails.append(f"{label}: child stderr was not passed on")
-            return r, outtext
+        def one_line(r):
+            return r.returncode == 2 and len(r.stderr.strip().splitlines()) == 1 and "Traceback" not in r.stderr
 
-        # ---- a good run: argv, environment, redaction in every channel
-        r, outtext = case("ok", "ok", 0)
-        rec = records()[-1]
-        argv = rec["argv"]
-        if "done" not in r.stdout or "0.2500" not in r.stdout:
-            fails.append(f"stdout lacks result or cost: {r.stdout!r}")
-        if REDACTED not in outtext or "[redacted]" not in r.stderr:
-            fails.append("redaction left no marker")
-        if not rec["key_set"] or "ANTHROPIC_API_KEY" not in rec["env"]:
-            fails.append("key did not reach the child environment")
-        if secret in json.dumps(argv):
-            fails.append("key in argv")
-        if argv[argv.index("--max-budget-usd") + 1] != "2.0":
-            fails.append("budget flag wrong")
-        if argv[argv.index("--allowedTools") + 1].split(",") != DEFAULT_ALLOW:
-            fails.append("allowed tools are not the defaults")
-        if argv[argv.index("--disallowedTools") + 1].split(",") != DENY:
-            fails.append("deny list not in argv")
-        if rec["cwd"] != wt or rec["stdin"] != "fix the ticket":
-            fails.append("job did not run in the worktree with the brief on stdin")
-        row = rows()[-1]
-        if (row["branch"], row["model"], row["budget"], row["cost"], row["cost_known"], row["turns"],
-                row["state"], row["session"]) != ("feat/x", "sonnet", 2.0, 0.25, True, 3, "ok", "sess-ok"):
-            fails.append(f"ledger row wrong: {row}")
-        if os.stat(os.path.join(tmp, "out-ok.json")).st_mode & 0o077:
-            fails.append("--out is readable by others")
+        def reset_ledger():
+            if os.path.exists(ledger):
+                os.remove(ledger)
 
-        # ---- the env of the child: stripped names do not reach it
-        fresh()
-        r = cr(*["--brief", brief, "--worktree", wt, "--budget", "2"],
-               ANTHROPIC_AUTH_TOKEN="t", ANTHROPIC_BASE_URL="http://other.invalid",
-               CLAUDE_CODE_USE_BEDROCK="1", CLAUDE_CODE_USE_VERTEX="1", CLAUDE_CODE_OAUTH_TOKEN="t",
-               GIT_DIR=os.path.join(main_repo, ".git"), GIT_AUTHOR_NAME="a", ANTHROPIC_API_KEY="other")
-        names = set(records()[-1]["env"]) if started() else set()
-        if r.returncode != 0:
-            fails.append(f"GIT_DIR in the caller broke the worktree check: rc={r.returncode} {r.stderr[-120:]!r}")
-        for n in sorted(STRIP_ENV | {"GIT_DIR", "GIT_AUTHOR_NAME"}):
-            if n in names:
-                fails.append(f"{n} reached the child")
-        if "ANTHROPIC_API_KEY" not in names:
-            fails.append("key missing when ANTHROPIC_API_KEY was already set")
+        # switch off
+        r = run(job_args(), env(LEAN_CREDIT_TOTAL_USD="2.0"))
+        check(one_line(r) and rec_json() is None and not os.path.exists(ledger), f"switch off did not stop the job: {r.returncode} {r.stderr!r}")
+        r = run(job_args(), env(LEAN_CREDIT_RUNS="off", LEAN_CREDIT_TOTAL_USD="2.0"))
+        check(one_line(r) and rec_json() is None, "switch off (explicit) started a job")
+        # an edit job never runs on the tool's own folder, above it or below it
+        for place in (ROOT, os.path.dirname(ROOT), os.path.join(ROOT, "tools")):
+            r = run(job_args(wtree=place), env(LEAN_CREDIT_RUNS="on", LEAN_CREDIT_TOTAL_USD="2.0"))
+            check(one_line(r) and "holds this tool" in r.stderr and rec_json() is None, f"edit job allowed at {place}: {r.stderr!r}")
+        # --spent and --key-help work with the switch off
+        r = run(["--spent"], env())
+        check(r.returncode == 0 and "local estimate" in r.stdout and "Console" in r.stdout, f"--spent: {r.stdout!r}")
+        r = run(["--key-help"], env())
+        check(r.returncode == 0 and ("security add-generic-password" in r.stdout or "secret-tool store" in r.stdout)
+              and KEY not in r.stdout, "--key-help")
 
-        # ---- cap, error, timeout, interrupted, no output, kill: still no key anywhere
-        r, _ = case("cap", "cap", 3)
-        if "sess-cap" not in r.stderr or "budget_cap" not in r.stderr or "claude --resume sess-cap" not in r.stderr:
-            fails.append(f"cap hit not reported with the session id: {r.stderr[-300:]!r}")
-        case("err", "err", 1)
-        t0 = time.monotonic()
-        r, _ = case("timeout", "sleep", 124, "--minutes", "0.02")
-        if time.monotonic() - t0 > 25 or "time limit" not in r.stderr or rows()[-1]["state"] != "timeout":
-            fails.append(f"time limit not enforced: {r.stderr[-200:]!r}")
-        # unknown cost: written as null, never a traceback, always a line
-        for label, mode, rc, want_cost, want_state in (("nojson", "nojson", 1, None, "error"),
-                                                       ("kill", "kill", 137, None, "error"),
-                                                       ("badcost", "badcost", 0, None, "ok"),
-                                                       ("array", "array", 0, 0.5, "ok")):
-            n = len(rows())
-            case(label, mode, rc)
-            new = rows()[n:]
-            if len(new) != 1 or new[0]["cost"] != want_cost or new[0]["cost_known"] != (want_cost is not None) \
-                    or new[0]["state"] != want_state:
-                fails.append(f"{label}: ledger row {new}")
-        if rows()[-1]["session"] != "sess-arr":
-            fails.append("array result entry not read")
+        # missing total
+        r = run(job_args(), env(LEAN_CREDIT_RUNS="on"))
+        check(one_line(r) and rec_json() is None, f"missing total started a job: {r.returncode} {r.stderr!r}")
 
-        # ---- SIGTERM: --out holds no raw key, one ledger line, nothing left in the temp dir
-        fresh()
-        ready = os.path.join(tmp, "ready")
-        o = os.path.join(tmp, "out-term.json")
-        n = len(rows())
-        p = subprocess.Popen([sys.executable, me, "--brief", brief, "--worktree", wt, "--budget", "2", "--out", o],
-                             env=dict(base_env, FAKE_MODE="hang", FAKE_READY=ready),
+        # a reservation over the total refuses: 0.6 + 0.5 turn reserve is 1.1 over 1.0
+        r = run(job_args(budget="0.6"), env(LEAN_CREDIT_RUNS="on", LEAN_CREDIT_TOTAL_USD="1.0"))
+        check(one_line(r) and rec_json() is None and not open(ledger).read().strip(), f"over-total job started: {r.returncode} {r.stderr!r}")
+
+        # a good run: env, options, ledger, key absence
+        reset_ledger()
+        e = env(**on, LEAN_CREDIT_ADVISOR="opus", LEAN_CREDIT_CACHE_TTL="1h",
+                ANTHROPIC_AUTH_TOKEN="tok-a", CLAUDE_CODE_OAUTH_TOKEN="tok-b", FAKE_MODE="leak",
+                ANTHROPIC_BASE_URL="http://x", CLAUDE_CODE_USE_BEDROCK="1",
+                CLAUDE_CODE_USE_VERTEX="1", CLAUDE_CODE_USE_FOUNDRY="1")
+        out_file = os.path.join(tmp, "out.json")
+        r = run(job_args("--role", "hunt", "--out", out_file), e)
+        c = rec_json()
+        check(r.returncode == 0 and c is not None, f"good run failed: {r.returncode} {r.stderr!r} {r.stdout!r}")
+        if c:
+            names = c["env_names"]
+            check("ANTHROPIC_AUTH_TOKEN" not in names, "ANTHROPIC_AUTH_TOKEN reached the child")
+            check("CLAUDE_CODE_OAUTH_TOKEN" not in names, "CLAUDE_CODE_OAUTH_TOKEN reached the child")
+            for gone in ("ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                         "CLAUDE_CODE_USE_FOUNDRY"):
+                check(gone not in names, f"{gone} reached the child")
+            check(c["key_ok"] is True, "the key did not reach the child env")
+            check(c["cache_ttl"] == "1h", f"cache ttl not passed: {c['cache_ttl']!r}")
+            check(c["scrub"] == "1", f"key not scrubbed from Bash and hooks: {c['scrub']!r}")
+            job = json.loads(c["stdin"])
+            opts = job["options"]
+            check(job["prompt"].startswith("do the thing") and "never `git -C`" in job["prompt"], "git note not in the prompt")
+            check(opts.get("settings", {}).get("advisorModel") == "opus", "advisor not passed")
+            check("fastMode" not in opts.get("settings", {}), "fastMode set without --fast")
+            check(opts.get("settings", {}).get("attribution") is False, "attribution not turned off")
+            check(not {"Edit", "Write"} & set(opts["allowedTools"]), "Edit or Write allowed outside the worktree")
+            check(any(x.startswith("Write(//") and x.endswith("/**)") for x in opts["allowedTools"]), "Write not scoped to the worktree")
+            check("Write(**/.git/**)" in opts["disallowedTools"] and "Edit(**/.git/**)" in opts["disallowedTools"], "git metadata not denied")
+            check("Bash(git * --out*)" in opts["disallowedTools"], "git --output not denied")
+            check(opts["settingSources"] == [] and opts["permissionMode"] == "dontAsk", "scope or permission mode")
+            check(opts["plugins"] == [{"type": "local", "path": ROOT}], "plugin path")
+            for d in ("Bash(git push:*)", "Bash(git -C:*)", "Bash(git -c:*)", "Read(/proc/**)"):
+                check(d in opts["disallowedTools"], f"{d} not denied on an edit job")
+            check(json.loads(c["stdin"])["prompt"].startswith("do the thing") and "never `git -C`" in json.loads(c["stdin"])["prompt"], "git note missing on an edit job")
+            check(opts["maxBudgetUsd"] == 0.5 and opts["model"] == "sonnet", "budget or model")
+            leak_places = {
+                "argv": json.dumps(c["argv"]), "stdin": c["stdin"], "stdout": r.stdout, "stderr": r.stderr,
+                "ledger": open(ledger).read(), "output file": open(out_file).read(),
+            }
+            for place, text in leak_places.items():
+                check(KEY not in text, f"the key is in the {place}")
+            check("[redacted]" in r.stdout + r.stderr, "the fake leaked the key but nothing was redacted")
+        check(scrub("a " + KEY, KEY) == "a [redacted]", "scrub does not remove the key")
+        lines = [json.loads(x) for x in open(ledger)]
+        check([x["phase"] for x in lines] == ["reserve", "final"] and lines[0]["run"] == lines[1]["run"], f"ledger shape: {lines}")
+        if len(lines) == 2:
+            check(lines[1]["role"] == "hunt" and lines[1]["advisor"] == "opus" and lines[1]["speed"] == "standard"
+                  and lines[1]["state"] == "ok" and lines[0]["reserved"] == 1.0, f"ledger fields: {lines}")
+        check("leaked [redacted]" in r.stdout and "cost $0.0100" in r.stdout, f"stdout: {r.stdout!r}")
+
+        # key problems: empty and missing exit 2 with one line and no job
+        for mode in ("empty", "missing"):
+            reset_ledger()
+            r = run(job_args(), env(**on, FAKE_KEY_MODE=mode))
+            check(one_line(r) and rec_json() is None and not os.path.exists(ledger), f"{mode} key: {r.returncode} {r.stderr!r}")
+            check(KEY not in r.stderr, "key text in error")
+
+        # --fast
+        reset_ledger()
+        r = run(job_args("--fast", "--model", "sonnet"), env(**on, LEAN_CREDIT_FAST="on"))
+        check(one_line(r) and rec_json() is None, "--fast with sonnet started")
+        r = run(job_args("--fast", "--model", "opus"), env(**on))
+        check(one_line(r) and rec_json() is None, "--fast without the switch started")
+        r = run(job_args("--fast", "--model", "claude-opus-4-1"), env(**on, LEAN_CREDIT_FAST="on"))
+        c = rec_json()
+        check(r.returncode == 0 and c and json.loads(c["stdin"])["options"]["settings"].get("fastMode") is True, f"--fast opus: {r.stderr!r}")
+        check(open(ledger).read().count('"speed": "fast"') == 2, "speed not in the ledger")
+
+        # push refused
+        for bad in ("Bash(git push:*)", "Bash", "Bash(git:*)", "Bash(git -C x push origin)",
+                    "Bash(git -C:*)", "Bash(git -c:*)", "Bash(git -c x=y status)", "Bash(git pu*)",
+                    "Bash(git p?sh:*)", "Bash(sh -c:*)", "Bash(bash:*)", "Bash(zsh -c:*)", "Bash(env:*)",
+                    "Bash(xargs:*)", "Bash(python:*)", "Bash(python3 -c:*)", "Bash(node -e:*)",
+                    "Bash(perl:*)", "Bash(ruby:*)", "Bash(eval:*)", "Bash(exec:*)", "Bash(/bin/sh -c:*)"):
+            r = run(job_args("--allow", bad), env(**on))
+            check(one_line(r) and rec_json() is None, f"--allow {bad!r} was not refused")
+        r = run(job_args("--allow", "Bash(npm run build:*)"), env(**on))
+        c = rec_json()
+        check(r.returncode == 0 and c and "Bash(npm run build:*)" in json.loads(c["stdin"])["options"]["allowedTools"], "a fine --allow was refused")
+
+        # worktree checks
+        for label, path in (("main checkout", main_repo), ("dirty worktree", wt_dirty)):
+            r = run(job_args(wtree=path), env(**on))
+            check(one_line(r) and rec_json() is None, f"{label} started a job")
+        r = run(job_args("--read-only", wtree=wt_dirty), env(**on))
+        c = rec_json()
+        check(r.returncode == 0 and c is not None, f"read-only on a dirty tree: {r.stderr!r}")
+        if c:
+            o = json.loads(c["stdin"])["options"]
+            for field in ("tools", "allowedTools"):
+                check(not any(x.startswith(("Edit", "Write")) for x in o[field]), f"read-only {field} has an edit tool: {o[field]}")
+            check(o["tools"] == ["Read", "Glob", "Grep"], f"read-only tools: {o['tools']}")
+            check(o["allowedTools"] == ["Read", "Glob", "Grep"], f"read-only allowedTools: {o['allowedTools']}")
+            check("Read(/proc/**)" in o["disallowedTools"], "read-only does not deny /proc")
+            check("git" not in json.loads(c["stdin"])["prompt"], "git note on a read-only job")
+        r = run(job_args("--read-only", "--allow", "Bash(git push:*)"), env(**on))
+        check(one_line(r) and rec_json() is None, "read-only with --allow push started")
+        r = run(job_args("--role", "nonsense"), env(**on))
+        check(one_line(r) and rec_json() is None, "bad role accepted")
+
+        # cap hit: cost counted, session id shown, exit 3
+        reset_ledger()
+        r = run(job_args(), env(**on, FAKE_MODE="cap"))
+        check(r.returncode == 3 and "sess-1" in r.stderr, f"cap hit: {r.returncode} {r.stderr!r}")
+        check(json.loads(open(ledger).readlines()[-1])["state"] == "cap", "cap state not in the ledger")
+        r = run(["--spent"], env(**on))
+        check("spent    $0.0900" in r.stdout and "reserved $0.0000" in r.stdout, f"cap spent: {r.stdout!r}")
+
+        # the timeout path: bounded stops the worker, exit 1, the reservation stays
+        reset_ledger()
+        r = run(job_args("--minutes", "0.02"), env(**on, FAKE_MODE="sleep"))
+        check(r.returncode == 1 and "time limit" in r.stderr and open(ledger).read().count("\n") == 1,
+              f"timeout: {r.returncode} {r.stderr!r}")
+        pid = (rec_json() or {}).get("pid")
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        # parallel reservations: 4 jobs reserve 1.0 each against a total of 2.0, so 2 pass
+        reset_ledger()
+        procs = []
+        for i in range(4):
+            procs.append(subprocess.Popen(
+                [sys.executable, me] + job_args("--minutes", "0.05"),
+                env=env(**on, FAKE_MODE="sleep", FAKE_REC=os.path.join(tmp, f"par{i}.json")),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        codes = sorted(p.wait(timeout=60) for p in procs)
+        for p in procs:
+            p.stdout.close()
+            p.stderr.close()
+        reserved_lines = sum(1 for x in open(ledger) if '"phase": "reserve"' in x)
+        check(codes == [1, 1, 2, 2] and reserved_lines == 2, f"parallel reserve: codes={codes} reserved={reserved_lines}")
+        for i in range(4):
+            try:
+                os.kill(json.load(open(os.path.join(tmp, f"par{i}.json")))["pid"], signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+
+        # a cut-off ledger line does not swallow the next record
+        reset_ledger()
+        with open(ledger, "w") as f:
+            f.write('{"run": "cut", "phase": "rese')
+        r = run(job_args(), env(**on))
+        parsed = []
+        for x in open(ledger).read().split("\n"):
+            try:
+                parsed.append(json.loads(x))
+            except ValueError:
+                pass
+        check(r.returncode == 0 and [x["phase"] for x in parsed] == ["reserve", "final"], f"cut-off line: {parsed}")
+
+        # a worker crash leaves its reservation counting
+        reset_ledger()
+        r = run(job_args(), env(**on, FAKE_MODE="crash"))
+        check(r.returncode == 1 and open(ledger).read().count("\n") == 1, f"crash: {r.returncode} {open(ledger).read()!r}")
+        r = run(["--spent"], env(**on))
+        check("reserved $1.0000" in r.stdout, f"crash reservation: {r.stdout!r}")
+
+        # a killed job's reservation counts, and blocks the next job
+        reset_ledger()
+        p = subprocess.Popen([sys.executable, me] + job_args(), env=env(**on, FAKE_MODE="sleep"),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         end = time.monotonic() + 15
-        while time.monotonic() < end and not os.path.exists(ready):
-            time.sleep(0.05)
-        p.send_signal(signal.SIGTERM)
-        try:
-            so, se = p.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            so, se = p.communicate()
-            fails.append("SIGTERM: credit-run did not stop")
-        new = rows()[n:]
-        outtext = open(o).read() if os.path.exists(o) else ""
-        if len(new) != 1 or new[0]["state"] != "interrupted":
-            fails.append(f"SIGTERM: ledger rows {new}")
-        for chan, text in (("stdout", so), ("stderr", se), ("output file", outtext), ("ledger", open(ledger_file).read())):
-            if leaks(text):
-                fails.append(f"SIGTERM: key leaked into {chan}")
-        if not outtext:
-            fails.append("SIGTERM: --out was not written")
+        while time.monotonic() < end and not (os.path.exists(ledger) and os.path.exists(rec)):
+            time.sleep(0.1)
+        child_pid = (rec_json() or {}).get("pid")
+        p.send_signal(signal.SIGKILL)
+        p.wait()
+        r = run(["--spent"], env(**on))
+        check("reserved $1.0000" in r.stdout, f"killed job not counted: {r.stdout!r}")
+        r = run(job_args(budget="0.6"), env(**on))
+        check(one_line(r) and rec_json() is None, f"a job passed over a killed job's reservation: {r.returncode} {r.stderr!r}")
+        if child_pid:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except OSError:
+                pass
 
-        # ---- missing keychain item: exit 2, one line, no job
-        fresh()
-        r = cr("--brief", brief, "--worktree", wt, "--budget", "2", FAKE_NOKEY="1")
-        if r.returncode != 2 or len(r.stderr.strip().splitlines()) != 1 or r.stdout or started():
-            fails.append(f"missing item: rc={r.returncode} err={r.stderr!r} started={started()}")
+        # older single-line rows (no phase) count against the total
+        reset_ledger()
+        with open(ledger, "w") as f:
+            f.write(json.dumps({"time": "t", "branch": "x", "model": "m", "budget": 1.0, "cost": 0.75,
+                                "cost_known": True, "turns": 1, "state": "ok", "session": "old-1"}) + "\n")
+            f.write(json.dumps({"time": "t", "budget": 0.4, "cost": None, "cost_known": False}) + "\n")
+            f.write(json.dumps({"time": "t", "budget": 0.4, "cost": "lots"}) + "\n")
+            f.write("not json\n")
+        r = run(["--spent"], env(**on))
+        check("spent    $1.1500" in r.stdout and "unknown  1" in r.stdout and "skipped  2" in r.stdout,
+              f"older rows: {r.stdout!r}")
+        # 1.15 spent plus a 1.0 reservation is over 2.0
+        r = run(job_args(), env(**on))
+        check(one_line(r) and rec_json() is None, f"a job passed over older rows: {r.returncode} {r.stderr!r}")
+        r = run(job_args(budget="0.3"), env(**on))
+        check(r.returncode == 0, f"a job that fits was refused: {r.stderr!r}")
 
-        # ---- --allow: each bad spelling is refused with no job, good ones pass through
-        for bad in BAD_ALLOW:
-            fresh()
-            r = cr("--brief", brief, "--worktree", wt, "--budget", "2", "--allow", bad)
-            if r.returncode != 2 or started() or len(r.stderr.strip().splitlines()) != 1:
-                fails.append(f"--allow {bad!r} not refused: rc={r.returncode} started={started()}")
-        for ok in GOOD_ALLOW:
-            fresh()
-            r = cr("--brief", brief, "--worktree", wt, "--budget", "2", "--allow", ok)
-            tools = records()[-1]["argv"] if started() else []
-            if r.returncode != 0 or ok not in ",".join(tools[tools.index("--allowedTools") + 1:][:1]).split(",") if tools else True:
-                fails.append(f"--allow {ok!r} rejected or missing: rc={r.returncode} {r.stderr[-100:]!r}")
+        # --pace: no key, no worker, no switch
+        import contextlib
+        import datetime as dt
+        import io
+        import credit_common as cc
+        day_rows = lambda *rs: open(ledger, "w").write("".join(json.dumps(x) + "\n" for x in rs))  # noqa: E731
 
-        # ---- budget and minutes
-        fresh()
-        r = cr("--brief", brief, "--worktree", wt, "--budget", "0.1234567")
-        if r.returncode != 0 or records()[-1]["argv"][records()[-1]["argv"].index("--max-budget-usd") + 1] != "0.1234567":
-            fails.append("budget was rounded or refused")
-        for label, args in (("no budget", []), ("zero budget", ["--budget", "0"]),
-                            ("under 0.01", ["--budget", "0.009"]), ("nan budget", ["--budget", "nan"]),
-                            ("inf budget", ["--budget", "inf"]), ("negative budget", ["--budget", "-1"]),
-                            ("minutes 0", ["--budget", "1", "--minutes", "0"]),
-                            ("minutes -1", ["--budget", "1", "--minutes", "-1"]),
-                            ("minutes nan", ["--budget", "1", "--minutes", "nan"])):
-            fresh()
-            r = cr("--brief", brief, "--worktree", wt, *args)
-            if r.returncode != 2 or started():
-                fails.append(f"{label} not refused: rc={r.returncode}")
+        def pace_in_process(now, **vals):
+            saved = dict(os.environ)
+            os.environ.update({"HOME": fake_home, "LEAN_CREDIT_TOTAL_USD": "100"})
+            for k in ("LEAN_CREDIT_UNTIL", "LEAN_CREDIT_CODE"):
+                os.environ.pop(k, None)
+            os.environ.update(vals)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    cc.pace_report(now)
+            finally:
+                os.environ.clear()
+                os.environ.update(saved)
+            return buf.getvalue()
 
-        # ---- worktree rules
-        fresh()
-        r = cr("--brief", brief, "--worktree", main_repo, "--budget", "1")
-        if r.returncode != 2 or started() or "not a linked worktree" not in r.stderr:
-            fails.append(f"main checkout not refused: rc={r.returncode} {r.stderr!r}")
-        with open(os.path.join(wt, "dirty"), "w") as f:
-            f.write("x")
-        r = cr("--brief", brief, "--worktree", wt, "--budget", "1")
-        if r.returncode != 2 or started():
-            fails.append(f"dirty worktree not refused: rc={r.returncode}")
-        os.remove(os.path.join(wt, "dirty"))
+        utc = dt.timezone.utc
+        noon = dt.datetime(2026, 11, 10, 12, 0, tzinfo=utc)
+        fin = lambda t, c: {"run": "x" + t, "phase": "final", "cost": c, "time": t}  # noqa: E731
+        # 10 days left (10 to 19 Nov, last day counts), 100 total, 0 spent: 10 per day
+        reset_ledger()
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("days left 10" in out and "per day   $10.0000" in out and "state     behind" in out
+              and "Next: move docs and tickets to credits. LEAN_CREDIT_CODE=on would add coding." in out,
+              f"pace behind: {out!r}")
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19", LEAN_CREDIT_CODE="on")
+        check("Next: move coding jobs to credits too." in out and "state     behind" in out, f"pace behind, code on: {out!r}")
+        # 12 spent today against 88 over 10 days (8.8 per day): ahead
+        day_rows(fin("2026-11-10T09:00:00+0000", 12.0))
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19", LEAN_CREDIT_CODE="on")
+        check("state     ahead" in out and "today     $12.0000 spent" in out
+              and out.strip().splitlines()[-1] == "Next: keep credits to review work.", f"pace ahead: {out!r}")
+        # reserved money counts as used for remaining
+        day_rows({"run": "r", "phase": "reserve", "reserved": 20.0, "time": "2026-11-10T09:00:00+0000"})
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("reserved  $20.0000" in out and "remaining $80.0000" in out and "per day   $8.0000" in out
+              and "today     $0.0000 spent" in out, f"pace reserved: {out!r}")
+        # the last day: days left 1
+        reset_ledger()
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-10")
+        check("days left 1" in out and "per day   $100.0000" in out, f"pace last day: {out!r}")
+        # 23:30 on the 9th at UTC-8 and 00:30 on the 11th at UTC+8 are both the 10th in UTC; 09:30 on the 11th at UTC+8 is the 11th
+        day_rows(fin("2026-11-09T23:30:00-0800", 3.0), fin("2026-11-11T00:30:00+0800", 4.0),
+                 fin("2026-11-11T09:30:00+0800", 50.0))
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("today     $7.0000 spent" in out, f"pace offsets: {out!r}")
+        # the same instant is a different day at another now
+        out = pace_in_process(dt.datetime(2026, 11, 10, 20, 5, tzinfo=dt.timezone(dt.timedelta(hours=-8))),
+                              LEAN_CREDIT_UNTIL="2026-11-19")
+        check("days left 9" in out and "today     $50.0000 spent" in out, f"pace now with an offset: {out!r}")
+        # legacy rows count in the total
+        day_rows({"time": "2026-11-10T01:00:00+0000", "budget": 1.0, "cost": 30.0, "cost_known": True})
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("spent     $30.0000" in out and "today     $30.0000 spent" in out, f"pace legacy row: {out!r}")
+        # exits: bad input, with the switch off, no key read and no worker started
+        for label, extra in (("past date", {"LEAN_CREDIT_UNTIL": "2000-01-01"}),
+                             ("bad date", {"LEAN_CREDIT_UNTIL": "2026-13-45"}),
+                             ("short date", {"LEAN_CREDIT_UNTIL": "2026-1-5"}),
+                             ("no date", {}),
+                             ("no total", {"LEAN_CREDIT_UNTIL": "2999-01-01", "LEAN_CREDIT_TOTAL_USD": ""})):
+            r = run(["--pace"], env(**dict({"LEAN_CREDIT_TOTAL_USD": "100"}, **extra)))
+            check(one_line(r) and rec_json() is None, f"--pace {label}: {r.returncode} {r.stderr!r}")
+        key_rec = os.path.join(tmp, "key-read")
+        bad_key = os.path.join(bindir, "security")
+        saved_tool = open(bad_key).read()
+        for name in ("security", "secret-tool"):
+            with open(os.path.join(bindir, name), "w") as f:
+                f.write(f'#!/bin/sh\ntouch "{key_rec}"\necho x\n')
+        r = run(["--pace"], env(LEAN_CREDIT_TOTAL_USD="100", LEAN_CREDIT_UNTIL="2999-01-01"))
+        check(r.returncode == 0 and "Next:" in r.stdout and rec_json() is None and not os.path.exists(key_rec),
+              f"--pace read the key or started a worker: {r.returncode} {r.stderr!r}")
+        for name in ("security", "secret-tool"):
+            with open(os.path.join(bindir, name), "w") as f:
+                f.write(saved_tool)
 
-        # ---- bounded missing: no job
-        lone = os.path.join(tmp, "lone")
-        os.makedirs(lone)
-        shutil.copy(me, os.path.join(lone, "credit-run"))
-        fresh()
-        r = subprocess.run([sys.executable, os.path.join(lone, "credit-run"), "--brief", brief, "--worktree", wt,
-                            "--budget", "1"], capture_output=True, text=True, env=base_env)
-        if r.returncode != 2 or started() or len(r.stderr.strip().splitlines()) != 1:
-            fails.append(f"missing bounded not refused: rc={r.returncode} {r.stderr!r}")
+        # the real worker under real node, against a fake SDK
+        real_node = shutil.which("node", path=os.environ.get("PATH", ""))
+        if not real_node:
+            print("self-test note: node not found, worker tests skipped")
+        else:
+            sdk = os.path.join(tmp, "fakesdk")
+            sdk_mod = os.path.join(sdk, "node_modules", "@anthropic-ai", "claude-agent-sdk")
+            os.makedirs(sdk_mod)
+            with open(os.path.join(sdk_mod, "sdk.mjs"), "w") as f:
+                f.write("""export async function* query() {
+  yield { type: 'system', subtype: 'init' }
+  if (process.env.FAKE_SDK_MODE === 'cap') {
+    yield { type: 'result', subtype: 'error_max_budget_usd', is_error: true, total_cost_usd: 0.09,
+            num_turns: 2, session_id: 's1', result: 'partial ' + process.env.ANTHROPIC_API_KEY }
+    throw new Error('Reached maximum budget')
+  }
+  throw new Error('boom')
+}
+""")
+            worker = os.path.join(HERE, "credit-run-worker.mjs")
+            wenv = {"PATH": os.environ.get("PATH", ""), "HOME": fake_home, "ANTHROPIC_API_KEY": KEY}
+            for mode in ("cap", "throw"):
+                wout = os.path.join(tmp, f"w-{mode}.json")
+                w = subprocess.run([real_node, worker, sdk], capture_output=True, text=True,
+                                   input=json.dumps({"prompt": "p", "options": {}, "out": wout}),
+                                   env=dict(wenv, FAKE_SDK_MODE=mode))
+                if mode == "cap":
+                    check(w.returncode == 0 and os.path.exists(wout), f"worker cap: rc={w.returncode} {w.stderr!r}")
+                    summary = json.loads(w.stdout.strip().splitlines()[-1]) if w.stdout.strip() else {}
+                    check(summary.get("subtype") == "error_max_budget_usd" and summary.get("session_id") == "s1"
+                          and summary.get("cost") == 0.09, f"worker cap summary: {summary}")
+                    written = open(wout).read() if os.path.exists(wout) else ""
+                    check(KEY not in w.stdout + w.stderr + written and "[redacted]" in written,
+                          "the worker did not scrub the key itself")
+                else:
+                    check(w.returncode == 1 and not os.path.exists(wout) and not w.stdout.strip(),
+                          f"worker throw: rc={w.returncode} out={os.path.exists(wout)} {w.stdout!r}")
+                    check(KEY not in w.stderr, "key in worker stderr")
 
-        # ---- --out: an existing file is refused and left alone, same-second runs get their own file
-        existing = os.path.join(tmp, "existing.json")
-        for victim in (existing, ledger_file):
-            if victim == existing:
-                with open(victim, "w") as f:
-                    f.write("keep me")
-            before = open(victim).read()
-            fresh()
-            r = cr("--brief", brief, "--worktree", wt, "--budget", "1", "--out", victim)
-            if r.returncode != 2 or started() or open(victim).read() != before:
-                fails.append(f"existing --out {victim} not refused or changed: rc={r.returncode}")
-        before = set(os.listdir(credit_out))
-        for _ in range(3):
-            cr("--brief", brief, "--worktree", wt, "--budget", "1")
-        if len(set(os.listdir(credit_out)) - before) != 3:
-            fails.append("runs in one second shared an output file")
-
-        if os.listdir(tmpdir):
-            fails.append(f"raw output left in the temp dir: {os.listdir(tmpdir)}")
-
-        # ---- --spent: sums, counts unknown and skipped lines, survives bad bytes
-        home2 = os.path.join(tmp, "home2")
-        os.makedirs(os.path.join(home2, ".lean"))
-        with open(os.path.join(home2, ".lean", "credit-runs.jsonl"), "wb") as f:
-            f.write(b'{"cost":0.5}\n{"cost":1.25,"branch":"\xff"}\n{"cost":NaN}\n{"cost":-3}\n'
-                    b'{"cost":null,"cost_known":false}\n{{\n\xff\xfe\n{"cost":"abc"}\n[1]\n\n')
-        r = cr("--spent", HOME=home2)
-        if "spent $1.7500 over 3 runs" not in r.stdout or "1 runs with unknown cost" not in r.stdout \
-                or "6 unreadable lines skipped" not in r.stderr:
-            fails.append(f"--spent wrong: {r.stdout!r} {r.stderr!r}")
-        r = cr("--spent", HOME=os.path.join(tmp, "nohome"))
-        if "spent $0.0000 over 0 runs" not in r.stdout:
-            fails.append(f"--spent with no ledger: {r.stdout!r}")
-
-        # ---- key-help prints a quoted command and no key
-        item = "my item; id"
-        r = cr("--key-help", LEAN_CREDIT_KEY_ITEM=item)
-        if shlex.quote(item) not in r.stdout or leaks(r.stdout + r.stderr):
-            fails.append(f"--key-help wrong: {r.stdout!r}")
+        # setup and missing pieces
+        npm_rec = base["FAKE_NPM_REC"]
+        r = run(["--setup"], env())
+        args = open(npm_rec).read().split() if os.path.exists(npm_rec) else []
+        check(r.returncode == 0 and "--prefix" in args and f"{SDK_PACKAGE}@{SDK_VERSION}" in args
+              and f"{BATCH_SDK_PACKAGE}@{BATCH_SDK_VERSION}" in args, f"--setup argv: {args}")
+        shutil.rmtree(os.path.join(fake_home, ".lean", "credit-sdk"))
+        r = run(job_args(), env(**on))
+        check(one_line(r) and "--setup" in r.stderr and rec_json() is None, f"no SDK: {r.stderr!r}")
+        r = run(job_args(), env(**on, PATH=nonode))
+        check(one_line(r) and "node" in r.stderr and rec_json() is None, f"no node: {r.stderr!r}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     for f in fails:
         print("self-test failed:", f)
     if fails:
@@ -838,6 +832,4 @@ def self_test():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--self-test"]:
-        sys.exit(self_test())
     sys.exit(main(sys.argv[1:]))

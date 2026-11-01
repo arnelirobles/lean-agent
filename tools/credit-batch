@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""Send read-only briefs as one Message Batch, paid by an API key, at half price.
+
+  credit-batch submit --brief FILE [--brief FILE ...] [--shared FILE] --max-tokens N
+                      [--model sonnet] [--role NAME]
+  credit-batch status ID
+  credit-batch results ID --dir DIR
+  credit-batch --self-test
+
+For work with no tool loop (retro digests, ticket shaping, spec review). Each brief is one
+request, with the custom_id taken from its file name. A batch can take up to a day.
+--shared is one stable text block sent first in every request with a cache breakpoint
+(ttl 1h), for text the briefs have in common.
+
+submit starts only when all of these hold:
+  LEAN_CREDIT_RUNS=on, LEAN_CREDIT_BATCH=on   both switches, default off
+  LEAN_CREDIT_TOTAL_USD=N                     the total cap shared with credit-run
+  the key is in the keychain                  same item and rules as credit-run
+status and results need only the key, so a paid batch can always be collected.
+
+Cap: submit reserves the estimated cost in ~/.lean/credit-runs.jsonl before it sends
+anything, under the same lock and total as credit-run. The estimate is the input tokens
+(UTF-8 bytes divided by 2, rounded up) plus max_tokens for every request, at the batch
+rates (50% of the prices in lib/leanstats.py, the shared text at the 1 hour cache write
+rate). Refused with exit 2 when spent plus reserved plus the estimate passes the total.
+A batch with no results call stays reserved. results works out the real cost from each
+request's token counts at the batch rates, writes the final line and so closes the
+reservation. That cost is computed, not a billed figure. The Console workspace spend
+limit is the only hard limit.
+
+results writes DIR/CUSTOM_ID.txt for every request: the text, or the error, expired or
+canceled state. It refuses with one line if the batch has not ended, and exits 1 naming
+every request that did not succeed.
+
+The model is sonnet, opus, haiku or one of claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5. Thinking and effort are left at
+the model default. The call goes through credit-batch-worker.mjs and @anthropic-ai/sdk,
+installed by credit-run --setup. Python standard library only.
+"""
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+import credit_common  # noqa: E402
+from credit_common import (append_line, child_env, die, key_command, money, read_key,  # noqa: E402
+                           read_ledger, reserve, scrub, sdk_dir, totals)
+from leanstats import HOUR_WRITE, LONG_PROMPT, PRICES, price_usage  # noqa: E402
+
+credit_common.PROG = "credit-batch"
+MODELS = {"sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5", "haiku": "claude-haiku-5-5"}
+PRICE_NAME = {"claude-sonnet-5-5": "sonnet", "claude-opus-5-5": "opus-5-5", "claude-haiku-5-5": "haiku-5-5"}
+CREATE_NOTE = ("; the batch may exist, its id is unknown, the reservation stays, "
+               "check the Console Batches page")
+SAFE = re.compile(r"[^A-Za-z0-9_-]")
+BASIS = "token counts at batch rates (half the list prices), not a billed figure"
+
+
+def full_model(name):
+    name = name.strip()
+    if name in MODELS:
+        return MODELS[name]
+    if name in PRICE_NAME:
+        return name
+    die(f"model must be sonnet, opus, haiku or one of {', '.join(PRICE_NAME)}, got {name!r}")
+
+
+def batch_price(model, prompt_tokens):
+    """The batch rates for a model: half the list prices, the long-prompt tier when over its limit."""
+    name = PRICE_NAME[model]
+    limit, long_price = LONG_PROMPT.get(name, (None, None))
+    price = long_price if limit is not None and prompt_tokens > limit else PRICES[name]
+    return tuple(p / 2 for p in price)
+
+
+def estimate(model, shared, brief, max_tokens):
+    """Upper bound for one request: every input token, the shared part at the 1 hour write rate, and max_tokens."""
+    prompt = math.ceil((len(shared.encode()) + len(brief.encode())) / 2)
+    shared_tokens = min(math.ceil(len(shared.encode()) / 2), prompt)
+    u = {"in": prompt - shared_tokens, "cw": shared_tokens, "cw1h": shared_tokens, "cr": 0, "out": max_tokens}
+    return price_usage(batch_price(model, prompt), u)
+
+
+def item_cost(model, usage, had_shared):
+    """Real cost of one request. With no 1h/5m split, a run that sent a shared block is priced at the 1h rate."""
+    hour = usage["cache_write_1h"]
+    if hour is None:
+        hour = usage["cache_write"] if had_shared else 0
+    u = {"in": usage["input"], "cw": usage["cache_write"], "cw1h": hour,
+         "cr": usage["cache_read"], "out": usage["output"]}
+    return price_usage(batch_price(model, u["in"] + u["cw"] + u["cr"]), u)
+
+
+def custom_id(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return SAFE.sub("_", stem)[:64] or "brief"
+
+
+def build_requests(a, model):
+    shared = ""
+    if a.shared:
+        with open(a.shared) as f:
+            shared = f.read()
+        if not shared.strip():
+            die(f"shared file is empty: {a.shared}")
+    requests, seen, briefs = [], {}, []
+    for path in a.brief:
+        if not os.path.isfile(path):
+            die(f"brief file not found: {path}")
+        with open(path) as f:
+            text = f.read()
+        if not text.strip():
+            die(f"brief file is empty: {path}")
+        cid = custom_id(path)
+        if cid.casefold() in seen:
+            die(f"two briefs give the custom_id {cid!r}: {seen[cid.casefold()]} and {path}")
+        seen[cid.casefold()] = path
+        params = {"model": model, "max_tokens": a.max_tokens_value,
+                  "messages": [{"role": "user", "content": text}]}
+        if shared:
+            params["system"] = [{"type": "text", "text": shared,
+                                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        requests.append({"custom_id": cid, "params": params})
+        briefs.append(text)
+    return requests, shared, briefs
+
+
+def sdk_entry():
+    return os.path.join(sdk_dir(), "node_modules", "@anthropic-ai", "sdk", "index.mjs")
+
+
+def need_sdk():
+    node = shutil.which("node")
+    if not node:
+        die("node not found; install node, then run credit-run --setup")
+    if not os.path.isfile(sdk_entry()):
+        die("the Anthropic SDK is not installed; run credit-run --setup")
+    return node
+
+
+def call(node, key, payload, note=""):
+    """One worker call. Returns its JSON line; any failure exits 1 with one scrubbed line."""
+    job = json.dumps(dict(payload, sdkDir=sdk_dir()))
+    try:
+        r = subprocess.run([node, os.path.join(HERE, "credit-batch-worker.mjs")], input=job,
+                           capture_output=True, text=True, env=child_env(key), timeout=900)
+    except subprocess.TimeoutExpired:
+        die("the worker took more than 15 minutes" + note, 1)
+    if r.returncode != 0:
+        lines = scrub(r.stderr, key).strip().splitlines()
+        die((lines[-1] if lines else f"the worker failed with exit {r.returncode}") + note, 1)
+    try:
+        return json.loads(scrub(r.stdout, key).strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        die("the worker printed no JSON" + note, 1)
+
+
+def need_on(name):
+    if os.environ.get(name, "").strip().lower() != "on":
+        die(f"batch runs are off; set LEAN_CREDIT_RUNS=on and LEAN_CREDIT_BATCH=on to allow them"
+            if name == "LEAN_CREDIT_BATCH" else "credit runs are off; set LEAN_CREDIT_RUNS=on to allow them")
+
+
+def submit(a):
+    need_on("LEAN_CREDIT_RUNS")
+    need_on("LEAN_CREDIT_BATCH")
+    total_text = os.environ.get("LEAN_CREDIT_TOTAL_USD")
+    if not total_text:
+        die("LEAN_CREDIT_TOTAL_USD is not set; set the total you allow to spend")
+    total = money(total_text, "LEAN_CREDIT_TOTAL_USD")
+    try:
+        a.max_tokens_value = int(a.max_tokens)
+    except (TypeError, ValueError):
+        a.max_tokens_value = 0
+    if a.max_tokens_value < 1:
+        die(f"--max-tokens must be a whole number of 1 or more, got {a.max_tokens!r}")
+    if key_command() is None:
+        die("only macOS and Linux are supported")
+    model = full_model(a.model)
+    requests, shared, briefs = build_requests(a, model)
+    node = need_sdk()
+    key = read_key()
+    reserved = round(sum(estimate(model, shared, b, a.max_tokens_value) for b in briefs), 6)
+    run = uuid.uuid4().hex[:12]
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    meta = {"run": run, "kind": "batch", "model": model, "role": a.role, "requests": len(requests),
+            "max_tokens": a.max_tokens_value, "shared": bool(shared)}
+    reserve(dict(meta, time=stamp, phase="reserve", reserved=reserved), total)
+    r = call(node, key, {"op": "create", "requests": requests}, CREATE_NOTE)
+    batch_id = r.get("id")
+    if not isinstance(batch_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", batch_id):
+        die("the worker returned no usable batch id" + CREATE_NOTE, 1)
+    append_line({"run": run, "kind": "batch", "phase": "submit", "batch_id": batch_id,
+                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    print(batch_id)
+    print(f"reserved ${reserved:.4f} for {len(requests)} request(s)", file=sys.stderr)
+    return 0
+
+
+def status(a):
+    node = need_sdk()
+    r = call(node, read_key(), {"op": "retrieve", "batch_id": a.id})
+    print(f"{r.get('id', a.id)} {r.get('processing_status')}")
+    counts = r.get("request_counts")
+    if isinstance(counts, dict):
+        print(" ".join(f"{k}={v}" for k, v in counts.items()))
+    return 0
+
+
+def results(a):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", a.id):
+        die(f"not a batch id: {a.id!r}")
+    node = need_sdk()
+    key = read_key()
+    r = call(node, key, {"op": "retrieve", "batch_id": a.id})
+    if r.get("processing_status") != "ended":
+        die(f"batch {a.id} has not ended (status {r.get('processing_status')}); try again later")
+    os.makedirs(a.dir, exist_ok=True)
+    out = call(node, key, {"op": "results", "batch_id": a.id, "dir": os.path.realpath(a.dir)})
+    items = out.get("items") if isinstance(out, dict) else None
+    if not isinstance(items, list):
+        die("the worker returned no items", 1)
+    for it in items:
+        cid = it.get("custom_id")
+        if not isinstance(cid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", cid):
+            die("the worker returned an unsafe custom_id", 1)
+        path = os.path.join(a.dir, f"{cid}.txt")
+        try:
+            if stat.S_ISLNK(os.lstat(path).st_mode):
+                raise OSError("symlink")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd) as f:
+                text = f.read()
+            if key in text:
+                fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+                with os.fdopen(fd, "w") as f:
+                    f.write(scrub(text, key))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            die(f"refusing to write through a symlink at {cid}.txt", 1)
+
+    rows = [r for r in read_ledger() if isinstance(r, dict)]
+    sub = next((r for r in rows if r.get("phase") == "submit" and r.get("batch_id") == a.id), None)
+    run = sub.get("run") if sub else None
+    held = next((r for r in rows if r.get("run") == run and r.get("phase") == "reserve"), None) if sub else None
+    cost = 0.0
+    for it in items:
+        if it.get("type") == "succeeded" and isinstance(it.get("usage"), dict):
+            if held:
+                cost += item_cost(held["model"], it["usage"], bool(held.get("shared")))
+    cost = round(cost, 6)
+    failed = [it for it in items if it.get("type") != "succeeded"]
+    if sub is None or held is None:
+        print(f"credit-batch: batch {a.id} is not in the ledger; its cost is not recorded", file=sys.stderr)
+    elif held.get("requests") != len(items):
+        print(f"credit-batch: batch {a.id} reserved {held.get('requests')} request(s) but the results hold "
+              f"{len(items)}; no final line written, the reservation stays, run results again", file=sys.stderr)
+        return 1
+    elif any(r.get("run") == run and r.get("phase") == "final" for r in rows):
+        print(f"credit-batch: batch {a.id} is already closed in the ledger", file=sys.stderr)
+    else:
+        append_line({"run": run, "kind": "batch", "phase": "final", "batch_id": a.id, "cost": cost,
+                     "cost_basis": BASIS, "requests": len(items), "failed": len(failed),
+                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    print(f"{len(items) - len(failed)} of {len(items)} succeeded, files in {a.dir}")
+    print(f"cost ${cost:.4f} ({BASIS})")
+    if failed:
+        names = ", ".join(f"{it['custom_id']} ({it.get('type')})" for it in failed)
+        print(f"credit-batch: did not succeed: {names}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="credit-batch", description="Send read-only briefs as one Message Batch.")
+    p.add_argument("--self-test", action="store_true")
+    sub = p.add_subparsers(dest="cmd")
+    s = sub.add_parser("submit")
+    s.add_argument("--brief", action="append", required=True)
+    s.add_argument("--shared")
+    s.add_argument("--max-tokens", required=True)
+    s.add_argument("--model", default="sonnet")
+    s.add_argument("--role")
+    t = sub.add_parser("status")
+    t.add_argument("id")
+    r = sub.add_parser("results")
+    r.add_argument("id")
+    r.add_argument("--dir", required=True)
+    return p
+
+
+def main(argv):
+    p = parser()
+    a = p.parse_args(argv)
+    if a.self_test:
+        return self_test()
+    if a.cmd == "submit":
+        return submit(a)
+    if a.cmd == "status":
+        return status(a)
+    if a.cmd == "results":
+        return results(a)
+    p.print_usage(sys.stderr)
+    return 2
+
+
+# self-test
+
+KEY = "sk-ant-FAKEKEY1234567890"
+
+FAKE_NODE = r'''#!/usr/bin/env python3
+import json, os, sys
+raw = sys.stdin.read()
+job = json.loads(raw)
+key = "%s"
+rec = {"argv": sys.argv, "stdin": raw, "env_names": sorted(os.environ), "op": job.get("op"),
+       "key_ok": os.environ.get("ANTHROPIC_API_KEY") == key}
+open(os.environ["FAKE_REC"], "a").write(json.dumps(rec) + "\n")
+mode = os.environ.get("FAKE_MODE", "ok")
+if mode == "leak":
+    sys.stderr.write("oops " + key + "\n")
+    sys.exit(1)
+op = job["op"]
+if op == "create":
+    print(json.dumps({"id": "msgbatch_fake1", "processing_status": "in_progress"}))
+elif op == "retrieve":
+    print(json.dumps({"id": job["batch_id"], "processing_status": os.environ.get("FAKE_STATUS", "ended"),
+                      "request_counts": {"succeeded": 1}, "ended_at": None}))
+elif op == "results":
+    items = json.loads(os.environ["FAKE_ITEMS"])
+    for it in items:
+        text = it.pop("text", "")
+        if mode == "leakfile":
+            text += " " + key
+        open(os.path.join(job["dir"], it["custom_id"] + ".txt"), "w").write(text + "\n")
+    print(json.dumps({"items": items}))
+''' % KEY
+
+FAKE_KEY_TOOL = '''#!/bin/sh
+case "$FAKE_KEY_MODE" in
+  empty) echo "" ;;
+  missing) exit 44 ;;
+  *) echo "%s" ;;
+esac
+''' % KEY
+
+FAKE_SDK = r'''import { appendFileSync } from 'node:fs'
+const rec = (o) => appendFileSync(process.env.FAKE_SDK_REC, JSON.stringify(o) + '\n')
+export default class Anthropic {
+  constructor() {
+    this.messages = { batches: {
+      create: async (body) => {
+        rec({ op: 'create', body, key: process.env.ANTHROPIC_API_KEY })
+        return { id: 'msgbatch_real1', processing_status: 'in_progress' }
+      },
+      retrieve: async (id) => {
+        rec({ op: 'retrieve', id })
+        return { id, processing_status: 'ended', request_counts: { succeeded: 1 }, ended_at: 'now' }
+      },
+      results: async (id) => {
+        rec({ op: 'results', id })
+        const usage = { input_tokens: 1000, output_tokens: 500, cache_creation_input_tokens: 2000,
+                        cache_read_input_tokens: 3000,
+                        cache_creation: { ephemeral_1h_input_tokens: 2000, ephemeral_5m_input_tokens: 0 } }
+        const rows = [
+          { custom_id: 'one', result: { type: 'succeeded', message: { model: 'claude-sonnet-5-5', usage,
+            content: [{ type: 'text', text: 'answer ' + process.env.ANTHROPIC_API_KEY }] } } },
+          { custom_id: 'two', result: { type: 'errored', error: { type: 'error',
+            error: { type: 'api_error', message: 'boom ' + process.env.ANTHROPIC_API_KEY } } } },
+          { custom_id: 'three', result: { type: 'expired' } },
+        ]
+        return (async function* () { for (const r of rows) yield r })()
+      },
+    } }
+  }
+}
+'''
+
+
+def self_test():
+    fails = []
+    me = os.path.realpath(__file__)
+
+    def check(ok, msg):
+        if not ok:
+            fails.append(msg)
+
+    tmp = tempfile.mkdtemp(prefix="credit-batch-test-")
+    try:
+        bindir = os.path.join(tmp, "bin")
+        realbin = os.path.join(tmp, "realbin")
+        nonode = os.path.join(tmp, "nonode")
+        for d in (bindir, realbin, nonode):
+            os.makedirs(d)
+        for name, body in (("node", FAKE_NODE), ("security", FAKE_KEY_TOOL), ("secret-tool", FAKE_KEY_TOOL)):
+            p = os.path.join(bindir, name)
+            with open(p, "w") as f:
+                f.write(body)
+            os.chmod(p, 0o755)
+        for name in ("security", "secret-tool"):
+            os.symlink(os.path.join(bindir, name), os.path.join(realbin, name))
+            os.symlink(os.path.join(bindir, name), os.path.join(nonode, name))
+        real_node = shutil.which("node")
+        if real_node:
+            os.symlink(real_node, os.path.join(realbin, "node"))
+        fake_home = os.path.join(tmp, "home")
+        sdk = os.path.join(fake_home, ".lean", "credit-sdk", "node_modules", "@anthropic-ai", "sdk")
+        os.makedirs(sdk)
+        open(os.path.join(sdk, "index.mjs"), "w").close()
+        ledger = os.path.join(fake_home, ".lean", "credit-runs.jsonl")
+        rec = os.path.join(tmp, "rec.jsonl")
+        outdir = os.path.join(tmp, "out")
+
+        def write(name, text):
+            p = os.path.join(tmp, name)
+            with open(p, "w") as f:
+                f.write(text)
+            return p
+
+        brief_a = write("alpha.md", "b" * 300)
+        brief_b = write("beta one.md", "b" * 300)
+        brief_c = write("gamma.md", "b" * 300)
+        shared = write("shared.md", "s" * 3000)
+
+        base = {"PATH": bindir + os.pathsep + os.environ.get("PATH", ""), "HOME": fake_home,
+                "FAKE_REC": rec, "ANTHROPIC_AUTH_TOKEN": "tok-should-go",
+                "CLAUDE_CODE_OAUTH_TOKEN": "oauth-should-go", "ANTHROPIC_BASE_URL": "https://elsewhere.invalid"}
+        on = {"LEAN_CREDIT_RUNS": "on", "LEAN_CREDIT_BATCH": "on", "LEAN_CREDIT_TOTAL_USD": "2.0"}
+
+        def env(**kw):
+            e = dict(base)
+            e.update(kw)
+            return e
+
+        def run(args, e):
+            if os.path.exists(rec):
+                os.remove(rec)
+            return subprocess.run([sys.executable, me] + args, capture_output=True, text=True, env=e)
+
+        def recs():
+            if not os.path.exists(rec):
+                return []
+            return [json.loads(line) for line in open(rec) if line.strip()]
+
+        def lines():
+            if not os.path.exists(ledger):
+                return []
+            return [json.loads(line) for line in open(ledger) if line.strip()]
+
+        def reset():
+            if os.path.exists(ledger):
+                os.remove(ledger)
+
+        def one_line(r):
+            return r.returncode == 2 and len(r.stderr.strip().splitlines()) == 1 and "Traceback" not in r.stderr
+
+        sub = ["submit", "--brief", brief_a, "--brief", brief_b, "--brief", brief_c, "--max-tokens", "1000"]
+        # sonnet batch rates are (1.0, 1.25, 0.1, 5.0) per million; bytes divided by 2 is
+        # 1500 shared tokens and 150 for a brief
+        per_request = (150 * 1.0 + 1500 * 1.0 * HOUR_WRITE + 1000 * 5.0) / 1e6
+        want_reserved = round(3 * per_request, 6)
+
+        # both switches off start nothing
+        for label, e in (("both off", env(LEAN_CREDIT_TOTAL_USD="2.0")),
+                         ("batch off", env(LEAN_CREDIT_RUNS="on", LEAN_CREDIT_TOTAL_USD="2.0")),
+                         ("runs off", env(LEAN_CREDIT_BATCH="on", LEAN_CREDIT_TOTAL_USD="2.0")),
+                         ("no total", env(LEAN_CREDIT_RUNS="on", LEAN_CREDIT_BATCH="on"))):
+            r = run(sub + ["--shared", shared], e)
+            check(one_line(r) and not recs() and not os.path.exists(ledger),
+                  f"{label} started something: {r.returncode} {r.stderr!r}")
+
+        # bad input
+        r = run(sub[:-1] + ["0"], env(**on))
+        check(one_line(r) and not recs(), "max-tokens 0 was accepted")
+        for bad in ("gpt-9", "claude-sonnet-4", "claude-sonnet-5-5-x", "sonnet-5"):
+            r = run(sub + ["--model", bad], env(**on))
+            check(one_line(r) and not recs() and not os.path.exists(ledger), f"model {bad!r} was accepted")
+        low, up = os.path.join(tmp, "low"), os.path.join(tmp, "up")
+        os.makedirs(low)
+        os.makedirs(up)
+        r = run(["submit", "--brief", write("low/alpha.md", "x"), "--brief", write("up/Alpha.md", "x"),
+                 "--max-tokens", "10"], env(**on))
+        check(one_line(r) and "custom_id" in r.stderr and not recs() and not os.path.exists(ledger),
+              f"Alpha and alpha were not refused: {r.stderr!r}")
+        r = run(["submit", "--brief", brief_a, "--brief", brief_a, "--max-tokens", "10"], env(**on))
+        check(one_line(r) and "custom_id" in r.stderr and not recs(), f"duplicate custom_id: {r.stderr!r}")
+        r = run(sub, env(FAKE_KEY_MODE="empty", **on))
+        check(one_line(r) and not recs(), "an empty key started a worker")
+        r = run(sub, dict(env(**on), PATH=nonode))
+        check(one_line(r) and "credit-run --setup" in r.stderr and not recs(), f"no node: {r.stderr!r}")
+
+        # an over-total reservation refuses and sends nothing
+        reset()
+        r = run(sub, env(LEAN_CREDIT_RUNS="on", LEAN_CREDIT_BATCH="on", LEAN_CREDIT_TOTAL_USD="0.01"))
+        check(one_line(r) and "over LEAN_CREDIT_TOTAL_USD" in r.stderr and not recs() and not lines(),
+              f"over-total batch was submitted: {r.returncode} {r.stderr!r}")
+
+        # a good submit, with --shared
+        reset()
+        r = run(sub + ["--shared", shared, "--role", "analyze"], env(**on))
+        check(r.returncode == 0 and r.stdout.strip() == "msgbatch_fake1", f"submit: {r.returncode} {r.stdout!r} {r.stderr!r}")
+        got = recs()
+        check(len(got) == 1 and got[0]["op"] == "create", f"worker calls on submit: {[g['op'] for g in got]}")
+        if got:
+            g = got[0]
+            job = json.loads(g["stdin"])
+            reqs = job.get("requests", [])
+            check([q["custom_id"] for q in reqs] == ["alpha", "beta_one", "gamma"], f"custom ids: {[q['custom_id'] for q in reqs]}")
+            p0 = reqs[0]["params"] if reqs else {}
+            check(p0.get("model") == "claude-sonnet-5-5" and p0.get("max_tokens") == 1000, f"params: {p0}")
+            check(p0.get("system") == [{"type": "text", "text": "s" * 3000,
+                                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+                  "the shared block is wrong")
+            check(g["stdin"].count("cache_control") == 3, "cache_control is on more than the shared blocks")
+            check(p0.get("messages") == [{"role": "user", "content": "b" * 300}], "the brief message is wrong")
+            check("speed" not in g["stdin"] and "fallbacks" not in g["stdin"] and "thinking" not in g["stdin"],
+                  "speed, fallbacks or thinking was sent")
+            check(g["key_ok"] and KEY not in json.dumps(g["argv"]) and KEY not in g["stdin"],
+                  "the key is missing from env or present in argv or stdin")
+            check(not any(n in g["env_names"] for n in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                                                         "ANTHROPIC_BASE_URL")), "an auth or base url variable reached the worker")
+        ls = lines()
+        res = [x for x in ls if x.get("phase") == "reserve"]
+        check(len(res) == 1 and abs(res[0]["reserved"] - want_reserved) < 1e-9 and res[0]["kind"] == "batch"
+              and res[0]["role"] == "analyze", f"reserve line: {res} want {want_reserved}")
+        check(any(x.get("phase") == "submit" and x.get("batch_id") == "msgbatch_fake1" and x.get("run") == res[0]["run"]
+                  for x in ls if res), "no submit line with the batch id")
+        check(KEY not in r.stdout + r.stderr + (open(ledger).read() if os.path.exists(ledger) else ""),
+              "the key leaked to stdout, stderr or the ledger")
+        # without --shared there is no system block
+        r2 = run(["submit", "--brief", brief_a, "--max-tokens", "10"], env(**on))
+        g2 = recs()
+        check(r2.returncode == 0 and g2 and "system" not in g2[0]["stdin"] and "cache_control" not in g2[0]["stdin"],
+              "a submit without --shared sent a system block")
+
+        # one total with credit-run
+        r = subprocess.run([sys.executable, os.path.join(HERE, "credit-run"), "--spent"], capture_output=True,
+                           text=True, env=env(**on))
+        check(f"reserved ${want_reserved + round(estimate('claude-sonnet-5-5', '', 'b' * 300, 10), 6):.4f}" in r.stdout,
+              f"credit-run --spent does not show the batch reservations: {r.stdout!r}")
+        reset()
+        with open(ledger, "w") as f:
+            f.write(json.dumps({"run": "r1", "phase": "reserve", "reserved": 1.99}) + "\n")
+        r = run(sub + ["--shared", shared], env(**on))
+        check(one_line(r) and "over LEAN_CREDIT_TOTAL_USD" in r.stderr and not recs(),
+              "a credit-run reservation did not count against a batch")
+        with open(ledger, "w") as f:
+            f.write(json.dumps({"run": "r1", "phase": "reserve", "reserved": 1.9}) + "\n")
+        r = run(sub + ["--shared", shared], env(**on))
+        check(r.returncode == 0, f"a batch under the shared total was refused: {r.stderr!r}")
+        # the other way: a batch reservation holds budget a credit-run job would need
+        spent, held = totals(read_ledger_at(ledger))
+        check(abs(held - (1.9 + want_reserved)) < 1e-9, f"held budget is {held}")
+
+        # older single-line rows count against the total
+        reset()
+        with open(ledger, "w") as f:
+            f.write(json.dumps({"time": "t", "branch": "b", "model": "m", "budget": 0.5, "cost": 1.99,
+                                "cost_known": True, "turns": 1, "state": "ok", "session": "s"}) + "\n")
+        r = run(sub + ["--shared", shared], env(**on))
+        check(one_line(r) and "over LEAN_CREDIT_TOTAL_USD" in r.stderr and not recs(),
+              "an older row with no phase did not count against the total")
+
+        # results: not ended refuses
+        reset()
+        r = run(sub, env(**on))
+        r = run(["results", "msgbatch_fake1", "--dir", outdir], env(FAKE_STATUS="in_progress", **on))
+        check(one_line(r) and "has not ended" in r.stderr and [g["op"] for g in recs()] == ["retrieve"]
+              and not any(x.get("phase") == "final" for x in lines()), f"results before the end: {r.returncode} {r.stderr!r}")
+
+        # results: one succeeded, one errored, one expired
+        usage = {"input": 1000, "cache_write": 2000, "cache_write_1h": 2000, "cache_read": 3000, "output": 500}
+        items = [{"custom_id": "alpha", "type": "succeeded", "model": "claude-sonnet-5-5", "usage": usage, "text": "the answer"},
+                 {"custom_id": "beta_one", "type": "errored", "error": "boom", "text": "errored: boom"},
+                 {"custom_id": "gamma", "type": "expired", "text": "expired"}]
+        r = run(["results", "msgbatch_fake1", "--dir", outdir], env(FAKE_ITEMS=json.dumps(items), **on))
+        check(r.returncode == 1 and "beta_one" in r.stderr and "gamma" in r.stderr and "alpha" not in r.stderr,
+              f"failed requests not named: {r.returncode} {r.stderr!r}")
+        check(os.path.exists(os.path.join(outdir, "alpha.txt")) and open(os.path.join(outdir, "gamma.txt")).read().strip() == "expired",
+              "result files are missing")
+        # batch rates: 1000*1.0 + 2000*1.0*2 (1h write) + 3000*0.1 + 500*5.0 per million
+        want_cost = (1000 * 1.0 + 2000 * 1.0 * HOUR_WRITE + 3000 * 0.1 + 500 * 5.0) / 1e6
+        fin = [x for x in lines() if x.get("phase") == "final"]
+        check(len(fin) == 1 and abs(fin[0]["cost"] - round(want_cost, 6)) < 1e-9 and fin[0]["batch_id"] == "msgbatch_fake1",
+              f"final line: {fin} want cost {want_cost}")
+        list_cost = price_usage(PRICES["sonnet"], {"in": 1000, "cw": 2000, "cw1h": 2000, "cr": 3000, "out": 500})
+        check(bool(fin) and abs(fin[0]["cost"] * 2 - list_cost) < 1e-6, "the final cost is not half the list price")
+        spent, held = totals(read_ledger_at(ledger))
+        check(abs(held) < 1e-12 and abs(spent - round(want_cost, 6)) < 1e-9, f"reservation not closed: spent {spent} held {held}")
+        r = run(["results", "msgbatch_fake1", "--dir", outdir], env(FAKE_ITEMS=json.dumps(items), **on))
+        check(len([x for x in lines() if x.get("phase") == "final"]) == 1, "a second results call wrote a second final line")
+        # a batch id that is not in the ledger
+        r = run(["results", "msgbatch_other", "--dir", outdir], env(FAKE_ITEMS=json.dumps(items[:1]), **on))
+        check(r.returncode == 0 and "not in the ledger" in r.stderr and len([x for x in lines() if x.get("phase") == "final"]) == 1,
+              f"an unknown batch: {r.returncode} {r.stderr!r}")
+        # status needs only the key, not the switches
+        r = run(["status", "msgbatch_fake1"], env())
+        check(r.returncode == 0 and "msgbatch_fake1 ended" in r.stdout, f"status: {r.stdout!r} {r.stderr!r}")
+
+        # the key never reaches output from a worker failure or a result file
+        r = run(["status", "msgbatch_fake1"], env(FAKE_MODE="leak"))
+        check(r.returncode == 1 and KEY not in r.stdout + r.stderr, f"worker stderr leaked the key: {r.stderr!r}")
+        r = run(["results", "msgbatch_fake1", "--dir", outdir], env(FAKE_MODE="leakfile", FAKE_ITEMS=json.dumps(items[:1])))
+        check(KEY not in open(os.path.join(outdir, "alpha.txt")).read() and KEY not in r.stdout + r.stderr,
+              "the key stayed in a result file")
+
+        def fresh(shared_flag):
+            reset()
+            args = sub + (["--shared", shared] if shared_flag else [])
+            r0 = run(args, env(**on))
+            check(r0.returncode == 0, f"submit for a results case: {r0.stderr!r}")
+
+        def close(its, odir, **kw):
+            return run(["results", "msgbatch_fake1", "--dir", odir], env(FAKE_ITEMS=json.dumps(its), **on, **kw))
+
+        def final_cost():
+            f = [x for x in lines() if x.get("phase") == "final"]
+            return f[0]["cost"] if len(f) == 1 else None
+
+        ok3 = [{"custom_id": c, "type": "succeeded", "model": "claude-sonnet-5-5", "usage": usage, "text": "t"}
+               for c in ("alpha", "beta_one", "gamma")]
+        # a 5m cache write is priced at the 5m rate
+        five = dict(usage, cache_write_1h=0)
+        fresh(True)
+        close([dict(x, usage=five) for x in ok3], os.path.join(tmp, "o5"))
+        want5 = 3 * (1000 * 1.0 + 2000 * 1.25 + 3000 * 0.1 + 500 * 5.0) / 1e6
+        check(final_cost() is not None and abs(final_cost() - round(want5, 6)) < 1e-9,
+              f"a 5m write was not priced at the 5m rate: {final_cost()} want {want5}")
+        # no split: priced at 1h when the run had a shared block, at 5m when it had none
+        nosplit = dict(usage, cache_write_1h=None)
+        fresh(True)
+        close([dict(x, usage=nosplit) for x in ok3], os.path.join(tmp, "o6"))
+        check(final_cost() is not None and abs(final_cost() - round(3 * want_cost, 6)) < 1e-9,
+              f"a missing split with shared was not priced at 1h: {final_cost()}")
+        fresh(False)
+        close([dict(x, usage=nosplit) for x in ok3], os.path.join(tmp, "o7"))
+        check(final_cost() is not None and abs(final_cost() - round(want5, 6)) < 1e-9,
+              f"a missing split without shared was not priced at 5m: {final_cost()}")
+        # a short result count keeps the reservation open, a rerun closes it
+        fresh(True)
+        r = close(ok3[:2], os.path.join(tmp, "o8"))
+        check(r.returncode == 1 and "reserved 3" in r.stderr and "hold 2" in r.stderr
+              and not any(x.get("phase") == "final" for x in lines()), f"short count: {r.returncode} {r.stderr!r}")
+        check(totals(read_ledger_at(ledger))[1] > 0, "a short count closed the reservation")
+        r = close(ok3, os.path.join(tmp, "o8"))
+        check(r.returncode == 0 and len([x for x in lines() if x.get("phase") == "final"]) == 1
+              and abs(totals(read_ledger_at(ledger))[1]) < 1e-12, f"the rerun did not close it: {r.returncode} {r.stderr!r}")
+        # a symlink at a result path is refused and not followed
+        fresh(True)
+        sdir = os.path.join(tmp, "o9")
+        os.makedirs(sdir)
+        victim = write("victim.txt", "keep")
+        os.symlink(victim, os.path.join(sdir, "alpha.txt"))
+        r = close(ok3, sdir, FAKE_MODE="leakfile")
+        check(r.returncode == 1 and "alpha.txt" in r.stderr and KEY in open(victim).read()
+              and not any(x.get("phase") == "final" for x in lines()), f"symlink target: {r.returncode} {r.stderr!r}")
+
+        # the real worker against a fake @anthropic-ai/sdk
+        if not real_node:
+            print("credit-batch self-test: node not found, the real worker test is skipped")
+        else:
+            with open(os.path.join(sdk, "index.mjs"), "w") as f:
+                f.write(FAKE_SDK)
+            sdk_rec = os.path.join(tmp, "sdk.jsonl")
+            real = env(PATH=realbin, FAKE_SDK_REC=sdk_rec, **on)
+            reset()
+            odir = os.path.join(tmp, "out-real")
+            # the worker's own scrub, before credit-batch touches any file
+            wdir = os.path.join(tmp, "out-worker")
+            os.makedirs(wdir)
+            w = subprocess.run([real_node, os.path.join(HERE, "credit-batch-worker.mjs")], capture_output=True, text=True,
+                               input=json.dumps({"sdkDir": os.path.join(fake_home, ".lean", "credit-sdk"), "op": "results",
+                                                 "batch_id": "msgbatch_real1", "dir": wdir}),
+                               env={"PATH": realbin, "ANTHROPIC_API_KEY": KEY, "FAKE_SDK_REC": sdk_rec})
+            wt = {n: open(os.path.join(wdir, n)).read() for n in os.listdir(wdir)}
+            check(w.returncode == 0 and wt.get("one.txt", "").startswith("answer [redacted]") and KEY not in "".join(wt.values()) + w.stdout,
+                  f"the worker did not scrub its own output: {w.returncode} {w.stderr!r} {wt}")
+            # the worker refuses a symlink at a result path
+            os.remove(os.path.join(wdir, "one.txt"))
+            victim2 = write("victim2.txt", "keep")
+            os.symlink(victim2, os.path.join(wdir, "one.txt"))
+            w = subprocess.run([real_node, os.path.join(HERE, "credit-batch-worker.mjs")], capture_output=True, text=True,
+                               input=json.dumps({"sdkDir": os.path.join(fake_home, ".lean", "credit-sdk"), "op": "results",
+                                                 "batch_id": "msgbatch_real1", "dir": wdir}),
+                               env={"PATH": realbin, "ANTHROPIC_API_KEY": KEY, "FAKE_SDK_REC": sdk_rec})
+            check(w.returncode == 1 and "one.txt" in w.stderr and open(victim2).read() == "keep",
+                  f"the worker followed a symlink: {w.returncode} {w.stderr!r}")
+            os.remove(sdk_rec)
+            r = run(sub + ["--shared", shared], real)
+            check(r.returncode == 0 and r.stdout.strip() == "msgbatch_real1", f"real worker submit: {r.returncode} {r.stderr!r}")
+            calls = [json.loads(x) for x in open(sdk_rec)] if os.path.exists(sdk_rec) else []
+            check(calls and calls[0]["op"] == "create" and calls[0]["key"] == KEY, "the SDK did not get the key from the environment")
+            if calls:
+                body = calls[0]["body"]
+                check(body["requests"][0] == {"custom_id": "alpha", "params": {
+                    "model": "claude-sonnet-5-5", "max_tokens": 1000,
+                    "system": [{"type": "text", "text": "s" * 3000, "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+                    "messages": [{"role": "user", "content": "b" * 300}]}}, "the request item sent to the SDK is wrong")
+                check(KEY not in json.dumps(body), "the key is in the request body")
+            r = run(["results", "msgbatch_real1", "--dir", odir], real)
+            texts = {n: open(os.path.join(odir, n)).read() for n in os.listdir(odir)} if os.path.isdir(odir) else {}
+            check(r.returncode == 1 and "two (errored)" in r.stderr and "three (expired)" in r.stderr,
+                  f"real worker results: {r.returncode} {r.stderr!r}")
+            check(sorted(texts) == ["one.txt", "three.txt", "two.txt"] and texts.get("one.txt", "").startswith("answer [redacted]")
+                  and "boom [redacted]" in texts.get("two.txt", "") and texts.get("three.txt", "").strip() == "expired",
+                  f"result files: {texts}")
+            check(KEY not in "".join(texts.values()) + r.stdout + r.stderr + open(ledger).read(),
+                  "the key leaked through the real worker")
+            fin = [x for x in lines() if x.get("phase") == "final"]
+            check(len(fin) == 1 and abs(fin[0]["cost"] - round(want_cost, 6)) < 1e-9, f"real worker final line: {fin}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if fails:
+        for f in fails:
+            print(f"FAIL {f}", file=sys.stderr)
+        return 1
+    print("credit-batch self-test passed")
+    return 0
+
+
+def read_ledger_at(path):
+    rows = []
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
