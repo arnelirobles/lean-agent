@@ -62,14 +62,15 @@ SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk"
 BATCH_SDK_VERSION = "1.3.0"
 BATCH_SDK_PACKAGE = "@anthropic-ai/sdk"
 ROLES = ("spec", "hunt", "refute", "analyze", "draft-doc")
-EDIT_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write"]
+READ_TOOLS = ["Read", "Glob", "Grep"]
+EDIT_TOOLS = READ_TOOLS + ["Edit", "Write"]
 # The allowlist matches "git log", not "git -C DIR log", and models reach for -C.
 GIT_NOTE = "\n\nYou are already in the job's directory. Run git as plain `git log`, never `git -C`, one command per Bash call with no && chains.\n"
 GIT_EDIT = ["status", "diff", "log", "add", "commit"]
 RUNNERS = {"sh", "bash", "zsh", "env", "xargs", "python", "python3", "node", "perl", "ruby", "eval", "exec"}
 PUSH_DENY = "Bash(git push:*)"
 DENY_ALWAYS = ["Read(/proc/**)"]
-DENY_EDIT = [PUSH_DENY, "Bash(git -C:*)", "Bash(git -c:*)"]
+DENY_EDIT = [PUSH_DENY, "Bash(git -C:*)", "Bash(git -c:*)", "Bash(git * --output*)"]
 
 
 def sdk_entry():
@@ -134,6 +135,18 @@ def check_worktree(worktree):
         die(f"{worktree} has uncommitted changes; commit or stash them first")
 
 
+def write_rules(worktree):
+    """Edit and Write only inside the worktree, never in git metadata: a planted hook would run with the key."""
+    real = os.path.realpath(worktree)
+    common = git(worktree, "rev-parse", "--git-common-dir") or ".git"
+    common = os.path.realpath(os.path.join(real, common))
+    # A leading // is an absolute path in a permission rule.
+    allow = [f"{t}(/{real}/**)" for t in ("Edit", "Write")]
+    deny = [f"{t}({p})" for t in ("Edit", "Write")
+            for p in (f"/{real}/.git", f"/{real}/.git/**", f"/{common}/**", "**/.git/**")]
+    return allow, deny
+
+
 def build_options(a, worktree, model):
     if a.read_only:
         tools = ["Read", "Glob", "Grep"]
@@ -143,8 +156,9 @@ def build_options(a, worktree, model):
         allow = a.allow or []
         names = [re.split(r"\(", x.strip(), 1)[0] for x in allow]
         tools = list(dict.fromkeys(EDIT_TOOLS + ["Bash"] + names))
-        allowed = EDIT_TOOLS + [f"Bash(git {g}:*)" for g in GIT_EDIT] + allow
-        denied = DENY_EDIT + DENY_ALWAYS
+        write_allow, write_deny = write_rules(worktree)
+        allowed = READ_TOOLS + write_allow + [f"Bash(git {g}:*)" for g in GIT_EDIT] + allow
+        denied = DENY_EDIT + DENY_ALWAYS + write_deny
     opts = {
         "model": model,
         "maxBudgetUsd": a.budget_value,
@@ -491,6 +505,10 @@ def self_test():
             check(opts.get("settings", {}).get("advisorModel") == "opus", "advisor not passed")
             check("fastMode" not in opts.get("settings", {}), "fastMode set without --fast")
             check(opts.get("settings", {}).get("attribution") is False, "attribution not turned off")
+            check(not {"Edit", "Write"} & set(opts["allowedTools"]), "Edit or Write allowed outside the worktree")
+            check(any(x.startswith("Write(//") and x.endswith("/**)") for x in opts["allowedTools"]), "Write not scoped to the worktree")
+            check("Write(**/.git/**)" in opts["disallowedTools"] and "Edit(**/.git/**)" in opts["disallowedTools"], "git metadata not denied")
+            check("Bash(git * --output*)" in opts["disallowedTools"], "git --output not denied")
             check(opts["settingSources"] == [] and opts["permissionMode"] == "dontAsk", "scope or permission mode")
             check(opts["plugins"] == [{"type": "local", "path": ROOT}], "plugin path")
             for d in ("Bash(git push:*)", "Bash(git -C:*)", "Bash(git -c:*)", "Read(/proc/**)"):
