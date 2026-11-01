@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""When `gh pr merge` fails, point the agent at pr-blockers.sh instead of a one-blocker-at-a-time hunt.
+"""When a merge fails (`gh pr merge`, `glab mr merge`, `az repos pr update --status completed`), point the agent at pr-blockers.sh instead of a one-blocker-at-a-time hunt.
 
 A refused merge was once diagnosed across four tool calls on a pull request that added one
 documentation file. The causes were independent facts that one script reads together.
@@ -24,14 +24,18 @@ REFUSAL = re.compile(
     r"not mergeable|base branch policy|protected branch|required status check|GH006|GH013"
     r"|merge strategy for .* is set by the merge queue|review is required|changes requested"
     r"|repository rule violations|pull request is not in a mergeable state|merge commits are not allowed"
-    r"|squash merges are not allowed|failed to merge|could not merge",
+    r"|squash merges are not allowed|failed to merge|could not merge"
+    r"|cannot be merged|pipeline must succeed|discussions must be resolved|TF4011\d\d|TF4012\d\d|branch policy|polic(?:y|ies) .*(?:block|reject|fail)",
     re.IGNORECASE,
 )
 SEPARATORS = {";", "&&", "||", "|", "&", "(", ")"}
 
 
 def merge_args(command):
-    """The arguments of the first real `gh pr merge` call, or None. Tokenised, so quoted text is not a call."""
+    """(kind, arguments) of the first real merge call on any host, or None. Tokenised, so quoted text is not a call.
+
+    The commands that count as a merge are the table in lib/hookkit.py.
+    """
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
         lex.whitespace_split = True
@@ -43,13 +47,15 @@ def merge_args(command):
         if t in SEPARATORS:
             start = True
             continue
-        if start and tokens[i:i + 3] == ["gh", "pr", "merge"]:
-            args = []
-            for a in tokens[i + 3:]:
+        if start and os.path.basename(t) in hookkit.FORGE_CLIS:
+            words = []
+            for a in tokens[i + 1:]:
                 if a in SEPARATORS:
                     break
-                args.append(a)
-            return args
+                words.append(a)
+            call = hookkit.ForgeCall(os.path.basename(t), words, ".")
+            if hookkit.forge_action(call) == "merge":
+                return call.kind, call.rest
         start = start and "=" in t and not t.startswith("-")
     return None
 
@@ -74,21 +80,32 @@ def exit_code(resp):
     return None
 
 
-def merge_target(args):
+def merge_target(kind, args):
+    """(number, repo) a merge call names. Azure names no repository: its repo comes from the clone."""
     num = repo = None
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("-R", "--repo") and i + 1 < len(args):
+        if a in ("-R", "--repo") and i + 1 < len(args) and kind != "azure":
             repo = args[i + 1]
             i += 2
             continue
-        if a.startswith("--repo="):
+        if kind == "azure" and a == "--id" and i + 1 < len(args):
+            num = args[i + 1].lstrip("#") if re.fullmatch(r"#?\d+", args[i + 1]) else num
+            i += 2
+            continue
+        if a.startswith("--repo=") and kind != "azure":
             repo = a.split("=", 1)[1]
-        elif num is None and re.fullmatch(r"#?\d+", a):
+        elif a.startswith("--id=") and kind == "azure" and re.fullmatch(r"\d+", a[5:]):
+            num = a[5:]
+        elif kind != "azure" and num is None and re.fullmatch(r"#?\d+", a):
             num = a.lstrip("#")
-        elif num is None:
+        elif kind == "github" and num is None:
             u = re.search(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", a)
+            if u:
+                repo, num = repo or u.group(1), u.group(2)
+        elif kind == "gitlab" and num is None:
+            u = re.fullmatch(r"(https?://[^/\s]+/[^\s]+?)/-/merge_requests/(\d+)/?", a)
             if u:
                 repo, num = repo or u.group(1), u.group(2)
         i += 1
@@ -101,9 +118,10 @@ def note_for(event):
     if event.get("tool_name") != "Bash":
         return None
     command = (event.get("tool_input") or {}).get("command") or ""
-    args = merge_args(command)
-    if args is None:
+    found = merge_args(command)
+    if found is None:
         return None
+    kind, args = found
     name = event.get("hook_event_name") or "PostToolUse"
     text = response_text(event.get("tool_response")) + "\n" + str(event.get("error") or "")
     failed = name == "PostToolUseFailure"
@@ -112,15 +130,16 @@ def note_for(event):
         failed = True
     if not failed and not REFUSAL.search(text):
         return None
-    num, repo = merge_target(args)
+    num, repo = merge_target(kind, args)
     cmd = "%s %s%s" % (hookkit.tool_path("pr-blockers.sh"), num or "<pr-number>", " -R " + repo if repo else "")
     msg = (
         "That merge did not go through. Do not diagnose it one blocker at a time. Run once:\n\n"
         "    %s\n\n"
         "It lists failing or missing required checks, runs waiting at action_required, unresolved "
         "review threads, requested changes, whether the base uses a merge queue (and so which "
-        "`gh pr merge` form works), ruleset rules such as extra approval for an unattributed "
-        "author, and whether the head is behind. It is read-only. Read each review thread before "
+        "merge form works), ruleset rules such as extra approval for an unattributed "
+        "author, and whether the head is behind. On GitLab and Azure DevOps it reads the merge "
+        "status, pipeline or policy results and open discussions. It is read-only. Read each review thread before "
         "resolving it." % cmd
     )
     return {"hookSpecificOutput": {"hookEventName": name, "additionalContext": msg}}
@@ -162,6 +181,19 @@ def self_test():
     case("after cd", ev("cd repo && gh pr merge 2", None, "PostToolUseFailure"), "pr-blockers.sh 2")
     case("env prefix", ev("GH_REPO=o/r gh pr merge 2", None, "PostToolUseFailure"), "pr-blockers.sh 2")
     case("skip env", ev("gh pr merge 1", None, "PostToolUseFailure"), None, {"LEAN_SKIP_PR_MERGE_BLOCKED": "1"})
+    case("glab merge", ev("glab mr merge 7 --squash", None, "PostToolUseFailure"), hookkit.tool_path("pr-blockers.sh") + " 7")
+    case("glab repo flag", ev("glab mr merge 7 -R g/sub/r", None, "PostToolUseFailure"), "pr-blockers.sh 7 -R g/sub/r")
+    case("glab url form", ev("glab mr merge https://gitlab.com/g/r/-/merge_requests/9", None, "PostToolUseFailure"), "pr-blockers.sh 9 -R https://gitlab.com/g/r")
+    case("glab refusal text", ev("glab mr merge 3 || true", {"stdout": "", "stderr": "merge request cannot be merged: pipeline must succeed"}), "pr-blockers.sh 3")
+    case("glab success is quiet", ev("glab mr merge 3", {"stdout": "Merged", "stderr": ""}), None)
+    case("glab other command quiet", ev("glab mr view 3", None, "PostToolUseFailure"), None)
+    case("glab echo quiet", ev("echo 'glab mr merge 3'", None, "PostToolUseFailure"), None)
+    case("glab after cd", ev("cd repo && glab mr merge 2", None, "PostToolUseFailure"), "pr-blockers.sh 2")
+    case("az merge", ev("az repos pr update --id 5 --status completed", None, "PostToolUseFailure"), hookkit.tool_path("pr-blockers.sh") + " 5")
+    case("az merge, id after status", ev("az repos pr update --status completed --id 6 --org https://dev.azure.com/o", None, "PostToolUseFailure"), "pr-blockers.sh 6\\n")
+    case("az refusal text", ev("az repos pr update --id 4 --status completed | cat", "TF401179: policy blocked the completion"), "pr-blockers.sh 4")
+    case("az update without completing is quiet", ev("az repos pr update --id 5 --title t", None, "PostToolUseFailure"), None)
+    case("az pr list is quiet", ev("az repos pr list", None, "PostToolUseFailure"), None)
     import sqlite3
     import subprocess
     import tempfile

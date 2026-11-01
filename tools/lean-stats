@@ -164,12 +164,16 @@ SEEN_ORGS = set()  # Azure organizations met in remotes during this run
 
 
 def repo_from_remote(url):
-    """owner/name of a GitHub-style remote, ORG/PROJECT/REPO for an Azure DevOps one (so it cannot collide)."""
-    if forge.kind_of((url or "").strip()) == "azure":
+    """owner/name of a GitHub-style remote, ORG/PROJECT/REPO for an Azure DevOps one (so it cannot collide),
+    HOST/group/project for a GitLab one."""
+    kind = forge.kind_of((url or "").strip())
+    if kind == "azure":
         slug = forge.azure_slug(url)
         if slug:
             SEEN_ORGS.add(slug.split("/")[0].lower())
         return slug
+    if kind == "gitlab":
+        return forge.gitlab_slug(url.strip())
     found = REMOTE.search((url or "").strip())
     return found.group(1) if found else ""
 
@@ -317,9 +321,10 @@ def run_command(cmd, timeout=600):
 
 
 def fetch_changes(repo, since, run=run_command, orgs=(), cut=None):
-    """Rows for the changes table for one repository, or None when gh (az for Azure) fails.
+    """Rows for the changes table for one repository, or None when the host's CLI (gh, glab or az) fails.
 
-    Azure rows leave fix rounds, failed checks and escaped refs empty: retro-signals reads GitHub only.
+    Azure rows leave fix rounds, failed checks and escaped refs empty: az cannot read them, so retro-signals
+    would print unknown for them. GitHub and GitLab rows get them from retro-signals.
     """
     provider = forge.for_repo(repo, run, orgs)
     merged = provider.merged_prs(repo, since)
@@ -482,17 +487,20 @@ def azure_repos(conn, orgs):
 def collect_changes(conn, repos, since, run=run_command, which=shutil.which, orgs=()):
     """Store the merged pull requests of each repository. Returns how many were stored.
 
-    GitHub repositories (owner/name) need gh and jq, Azure ones (ORG/PROJECT/REPO, ORG one of `orgs`) need az.
-    A tool that is missing skips only its own repositories, with one line.
+    GitHub repositories (owner/name) need gh and jq, GitLab ones (HOST/group/project) glab and jq, Azure ones
+    (ORG/PROJECT/REPO, ORG one of `orgs`) need az. A tool that is missing skips only its own repositories, with
+    one line.
     """
     missing = {}
-    for tool, kind in (("gh", "github"), ("jq", "github"), ("az", "azure")):
-        if not which(tool):
-            missing.setdefault(kind, []).append(tool)
+    for kind in forge.KINDS:
+        needs = [forge.CLI_OF[kind]] + ([] if kind == "azure" else ["jq"])
+        missing[kind] = [tool for tool in needs if not which(tool)]
+    missing = {kind: tools for kind, tools in missing.items() if tools}
     for kind, tools in missing.items():
         if not any(forge.repo_kind(r, orgs) == kind for r in repos):
             continue
-        print(f"changes: skipped{' Azure' if kind == 'azure' else ''}, {' and '.join(tools)} not found")
+        label = {"github": "", "gitlab": " GitLab", "azure": " Azure"}[kind]
+        print(f"changes: skipped{label}, {' and '.join(tools)} not found")
     repos = [r for r in repos if forge.repo_kind(r, orgs) not in missing]
     if not repos:
         return 0
@@ -508,7 +516,7 @@ def collect_changes(conn, repos, since, run=run_command, which=shutil.which, org
             print(f"changes: skipped {repo}: {e}")
             continue
         if rows is None:
-            print(f"changes: skipped {repo}, the {'az' if forge.repo_kind(repo, orgs) == 'azure' else 'gh'} call failed")
+            print(f"changes: skipped {repo}, the {forge.CLI_OF.get(forge.repo_kind(repo, orgs), 'forge')} call failed")
             continue
         with leanstats.tx(conn):
             conn.executemany("INSERT OR REPLACE INTO changes VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
@@ -532,9 +540,10 @@ def cmd_collect(conn, args):
         print(f"transcripts: {imported} imported, {unchanged} unchanged")
         return 0
     since, _, repos = options(args)
-    bad = [r for r in repos if not re.fullmatch(AZURE_NAME + "|[\\w.-]+/[\\w.-]+", r)]
+    bad = [r for r in repos if not re.fullmatch(AZURE_NAME + "|[\\w.-]+/[\\w.-]+", r)
+           and not (forge.repo_kind(r) == "gitlab" and re.fullmatch(r"[\w.-]+(?:/[\w.-]+){2,}", r))]
     if bad:
-        raise ValueError(f"not an owner/repo or ORG/PROJECT/REPO: {bad[0]}")
+        raise ValueError(f"not an owner/repo, HOST/group/project or ORG/PROJECT/REPO: {bad[0]}")
     if repos and not since:
         raise ValueError("naming repositories needs --since YYYY-MM-DD, the start of the batch")
     imported, unchanged = collect_transcripts(conn, projects_root(), since, make_repo_of())
@@ -543,7 +552,7 @@ def cmd_collect(conn, args):
     if fixed:
         print(f"legacy Azure names: {sum(fixed.values())} rows rewritten in {len(fixed)} repositories")
     # A three-part name typed on the command line is Azure by the typing; others need a known organization.
-    named = {r.split("/")[0] for r in repos if r.count("/") == 2}
+    named = {r.split("/")[0] for r in repos if r.count("/") == 2 and forge.repo_kind(r) != "gitlab"}
     orgs = known_azure_orgs(conn, named)
     if not repos and since:
         repos = azure_repos(conn, orgs)  # nothing named: the Azure repositories the transcripts already name
@@ -1275,6 +1284,34 @@ def test_changes(check, tmp):
     check("a full listing says nothing about partial", "partial" in out.getvalue(), False)
     check("retro-signals failing still stores the changes",
           len(fetch_changes("o/r", "2026-10-01", lambda cmd, timeout=600: listing if cmd[0] == "gh" else None)), 2)
+    check("a GitLab remote is HOST/group/project", repo_from_remote("https://gitlab.example.com/g/sub/r.git"),
+          "gitlab.example.com/g/sub/r")
+    check("a GitLab ssh remote", repo_from_remote("git@gitlab.com:g/r.git"), "gitlab.com/g/r")
+    mrs = json.dumps([{"iid": 4, "source_branch": "$(id)", "sha": "cafe01", "created_at": "2026-09-30T01:00:00Z",
+                       "merged_at": "2026-10-01T01:00:00Z", "updated_at": "2026-10-01T01:00:00Z"}])
+    glab_calls = []
+
+    def glab_fake(cmd, timeout=600):
+        glab_calls.append(cmd)
+        if cmd[0] == "glab":
+            return mrs
+        return ("repo\tpr\tfix_rounds\tfailed_checks\tdays_to_merge\tescaped_refs\tlogged_review\n"
+                "gitlab.example.com/g/r\t4\t3\t1\t1\t0\tunknown\n")
+
+    def only_tools(*names):
+        return lambda tool: "/usr/bin/" + tool if tool in names else None
+
+    conn2 = leanstats.connect()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        check("a GitLab change is stored with its retro signals",
+              collect_changes(conn2, ["gitlab.example.com/g/r"], "2026-10-01", glab_fake, only_tools("glab", "jq")), 1)
+        check("no glab stores nothing", collect_changes(conn2, ["gitlab.example.com/g/r"], "2026-10-01", glab_fake,
+                                                        only_tools("gh", "jq")), 0)
+    check("says that glab and jq are the tools for GitLab", "changes: skipped GitLab, glab not found" in out.getvalue(), True)
+    check("the GitLab row", [tuple(r) for r in conn2.execute("SELECT * FROM changes WHERE repo LIKE 'gitlab%'")],
+          [("gitlab.example.com/g/r", 4, "$(id)", "2026-09-30T01:00:00Z", "2026-10-01T01:00:00Z", 3, 1, 0)])
+    check("the GitLab read goes through glab api", glab_calls[0][:3], ["glab", "api", "--hostname"])
     test_azure_changes(check, conn)
     with contextlib.redirect_stderr(io.StringIO()):
         check("repositories need a window", main(["collect", "o/r"]), 2)

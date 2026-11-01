@@ -2,16 +2,18 @@
 """Wait for a pull request's checks, or one pipeline run, and print only what failed.
 
   pr-wait <pr> [--repo R]                                   checks of a pull request (GitHub, through gh)
+  pr-wait <mr> [--repo R]                                   jobs of a merge request's pipeline (GitLab, through glab)
   pr-wait --provider azure <run-id> --org O --project P     one Azure Pipelines run (through az)
+  pr-wait --provider azure --pr <pr-id> --org O             policy evaluations of an Azure pull request
   options: --interval SECS (default 30)  --timeout SECS (default 7200)  --tail N (default 40)
   pr-wait --self-test
 
-The provider comes from the origin URL of the current folder (lib/forge.py kind_of); --provider overrides
-it. Where the URL says nothing (no remote, another host) it is GitHub. The provider classes are in
+The provider comes from the origin URL of the current folder (lib/forge.py detect, which honours LEAN_FORGE);
+--provider overrides it. Where the URL says nothing (no remote, another host) it is GitHub. The provider classes are in
 lib/forge.py, with the interface they share.
 
 Run it with run_in_background and end the turn: one command, one wake-up. It polls on its own, so the
-agent never calls `gh pr checks` or `az pipelines runs show` twice for the same thing.
+agent never calls `gh pr checks`, `glab api` or `az pipelines runs show` twice for the same thing.
 
 Exit 0 green (one line), 1 red (each failed check by name, then the last N lines of its log, preceded by any
 known environmental cause why-red.sh finds in it), 2 a usage or tool error, 3 timeout (prints what was still
@@ -115,16 +117,18 @@ def seconds(text):
 
 
 def parse(argv):
-    p = argparse.ArgumentParser(prog="pr-wait", description="Wait for a pull request's checks (github) or one "
+    p = argparse.ArgumentParser(prog="pr-wait", description="Wait for a pull request's checks (github), a merge request's pipeline (gitlab) or one "
                                 "pipeline run (azure). A check or run that ends in anything but success counts as "
                                 "failed, partiallySucceeded included. Zero checks reported yet counts as pending. "
                                 "Up to the timeout, a failed poll is retried, until --max-errors fail in a row; exit 2 is a bad argument, a missing "
                                 "tool or a first poll that fails.")
-    p.add_argument("target", help="github: a pull request number or URL; azure: a pipeline RUN ID, not a pull request")
+    p.add_argument("target", help="github: a pull request number or URL; gitlab: a merge request number; azure: a pipeline RUN ID, "
+                   "or with --pr a pull request id")
     p.add_argument("--provider", choices=sorted(forge.CI_PROVIDERS), help="default: from the origin URL")
-    p.add_argument("--repo", help="github: OWNER/NAME, default the repository of the current folder")
+    p.add_argument("--repo", help="github: OWNER/NAME; gitlab: HOST/GROUP/PROJECT; default the repository of the current folder")
+    p.add_argument("--pr", action="store_true", help="azure: the target is a pull request id, not a pipeline run id")
     p.add_argument("--org", help="azure: organization URL")
-    p.add_argument("--project", help="azure: project name")
+    p.add_argument("--project", help="azure: project name (not needed with --pr)")
     p.add_argument("--interval", type=seconds, default=30, help="seconds between polls, at least 1")
     p.add_argument("--timeout", type=seconds, default=7200)
     p.add_argument("--max-errors", type=positive_int, default=5, metavar="N",
@@ -135,11 +139,15 @@ def parse(argv):
 
 def main(argv, capture=forge.capture_command):
     a = parse(argv)
-    kind = a.provider or forge.kind_of(forge.remote_url("."))
+    kind = a.provider or forge.detect(forge.remote_url("."))
     if kind == "unknown":
         kind = "github"
+    problem = forge.missing_cli(kind)
+    if problem:
+        print(f"pr-wait: {problem}", file=sys.stderr)
+        return 2
     try:
-        provider = forge.ci_provider(kind, a.target, a.repo, a.org, a.project, capture)
+        provider = forge.ci_provider(kind, a.target, a.repo, a.org, a.project, capture, pull_request=a.pr)
         return wait(provider, a, sys.stdout)
     except forge.CiError as ex:
         print(f"pr-wait: {ex}", file=sys.stderr)
@@ -270,9 +278,30 @@ def self_test():
         r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "5", "--provider", "azure"],
                            capture_output=True, text=True, env=env, cwd=root)
         check("azure without org and project exits 2", r.returncode == 2 and "--org" in r.stderr, (r.returncode, r.stderr))
-        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "5", "--provider", "gitlab"],
+        # GitLab: a fake glab, a merge request whose pipeline has one failed job. A title holding $(id) is never run.
+        jobs = [{"id": 6, "name": "test$(id)", "status": "failed"}, {"id": 5, "name": "build", "status": "success"}]
+        d2, env2 = forge.make_scene(root, {"glab": forge.FAKE_GLAB, "gh": "#!/bin/sh\necho gh >> \"$FAKE_DIR/gh-called\"\n"},
+                                    {"merge_requests.json": {"iid": 3, "title": "$(id)", "head_pipeline": {"id": 99}},
+                                     "pipelines.json": jobs, "jobs.json": "a\nboom"})
+        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "3", "--provider", "gitlab",
+                            "--repo", "gitlab.example.com/g/r"], capture_output=True, text=True, env=env2, cwd=root)
+        check("end to end gitlab red", r.returncode == 1 and "FAILED test$(id)" in r.stdout and "| boom" in r.stdout,
+              (r.returncode, r.stdout, r.stderr))
+        check("gitlab makes no gh call", not os.path.exists(os.path.join(d2, "gh-called")), "gh called")
+        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "$(id)", "--provider", "gitlab"],
+                           capture_output=True, text=True, env=env2, cwd=root)
+        check("a gitlab target that is no number exits 2", r.returncode == 2 and "merge request number" in r.stderr,
+              (r.returncode, r.stderr))
+        empty = tempfile.mkdtemp(dir=root)
+        for kind, cli in (("gitlab", "glab"), ("github", "gh"), ("azure", "az")):
+            r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "5", "--provider", kind, "--org", "o",
+                                "--project", "p"], capture_output=True, text=True, env=dict(env, PATH=empty), cwd=root)
+            check(f"missing {cli} gives one line and exit 2",
+                  r.returncode == 2 and len(r.stderr.splitlines()) == 1 and f"{cli} is not installed" in r.stderr,
+                  (r.returncode, r.stderr))
+        r = subprocess.run([sys.executable, "-I", os.path.realpath(__file__), "5", "--provider", "bitbucket"],
                            capture_output=True, text=True, env=env, cwd=root)
-        check("a provider not wired exits 2", r.returncode == 2, (r.returncode, r.stderr))
+        check("an unknown provider exits 2", r.returncode == 2, (r.returncode, r.stderr))
 
     if fails:
         print("self-test failed:\n  " + "\n  ".join(str(f) for f in fails))
