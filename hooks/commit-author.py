@@ -135,16 +135,18 @@ def main():
         return 0
     found = problems(command, event.get("cwd") or os.getcwd())
     if found:
-        print("Blocked by lean-agent, the commit author email is wrong: " + "; ".join(found)
-              + ". Set it with git config user.email (or -c user.email=... on this commit) "
-              "and run the command again. LEAN_ALLOW_COMMIT_AUTHOR=1 in front of the command, or in "
-              "the env block of Claude Code settings, turns this check off.",
-              file=sys.stderr)
-        return 2
+        text = ("Blocked by lean-agent, the commit author email is wrong: " + "; ".join(found)
+                + ". Set it with git config user.email (or -c user.email=... on this commit) "
+                "and run the command again. LEAN_ALLOW_COMMIT_AUTHOR=1 in front of the command, or in "
+                "the env block of Claude Code settings, turns this check off.")
+        note = ("The commit author email looks wrong: " + "; ".join(found)
+                + ". Consider git config user.email (or -c user.email=... on this commit) before committing.")
+        return hookkit.refuse("PreToolUse", text, standard="note", note=note)
     return 0
 
 
 def self_test():
+    os.environ["LEAN_PROFILE"] = "strict"
     import subprocess
     import tempfile
 
@@ -223,6 +225,23 @@ def self_test():
         for key, value in saved.items():
             if value is not None:
                 os.environ[key] = value
+    def std(event, **env):
+        return hookkit.probe(os.path.realpath(__file__), event, LEAN_PROFILE="standard", **env)
+
+    def want(label, got, rc, out=False):
+        nonlocal failures
+        if got[0] != rc or bool(got[1]) != out or got[2]:
+            print(f"FAIL standard {label}: {got!r}")
+            failures += 1
+
+    with tempfile.TemporaryDirectory() as there:
+        bad_author = {"tool_input": {"command": "git -c user.email=nobody commit -m x"}, "cwd": there}
+        want("bad author email is a note", std(bad_author, GIT_CONFIG_NOSYSTEM="1", HOME=there), 0, True)
+        if hookkit.probe(os.path.realpath(__file__), bad_author, LEAN_PROFILE="strict",
+                         GIT_CONFIG_NOSYSTEM="1", HOME=there)[0] != 2:
+            print("FAIL strict should still block a bad author email")
+            failures += 1
+
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

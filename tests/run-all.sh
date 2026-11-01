@@ -16,6 +16,8 @@ cd "$root" || exit 2
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/lean-run-all.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 export LEAN_BRAIN_DB="$scratch/brain.db"
+# The self-tests assert the strict behaviour; tests/profile.py sets its own profile per case.
+export LEAN_PROFILE=strict
 
 # A while-read loop rather than mapfile, which macOS's bash 3.2 does not have.
 scripts=()
