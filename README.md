@@ -201,6 +201,14 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_DIRECT_TEST` | block in `strict`, nothing in `standard` | `allow` stops the block on a direct `dotnet test`, `npm test`, `npx vitest` or `vitest run` where test-phase can take the job. Tests go through `brain queue add` and `test-phase`. A `package.json` that uses jest and not vitest is left alone, and so is a `pnpm -r`, `--filter`, `turbo` or `nx` script, since the queue has no jest runner. |
 | `LEAN_NPM_REGISTRY` | `npm config get registry`, else `https://registry.npmjs.org` | The npm registry `pkg-version` asks. |
 | `LEAN_NUGET_REGISTRY` | `https://api.nuget.org/v3-flatcontainer` | The nuget flat container `pkg-version` asks. |
+| `LEAN_CREDIT_RUNS` | off | `on` lets `credit-run` start a job. Anything else exits 2 and starts nothing. |
+| `LEAN_CREDIT_TOTAL_USD` | unset | The most `credit-run` may spend in total. Required to start a job. |
+| `LEAN_CREDIT_TURN_USD` | `0.50` | Added to each job's budget as its reservation, since the SDK stops a job only after a turn. |
+| `LEAN_CREDIT_KEY_ITEM` | `lean-api-credit` | The keychain item (macOS) or `service` attribute (Linux) that holds the API key. |
+| `LEAN_CREDIT_ADVISOR` | `off` | `opus` gives jobs the Opus advisor. `--advisor` overrides it. |
+| `LEAN_CREDIT_CACHE_TTL` | `5m` | Prompt cache lifetime for jobs, `5m` or `1h`. `--cache-ttl` overrides it. |
+| `LEAN_CREDIT_FAST` | off | `on` allows `--fast`, and only with an Opus model. Fast mode switches any other model to Opus at double Opus rates. |
+| `LEAN_CREDIT_BATCH` | off | `on`, together with `LEAN_CREDIT_RUNS=on`, lets `credit-batch submit` send a batch. `status` and `results` work without it. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
 
@@ -235,6 +243,35 @@ The explicit settings win in every profile: `LEAN_ALLOW_*`, `LEAN_SKIP_*`, `LEAN
 A direct test run gets no wait-loop note under `standard` either, unless `LEAN_DIRECT_TEST=allow` is set, which is the one case that note already covered.
 
 The git hooks that `secret-scan install` writes do not read `LEAN_PROFILE`. A person has them only after running install, so they keep blocking a key in a commit or push in every profile. `LEAN_SKIP_SECRET_SCAN=1` or an `allow-secret` line is how to get past them.
+
+## Jobs on API credits
+
+`credit-run` runs one brief as a headless job through the Claude Agent SDK, paid by an API key, with a dollar cap. Your session stays on your subscription. It is meant for read and judge work (spec review, hunting, refuting, analysis) and for drafts, so `--read-only --role hunt` returns the result text on stdout.
+
+```bash
+credit-run --setup        # once: installs the pinned SDKs (agent and batch) under ~/.lean/credit-sdk (needs node)
+credit-run --key-help     # prints the keychain command for you to run; the key is never an argument
+export LEAN_CREDIT_RUNS=on LEAN_CREDIT_TOTAL_USD=20
+credit-run --brief brief.md --worktree ../app-wt --budget 2 --model sonnet
+credit-run --brief brief.md --worktree . --budget 1 --read-only --role hunt
+credit-run --spent
+```
+
+The key goes into the worker's environment only. `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are removed from it, because the auth token outranks the key, and so are `ANTHROPIC_BASE_URL` and the Bedrock, Vertex and Foundry switches, so the key only goes to the Claude API. The job loads no user settings and only this plugin. Tools are Read, Glob, Grep, Edit, Write and git status, diff, log, add, commit; everything else is denied, and `git push` is refused even through `--allow`, and so are `--allow` entries that run git with an option before the subcommand, a wildcard in the git subcommand, or a shell or runner such as `sh`, `env` or `python`. Reading `/proc` is denied. A job that edits needs a clean linked worktree. `--read-only` gets Read, Glob and Grep only, with no Bash and no edits, so put any diff in the brief.
+
+Each job reserves its budget plus `LEAN_CREDIT_TURN_USD` in `~/.lean/credit-runs.jsonl` before it starts and is refused when spent plus reserved plus that reservation passes the total. A job that dies without a final line keeps counting at its reserved amount. A cap hit exits 3 and prints the session id for `--resume`. These figures are a local estimate from `total_cost_usd`, and a cost figure does not prove which balance paid. The only hard limit is the spend limit on the Console workspace. `credit-run --spent` also names older single-line rows with no known cost (counted at their budget) and ledger lines it had to skip.
+
+### Batches
+
+`credit-batch` sends read-only briefs (retro digests, ticket shaping, spec review) as one Message Batch at 50% off. There is no tool loop, and a batch can take up to a day. It is off unless `LEAN_CREDIT_RUNS=on` and `LEAN_CREDIT_BATCH=on`.
+
+```bash
+credit-batch submit --brief a.md --brief b.md --shared rules.md --max-tokens 4000 --model sonnet
+credit-batch status msgbatch_...
+credit-batch results msgbatch_... --dir out/
+```
+
+Each brief is one request, named by its file. `--shared` is one text block sent first in every request with a 1 hour cache breakpoint. `submit` reserves the estimated cost (input tokens plus `--max-tokens`, at batch rates) in the same ledger and under the same total as `credit-run`. `results` writes one file per request, works out the real cost from the token counts, and closes the reservation. It refuses until the batch has ended and exits 1 naming any request that errored, expired or was canceled. A batch whose results are never fetched stays reserved. If `results` holds a different number of requests than `submit` reserved, it writes no final line, names both counts and exits 1, and a later run closes it. A result file that is a symlink is refused and not followed. If `submit` fails or times out after it reserved, the reservation stays and the batch may exist with an unknown id, so check the Console Batches page. The model is `sonnet`, `opus`, `haiku` or one of `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-5-5`. Request size is estimated as UTF-8 bytes divided by 2. Batch costs are computed from token counts, not a billed figure. `credit-run --setup` installs the SDK it uses.
 
 ## Keep keys out of git
 
