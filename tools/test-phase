@@ -163,7 +163,7 @@ try:
 except ImportError:  # without the helper a job takes the lane command by command, as before
     hl = None
 import gradle_args as ga
-from test_kinds import DOTNET_FILES, SUPPORTED_KINDS
+from test_kinds import DOTNET_FILES, GO_PATTERN, SUPPORTED_KINDS
 try:
     import test_needs as tn
 except ImportError:  # without the module no prerequisite or environment check runs
@@ -899,12 +899,13 @@ class Gradle:
         return out
 
 
-GO_PATTERN = re.compile(r"^(?:\.|\./\S*|\.\.\.)$")
 # The package pattern, the -run regex and any extra arguments are positional parameters of a fixed script, so
 # nothing the job names is read as shell. go build first, then go test with JSON events; extra arguments are test flags.
+# go test reads -- as the end of the package list, so none goes before the pattern; GO_PATTERN starts with a dot, so
+# the pattern is never a flag.
 GO_SCRIPT = ('pat=$1; run=$2; shift 2; go build -- "$pat" || exit $?; '
-             'if [ -n "$run" ]; then exec go test -json "$@" -run "$run" -- "$pat"; '
-             'else exec go test -json "$@" -- "$pat"; fi')
+             'if [ -n "$run" ]; then exec go test -json "$@" -run "$run" "$pat"; '
+             'else exec go test -json "$@" "$pat"; fi')
 
 
 class Go:
@@ -918,12 +919,21 @@ class Go:
         return "go"
 
     @staticmethod
-    def command(mode, project, cls_filter=None, fast=False, extra=(), probe=False, **_):
-        run = "|".join(p.strip() for p in (cls_filter or "").split("|") if p.strip())
-        if any(p.strip().startswith("-") for p in (cls_filter or "").split("|")):
+    def command(mode, project, cls_filter=None, fast=False, extra=(), probe=False, rerun=False, **_):
+        """A user filter is a raw -run regex. A rerun filter is a list of test names, so each is anchored
+        (^(TestFoo)$) and TestFooBar does not run with TestFoo."""
+        pieces = [p.strip() for p in (cls_filter or "").split("|") if p.strip()]
+        if any(p.startswith("-") for p in pieces):
             raise ValueError("a filter piece starts with -")
         if not GO_PATTERN.match(project or ""):
             raise ValueError("not a Go package pattern")
+        if rerun and pieces:
+            pieces = [p for p in pieces if " [" not in p]  # a package that failed to build has no test to rerun
+            if not pieces:
+                raise ValueError("a package failure has no test to rerun")
+            run = "^(" + "|".join(re.escape(p) for p in pieces) + ")$"
+        else:
+            run = "|".join(pieces)
         return ["sh", "-c", GO_SCRIPT, "go", project, run] + [a for a in extra if a != "--no-build"]
 
     @staticmethod
@@ -938,32 +948,80 @@ class Go:
                     yield e
 
     @staticmethod
-    def failures(text):
-        """[(test name, its output)] for each failed test. A parent whose subtest failed is left out."""
-        out, failed = {}, []
+    def results(text):
+        """{(package, test): last Action of pass, fail or skip} in order."""
+        out = {}
         for e in Go.events(text):
-            t = e.get("Test")
-            if not t:
+            if e.get("Test") and e.get("Action") in ("pass", "fail", "skip"):
+                out[(e.get("Package"), e["Test"])] = e["Action"]
+        return out
+
+    @staticmethod
+    def failures(text):
+        """[(name, output)]. A failed test is named by its test name, a parent whose subtest failed is left out.
+        A package that failed with no failed test is "<pkg> [build failed]" with the compiler output, or
+        "<pkg> [timed out]" with the panic line; the output is decoded text, not JSON."""
+        evs = list(Go.events(text))
+        res = Go.results(text)
+        failed = [k for k, v in res.items() if v == "fail" and not any(
+            o[0] == k[0] and o[1].startswith(k[1] + "/") and res[o] == "fail" for o in res)]
+        out, pkg_out, build, pkg_fail = {}, {}, {}, {}
+        for e in evs:
+            a, t, pkg = e.get("Action"), e.get("Test"), e.get("Package")
+            if a == "build-output":
+                build.setdefault(e.get("ImportPath"), []).append(e.get("Output", ""))
+            elif a == "output" and pkg:
+                pkg_out.setdefault(pkg, []).append(e.get("Output", ""))
+                if t:
+                    out.setdefault((pkg, t), []).append(e.get("Output", ""))
+            elif a == "fail" and pkg and not t:
+                pkg_fail[pkg] = e.get("FailedBuild")
+        found, seen = [], set()
+        for k in failed:
+            if k[1] not in seen:
+                seen.add(k[1])
+                found.append((k[1], "".join(out.get(k, []))[-2000:].strip()))
+        for pkg, built in pkg_fail.items():
+            if any(k[0] == pkg for k in failed):
                 continue
-            if e.get("Action") == "output":
-                out.setdefault(t, []).append(e.get("Output", ""))
-            elif e.get("Action") == "fail" and t not in failed:
-                failed.append(t)
-        return [(t, "".join(out.get(t, []))[-2000:].strip()) for t in failed
-                if not any(o.startswith(t + "/") for o in failed)]
+            body = "".join(pkg_out.get(pkg, []))
+            if built:
+                found.append((f"{pkg} [build failed]", "".join(build.get(built, []))[-2000:].strip()
+                              or body[-2000:].strip()))
+            elif "panic: test timed out" in body:
+                i = body.index("panic: test timed out")
+                found.append((f"{pkg} [timed out]", "\n".join(body[i:].splitlines()[:6]).strip()))
+            else:
+                found.append((f"{pkg} [failed]", body[-2000:].strip()))
+        return found
 
     @staticmethod
     def counts(text):
-        """(passed, failed, skipped) of the tests in go test -json events."""
+        """(passed, failed, skipped), leaf tests only: a parent is not counted when it has subtests, except a
+        parent that failed with no failed subtest."""
+        res = Go.results(text)
         n = {"pass": 0, "fail": 0, "skip": 0}
-        for e in Go.events(text):
-            if e.get("Test") and e.get("Action") in n:
-                n[e["Action"]] += 1
+        for (pkg, t), a in res.items():
+            kids = [o for o in res if o[0] == pkg and o[1].startswith(t + "/")]
+            if a == "fail":
+                if not any(res[o] == "fail" for o in kids):
+                    n["fail"] += 1
+            elif not kids:
+                n[a] += 1
         return n["pass"], n["fail"], n["skip"]
 
     @staticmethod
+    def no_tests(text):
+        """No test ran: a package event said "no tests to run" or "[no test files]" and nothing passed, failed or skipped."""
+        if sum(Go.counts(text)):
+            return False
+        return any(e.get("Action") == "output" and not e.get("Test")
+                   and ("no tests to run" in e.get("Output", "") or "[no test files]" in e.get("Output", ""))
+                   for e in Go.events(text))
+
+    @staticmethod
     def class_of(test):
-        return test.split("/", 1)[0]
+        return test if " [" in test else test.split("/", 1)[0]
 
 
 RUNNERS = [Dotnet, Vitest, Playwright, Gradle, Go]
@@ -1369,7 +1427,7 @@ def build_args(extra):
     return out
 
 
-def matched_none(rc, text):
+def matched_none(rc, text, runner=None):
     """A filtered run that ran no test: MTP exit 8, VSTest's no-match line, vitest's no-files line, or a summary of zero tests."""
     if rc == 8:
         return True
@@ -1380,8 +1438,8 @@ def matched_none(rc, text):
     if rc != 0:
         return False
     text = ANSI.sub("", text)
-    if "no tests to run" in text and not sum(Go.counts(text)):  # go test -run that matched nothing exits 0
-        return True
+    if runner is Go:  # go test -run that matched nothing exits 0; only a Go event line says so
+        return Go.no_tests(text)
     if sum(Dotnet.counts(text)):  # a multi-target run can miss on one framework and run tests on another
         return False
     return "No test matches the given testcase filter" in text \
@@ -1583,6 +1641,8 @@ def _run_job(job, a, run_dir, runner, lane, hold):
         kw = {"hang": hargs} if hargs else {}
         if runner is Gradle and name == "rerun" and rerun_tasks.get(cls_filter):
             kw["rerun_tasks"] = rerun_tasks[cls_filter]
+        if runner is Go and name == "rerun":
+            kw["rerun"] = True
         cmd = runner.command(mode, project, cls_filter, name == "fast",
                              extra + ["--no-build"] if kept.get("dest") or probe or hargs else extra, probe, **kw)
         if remote:
@@ -1691,15 +1751,15 @@ def _run_job(job, a, run_dir, runner, lane, hold):
                  f"Log: {stem}.log", run_id, ctx)
     elif rc == 75:
         row["notes"].append("lane busy, nothing ran")
-    elif job["filter"] and not failing and not row.get("env") and matched_none(rc, text):
+    elif job["filter"] and not failing and not row.get("env") and matched_none(rc, text, runner):
         row["result"] = "fail"
         row["notes"].append("filter matched no test")
         add_item(row, "test-fail", f"filter-matched-no-test: {project}", "important",
                  f"filter {job['filter']!r} matched no test (exit {rc}). Log: {stem}.log", run_id, ctx)
     elif runner is not Gradle and not failing and not row.get("env") \
-            and (matched_none(rc, text) or (rc == 0 and not sum(runner.counts(text)[:2]))):
+            and (matched_none(rc, text, runner) or (rc == 0 and not sum(runner.counts(text)[:2]))):
         row["result"] = "fail"
-        if matched_none(rc, text) or explicit_zero(runner, text):
+        if matched_none(rc, text, runner) or explicit_zero(runner, text):
             row["notes"].append("ran no tests")
             add_item(row, "test-fail", f"ran-no-tests: {project}", "important",
                      f"The run exited {rc} but passed or failed no test, so it proved nothing. A project with no tests "
@@ -2977,18 +3037,95 @@ def go_checks(fails):
         ev = lambda a, t=None, o=None: json.dumps({"Action": a, "Package": "x", **({"Test": t} if t else {}),
                                                   **({"Output": o} if o else {})}) + "\n"
         rc, out, calls = run("TestA|TestB", ev("pass", "TestA") + ev("output", "TestB", "boom\n") + ev("fail", "TestB"))
-        if calls != ["build -- ./...", "test -json -count=1 -run TestA|TestB -- ./..."]:
+        if calls != ["build -- ./...", "test -json -count=1 -run TestA|TestB ./..."]:
             fails.append(f"Go must build, then test with -run and the filter as one argument: {calls}")
         if Go.counts(out) != (1, 1, 0) or [n for n, _ in Go.failures(out)] != ["TestB"] \
-                or "boom" not in Go.failures(out)[0][1] or matched_none(0, out):
+                or "boom" not in Go.failures(out)[0][1] or matched_none(0, out, Go):
             fails.append(f"Go counts and failures must be read from the JSON events: {Go.counts(out)} {Go.failures(out)}")
         rc, out, calls = run("", ev("pass", "TestA"))
-        if calls[1] != "test -json -count=1 -- ./...":
+        if calls[1] != "test -json -count=1 ./...":
             fails.append(f"Go with no filter must not pass -run: {calls}")
         none = ev("output", None, "testing: warning: no tests to run\n") + ev("pass")
         rc, out, calls = run("TestNope", none)
-        if matched_none(rc, out) is not True or Go.counts(out) != (0, 0, 0):
+        if matched_none(rc, out, Go) is not True or Go.counts(out) != (0, 0, 0):
             fails.append("a Go run that printed no tests to run must count as matched none")
+
+        # Only a Go event line counts: dotnet and vitest output that holds the text is not a no-match.
+        dn = "Passed!  - Failed: 0, Passed: 3, Skipped: 0, Total: 3\nlog: no tests to run for stage 2\n"
+        vt = " Tests  3 passed (3)\nnote: no tests to run in watch mode\n"
+        if matched_none(0, dn) or matched_none(0, vt) or matched_none(0, dn, Dotnet) or matched_none(0, vt, Vitest):
+            fails.append("text holding no tests to run must not make a dotnet or vitest run matched none")
+        # Leaf tests only, and the package failures are named with decoded text.
+        sub = ev("pass", "TestP/s1") + ev("pass", "TestP/s2") + ev("pass", "TestP") + ev("skip", "TestQ")
+        if Go.counts(sub) != (2, 0, 1):
+            fails.append(f"Go counts must be leaf tests only: {Go.counts(sub)}")
+        sf = ev("fail", "TestP/s1") + ev("pass", "TestP/s2") + ev("fail", "TestP")
+        if Go.counts(sf) != (1, 1, 0) or [n for n, _ in Go.failures(sf)] != ["TestP/s1"]:
+            fails.append(f"a parent with a failed subtest must not count twice: {Go.counts(sf)} {Go.failures(sf)}")
+        nt = json.dumps({"Action": "output", "Package": "x/c", "Output": "?   \tx/c\t[no test files]\n"}) + "\n" \
+            + json.dumps({"Action": "skip", "Package": "x/c"}) + "\n"
+        if matched_none(0, nt, Go) is not True:
+            fails.append("packages that only say [no test files] must count as matched none")
+        bf = json.dumps({"ImportPath": "x/d [x/d.test]", "Action": "build-output", "Output": "d_test.go:3: bad\n"}) + "\n" \
+            + json.dumps({"Action": "fail", "Package": "x/d", "FailedBuild": "x/d [x/d.test]"}) + "\n"
+        got = Go.failures(bf)
+        if got != [("x/d [build failed]", "d_test.go:3: bad")]:
+            fails.append(f"a build failure must be named with the compiler text: {got}")
+        to = ev("output", "TestSlow", "panic: test timed out after 1s\n") \
+            + json.dumps({"Action": "fail", "Package": "x/e"}) + "\n"
+        to = to.replace('"Package": "x"', '"Package": "x/e"')
+        got = Go.failures(to)
+        if [n for n, _ in got] != ["x/e [timed out]"] or "test timed out after 1s" not in got[0][1] or "{" in got[0][1]:
+            fails.append(f"a timeout must be named with the panic line: {got}")
+        if Go.class_of("x/d [build failed]") != "x/d [build failed]" or Go.class_of("TestP/s1") != "TestP":
+            fails.append("Go class_of must keep a package failure whole and cut a subtest to its test")
+        got = Go.command("go", "./...", "TestFoo|TestBar", rerun=True)[5]
+        if got != "^(TestFoo|TestBar)$" or Go.command("go", "./...", "TestFoo", rerun=False)[5] != "TestFoo":
+            fails.append(f"a rerun must anchor the names and a user filter stay raw: {got}")
+        try:
+            Go.command("go", "./...", "x/d [build failed]", rerun=True)
+            fails.append("a rerun of a package failure must be refused")
+        except ValueError:
+            pass
+        go_real_check(fails, d)
+
+
+def go_real_check(fails, d):
+    """Real go on a two-package module; skipped when go is not on PATH."""
+    gobin = shutil.which("go")
+    if not gobin:
+        return
+    mod = os.path.join(d, "mod")
+    for sub_, body in (("a", "package a\nimport \"testing\"\nfunc TestFoo(t *testing.T) { t.Run(\"s\", func(t *testing.T) {}) }\n"
+                              "func TestFooBar(t *testing.T) {}\n"),
+                       ("b", "package b\nimport \"testing\"\nfunc TestB(t *testing.T) {}\n")):
+        os.makedirs(os.path.join(mod, sub_))
+        open(os.path.join(mod, sub_, sub_ + "_test.go"), "w").write(body)
+    open(os.path.join(mod, "go.mod"), "w").write("module x\ngo 1.20\n")
+    env = dict(os.environ, GOFLAGS="", GOTOOLCHAIN="local")
+
+    def real(*args, **kw):
+        return subprocess.run(Go.command("go", *args, **kw), cwd=mod, env=env, capture_output=True, text=True, timeout=240)
+    p = real("./...")
+    if p.returncode != 0 or Go.counts(p.stdout) != (3, 0, 0):
+        fails.append(f"real go ./... must test both packages: {p.returncode} {Go.counts(p.stdout)} {p.stderr[-200:]}")
+    p = real("./...", "TestFoo", rerun=True)
+    if p.returncode != 0 or Go.counts(p.stdout) != (1, 0, 0):
+        fails.append(f"a real rerun of TestFoo must not run TestFooBar: {Go.counts(p.stdout)}")
+    p = real("./...", "TestNothing")
+    if matched_none(p.returncode, p.stdout, Go) is not True:
+        fails.append(f"a real -run that matches nothing must be matched none: {p.returncode} {p.stdout[-300:]}")
+
+
+def self_test_go():
+    """go_checks only, for a quick check of the Go runner."""
+    fails = []
+    go_checks(fails)
+    if fails:
+        print("self-test-go failed:\n  " + "\n  ".join(fails))
+        return 1
+    print("self-test-go passed")
+    return 0
 
 
 def self_test():
@@ -4358,4 +4495,6 @@ exit 0
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         sys.exit(self_test())
+    if sys.argv[1:] == ["--self-test-go"]:
+        sys.exit(self_test_go())
     sys.exit(main(sys.argv[1:]))
