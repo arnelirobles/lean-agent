@@ -693,6 +693,21 @@ def run(brain_cli):
         if rc != 0:
             fails.append(f"route --to any --force must be allowed on a private job: {rc} {out!r} {err!r}")
         run("queue", "cancel", pn)
+        # Go: a package pattern is a test path only in a repo with go.mod.
+        rc, out, err = run("queue", "add", rp, ".")
+        if rc == 0 or "not a test path" not in err:
+            fails.append(f"a Go pattern without go.mod must be refused: {rc} {out!r} {err!r}")
+        mk("go.mod", "module x\n")
+        os.makedirs(os.path.join(rp, "cmd", "x"), exist_ok=True)
+        for pat in (".", "./cmd/x", "./..."):
+            rc, out, err = run("queue", "add", rp, pat)
+            if rc != 0:
+                fails.append(f"a Go pattern {pat} with go.mod must be accepted: {rc} {out!r} {err!r}")
+            else:
+                if detect_platform(rp, pat) != "private":
+                    fails.append(f"a Go job must stay on the local lane: detect_platform({pat})")
+                run("queue", "cancel", out.strip())
+        os.remove(os.path.join(rp, "go.mod"))
         # Gradle: a settings file or its folder is a Gradle job. It stays local, and an iOS test task makes it apple.
         mk("kmp/settings.gradle.kts", "rootProject.name = \"x\"\n")
         mk("groovy/settings.gradle", "rootProject.name = 'x'\n")
