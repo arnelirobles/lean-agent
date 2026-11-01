@@ -775,7 +775,7 @@ def _self_test():
     for fn in ("SELECT zeroblob(8)", "SELECT randomblob(8)"):
         check("blob functions refused", refused(fn), True)
     check("huge blob refused", refused("SELECT hex(zeroblob(2000000))"), True)
-    check("huge string refused", refused("SELECT printf('%.*c', 2000000000, 'x')"), True)
+    check("huge string refused", refused("SELECT printf('%2000000s', 'x')"), True)
     class Cursor:
         calls = 0
 
