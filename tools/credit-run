@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Run a ticket as a headless `claude -p` job paid by API credits, with a dollar cap.
+
+  credit-run --brief FILE --worktree DIR --budget USD [--model sonnet] [--minutes N]
+             [--allow TOOL ...] [--out FILE]
+  credit-run --key-help
+  credit-run --spent
+  credit-run --self-test
+
+`claude -p` bills the account behind ANTHROPIC_API_KEY when that variable is set. This tool
+reads the key from the OS keychain (macOS `security`, Linux `secret-tool`; item name from
+LEAN_CREDIT_KEY_ITEM, default lean-api-credit) and puts it in the job's environment only.
+It is never printed, logged, written to the output file, or put in argv. The tool never takes
+the key as an argument: run `credit-run --key-help` and type the printed command yourself.
+
+The budget is required and becomes `--max-budget-usd`, so a job with no cap does not start.
+The worktree must be a clean linked git worktree, not the main checkout. The job runs under
+`bounded` (--minutes, default 60). Default tools: Read, Edit, Write, Glob, Grep and git
+status, diff, log, add, commit. `git push` is refused, also when --allow asks for it, and
+so are bare Bash and Bash(git:*), which would include it.
+
+Each run appends one line to ~/.lean/credit-runs.jsonl (time, branch, model, budget, cost,
+turns, state, session). `--spent` sums it. A cap hit (budget or turns) is reported on stderr
+with the session id so it can be resumed with `claude --resume ID`. The full output JSON goes
+to --out (default ~/.lean/credit-out/<time>.json); stdout gets the result text and the cost.
+
+A headless job gets no later turn and no notice, so its brief must say to run everything in the
+foreground, each command under 10 minutes, and a commit hook that needs a person can refuse the
+job's commit. When that happens the work stays in the worktree: commit it from your session.
+
+Limit: the cost in `-p` output is what the run cost. It does not prove which balance paid,
+and this tool does not claim credit was used. Check the console billing page.
+
+Exit: 0 done, 3 cap hit, 2 bad input or no key or unsupported platform, else the job's code.
+Python 3 standard library, macOS and Linux.
+"""
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+DEFAULT_ITEM = "lean-api-credit"
+DEFAULT_ALLOW = ["Read", "Edit", "Write", "Glob", "Grep",
+                 "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+                 "Bash(git add:*)", "Bash(git commit:*)"]
+DENY = ["Bash(git push:*)"]
+TOO_BROAD = {"bash", "bash(*)", "bash(:*)", "bash(git:*)", "bash(git *)", "bash(git*)"}
+
+
+def die(msg, code=2):
+    print(f"credit-run: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def home():
+    return os.path.join(os.path.expanduser("~"), ".lean")
+
+
+def ledger_path():
+    return os.path.join(home(), "credit-runs.jsonl")
+
+
+def item_name():
+    return os.environ.get("LEAN_CREDIT_KEY_ITEM") or DEFAULT_ITEM
+
+
+def platform():
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    die(f"unsupported platform {sys.platform}, macOS and Linux only")
+
+
+def key_help():
+    item = item_name()
+    if platform() == "mac":
+        print(f'security add-generic-password -U -s {item} -a "$USER" -w')
+    else:
+        print(f"secret-tool store --label={item} service {item}")
+    print("Run it yourself; it prompts for the key. credit-run never takes the key as an argument.",
+          file=sys.stderr)
+
+
+def read_key():
+    item = item_name()
+    if platform() == "mac":
+        cmd = ["security", "find-generic-password", "-s", item, "-w"]
+    else:
+        cmd = ["secret-tool", "lookup", "service", item]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        die(f"cannot read keychain item {item}; run: credit-run --key-help")
+    key = r.stdout.strip()
+    if r.returncode != 0 or not key:
+        die(f"no keychain item {item}; run: credit-run --key-help")
+    return key
+
+
+def check_allow(tools):
+    for t in tools:
+        low = t.lower().replace(" ", "")
+        if "gitpush" in low or low in TOO_BROAD:
+            die(f"refused --allow {t!r}: it would allow git push")
+    return tools
+
+
+def git(worktree, *args):
+    r = subprocess.run(["git", "-C", worktree, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def check_worktree(worktree):
+    if not os.path.isdir(worktree):
+        die(f"worktree {worktree} is not a directory")
+    rc, gd = git(worktree, "rev-parse", "--absolute-git-dir")
+    rc2, cd = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc or rc2:
+        die(f"{worktree} is not a git worktree")
+    if os.path.realpath(gd) == os.path.realpath(cd):
+        die(f"{worktree} is the main checkout, use a linked worktree")
+    rc, dirty = git(worktree, "status", "--porcelain")
+    if rc or dirty:
+        die(f"worktree {worktree} is not clean")
+    return git(worktree, "rev-parse", "--abbrev-ref", "HEAD")[1]
+
+
+def state_of(data, code):
+    sub = str((data or {}).get("subtype") or "")
+    if code == 124:
+        return "timeout"
+    if "budget" in sub:
+        return "budget_cap"
+    if "max_turns" in sub:
+        return "turns_cap"
+    if code == 0 and data and not data.get("is_error"):
+        return "ok"
+    return "error"
+
+
+def spent():
+    total, n = 0.0, 0
+    try:
+        with open(ledger_path()) as f:
+            for line in f:
+                try:
+                    total += float(json.loads(line).get("cost") or 0)
+                    n += 1
+                except (ValueError, AttributeError, TypeError):
+                    pass
+    except OSError:
+        pass
+    print(f"spent ${total:.4f} over {n} runs")
+
+
+def run(a):
+    if not math.isfinite(a.budget) or a.budget <= 0:
+        die("--budget must be a positive number of dollars")
+    if not math.isfinite(a.minutes) or a.minutes < 0:
+        die("--minutes must be 0 or more")
+    if not os.path.isfile(a.brief):
+        die(f"brief {a.brief} is not a file")
+    allow = DEFAULT_ALLOW + check_allow(a.allow or [])
+    platform()
+    branch = check_worktree(a.worktree)
+    key = read_key()
+
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    out = a.out or os.path.join(home(), "credit-out", f"{stamp}.json")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    bounded = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bounded")
+    argv = [sys.executable, bounded, "--minutes", f"{a.minutes:g}", "--",
+            "claude", "-p", "--output-format", "json", "--model", a.model,
+            "--max-budget-usd", f"{a.budget:g}",
+            "--allowedTools", ",".join(allow), "--disallowedTools", ",".join(DENY)]
+    env = dict(os.environ, ANTHROPIC_API_KEY=key)
+    with open(a.brief) as brief, open(out, "w") as outf:
+        code = subprocess.run(argv, stdin=brief, stdout=outf, env=env, cwd=a.worktree).returncode
+
+    with open(out) as f:
+        raw = f.read()
+    if key in raw:
+        raw = raw.replace(key, "[redacted]")
+        with open(out, "w") as f:
+            f.write(raw)
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            data = None
+    except ValueError:
+        data = None
+    state = state_of(data, code)
+    cost = float((data or {}).get("total_cost_usd") or 0)
+    turns = (data or {}).get("num_turns")
+    sid = (data or {}).get("session_id")
+    os.makedirs(home(), exist_ok=True)
+    line = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "branch": branch, "model": a.model,
+            "budget": a.budget, "cost": cost, "turns": turns, "state": state, "session": sid}
+    with open(ledger_path(), "a") as f:
+        f.write(json.dumps(line) + "\n")
+
+    if data and data.get("result"):
+        print(data["result"])
+    print(f"cost ${cost:.4f} of ${a.budget:g} budget, state {state}, output {out}")
+    if state in ("budget_cap", "turns_cap"):
+        print(f"credit-run: cap hit ({state}), session {sid}; resume with: claude --resume {sid}",
+              file=sys.stderr)
+        return 3
+    if state == "timeout":
+        print(f"credit-run: stopped by the time limit, session {sid}", file=sys.stderr)
+    return 0 if state == "ok" else (code or 1)
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="credit-run", description=__doc__.split("\n")[0])
+    p.add_argument("--brief")
+    p.add_argument("--worktree")
+    p.add_argument("--budget", type=float)
+    p.add_argument("--model", default="sonnet")
+    p.add_argument("--minutes", type=float, default=60)
+    p.add_argument("--allow", action="append", nargs="+")
+    p.add_argument("--out")
+    p.add_argument("--key-help", action="store_true")
+    p.add_argument("--spent", action="store_true")
+    a = p.parse_args(argv)
+    a.allow = [t for group in (a.allow or []) for t in group]
+    if a.key_help:
+        return key_help()
+    if a.spent:
+        return spent()
+    if a.budget is None or not a.brief or not a.worktree:
+        p.error("--brief, --worktree and --budget are required")
+    return run(a)
+
+
+FAKE_CLAUDE = r'''#!/bin/sh
+{
+  echo "ARGV: $*"
+  echo "ENVNAMES: $(env | cut -d= -f1 | sort | tr '\n' ' ')"
+  echo "KEYSET: ${ANTHROPIC_API_KEY:+yes}"
+  echo "PWD: $(pwd)"
+  echo "STDIN: $(cat)"
+} >> "$FAKE_LOG"
+case "$FAKE_MODE" in
+  cap) echo '{"type":"result","subtype":"error_max_budget_usd","is_error":false,"total_cost_usd":1.5,"num_turns":9,"session_id":"sess-cap","result":"partial"}';;
+  *) echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25,"num_turns":3,"session_id":"sess-ok","result":"done the ticket"}';;
+esac
+'''
+FAKE_SECURITY = '#!/bin/sh\nif [ "$FAKE_NOKEY" = 1 ]; then exit 44; fi\necho "$FAKE_KEY"\n'
+
+
+def self_test():
+    fails = []
+    me = os.path.realpath(__file__)
+    secret = "sk-ant-SELFTEST-0123456789"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = os.path.realpath(tmp)
+        bindir = os.path.join(tmp, "bin")
+        os.makedirs(bindir)
+        for name, body in (("claude", FAKE_CLAUDE), ("security", FAKE_SECURITY),
+                           ("secret-tool", FAKE_SECURITY)):
+            path = os.path.join(bindir, name)
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0o755)
+        fake_home = os.path.join(tmp, "home")
+        os.makedirs(fake_home)
+        log = os.path.join(tmp, "claude.log")
+        main_repo = os.path.join(tmp, "main")
+        wt = os.path.join(tmp, "wt")
+        g = lambda *x, cwd=main_repo: subprocess.run(["git", "-C", cwd, *x], capture_output=True, check=True)
+        os.makedirs(main_repo)
+        g("init", "-q", "-b", "main")
+        g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i")
+        g("worktree", "add", "-q", "-b", "feat/x", wt)
+        brief = os.path.join(tmp, "brief.md")
+        with open(brief, "w") as f:
+            f.write("fix the ticket")
+        base_env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"], HOME=fake_home,
+                        FAKE_KEY=secret, FAKE_LOG=log)
+        base_env.pop("LEAN_CREDIT_KEY_ITEM", None)
+        base_env.pop("ANTHROPIC_API_KEY", None)
+
+        def cr(*args, **env):
+            return subprocess.run([sys.executable, me, *args], capture_output=True, text=True,
+                                  env=dict(base_env, **env))
+
+        good = ["--brief", brief, "--worktree", wt, "--budget", "2"]
+        out = os.path.join(tmp, "out.json")
+        r = cr(*good, "--out", out)
+        ledger = open(os.path.join(fake_home, ".lean", "credit-runs.jsonl")).read()
+        outfile = open(out).read()
+        flog = open(log).read()
+        if r.returncode != 0:
+            fails.append(f"good run rc={r.returncode} err={r.stderr[-120:]!r}")
+        if "done the ticket" not in r.stdout or "0.2500" not in r.stdout:
+            fails.append(f"stdout lacks result or cost: {r.stdout!r}")
+        for label, text in (("argv", flog.split("ENVNAMES")[0]), ("stdout", r.stdout), ("stderr", r.stderr),
+                            ("ledger", ledger), ("output file", outfile)):
+            if secret in text:
+                fails.append(f"key leaked into {label}")
+        if "KEYSET: yes" not in flog:
+            fails.append("key did not reach the child environment")
+        if "--max-budget-usd 2" not in flog or "git push" in flog.split("--allowedTools")[1].split("--disallowedTools")[0]:
+            fails.append("budget flag missing or push allowed")
+        if f"PWD: {wt}" not in flog:
+            fails.append("job did not run in the worktree")
+        if "fix the ticket" not in flog:
+            fails.append("brief not given on stdin")
+        row = json.loads(ledger.splitlines()[-1])
+        if (row["branch"], row["model"], row["budget"], row["cost"], row["turns"], row["state"]) != \
+                ("feat/x", "sonnet", 2.0, 0.25, 3, "ok"):
+            fails.append(f"ledger row wrong: {row}")
+        # a key that the child echoes into its output is redacted
+        # missing item: exit 2, one line, no job
+        os.remove(log)
+        r = cr(*good, FAKE_NOKEY="1")
+        if r.returncode != 2 or len(r.stderr.strip().splitlines()) != 1 or r.stdout or os.path.exists(log):
+            fails.append(f"missing item: rc={r.returncode} err={r.stderr!r} job_started={os.path.exists(log)}")
+        # push refused, also in broad forms
+        for bad in ("Bash(git push:*)", "Bash(git push origin main)", "Bash", "Bash(git:*)"):
+            r = cr(*good, "--allow", bad)
+            if r.returncode != 2 or os.path.exists(log):
+                fails.append(f"--allow {bad!r} not refused: rc={r.returncode}")
+        r = cr(*good, "--allow", "Bash(ls:*)")
+        if r.returncode != 0 or "Bash(ls:*)" not in open(log).read():
+            fails.append(f"safe --allow rejected: rc={r.returncode} {r.stderr[-80:]!r}")
+        os.remove(log)
+        # no budget: no job
+        r = cr("--brief", brief, "--worktree", wt)
+        if r.returncode != 2 or os.path.exists(log):
+            fails.append(f"missing budget not refused: rc={r.returncode}")
+        r = cr("--brief", brief, "--worktree", wt, "--budget", "0")
+        if r.returncode != 2 or os.path.exists(log):
+            fails.append("zero budget not refused")
+        # main checkout and dirty worktree
+        r = cr("--brief", brief, "--worktree", main_repo, "--budget", "1")
+        if r.returncode != 2 or os.path.exists(log):
+            fails.append(f"main checkout not refused: rc={r.returncode}")
+        with open(os.path.join(wt, "dirty"), "w") as f:
+            f.write("x")
+        r = cr(*good)
+        if r.returncode != 2 or os.path.exists(log):
+            fails.append(f"dirty worktree not refused: rc={r.returncode}")
+        os.remove(os.path.join(wt, "dirty"))
+        # cap hit
+        r = cr(*good, "--out", out, FAKE_MODE="cap")
+        if r.returncode != 3 or "sess-cap" not in r.stderr or "budget_cap" not in r.stderr:
+            fails.append(f"cap hit not reported: rc={r.returncode} err={r.stderr!r}")
+        # spent sums the ledger: 0.25 + 0.25 (safe allow run) + 1.5
+        r = cr("--spent")
+        if "$2.0000 over 3 runs" not in r.stdout:
+            fails.append(f"--spent wrong: {r.stdout!r}")
+        # key-help prints a command and no key
+        r = cr("--key-help", LEAN_CREDIT_KEY_ITEM="my-item")
+        if "my-item" not in r.stdout or secret in r.stdout + r.stderr:
+            fails.append(f"--key-help wrong: {r.stdout!r}")
+    for f in fails:
+        print("self-test failed:", f)
+    if fails:
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    sys.exit(main(sys.argv[1:]))
