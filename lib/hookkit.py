@@ -436,8 +436,8 @@ FORGE_COMMANDS = {
         ("release", "create"): "text", ("release", "edit"): "text",
     },
     "glab": {
-        ("mr", "create"): "create", ("mr", "merge"): "merge", ("mr", "update"): "update",
-        ("mr", "note"): "text", ("mr", "note", "create"): "text",
+        ("mr", "create"): "create", ("mr", "new"): "create", ("mr", "merge"): "merge", ("mr", "update"): "update",
+        ("mr", "comment"): "text", ("issue", "comment"): "text", ("mr", "note"): "text", ("mr", "note", "create"): "text",
         ("issue", "create"): "text", ("issue", "update"): "text", ("issue", "note"): "text",
         ("issue", "note", "create"): "text", ("release", "create"): "text", ("release", "update"): "text",
     },
@@ -451,7 +451,8 @@ FORGE_COMMANDS = {
 FORGE_FLAGS = {
     "gh": {"text": {"--title", "-t", "--body", "-b", "--notes", "-n", "--subject"},
            "file": {"--body-file", "-F", "--notes-file"}, "multi": False},
-    "glab": {"text": {"--title", "-t", "--description", "-d", "--message", "-m", "--notes", "-N"},
+    "glab": {"text": {"--title", "-t", "--description", "-d", "--message", "-m", "--notes", "-N",
+                      "--squash-message"},
              "file": {"--notes-file", "-F"}, "multi": False},
     "az": {"text": {"--title", "--description", "-d", "--discussion"}, "file": set(), "multi": True},
 }
@@ -506,6 +507,14 @@ def forge_action(call):
     return call.action
 
 
+AZ_SHORT_FLAGS = {"-d", "-t", "-s", "-b", "-p", "-r", "-i", "-o", "-h", "-w"}
+
+
+def is_az_flag(word):
+    """True for a flag word on an az command: --name (also --name=value), or a short flag az knows."""
+    return (word.startswith("--") and len(word) > 2) or word in AZ_SHORT_FLAGS
+
+
 def forge_flag_values(call, flags, args=None):
     """(flag, value) for `--flag value`, `--flag=value` and `-f value` in the call's words, up to `--`.
     For a host whose flags take several words (az), the value is all the words up to the next flag."""
@@ -518,11 +527,15 @@ def forge_flag_values(call, flags, args=None):
             if i + 1 >= len(words):
                 continue
             if multi:
+                # The first word is the value whatever it starts with ("- a fix", "-1 x"); later words belong to it
+                # until a real flag (--word, or a short az flag) or a separator.
                 j = i + 1
-                while j < len(words) and not words[j].startswith("-") and words[j] not in SEPARATORS:
+                if words[j] in SEPARATORS:
+                    continue
+                j += 1
+                while j < len(words) and words[j] not in SEPARATORS and not is_az_flag(words[j]):
                     j += 1
-                if j > i + 1:
-                    yield word, "\n".join(words[i + 1:j])
+                yield word, "\n".join(words[i + 1:j])
             else:
                 yield word, words[i + 1]
         elif word.startswith("--") and "=" in word and word.split("=", 1)[0] in flags:
@@ -588,6 +601,8 @@ def self_test():
                               ("az repos pr update --id 3 --draft true", "azure", "update"),
                               ("gh pr ready 3", "github", "ready"), ("glab mr update 3 --ready", "gitlab", "ready"),
                               ("glab mr update 3 --title t", "gitlab", "update"),
+                              ("glab mr new -d x", "gitlab", "create"), ("glab mr comment 3 -m hi", "gitlab", "text"),
+                              ("glab issue comment 3 -m hi", "gitlab", "text"),
                               ("glab mr note 3 -m hi", "gitlab", "text"), ("glab mr note create 3 -m hi", "gitlab", "text"),
                               ("/usr/bin/glab mr merge 3", "gitlab", "merge"), ("GITLAB_HOST=x glab mr merge 3", "gitlab", "merge")):
         fc = forge_call(segments(cmd)[0])
@@ -601,6 +616,26 @@ def self_test():
     az = forge_call(segments("az repos pr create --title 'a b' --description 'one' 'two words' --auto-complete true")[0])
     check("az description takes every word", list(forge_flag_values(az, FORGE_FLAGS["az"]["text"])),
           [("--title", "a b"), ("--description", "one\ntwo words")])
+    def az_values(command, args=None):
+        return list(forge_flag_values(forge_call(segments(command)[0]), FORGE_FLAGS["az"]["text"], args))
+
+    check("az bullet body", az_values("az repos pr create --title t --description '- a rob" + "ust fix'"),
+          [("--title", "t"), ("--description", "- a rob" + "ust fix")])
+    check("az first word then bullet", az_values("az repos pr create --description 'first line' '- rob" + "ust'"),
+          [("--description", "first line\n- rob" + "ust")])
+    check("az body starting with a number", az_values("az repos pr create --description '-1 x'"), [("--description", "-1 x")])
+    check("az equals form with a bullet", az_values("az repos pr create --description='- x'"), [("--description", "- x")])
+    check("az body stops at a long flag", az_values("az repos pr create --description a b --auto-complete true"),
+          [("--description", "a\nb")])
+    check("az body stops at a short flag", az_values("az repos pr create --description a b -s feat"), [("--description", "a\nb")])
+    check("az flag with no value", az_values("az repos pr create --description"), [])
+    az_call = forge_call(segments("az repos pr create")[0])
+    check("az body stops at a separator",
+          list(forge_flag_values(az_call, FORGE_FLAGS["az"]["text"], ["--title", "t", "&&", "echo", "-", "x"])),
+          [("--title", "t")])
+    check("az separator right after the flag", list(forge_flag_values(az_call, FORGE_FLAGS["az"]["text"], ["--title", "&&", "x"])), [])
+    check("glab squash message is text", list(forge_flag_values(forge_call(segments("glab mr merge 3 --squash-message 'a b'")[0]),
+                                                                FORGE_FLAGS["glab"]["text"])), [("--squash-message", "a b")])
     glab = forge_call(segments("glab mr create --title=t -d 'body here'")[0])
     check("glab flag forms", list(forge_flag_values(glab, FORGE_FLAGS["glab"]["text"])), [("--title", "t"), ("-d", "body here")])
     check("unbalanced quote falls back", len(segments('git commit -m "oops')) >= 1, True)

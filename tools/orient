@@ -115,8 +115,11 @@ def pull_request(cwd, branch):
     kind = "github" if kind == "unknown" else kind
     if forge.missing_cli(kind):
         return "none, or %s is not available" % forge.CLI_OF[kind]
-    info = forge.pr_info(kind, cwd, branch, checks=True, timeout=10)
+    problems = []
+    info = forge.pr_info(kind, cwd, branch, checks=True, timeout=10, problems=problems)
     if info is None:
+        if problems:
+            return "%s answered with something unreadable" % forge.CLI_OF[kind]
         return "none, or %s is not available" % forge.CLI_OF[kind]
     if not info["open"]:
         return "none open"
@@ -246,6 +249,14 @@ def self_test():
         g(other, "remote", "add", "origin", url)
         check("%s origin asks its own CLI" % name, "pr: %s" % pull_request(other, "feat/x") == want,
               pull_request(other, "feat/x"))
+    unreadable = os.path.join(fake, "gh")
+    saved_gh = open(unreadable).read()
+    with open(unreadable, "w") as f:
+        f.write("#!/bin/sh\necho 'not json'\n")
+    check("unreadable gh answer", pull_request(repo, "feat/x") == "gh answered with something unreadable",
+          pull_request(repo, "feat/x"))
+    with open(unreadable, "w") as f:
+        f.write(saved_gh)
     other = os.path.join(tmp, "gl")
     os.remove(os.path.join(fake, "glab"))
     saved = os.environ["PATH"]

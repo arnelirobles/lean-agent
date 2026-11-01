@@ -111,7 +111,7 @@ def kind_of(url):
     host = host_of(url)
     if host == "github.com":
         return "github"
-    if "gitlab" in host:
+    if re.search(r"(^|\.)gitlab(\.|$)", host):
         return "gitlab"
     if host == "dev.azure.com" or host.endswith(".visualstudio.com") or host == "ssh.dev.azure.com":
         return "azure"
@@ -133,6 +133,11 @@ def run_command(cmd, timeout=600):
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout if result.returncode == 0 else None
+
+
+def redact(text):
+    """text with the userinfo (user, user:password or a token) of any URL in it removed."""
+    return re.sub(r"(?<=://)[^/@\s]*@", "", text or "")
 
 
 def is_url(repo):
@@ -172,7 +177,7 @@ def repo_kind(repo, orgs=()):
 def for_repo(repo, run=run_command, orgs=()):
     kind = repo_kind(repo, orgs)
     if kind not in PROVIDERS:
-        raise Unsupported(f"{kind} is not a code host forge.py reads: {repo}")
+        raise Unsupported(f"{kind} is not a code host forge.py reads: {redact(repo)}")
     return PROVIDERS[kind](run)
 
 
@@ -400,7 +405,7 @@ class Azure:
     def _target(self, repo):
         found = parse_azure(repo)
         if not found:
-            raise Unsupported(f"not an Azure DevOps repository: {repo}")
+            raise Unsupported(f"not an Azure DevOps repository: {redact(repo)}")
         return f"https://dev.azure.com/{found[0]}", found[1], found[2]
 
     def default_org(self):
@@ -1126,12 +1131,13 @@ def _rollup(rows):
             else {"status": "PENDING"} for r in rows]
 
 
-def pr_info(kind, cwd, ref="", repo=None, checks=False, timeout=10):
+def pr_info(kind, cwd, ref="", repo=None, checks=False, timeout=10, problems=None):
     """The pull request that `ref` (a number, URL or branch name; empty means the current branch) names on the
     host `kind`, read from folder cwd. A dict: number, url, repo (the name its URL gives, "" when none), open
     (True while it is open) and, with checks=True, rollup (GitHub statusCheckRollup items; None when the host
     could not give the checks). None when the CLI is missing, a call fails, there is no such pull request or
-    the answer is not what the host's CLI prints. `repo` is the -R value (GitHub, GitLab), else the folder's own.
+    the answer is not what the host's CLI prints (then "unreadable" is added to the list `problems`, when given).
+    `repo` is the -R value (GitHub, GitLab), else the folder's own.
     Host text only goes into argument lists."""
     from urllib.parse import quote
     capture = capture_in(cwd, timeout)
@@ -1203,7 +1209,11 @@ def pr_info(kind, cwd, ref="", repo=None, checks=False, timeout=10):
                 except CiError:
                     info["rollup"] = None
             return info
-    except (CiError, ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError):
+        if problems is not None:
+            problems.append("unreadable")
+        return None
+    except CiError:
         return None
     return None
 
@@ -1217,10 +1227,13 @@ def _current_branch(cwd):
 
 
 def repo_name(url):
-    """The REPO name the commands take, from an origin URL. Azure keeps the URL, which names its org."""
+    """The REPO name the commands take, from an origin URL. Azure gives the https://dev.azure.com/ORG/PROJECT/_git/REPO
+    form, which names its org; no userinfo of the origin URL is kept."""
+    from urllib.parse import quote
     kind = detect(url)
     if kind == "azure":
-        return url if parse_azure(url) else ""
+        found = parse_azure(url)
+        return "https://dev.azure.com/%s/%s/_git/%s" % tuple(quote(p, safe="") for p in found) if found else ""
     if kind == "gitlab":
         return gitlab_slug(url)
     return slug(url) if kind == "github" else ""
@@ -1287,7 +1300,7 @@ def main(argv):
     if cmd == "merged-prs":
         prs = provider.merged_prs(repo, rest[0])
         if prs is None:
-            print(f"forge: listing merged pull requests of {repo} failed", file=sys.stderr)
+            print(f"forge: listing merged pull requests of {redact(repo)} failed", file=sys.stderr)
             return 1
         for pr in prs:
             print(f"{pr['number']}\t{pr['created_at']}\t{pr['merged_at']}\t{pr['head_sha']}")
@@ -1766,6 +1779,27 @@ def forge_cli(env, *args):
     return r.returncode, r.stdout, r.stderr
 
 
+def userinfo_test(check, root):
+    """No form of an origin URL with userinfo reaches the output of repo, kind or an error."""
+    token = "TOKEN123"
+    forms = ["https://%s@dev.azure.com/org/proj/_git/repo" % token, "https://user:%s@dev.azure.com/org/proj/_git/repo" % token,
+             "https://%s@org.visualstudio.com/proj/_git/repo" % token, "ssh://%s@ssh.dev.azure.com/v3/org/proj/repo" % token,
+             "https://%s@github.com/o/r.git" % token, "https://%s@gitlab.example.com/g/r.git" % token,
+             "https://%s@bitbucket.org/o/r.git" % token]
+    d, env = make_scene(root, {}, {})
+    git = shutil.which("git")
+    os.symlink(git, os.path.join(d, "bin", "git"))
+    env = dict(env, PATH=os.path.join(d, "bin"))
+    for url in forms:
+        work = os.path.join(d, "w")
+        subprocess.run([git, "init", "-q", work], check=True)
+        subprocess.run([git, "-C", work, "remote", "add", "origin", url], check=True)
+        for args in (("repo", work), ("kind", work), ("merged-prs", url, "2026-01-01"), ("failed-checks", url, "abc")):
+            rc, out, err = forge_cli(env, *args)
+            check(f"no token in forge {args[0]} for {url.split('@')[-1]}", token in out + err, False)
+        shutil.rmtree(work)
+
+
 def missing_cli_test(check, root):
     """A host whose CLI is not on PATH gives one line naming the CLI to install, and exit 2."""
     import tempfile
@@ -2054,8 +2088,29 @@ def self_test():
                       ("ssh://git@github.com/o/r.git", "github"), ("https://gitlab.com/g/r", "gitlab"),
                       ("https://gitlab.example.org/g/r", "gitlab"), ("https://dev.azure.com/org/p/_git/r", "azure"),
                       ("https://org.visualstudio.com/p/_git/r", "azure"), ("https://bitbucket.org/o/r", "unknown"),
+                      ("https://mygitlabfoo.com/g/r", "unknown"), ("https://gitlab.mycorp.com/g/r", "gitlab"),
+                      ("https://notgitlab.com/g/r", "unknown"), ("git@gitlab.mycorp.com:g/r.git", "gitlab"),
                       ("", "unknown")):
         check(f"kind of {url!r}", kind_of(url), want)
+    os.environ["LEAN_FORGE"] = "gitlab"
+    try:
+        check("LEAN_FORGE covers an odd host", detect("https://code.mycorp.com/g/r"), "gitlab")
+    finally:
+        del os.environ["LEAN_FORGE"]
+
+    token = "TOKEN123"
+    for url, want in (("https://%s@dev.azure.com/org/proj/_git/repo" % token, "https://dev.azure.com/org/proj/_git/repo"),
+                      ("https://user:%s@dev.azure.com/org/proj/_git/My%%20Repo" % token,
+                       "https://dev.azure.com/org/proj/_git/My%20Repo"),
+                      ("https://%s@org.visualstudio.com/proj/_git/repo" % token, "https://dev.azure.com/org/proj/_git/repo"),
+                      ("https://org.visualstudio.com/DefaultCollection/proj/_git/repo", "https://dev.azure.com/org/proj/_git/repo"),
+                      ("ssh://%s@ssh.dev.azure.com/v3/org/proj/repo" % token, "https://dev.azure.com/org/proj/_git/repo"),
+                      ("git@ssh.dev.azure.com:v3/org/proj/repo", "https://dev.azure.com/org/proj/_git/repo"),
+                      ("https://%s@github.com/o/r.git" % token, "o/r"),
+                      ("https://%s@gitlab.example.com/g/s/r.git" % token, "gitlab.example.com/g/s/r")):
+        check(f"repo_name {want}", repo_name(url), want)
+    check("redact strips userinfo", redact("see https://u:%s@h.example/x and http://%s@h/y" % (token, token)),
+          "see https://h.example/x and http://h/y")
 
     check("owner/name is GitHub", isinstance(for_repo("o/r"), GitHub), True)
     check("a GitHub URL is GitHub", isinstance(for_repo("https://github.com/o/r"), GitHub), True)
@@ -2127,6 +2182,7 @@ def self_test():
     import tempfile
     with tempfile.TemporaryDirectory() as root:
         guarded(check, "missing CLI", 60, missing_cli_test, root)
+        guarded(check, "userinfo", 60, userinfo_test, root)
         guarded(check, "hosts", 120, hosts_test, root)
         guarded(check, "gitlab ci", 60, gitlab_ci_test, root)
         guarded(check, "pr_info", 60, pr_info_test, root)

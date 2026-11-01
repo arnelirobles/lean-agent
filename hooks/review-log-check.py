@@ -36,14 +36,19 @@ database file, no reviews table, or any error allows. --help and -h allow.
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
-import forge  # noqa: E402
 import hookkit  # noqa: E402
+
+try:
+    import forge  # noqa: E402
+except Exception:  # a missing or broken lib/forge.py: GitHub keeps its own lookup below, other hosts allow
+    forge = None
 
 SKIP = "LEAN_SKIP_REVIEW_LOG_CHECK"
 # Flags before the command word that take a value, and flags after it that take a value, per CLI. -R/--repo
@@ -151,10 +156,30 @@ def parse_az(call):
     return pairs.get("--id"), helped
 
 
+def pr_url(text):
+    """(repository name, number) from a pull request URL: lib/forge.py's reading, or GitHub's alone without it."""
+    if forge is not None:
+        return forge.pr_url(text)
+    found = re.search(r"([^/]+/[^/]+)/pull/(\d+)", (text or "").split("#")[0].split("?")[0])
+    return (found.group(1), int(found.group(2))) if found else None
+
+
 def view(call, arg, repo):
     """(number, url) from the host's own pull request lookup (lib/forge.py), else None. Runs with the hook's own
     environment, never the command's inline one: the hook runs before the command is approved, so an inline PATH
-    must not pick which CLI runs."""
+    must not pick which CLI runs. Without forge only GitHub is looked up, with gh directly."""
+    if forge is None:
+        if call.kind != "github":
+            return None
+        cmd = ["gh", "pr", "view"] + ([arg] if arg else []) + (["-R", repo] if repo else []) + ["--json", "number,url"]
+        try:
+            out = subprocess.run(cmd, cwd=call.cwd, capture_output=True, text=True, timeout=5)
+            if out.returncode != 0:
+                return None
+            data = json.loads(out.stdout)
+            return int(data["number"]), str(data.get("url") or "")
+        except Exception:
+            return None
     info = forge.pr_info(call.kind, call.cwd, arg or "", repo=repo, timeout=5)
     return (info["number"], info["url"]) if info else None
 
@@ -173,13 +198,13 @@ def target(seg, call, parsed):
         found = re.fullmatch(r"#?(\d+)", arg)
         if found:
             return int(found.group(1)), repo or full_name(hookkit.git(seg.cwd, "remote", "get-url", "origin") or "")
-        shown = forge.pr_url(arg)
+        shown = pr_url(arg)
         if shown:
             return shown[1], shown[0]
     got = view(call, arg, repo)
     if not got:
         return None
-    return got[0], (forge.pr_url(got[1]) or ("",))[0] or repo or ""
+    return got[0], (pr_url(got[1]) or ("",))[0] or repo or ""
 
 
 def logged(number, repo, kind="github"):
@@ -424,6 +449,34 @@ def self_test():
         os.remove(glab)
         check("glab missing allows", message("glab mr merge feat/x", repo), False)
         check("glab unrelated api allows", message("glab api projects/1/merge_requests/6/merge", repo), False)
+        # A missing or broken lib/forge.py: no traceback on import, GitHub keeps working, other hosts allow.
+        fake_gh("echo '{\"number\": 6, \"url\": \"https://github.com/o/r/pull/6\"}'")
+        fake_glab("echo '" + gl_mr % (6, 6) + "'")
+        broken = os.path.join(tmp, "broken-lib")
+        shutil.copytree(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"), broken,
+                        ignore=shutil.ignore_patterns("__pycache__", "brain"))
+        with open(os.path.join(broken, "forge.py"), "w") as fh:
+            fh.write("raise RuntimeError('broken forge')\n")
+        hook = os.path.realpath(__file__)
+        hooks_copy = os.path.join(tmp, "hooks-copy")
+        os.mkdir(hooks_copy)
+        shutil.copy(hook, os.path.join(hooks_copy, "review-log-check.py"))
+        os.symlink(broken, os.path.join(tmp, "lib"))
+
+        def run_hook(command):
+            event = json.dumps({"tool_input": {"command": command}, "cwd": repo})
+            return subprocess.run([sys.executable, os.path.join(hooks_copy, "review-log-check.py")], input=event,
+                                  capture_output=True, text=True, env=dict(os.environ, LEAN_PROFILE="strict"))
+
+        r = run_hook("gh pr merge feat/x")
+        check("broken forge: no traceback", "Traceback" in r.stderr, False)
+        check("broken forge: gh branch lookup still denies", r.returncode != 0 or "has no review logged" in r.stdout + r.stderr, True)
+        r = run_hook("gh pr merge 5")
+        check("broken forge: logged gh merge allows", r.returncode == 0 and "Traceback" not in r.stderr, True)
+        r = run_hook("glab mr merge feat/x")
+        check("broken forge: glab branch lookup allows quietly", r.returncode == 0 and "Traceback" not in r.stderr, True)
+        r = run_hook("glab mr merge 6")
+        check("broken forge: glab number still denies", r.returncode != 0 or "has no review logged" in r.stdout + r.stderr, True)
         fake_gh("exit 1")
         os.environ["LEAN_PROFILE"] = "standard"
         try:
