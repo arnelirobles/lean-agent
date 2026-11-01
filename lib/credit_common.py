@@ -4,6 +4,7 @@ One ledger, ~/.lean/credit-runs.jsonl, and one total cap (LEAN_CREDIT_TOTAL_USD)
 A job writes a reserve line before it starts under a file lock that also checks the cap, and a
 final line when it ends. A reserve line with no final line counts at its reserved amount.
 """
+import datetime
 import fcntl
 import json
 import os
@@ -78,6 +79,7 @@ def child_env(key, ttl=None):
     for name in DROP_ENV:
         env.pop(name, None)
     env["ANTHROPIC_API_KEY"] = key
+    env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"  # keeps the key out of Bash and hooks
     if ttl:
         env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = ttl
     return env
@@ -215,4 +217,92 @@ def spent_report():
     print("This is a local estimate from total_cost_usd. The Console workspace spend limit "
           "is the only hard limit.")
     print("Batch costs are computed from token counts, not a billed figure.")
+    return 0
+
+
+def parse_time(text):
+    """A ledger time field as an aware UTC datetime, or None."""
+    if not isinstance(text, str):
+        return None
+    for fn in (lambda t: datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%S%z"),
+               datetime.datetime.fromisoformat):
+        try:
+            d = fn(text)
+        except ValueError:
+            continue
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc)
+    return None
+
+
+def spent_on(rows, day):
+    """Dollars of finished work whose row time falls on this UTC date, by the same rules as totals_ex."""
+    reserved = {}
+    for r in rows:
+        if isinstance(r, dict) and r.get("phase") == "reserve":
+            reserved[r.get("run")] = number(r.get("reserved")) or 0.0
+    done = 0.0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        phase = r.get("phase")
+        if phase not in ("final", None):
+            continue
+        when = parse_time(r.get("time"))
+        if when is None or when.date() != day:
+            continue
+        if phase == "final":
+            n = number(r.get("cost"))
+            done += n if n is not None else reserved.get(r.get("run"), 0.0)
+        else:
+            cost = r.get("cost")
+            if cost is None or r.get("cost_known") is False:
+                done += number(r.get("budget")) or 0.0
+            else:
+                done += number(cost) or 0.0
+    return done
+
+
+def pace_report(now=None):
+    """Print the pace against LEAN_CREDIT_TOTAL_USD and LEAN_CREDIT_UNTIL. now is for the self-test."""
+    total_text = os.environ.get("LEAN_CREDIT_TOTAL_USD")
+    if not total_text:
+        die("LEAN_CREDIT_TOTAL_USD is not set; set the total you allow to spend")
+    total = money(total_text, "LEAN_CREDIT_TOTAL_USD")
+    until_text = (os.environ.get("LEAN_CREDIT_UNTIL") or "").strip()
+    if not until_text:
+        die("LEAN_CREDIT_UNTIL is not set; set the last day as YYYY-MM-DD")
+    try:
+        if len(until_text) != 10:
+            raise ValueError(until_text)
+        until = datetime.date.fromisoformat(until_text)
+    except ValueError:
+        die(f"LEAN_CREDIT_UNTIL must be a date as YYYY-MM-DD, got {until_text!r}")
+    today = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc).date()
+    if until < today:
+        die(f"LEAN_CREDIT_UNTIL {until_text} is already past (today is {today.isoformat()} UTC)")
+    days = (until - today).days + 1
+    rows = read_ledger()
+    spent, held, _, _ = totals_ex(rows)
+    remaining = total - spent - held
+    per_day = remaining / days
+    today_spent = spent_on(rows, today)
+    behind = today_spent < per_day
+    code = os.environ.get("LEAN_CREDIT_CODE", "").strip().lower() == "on"
+    print(f"total     ${total:.4f}")
+    print(f"spent     ${spent:.4f}")
+    print(f"reserved  ${held:.4f}")
+    print(f"remaining ${remaining:.4f}")
+    print(f"until     {until_text} (UTC dates, the last day counts)")
+    print(f"days left {days}")
+    print(f"per day   ${per_day:.4f}")
+    print(f"today     ${today_spent:.4f} spent")
+    print(f"state     {'behind' if behind else 'ahead'}")
+    if behind and code:
+        print("Next: move coding jobs to credits too.")
+    elif behind:
+        print("Next: move docs and tickets to credits. LEAN_CREDIT_CODE=on would add coding.")
+    else:
+        print("Next: keep credits to review work.")
     return 0

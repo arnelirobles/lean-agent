@@ -96,7 +96,7 @@ Update with `claude plugin update lean-agent@lean-agent`. Claude Code picks up a
 | Hooks | In the `strict` profile these block (attribution and slop in public text, a bad commit author, files in a scratchpad root, background shells, sleep loops, direct test runs, keys and tokens in a commit, push or written file); in `standard` only a key in a written file blocks. The rest add a note and never stop the call. One of them hands the session a brain digest for its project at startup and after a compaction. Each has an off switch. | [Hooks](https://github.com/arnelirobles/lean-agent/wiki/Hooks) |
 | `lean-stats` | One local SQLite file of tokens, reviews, merges and hook fires. Nothing leaves the machine. | [Measure every batch](https://github.com/arnelirobles/lean-agent/wiki/Measure-Every-Batch) |
 
-`tools/credit-run` runs one brief as a headless Agent SDK job paid by API credits, and `tools/credit-batch` sends single-shot briefs at batch prices, so a person on a subscription can spend credits without changing how they sign in. Setup, settings and limits are under Jobs on API credits below. Edit and Write are limited to the worktree and denied in git metadata, but an edit job is not a sandbox: `git commit` runs the repository's hooks with the key in their environment, so run jobs only in a repository you trust. The tool's cost figure does not prove which balance paid.
+`tools/credit-run` runs one brief as a headless Agent SDK job paid by API credits, and `tools/credit-batch` sends single-shot briefs at batch prices, so a person on a subscription can spend credits without changing how they sign in. Setup, settings and limits are under Jobs on API credits below. Edit and Write are limited to the worktree and denied in git metadata, but an edit job is not a sandbox: the key is scrubbed from Bash and hook environments, yet `git commit` still runs the repository's hooks as you, so run jobs only in a repository you trust. The tool's cost figure does not prove which balance paid.
 
 Everything in the method still works without the plugin. Without it, run the scripts from `tools/` (for example `tools/holdout.sh`).
 
@@ -213,6 +213,9 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_CREDIT_CACHE_TTL` | `5m` | Prompt cache lifetime for jobs, `5m` or `1h`. `--cache-ttl` overrides it. |
 | `LEAN_CREDIT_FAST` | off | `on` allows `--fast`, and only with an Opus model. Fast mode switches any other model to Opus at double Opus rates. |
 | `LEAN_CREDIT_BATCH` | off | `on`, together with `LEAN_CREDIT_RUNS=on`, lets `credit-batch submit` send a batch. `status` and `results` work without it. |
+| `LEAN_CREDIT_UNTIL` | unset | The last day to spend the total, as `YYYY-MM-DD` (UTC, the last day counts). `credit-run --pace` needs it. |
+| `LEAN_CREDIT_CODE` | off | `on` routes `lean:draft` coding work to `credit-run` edit jobs. A routing setting for the method and `--pace`; `credit-run` takes edit jobs either way. |
+| `LEAN_CREDIT_ASK` | off | `on` makes the coordinator ask once, with a cost estimate, on a case the routing does not settle. A method rule only. |
 
 Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lean-agent/wiki/Settings).
 
@@ -264,6 +267,15 @@ credit-run --spent
 The key goes into the worker's environment only. `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are removed from it, because the auth token outranks the key, and so are `ANTHROPIC_BASE_URL` and the Bedrock, Vertex and Foundry switches, so the key only goes to the Claude API. The job loads no user settings and only this plugin. Tools are Read, Glob, Grep, Edit, Write and git status, diff, log, add, commit; everything else is denied, and `git push` is refused even through `--allow`, and so are `--allow` entries that run git with an option before the subcommand, a wildcard in the git subcommand, or a shell or runner such as `sh`, `env` or `python`. Reading `/proc` is denied. A job that edits needs a clean linked worktree. `--read-only` gets Read, Glob and Grep only, with no Bash and no edits, so put any diff in the brief.
 
 Each job reserves its budget plus `LEAN_CREDIT_TURN_USD` in `~/.lean/credit-runs.jsonl` before it starts and is refused when spent plus reserved plus that reservation passes the total. A job that dies without a final line keeps counting at its reserved amount. A cap hit exits 3 and prints the session id for `--resume`. These figures are a local estimate from `total_cost_usd`, and a cost figure does not prove which balance paid. The only hard limit is the spend limit on the Console workspace. `credit-run --spent` also names older single-line rows with no known cost (counted at their budget) and ledger lines it had to skip.
+
+### Pace
+
+```bash
+export LEAN_CREDIT_TOTAL_USD=200 LEAN_CREDIT_UNTIL=2026-12-01
+credit-run --pace
+```
+
+It prints total, spent, reserved, remaining, days left, the amount per day (remaining over days left) and what was spent today (UTC), then `behind` or `ahead`, and ends with one line naming the next move. Behind means today's spend is under the amount per day. It needs neither the key nor `LEAN_CREDIT_RUNS`, and exits 2 on a missing total, a missing or bad date, or a date already past.
 
 ### Batches
 

@@ -7,6 +7,7 @@
   credit-run --setup       install the pinned SDKs (agent and batch) under ~/.lean/credit-sdk
   credit-run --key-help    print the command that stores the key, for you to run
   credit-run --spent       spent, reserved and remaining against LEAN_CREDIT_TOTAL_USD
+  credit-run --pace        spend per day against LEAN_CREDIT_UNTIL, and the next move; needs no key
   credit-run --self-test
 
 A job starts only when all of these hold:
@@ -55,7 +56,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 from credit_common import (append_line, child_env, die, home, key_command, key_item, ledger_path,  # noqa: E402
-                           money, read_key, reserve, scrub, sdk_dir, spent_report)
+                           money, pace_report, read_key, reserve, scrub, sdk_dir, spent_report)
 
 SDK_VERSION = "0.3.316"
 SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk"
@@ -70,7 +71,7 @@ GIT_EDIT = ["status", "diff", "log", "add", "commit"]
 RUNNERS = {"sh", "bash", "zsh", "env", "xargs", "python", "python3", "node", "perl", "ruby", "eval", "exec"}
 PUSH_DENY = "Bash(git push:*)"
 DENY_ALWAYS = ["Read(/proc/**)"]
-DENY_EDIT = [PUSH_DENY, "Bash(git -C:*)", "Bash(git -c:*)", "Bash(git * --output*)"]
+DENY_EDIT = [PUSH_DENY, "Bash(git -C:*)", "Bash(git -c:*)", "Bash(git * --out*)"]
 
 
 def sdk_entry():
@@ -204,6 +205,7 @@ def parser():
     p.add_argument("--setup", action="store_true")
     p.add_argument("--key-help", action="store_true")
     p.add_argument("--spent", action="store_true")
+    p.add_argument("--pace", action="store_true")
     p.add_argument("--self-test", action="store_true")
     return p
 
@@ -226,6 +228,8 @@ def main(argv):
         return key_help()
     if a.spent:
         return spent_report()
+    if a.pace:
+        return pace_report()
     if a.setup:
         return setup()
 
@@ -277,6 +281,9 @@ def main(argv):
     if not os.path.isfile(sdk_entry()):
         die("the Agent SDK is not installed; run credit-run --setup")
     if not a.read_only:
+        tool = os.path.realpath(ROOT)
+        if os.path.commonpath([tool, worktree]) in (tool, worktree):
+            die(f"{worktree} holds this tool; an edit job there could change its own limits")
         check_worktree(worktree)
     key = read_key()
     with open(a.brief) as f:
@@ -357,6 +364,7 @@ key = "%s"
 rec = {"argv": sys.argv, "stdin": raw, "pid": os.getpid(),
        "env_names": sorted(os.environ),
        "cache_ttl": os.environ.get("CLAUDE_CODE_PROMPT_CACHE_TTL"),
+       "scrub": os.environ.get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"),
        "key_ok": os.environ.get("ANTHROPIC_API_KEY") == key}
 open(os.environ["FAKE_REC"], "w").write(json.dumps(rec))
 if mode == "sleep":
@@ -465,6 +473,10 @@ def self_test():
         check(one_line(r) and rec_json() is None and not os.path.exists(ledger), f"switch off did not stop the job: {r.returncode} {r.stderr!r}")
         r = run(job_args(), env(LEAN_CREDIT_RUNS="off", LEAN_CREDIT_TOTAL_USD="2.0"))
         check(one_line(r) and rec_json() is None, "switch off (explicit) started a job")
+        # an edit job never runs on the tool's own folder, above it or below it
+        for place in (ROOT, os.path.dirname(ROOT), os.path.join(ROOT, "tools")):
+            r = run(job_args(wtree=place), env(LEAN_CREDIT_RUNS="on", LEAN_CREDIT_TOTAL_USD="2.0"))
+            check(one_line(r) and "holds this tool" in r.stderr and rec_json() is None, f"edit job allowed at {place}: {r.stderr!r}")
         # --spent and --key-help work with the switch off
         r = run(["--spent"], env())
         check(r.returncode == 0 and "local estimate" in r.stdout and "Console" in r.stdout, f"--spent: {r.stdout!r}")
@@ -499,6 +511,7 @@ def self_test():
                 check(gone not in names, f"{gone} reached the child")
             check(c["key_ok"] is True, "the key did not reach the child env")
             check(c["cache_ttl"] == "1h", f"cache ttl not passed: {c['cache_ttl']!r}")
+            check(c["scrub"] == "1", f"key not scrubbed from Bash and hooks: {c['scrub']!r}")
             job = json.loads(c["stdin"])
             opts = job["options"]
             check(job["prompt"].startswith("do the thing") and "never `git -C`" in job["prompt"], "git note not in the prompt")
@@ -508,7 +521,7 @@ def self_test():
             check(not {"Edit", "Write"} & set(opts["allowedTools"]), "Edit or Write allowed outside the worktree")
             check(any(x.startswith("Write(//") and x.endswith("/**)") for x in opts["allowedTools"]), "Write not scoped to the worktree")
             check("Write(**/.git/**)" in opts["disallowedTools"] and "Edit(**/.git/**)" in opts["disallowedTools"], "git metadata not denied")
-            check("Bash(git * --output*)" in opts["disallowedTools"], "git --output not denied")
+            check("Bash(git * --out*)" in opts["disallowedTools"], "git --output not denied")
             check(opts["settingSources"] == [] and opts["permissionMode"] == "dontAsk", "scope or permission mode")
             check(opts["plugins"] == [{"type": "local", "path": ROOT}], "plugin path")
             for d in ("Bash(git push:*)", "Bash(git -C:*)", "Bash(git -c:*)", "Read(/proc/**)"):
@@ -676,6 +689,87 @@ def self_test():
         check(one_line(r) and rec_json() is None, f"a job passed over older rows: {r.returncode} {r.stderr!r}")
         r = run(job_args(budget="0.3"), env(**on))
         check(r.returncode == 0, f"a job that fits was refused: {r.stderr!r}")
+
+        # --pace: no key, no worker, no switch
+        import contextlib
+        import datetime as dt
+        import io
+        import credit_common as cc
+        day_rows = lambda *rs: open(ledger, "w").write("".join(json.dumps(x) + "\n" for x in rs))  # noqa: E731
+
+        def pace_in_process(now, **vals):
+            saved = dict(os.environ)
+            os.environ.update({"HOME": fake_home, "LEAN_CREDIT_TOTAL_USD": "100"})
+            for k in ("LEAN_CREDIT_UNTIL", "LEAN_CREDIT_CODE"):
+                os.environ.pop(k, None)
+            os.environ.update(vals)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    cc.pace_report(now)
+            finally:
+                os.environ.clear()
+                os.environ.update(saved)
+            return buf.getvalue()
+
+        utc = dt.timezone.utc
+        noon = dt.datetime(2026, 11, 10, 12, 0, tzinfo=utc)
+        fin = lambda t, c: {"run": "x" + t, "phase": "final", "cost": c, "time": t}  # noqa: E731
+        # 10 days left (10 to 19 Nov, last day counts), 100 total, 0 spent: 10 per day
+        reset_ledger()
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("days left 10" in out and "per day   $10.0000" in out and "state     behind" in out
+              and "Next: move docs and tickets to credits. LEAN_CREDIT_CODE=on would add coding." in out,
+              f"pace behind: {out!r}")
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19", LEAN_CREDIT_CODE="on")
+        check("Next: move coding jobs to credits too." in out and "state     behind" in out, f"pace behind, code on: {out!r}")
+        # 12 spent today against 88 over 10 days (8.8 per day): ahead
+        day_rows(fin("2026-11-10T09:00:00+0000", 12.0))
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19", LEAN_CREDIT_CODE="on")
+        check("state     ahead" in out and "today     $12.0000 spent" in out
+              and out.strip().splitlines()[-1] == "Next: keep credits to review work.", f"pace ahead: {out!r}")
+        # reserved money counts as used for remaining
+        day_rows({"run": "r", "phase": "reserve", "reserved": 20.0, "time": "2026-11-10T09:00:00+0000"})
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("reserved  $20.0000" in out and "remaining $80.0000" in out and "per day   $8.0000" in out
+              and "today     $0.0000 spent" in out, f"pace reserved: {out!r}")
+        # the last day: days left 1
+        reset_ledger()
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-10")
+        check("days left 1" in out and "per day   $100.0000" in out, f"pace last day: {out!r}")
+        # 23:30 on the 9th at UTC-8 and 00:30 on the 11th at UTC+8 are both the 10th in UTC; 09:30 on the 11th at UTC+8 is the 11th
+        day_rows(fin("2026-11-09T23:30:00-0800", 3.0), fin("2026-11-11T00:30:00+0800", 4.0),
+                 fin("2026-11-11T09:30:00+0800", 50.0))
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("today     $7.0000 spent" in out, f"pace offsets: {out!r}")
+        # the same instant is a different day at another now
+        out = pace_in_process(dt.datetime(2026, 11, 10, 20, 5, tzinfo=dt.timezone(dt.timedelta(hours=-8))),
+                              LEAN_CREDIT_UNTIL="2026-11-19")
+        check("days left 9" in out and "today     $50.0000 spent" in out, f"pace now with an offset: {out!r}")
+        # legacy rows count in the total
+        day_rows({"time": "2026-11-10T01:00:00+0000", "budget": 1.0, "cost": 30.0, "cost_known": True})
+        out = pace_in_process(noon, LEAN_CREDIT_UNTIL="2026-11-19")
+        check("spent     $30.0000" in out and "today     $30.0000 spent" in out, f"pace legacy row: {out!r}")
+        # exits: bad input, with the switch off, no key read and no worker started
+        for label, extra in (("past date", {"LEAN_CREDIT_UNTIL": "2000-01-01"}),
+                             ("bad date", {"LEAN_CREDIT_UNTIL": "2026-13-45"}),
+                             ("short date", {"LEAN_CREDIT_UNTIL": "2026-1-5"}),
+                             ("no date", {}),
+                             ("no total", {"LEAN_CREDIT_UNTIL": "2999-01-01", "LEAN_CREDIT_TOTAL_USD": ""})):
+            r = run(["--pace"], env(**dict({"LEAN_CREDIT_TOTAL_USD": "100"}, **extra)))
+            check(one_line(r) and rec_json() is None, f"--pace {label}: {r.returncode} {r.stderr!r}")
+        key_rec = os.path.join(tmp, "key-read")
+        bad_key = os.path.join(bindir, "security")
+        saved_tool = open(bad_key).read()
+        for name in ("security", "secret-tool"):
+            with open(os.path.join(bindir, name), "w") as f:
+                f.write(f'#!/bin/sh\ntouch "{key_rec}"\necho x\n')
+        r = run(["--pace"], env(LEAN_CREDIT_TOTAL_USD="100", LEAN_CREDIT_UNTIL="2999-01-01"))
+        check(r.returncode == 0 and "Next:" in r.stdout and rec_json() is None and not os.path.exists(key_rec),
+              f"--pace read the key or started a worker: {r.returncode} {r.stderr!r}")
+        for name in ("security", "secret-tool"):
+            with open(os.path.join(bindir, name), "w") as f:
+                f.write(saved_tool)
 
         # the real worker under real node, against a fake SDK
         real_node = shutil.which("node", path=os.environ.get("PATH", ""))
