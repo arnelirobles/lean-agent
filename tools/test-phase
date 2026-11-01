@@ -119,6 +119,10 @@ count. TEST_PHASE_DOTNET_ARGS does not reach a Vitest or Playwright job; `args=`
 the job does. A remote lane runs them in the node_image container, which has no Playwright browsers; see
 docs/remote-lane.md.
 
+Go runs a job whose test path is a package pattern (./..., ./cmd/x or .) in a repo with go.mod: `go build`, then
+`go test -json`. A filter is `-run`, with | as regex alternation. A run whose -run matched nothing ("no tests
+to run") counts as ran no tests. Go jobs run on the local lane only.
+
 Gradle runs a job whose test path is a settings.gradle(.kts) or the folder holding one (both are named by the
 folder). It runs only the repo's ./gradlew (`--console=plain --continue --no-daemon`; heavy.sh stops only its
 own process group, so a daemon would outlive a stall kill), by default the `check` task, or the tasks in
@@ -895,7 +899,74 @@ class Gradle:
         return out
 
 
-RUNNERS = [Dotnet, Vitest, Playwright, Gradle]
+GO_PATTERN = re.compile(r"^(?:\.|\./\S*|\.\.\.)$")
+# The package pattern, the -run regex and any extra arguments are positional parameters of a fixed script, so
+# nothing the job names is read as shell. go build first, then go test with JSON events; extra arguments are test flags.
+GO_SCRIPT = ('pat=$1; run=$2; shift 2; go build -- "$pat" || exit $?; '
+             'if [ -n "$run" ]; then exec go test -json "$@" -run "$run" -- "$pat"; '
+             'else exec go test -json "$@" -- "$pat"; fi')
+
+
+class Go:
+    """A Go package pattern (./... or ./cmd/x) in a repo with go.mod: go build, then go test -json. A filter is
+    a -run regex, so | stays alternation. A failed test is named by its test name and the top-level test is the class."""
+    name = "go"
+    progress = r'^\{.*"Action":"(?:pass|fail|skip)".*"Test":.*'
+
+    @staticmethod
+    def mode(_repo):
+        return "go"
+
+    @staticmethod
+    def command(mode, project, cls_filter=None, fast=False, extra=(), probe=False, **_):
+        run = "|".join(p.strip() for p in (cls_filter or "").split("|") if p.strip())
+        if any(p.strip().startswith("-") for p in (cls_filter or "").split("|")):
+            raise ValueError("a filter piece starts with -")
+        if not GO_PATTERN.match(project or ""):
+            raise ValueError("not a Go package pattern")
+        return ["sh", "-c", GO_SCRIPT, "go", project, run] + [a for a in extra if a != "--no-build"]
+
+    @staticmethod
+    def events(text):
+        for line in text.splitlines():
+            if line.startswith("{"):
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict):
+                    yield e
+
+    @staticmethod
+    def failures(text):
+        """[(test name, its output)] for each failed test. A parent whose subtest failed is left out."""
+        out, failed = {}, []
+        for e in Go.events(text):
+            t = e.get("Test")
+            if not t:
+                continue
+            if e.get("Action") == "output":
+                out.setdefault(t, []).append(e.get("Output", ""))
+            elif e.get("Action") == "fail" and t not in failed:
+                failed.append(t)
+        return [(t, "".join(out.get(t, []))[-2000:].strip()) for t in failed
+                if not any(o.startswith(t + "/") for o in failed)]
+
+    @staticmethod
+    def counts(text):
+        """(passed, failed, skipped) of the tests in go test -json events."""
+        n = {"pass": 0, "fail": 0, "skip": 0}
+        for e in Go.events(text):
+            if e.get("Test") and e.get("Action") in n:
+                n[e["Action"]] += 1
+        return n["pass"], n["fail"], n["skip"]
+
+    @staticmethod
+    def class_of(test):
+        return test.split("/", 1)[0]
+
+
+RUNNERS = [Dotnet, Vitest, Playwright, Gradle, Go]
 
 
 def skips_node_modules(runner):
@@ -926,7 +997,8 @@ def is_dotnet(test_project, repo=None):
 
 def runner_for(test_project, repo=None):
     """Gradle for a settings.gradle(.kts) or a folder holding one, Vitest for a package.json, Playwright for a
-    playwright.config file, Dotnet for a dotnet project, solution or a folder holding one, else None."""
+    playwright.config file, Dotnet for a dotnet project, solution or a folder holding one, Go for a package
+    pattern such as ./... in a repo with go.mod, else None."""
     base = os.path.basename(test_project)
     if base in GRADLE_SETTINGS:
         return Gradle
@@ -937,7 +1009,11 @@ def runner_for(test_project, repo=None):
         return Playwright
     if base == "package.json":
         return Vitest
-    return Dotnet if is_dotnet(test_project, repo) else None
+    if is_dotnet(test_project, repo):
+        return Dotnet
+    if repo and GO_PATTERN.match(test_project) and os.path.isfile(os.path.join(repo, "go.mod")):
+        return Go
+    return None
 
 
 class Lane:
@@ -1304,6 +1380,8 @@ def matched_none(rc, text):
     if rc != 0:
         return False
     text = ANSI.sub("", text)
+    if "no tests to run" in text and not sum(Go.counts(text)):  # go test -run that matched nothing exits 0
+        return True
     if sum(Dotnet.counts(text)):  # a multi-target run can miss on one framework and run tests on another
         return False
     return "No test matches the given testcase filter" in text \
@@ -1408,6 +1486,10 @@ def _run_job(job, a, run_dir, runner, lane, hold):
     except ValueError as e:
         row["result"] = "error"
         row["notes"].append(f"bad filter: {e}")
+        return row
+    if runner is Go and remote:  # the remote image has no Go toolchain
+        row["result"], row["lane_rest"] = "requeued", "a Go job reached a remote lane"
+        row["lane_problem"] = "a Go job runs on the local lane only (the remote image has no Go toolchain)"
         return row
     if runner is Gradle:
         if remote:  # no Gradle or Maven credential file may leave this machine: hand the job back, brain pins it local
@@ -2851,6 +2933,64 @@ def needs_checks(fails):
                 fails.append(f"an unreadable test-needs file must be a blocker, not a crash ({rc}): {nb} {out}")
 
 
+def go_checks(fails):
+    """Runner choice, the filter mapping and the no-match case, with a fake go on PATH."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = os.path.join(d, "r")
+        os.makedirs(repo)
+        if runner_for("./...", repo) is Go or runner_for("./...") is Go:
+            fails.append("Go must not be chosen without go.mod")
+        open(os.path.join(repo, "go.mod"), "w").write("module x\n")
+        if runner_for("./...", repo) is not Go or runner_for("./cmd/x", repo) is not Go:
+            fails.append("Go must be chosen for a package pattern in a repo with go.mod")
+        if runner_for("web/package.json", repo) is not Vitest:
+            fails.append("a package.json must stay on npm in a Go repo")
+        if runner_for("App.csproj", repo) is not Dotnet or runner_for("./App.csproj", repo) is not Dotnet:
+            fails.append("a .csproj must stay on Dotnet in a Go repo")
+        got = Go.command("go", "./...", "TestA|TestB")
+        if got != ["sh", "-c", GO_SCRIPT, "go", "./...", "TestA|TestB"]:
+            fails.append(f"Go filter must pass as one -run argument with | kept: {got}")
+        if Go.command("go", "./cmd/x")[-2:] != ["./cmd/x", ""]:
+            fails.append("Go with no filter must pass an empty run")
+        try:
+            Go.command("go", "./...", "TestA|-bad")
+            fails.append("a Go filter piece starting with - must be refused")
+        except ValueError:
+            pass
+        # A fake go that logs its arguments and prints what the test says.
+        bindir = os.path.join(d, "bin")
+        os.makedirs(bindir)
+        log = os.path.join(d, "calls")
+        fake = os.path.join(bindir, "go")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_LOG"\n[ "$1" = test ] && cat "$FAKE_OUT"\nexit 0\n')
+        os.chmod(fake, 0o755)
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"], FAKE_LOG=log)
+
+        def run(filter_, out):
+            open(os.path.join(d, "out"), "w").write(out)
+            if os.path.exists(log):
+                os.remove(log)
+            cmd = Go.command("go", "./...", filter_, extra=["-count=1"])
+            p = subprocess.run(cmd, cwd=repo, env=dict(env, FAKE_OUT=os.path.join(d, "out")), capture_output=True, text=True)
+            return p.returncode, p.stdout, open(log).read().splitlines()
+        ev = lambda a, t=None, o=None: json.dumps({"Action": a, "Package": "x", **({"Test": t} if t else {}),
+                                                  **({"Output": o} if o else {})}) + "\n"
+        rc, out, calls = run("TestA|TestB", ev("pass", "TestA") + ev("output", "TestB", "boom\n") + ev("fail", "TestB"))
+        if calls != ["build -- ./...", "test -json -count=1 -run TestA|TestB -- ./..."]:
+            fails.append(f"Go must build, then test with -run and the filter as one argument: {calls}")
+        if Go.counts(out) != (1, 1, 0) or [n for n, _ in Go.failures(out)] != ["TestB"] \
+                or "boom" not in Go.failures(out)[0][1] or matched_none(0, out):
+            fails.append(f"Go counts and failures must be read from the JSON events: {Go.counts(out)} {Go.failures(out)}")
+        rc, out, calls = run("", ev("pass", "TestA"))
+        if calls[1] != "test -json -count=1 -- ./...":
+            fails.append(f"Go with no filter must not pass -run: {calls}")
+        none = ev("output", None, "testing: warning: no tests to run\n") + ev("pass")
+        rc, out, calls = run("TestNope", none)
+        if matched_none(rc, out) is not True or Go.counts(out) != (0, 0, 0):
+            fails.append("a Go run that printed no tests to run must count as matched none")
+
+
 def self_test():
     fails = []
     # A fast filter of several classes joined by | runs each of them, on both runners.
@@ -4207,6 +4347,7 @@ exit 0
                 or leftovers() != ([], []):
             fails.append(f"a stale remote job needs its host cleaned: {got!r} {qlist('--cycle', 'r7')} {leftovers()}")
     needs_checks(fails)
+    go_checks(fails)
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1
