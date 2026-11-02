@@ -7,7 +7,7 @@
   brain show ID
   brain close ID (--resolution R | --wontfix) [--note N] [--commit H] [--tag T ...]
   brain reopen ID
-  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest|vitest|playwright|gradle]
+  brain run-add --cycle C --project P --test-project T --tier fast|full|rerun [--repo R] [--runner mtp|vstest|vitest|playwright|gradle|go]
             [--started E] [--ended E] [--lane-wait N] [--load-start X] [--load-end X] [--passed N]
             [--failed N] [--skipped N] [--stalled 0|1] [--exit-code N] [--host NAME]      prints the run id
   brain flaky-clear --project P --test-project T [--runs 5]      closes each open flaky item of T with no new
