@@ -26,7 +26,7 @@ MODEL = ("haiku", "sonnet", "opus", "")
 TIERS = ("fast", "full", "rerun")
 
 
-RUNNERS = ("mtp", "vstest", "vitest", "playwright", "gradle", "")
+RUNNERS = ("mtp", "vstest", "vitest", "playwright", "gradle", "go", "")
 
 
 KIND = ("test-fail flaky minor question ticket security pending blocker agent note failure risk ruling bug "
