@@ -31,10 +31,12 @@ the local machine. The docs are in docs/remote-lane.md.
 """
 import configparser
 import fnmatch
+import glob
 import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,6 +51,48 @@ DEFAULT_NODE_IMAGE = "node:22-bookworm-slim"
 MARKER = "lean-remote: started"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
+SOCKET_DIR = "~/.ssh"
+SOCKET_PREFIX = "cm-lean-"
+
+
+def login_hours():
+    """How long one ssh login is reused (LEAN_SSH_LOGIN_HOURS, default 2). 0 logs in on every call."""
+    try:
+        return max(0.0, float(os.environ.get("LEAN_SSH_LOGIN_HOURS", "2")))
+    except ValueError:
+        return 2.0
+
+
+def login_opts():
+    # One login per host, reused by every call, so a key that needs a touch or Touch ID asks once per window.
+    hours = login_hours()
+    if not hours:
+        return ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    return ["-o", "ControlMaster=auto", "-o", f"ControlPath={SOCKET_DIR}/{SOCKET_PREFIX}%C",
+            "-o", f"ControlPersist={max(1, int(hours * 60))}m"]
+
+
+def expire_logins(run=subprocess.run, now=None):
+    """Close a reused login once it is older than the window, so the next call asks again.
+    A control socket keeps the time its login started, however often it is used."""
+    hours = login_hours()
+    if not hours:
+        return []
+    now = time.time() if now is None else now
+    closed = []
+    for p in glob.glob(os.path.join(os.path.expanduser(SOCKET_DIR), SOCKET_PREFIX + "*")):
+        try:
+            if now - os.lstat(p).st_mtime < hours * 3600:
+                continue
+        except OSError:
+            continue
+        try:
+            run(["ssh", "-o", f"ControlPath={p}", "-O", "stop", "lean-expired"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        closed.append(p)
+    return closed
 
 
 class LaneProblem(Exception):
@@ -195,7 +239,7 @@ def sh_path(p):
 
 
 def ssh_cmd(r):
-    return ["ssh"] + SSH_OPTS + [r.host]
+    return ssh_cmd_opts() + [r.host]
 
 
 def ssh_argv(r, *remote_cmd):
@@ -350,7 +394,8 @@ def sync_argv(r, repo, job_id, dest=None):
 
 
 def ssh_cmd_opts():
-    return ["ssh"] + SSH_OPTS
+    expire_logins()
+    return ["ssh"] + SSH_OPTS + login_opts()
 
 
 def env_path(r, job_id, dest=None):
@@ -579,6 +624,50 @@ docker = yes
         if "BatchMode=yes" not in argv or "StrictHostKeyChecking=yes" not in argv or argv[-2] != "devbox" \
                 or argv[-1] != "echo 'a b'":
             fails.append(f"ssh_argv: {argv}")
+
+        # The login window: reuse for LEAN_SSH_LOGIN_HOURS, close a login older than that, 0 turns reuse off.
+        saved_dir, saved_hours = SOCKET_DIR, os.environ.get("LEAN_SSH_LOGIN_HOURS")
+        sock_dir = tempfile.mkdtemp()
+        globals()["SOCKET_DIR"] = sock_dir
+        try:
+            os.environ["LEAN_SSH_LOGIN_HOURS"] = "2"
+            if "ControlPersist=120m" not in login_opts() or "ControlMaster=auto" not in login_opts():
+                fails.append(f"a 2 hour window must reuse the login for 120m: {login_opts()}")
+            real_expire, expired = expire_logins, []
+            globals()["expire_logins"] = lambda: expired.append(1)
+            try:
+                rr = Remote(name="dev", host="h", workdir="~/w")
+                sa = sync_argv(rr, "/repo", 1)
+                for where, opts in (("ssh", ssh_cmd(rr)), ("rsync -e", sa[sa.index("-e") + 1].split())):
+                    if "ControlMaster=auto" not in opts or "ControlPersist=120m" not in opts:
+                        fails.append(f"{where} must carry the login options: {opts}")
+            finally:
+                globals()["expire_logins"] = real_expire
+            if len(expired) != 2:
+                fails.append(f"every ssh and rsync call must close expired logins first: {len(expired)} calls")
+            old, new = os.path.join(sock_dir, SOCKET_PREFIX + "old"), os.path.join(sock_dir, SOCKET_PREFIX + "new")
+            other = os.path.join(sock_dir, "cm-someone-else")
+            for p in (old, new, other):
+                open(p, "w").close()
+            os.utime(old, (1000, 1000))
+            os.utime(other, (1000, 1000))
+            calls = []
+            closed = expire_logins(run=lambda argv, **kw: calls.append(argv), now=1000 + 2 * 3600 + 1)
+            if closed != [old] or len(calls) != 1 or f"ControlPath={old}" not in calls[0] or "stop" not in calls[0]:
+                fails.append(f"only a lean login older than the window must be closed: {closed} {calls}")
+            os.environ["LEAN_SSH_LOGIN_HOURS"] = "0"
+            if "ControlMaster=no" not in login_opts() or expire_logins(run=lambda *a, **k: None, now=10 ** 10):
+                fails.append(f"a 0 hour window must log in every call and close nothing: {login_opts()}")
+            os.environ["LEAN_SSH_LOGIN_HOURS"] = "soon"
+            if login_hours() != 2.0:
+                fails.append(f"a bad window must fall back to 2 hours: {login_hours()}")
+        finally:
+            globals()["SOCKET_DIR"] = saved_dir
+            if saved_hours is None:
+                os.environ.pop("LEAN_SSH_LOGIN_HOURS", None)
+            else:
+                os.environ["LEAN_SSH_LOGIN_HOURS"] = saved_hours
+            shutil.rmtree(sock_dir, ignore_errors=True)
 
         class Fake:
             def __init__(self, rc=0, out="", err=""):

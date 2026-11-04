@@ -1916,6 +1916,9 @@ def rest_seconds():
         return 600.0
 
 
+HOST_CHECK_SECONDS = 60
+
+
 def poll_seconds():
     try:
         return float(os.environ.get("TEST_PHASE_POLL", "3"))
@@ -2008,9 +2011,10 @@ def drain(a, run_dir, lanes=None):
 
     def lane_loop(lane):
         last_why, job = None, None
+        checked = None  # when the host last passed; an idle lane polls every few seconds but checks it once a minute
         try:
             while True:
-                if lane.remote:
+                if lane.remote and (checked is None or time.monotonic() - checked >= HOST_CHECK_SECONDS):
                     sweep_remote(lane.remote)
                     ok, why = lr.preflight(lane.remote)
                     if not ok:
@@ -2020,7 +2024,7 @@ def drain(a, run_dir, lanes=None):
                         if not rest(lane):
                             return
                         continue
-                    last_why = None
+                    last_why, checked = None, time.monotonic()
                 count = done[0]
                 out = brain(["queue", "next", "--where", lane.where]
                             + (["--host", lane.remote.name] if lane.remote else []))
@@ -2032,6 +2036,7 @@ def drain(a, run_dir, lanes=None):
                 say(f"test-phase: job #{job['id']} {job['project']} {job['test_project']} ({job['tier']})"
                     + (f" on {lane.remote.name}" if lane.remote else ""))
                 row = run_job(job, a, run_dir, runner_for(job["test_project"], job.get("repo_dir")), lane)
+                checked = None  # sweep and check the host again before the next job
                 problem = row.get("lane_problem")
                 if problem:
                     if requeue_job(job["id"], problem, say):

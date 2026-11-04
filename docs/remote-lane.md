@@ -12,6 +12,8 @@
 
 `~/.config/lean/remotes.ini`, or the file named by `TEST_PHASE_REMOTES_FILE`. `TEST_PHASE_REMOTES=off` turns every remote off. A bad file prints a warning and the drainer runs the local lane only.
 
+Each host gets one ssh login that every call reuses, so a key that needs Touch ID or a touch asks once per window. `LEAN_SSH_LOGIN_HOURS` sets the window (default 2). A login older than that takes no new calls, so the next call asks again, and a job already running on it finishes. `LEAN_SSH_LOGIN_HOURS=0` logs in on every call. `ssh -O exit -o ControlPath=~/.ssh/cm-lean-<hash> x` ends one early.
+
 ```ini
 [remote dev]
 host = dev
