@@ -56,11 +56,11 @@ SOCKET_PREFIX = "cm-lean-"
 
 
 def login_hours():
-    """How long one ssh login is reused (LEAN_SSH_LOGIN_HOURS, default 8). 0 logs in on every call."""
+    """How long one ssh login is reused (LEAN_SSH_LOGIN_HOURS, default 2). 0 logs in on every call."""
     try:
-        return max(0.0, float(os.environ.get("LEAN_SSH_LOGIN_HOURS", "8")))
+        return max(0.0, float(os.environ.get("LEAN_SSH_LOGIN_HOURS", "2")))
     except ValueError:
-        return 8.0
+        return 2.0
 
 
 def login_opts():
@@ -647,8 +647,8 @@ docker = yes
             if "ControlMaster=no" not in login_opts() or expire_logins(run=lambda *a, **k: None, now=10 ** 10):
                 fails.append(f"a 0 hour window must log in every call and close nothing: {login_opts()}")
             os.environ["LEAN_SSH_LOGIN_HOURS"] = "soon"
-            if login_hours() != 8.0:
-                fails.append(f"a bad window must fall back to 8 hours: {login_hours()}")
+            if login_hours() != 2.0:
+                fails.append(f"a bad window must fall back to 2 hours: {login_hours()}")
         finally:
             globals()["SOCKET_DIR"] = saved_dir
             if saved_hours is None:
