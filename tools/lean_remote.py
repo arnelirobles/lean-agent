@@ -48,7 +48,9 @@ DEFAULT_IMAGE = "mcr.microsoft.com/dotnet/sdk:10.0"
 DEFAULT_NODE_IMAGE = "node:22-bookworm-slim"
 MARKER = "lean-remote: started"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15",
-            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4",
+            # One login per host, reused by every call: a key that needs a touch or Touch ID asks once.
+            "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cm-lean-%C", "-o", "ControlPersist=10m"]
 
 
 class LaneProblem(Exception):
