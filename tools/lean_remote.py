@@ -87,7 +87,7 @@ def expire_logins(run=subprocess.run, now=None):
         except OSError:
             continue
         try:
-            run(["ssh", "-o", f"ControlPath={p}", "-O", "exit", "lean-expired"],
+            run(["ssh", "-o", f"ControlPath={p}", "-O", "stop", "lean-expired"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         except (OSError, subprocess.SubprocessError):
             pass
@@ -633,6 +633,18 @@ docker = yes
             os.environ["LEAN_SSH_LOGIN_HOURS"] = "2"
             if "ControlPersist=120m" not in login_opts() or "ControlMaster=auto" not in login_opts():
                 fails.append(f"a 2 hour window must reuse the login for 120m: {login_opts()}")
+            real_expire, expired = expire_logins, []
+            globals()["expire_logins"] = lambda: expired.append(1)
+            try:
+                rr = Remote(name="dev", host="h", workdir="~/w")
+                sa = sync_argv(rr, "/repo", 1)
+                for where, opts in (("ssh", ssh_cmd(rr)), ("rsync -e", sa[sa.index("-e") + 1].split())):
+                    if "ControlMaster=auto" not in opts or "ControlPersist=120m" not in opts:
+                        fails.append(f"{where} must carry the login options: {opts}")
+            finally:
+                globals()["expire_logins"] = real_expire
+            if len(expired) != 2:
+                fails.append(f"every ssh and rsync call must close expired logins first: {len(expired)} calls")
             old, new = os.path.join(sock_dir, SOCKET_PREFIX + "old"), os.path.join(sock_dir, SOCKET_PREFIX + "new")
             other = os.path.join(sock_dir, "cm-someone-else")
             for p in (old, new, other):
@@ -641,7 +653,7 @@ docker = yes
             os.utime(other, (1000, 1000))
             calls = []
             closed = expire_logins(run=lambda argv, **kw: calls.append(argv), now=1000 + 2 * 3600 + 1)
-            if closed != [old] or len(calls) != 1 or f"ControlPath={old}" not in calls[0] or "exit" not in calls[0]:
+            if closed != [old] or len(calls) != 1 or f"ControlPath={old}" not in calls[0] or "stop" not in calls[0]:
                 fails.append(f"only a lean login older than the window must be closed: {closed} {calls}")
             os.environ["LEAN_SSH_LOGIN_HOURS"] = "0"
             if "ControlMaster=no" not in login_opts() or expire_logins(run=lambda *a, **k: None, now=10 ** 10):
