@@ -65,6 +65,9 @@
             exits 0. --idle-exit stops it after MIN minutes with no open session. --install always starts it
             at login (launchd, systemd user unit or Windows Startup folder; no admin rights); the other two
             modes remove that and leave the start to the plugin's serve_mode setting. --uninstall removes it
+  brain assistant-setup
+            makes a virtual environment named assistant-venv next to brain.db and installs the anthropic package
+            in it, for the optional Ask section of the page (docs/assistant.md). Writes nothing into the repo
   brain --self-test
 
 The file is ${LEAN_BRAIN_DB:-~/.local/share/lean/brain.db}, one sqlite database with a schema version
@@ -329,6 +332,8 @@ def parser():
     g.add_argument("--install", choices=("always", "session", "manual"))
     g.add_argument("--uninstall", action="store_true")
     s.set_defaults(fn=cmd_serve)
+    s = sub.add_parser("assistant-setup")
+    s.set_defaults(fn=cmd_assistant_setup)
     return p
 
 
@@ -425,6 +430,11 @@ def cmd_serve(a):
     except KeyboardInterrupt:
         pass
     return 0
+
+
+def cmd_assistant_setup(a):
+    from .web import assistant
+    return assistant.setup()
 
 
 def main(argv):

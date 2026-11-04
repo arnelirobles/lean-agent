@@ -21,14 +21,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
+import assistant  # noqa: E402
+import charts  # noqa: E402
 import forges  # noqa: E402
+import mdlite  # noqa: E402
 import page  # noqa: E402
 import sections  # noqa: E402
 import session  # noqa: E402
+import summary  # noqa: E402
 
 HOSTS = ("leanagent.localhost", "localhost", "127.0.0.1", "[::1]")
 MAX_BODY = 16 * 1024
+MAX_ASK_BODY = 96 * 1024
 MAX_ANSWER = 4000
+ITEM_ROUTES = ("/session", "/answer", "/dismiss")
+KEY_ROUTES = ("/assistant-key", "/assistant-key-remove")
 SESSION_KINDS = ("question", "blocker", "pending", "risk")
 _LENGTH = re.compile(r"[0-9]{1,6}")
 _ID = re.compile(r"[1-9][0-9]{0,9}")
@@ -85,8 +92,10 @@ class App:
         self.roots = roots or []
         self.cache = forges.Cache()
         self.flash = Flash()
+        self.assistant = assistant.Assistant()
         self.start_session = session.start_session
         self.recent = {}
+        self.auto = None
         self.recent_lock = threading.Lock()
 
     def first_start(self, item_id, window=10):
@@ -160,7 +169,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
         if isinstance(body, str):
-            body = body.encode("utf-8")
+            body = body.encode("utf-8", "replace")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -196,21 +205,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, f"lean-brain {version()}\n")
         if url.path != "/":
             return self._send(404, "not found\n")
-        flash = self.app.flash.pop(urllib.parse.parse_qs(url.query).get("r", [""])[0])
+        query = urllib.parse.parse_qs(url.query)
+        flash = self.app.flash.pop(query.get("r", [""])[0])
+        tab = page.tab_name(query.get("tab", [""])[0])
         try:
             con = _connect()
             try:
-                data = sections.collect(con, self.app.cache, self.app.roots)
+                data = sections.collect(con, self.app.cache, self.app.roots, only=page.sections_for(tab))
             finally:
                 con.close()
         except Exception as ex:
             data = {"errors": {"needs_you": f"could not read: {type(ex).__name__}"}}
         try:
-            html = page.render(data, self.app.key, self.app.port)
+            try:
+                ask = self.app.assistant.state()
+            except Exception:
+                ask = None
+            summ = {"entries": summary.load(), "error": self.app.auto.error if self.app.auto else None}
+            html = page.render(data, self.app.key, self.app.port, ask, summ, tab)
         except Exception as ex:
             return self._send(500, f"could not render the page: {page.e(type(ex).__name__)}\n")
         if flash:
-            html = html.replace("<h1>lean brain</h1>", "<h1>lean brain</h1>" + _banner(flash), 1)
+            html = html.replace("</header>", "</header>" + _banner(flash), 1)
         self._send(200, html, "text/html; charset=utf-8")
 
     def do_POST(self):
@@ -219,7 +235,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not origin_ok(self.headers.get("Origin"), self.app.port):
             return self._send(403, "forbidden\n")
         route = urllib.parse.urlsplit(self.path).path
-        if route not in ("/session", "/answer", "/dismiss"):
+        if route not in ITEM_ROUTES + KEY_ROUTES + ("/ask", "/summary"):
             return self._send(404, "not found\n")
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/x-www-form-urlencoded":
@@ -230,12 +246,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not _LENGTH.fullmatch(raw_length.strip()):
             return self._send(400, "bad request\n")
         length = int(raw_length)
-        if length > MAX_BODY:
+        if length > (MAX_ASK_BODY if route == "/ask" else MAX_BODY):
             return self._send(413, "too large\n")
         raw = self.rfile.read(length).decode("utf-8", "replace")
         form = {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
         if not hmac.compare_digest(str(form.get("key", "")).encode("utf-8"), self.app.key.encode("utf-8")):
             return self._send(403, "wrong or missing key, reload the page\n")
+        if route == "/ask":
+            return self._ask(form)
+        if route == "/summary":
+            return self._summary(form)
+        if route in KEY_ROUTES:
+            return self._redirect(self._key_result(route, form), form)
         item_id = str(form.get("id", ""))
         if not _ID.fullmatch(item_id):
             return self._send(400, "bad id\n")
@@ -254,8 +276,144 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 con.close()
         except Exception as ex:
             text = f"Failed: {type(ex).__name__}"
-        token = self.app.flash.put(text)
-        self._send(303, b"", extra={"Location": "/?r=" + token})
+        self._redirect(text, form)
+
+    def _redirect(self, text, form=None):
+        tab = page.tab_name((form or {}).get("tab"))
+        self._send(303, b"", extra={"Location": f"/?tab={tab}&r=" + self.app.flash.put(text)})
+
+    def _key_result(self, route, form):
+        """Fixed messages only; nothing from the request is echoed."""
+        asst = self.app.assistant
+        if not asst.mac:
+            return "Saving a key needs macOS. Set ANTHROPIC_API_KEY instead."
+        if route == "/assistant-key-remove":
+            return "Removed the saved key." if asst.key_delete() else "There was no saved key to remove."
+        if not assistant.KEY_RX.fullmatch(str(form.get("apikey", "")).strip()):
+            return "That does not look like an Anthropic API key."
+        return "Saved the key in the macOS Keychain." if asst.key_set(str(form["apikey"]).strip()) else "Could not save the key."
+
+    def _ask(self, form):
+        asst = self.app.assistant
+        question = (form.get("question") or "").strip()
+        if not question:
+            return self._send(400, "empty question\n")
+        if len(question) > assistant.MAX_QUESTION:
+            return self._send(413, "question too long\n")
+        token = form.get("chat") or ""
+        if not token:
+            model, effort = form.get("model"), form.get("effort")
+            if model not in assistant.MODELS:
+                return self._send(400, "bad model\n")
+            if effort not in assistant.EFFORTS:
+                return self._send(400, "bad effort\n")
+        if not asst.slots.acquire(blocking=False):
+            return self._send(429, "two questions are already running, wait for one to finish\n")
+        try:
+            chat = None
+            if token:
+                chat = asst.chats.take(token)
+                if chat is None:
+                    return self._send(409, "that conversation is gone or still running, ask again from the page\n")
+                model, effort = chat["model"], chat["effort"]
+            else:
+                token = asst.chats.new_token()
+            self._stream_answer(token, chat, question, model, effort)
+        finally:
+            asst.slots.release()
+
+    def _summary(self, form):
+        asst = self.app.assistant
+        rng = form.get("range")
+        if rng not in summary.RANGES:
+            return self._send(400, "bad range\n")
+        if not asst.slots.acquire(blocking=False):
+            return self._send(429, "two questions are already running, wait for one to finish\n")
+        try:
+            self._stream_answer(asst.chats.new_token(), None, summary.question(rng), assistant.DEFAULT_MODEL,
+                                assistant.DEFAULT_EFFORT, rng)
+        finally:
+            asst.slots.release()
+
+    def _stream_answer(self, token, chat, question, model, effort, rng=None):
+        """Answer as one HTML document on this connection: no Content-Length, closed at the end. The
+        write timeout is per send, so the 10 second handler timeout does not cut a long answer; it is
+        raised for a slow reader."""
+        asst = self.app.assistant
+        self.close_connection = True
+        e = page.e
+
+        def out(text):
+            self.wfile.write(text.encode("utf-8", "replace"))
+            self.wfile.flush()
+
+        md = mdlite.Stream(clean=assistant.mask)
+        col = summary.Collector() if rng else None
+        back = "/?tab=overview" if rng else "/?tab=ask"
+
+        def emit(kind, text):
+            if col:
+                col.add(kind, text)
+            if kind == "text":
+                out(md.feed(text))
+                return
+            out(md.flush())
+            if kind == "chart":
+                try:
+                    drawn = charts.svg(text)
+                except Exception:
+                    drawn = '<p class="note">The chart could not be drawn.</p>'
+                out(drawn + "\n")
+            elif kind == "tool":
+                out(f'<details class="tool"><summary>Ran a query</summary><pre>{e(text[:500])}</pre></details>\n')
+            else:
+                out(f'<p class="note">{e(text)}</p>\n')
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.connection.settimeout(60)
+            out(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<title>lean brain</title><style>{page.CSS}</style>'
+                f'</head><body><h1>lean brain</h1><p><a href="{back}">Back to the page</a></p><h2>Question</h2>'
+                f'<pre>{e(question)}</pre><!-- {" " * 1024} --><h2>Answer</h2>'
+                '<div class="answer">')
+            try:
+                client, _source = asst.client()
+                if chat is None:
+                    chat = {"system": assistant.build_system(), "messages": [], "model": model, "effort": effort}
+            except assistant.Setup as ex:
+                out(f'<p class="note">{e(ex)}</p></div></body></html>')
+                return
+            except Exception as ex:
+                out(f'<p class="note">Could not start the assistant ({e(type(ex).__name__)}).</p></div></body></html>')
+                return
+            res = assistant.run_question(client, asst.sdk_loader(), chat, question, model, effort, emit)
+            if res["reason"] == "disconnected":
+                return
+            out(md.flush())
+            if col and res["reason"] == "done":
+                try:
+                    blocks = col.finish()
+                    if blocks:
+                        summary.save(rng, blocks, model, res["usd"])
+                        out('<p class="muted">Saved to the Activity section.</p>')
+                except Exception as ex:
+                    out(f'<p class="note">Could not save the summary ({e(type(ex).__name__)}).</p>')
+            total, n = assistant.usage_total()
+            out(f'</div><p class="muted">This question cost about ${res["usd"]:.4f} (estimate). '
+                f'Total so far about ${total:.2f} over {n} questions.</p>'
+                f'<form method="post" action="/ask">{page._key(self.app.key)}'
+                f'<input type="hidden" name="chat" value="{e(token)}">'
+                '<textarea name="question" placeholder="Ask a follow-up"></textarea><button>Ask</button></form>'
+                '</body></html>')
+        except OSError:
+            pass
+        finally:
+            if chat is not None:
+                asst.chats.put(token, chat)
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -277,12 +435,15 @@ def make_server(port, key, db_path=None, roots=None) -> http.server.ThreadingHTT
     return srv
 
 
-def main(argv) -> int:
+def main(argv, make=make_server, start=summary.start_auto, env=None) -> int:
     if "--self-test" in argv:
         return _self_test()
-    port = int(os.environ.get("LEAN_SERVE_PORT") or 8770)
+    env = os.environ if env is None else env
+    port = int(env.get("LEAN_SERVE_PORT") or 8770)
     key = secrets.token_urlsafe(32)
-    srv = make_server(port, key)
+    srv = make(port, key)
+    if env.get("LEAN_ASSISTANT_AUTO_SUMMARY") == "1":
+        srv.app.auto = start(srv.app.assistant)
     print(f"http://leanagent.localhost:{srv.app.port}  (also http://127.0.0.1:{srv.app.port})", flush=True)
     try:
         srv.serve_forever()
@@ -360,6 +521,9 @@ def _self_test() -> int:
     def post(path, form, **kw):
         return req("POST", path, urllib.parse.urlencode(form), **kw)
 
+    def allp():
+        return "".join(req("GET", "/?tab=" + n)[2] for n in page.TAB_NAMES)
+
     def state(ref):
         c = store.connect(timeout=2)
         r = c.execute("SELECT status, resolution, body FROM items WHERE ref=?", (ref,)).fetchone()
@@ -373,7 +537,13 @@ def _self_test() -> int:
     check("healthz", (s, b.startswith("lean-brain ")), (200, True))
     s, h, b = req("GET", "/")
     check("page 200", s, 200)
-    check("page has key", f'value="{key}"' in b, True)
+    check("page has key", f'value="{key}"' in allp(), True)
+    check("default tab is overview", ('aria-current="page">Overview' in b, "<h2>Activity</h2>" in b, "<h2>Worktrees</h2>" in b), (True, True, False))
+    w = req("GET", "/?tab=work")[2]
+    check("work tab", ("<h2>Worktrees</h2>" in w, "<h2>Activity</h2>" in w), (True, False))
+    for bogus in ("bogus", "%3Cscript%3Ex", "log%00", ""):
+        bb = req("GET", "/?tab=" + bogus)
+        check("bad tab " + bogus + " falls back", (bb[0], "<h2>Activity</h2>" in bb[2], "bogus" in bb[2], "<script>x" in bb[2]), (200, True, False, False))
     check("csp", h.get("content-security-policy"), _CSP)
     check("xfo", h.get("x-frame-options"), "DENY")
     # no-referrer makes browsers send "Origin: null" on form POSTs, which origin_ok rejects
@@ -413,7 +583,7 @@ def _self_test() -> int:
         s, h, b = resp
         check("303", s, 303)
         loc = h.get("location", "")
-        check("redirect to /", loc.startswith("/?r="), True)
+        check("redirect to /", loc.startswith("/?tab=") and "&r=" in loc, True)
         check("no cors on redirect", "access-control-allow-origin" in h, False)
         page_ = req("GET", loc)[2]
         again = req("GET", loc)[2]
@@ -462,7 +632,260 @@ def _self_test() -> int:
     check("notice dismissed", bool(c.execute("SELECT dismissed_at FROM notices WHERE id=1").fetchone()[0]), True)
     c.close()
     p = followed(post("/dismiss", {"id": 99, "key": key}))
+    for tabv, want in (("work", "work"), ("log", "log"), ("evil", "overview"), ("<b>", "overview"), ("", "overview")):
+        loc = post("/dismiss", {"id": 99, "key": key, "tab": tabv})[1].get("location", "")
+        check("dismiss returns to tab " + repr(tabv), (loc.startswith(f"/?tab={want}&r="), "evil" in loc, "<b>" in loc), (True, False, False))
+    check("no tab goes to overview", post("/dismiss", {"id": 99, "key": key})[1].get("location", "").startswith("/?tab=overview&r="), True)
+    check("key route returns to ask", post("/assistant-key-remove", {"key": key, "tab": "ask"})[1].get("location", "").startswith("/?tab=ask&r="), True)
     check("missing notice reported", "not found" in p, True)
+
+    # the assistant routes, with a fake SDK and a fake keychain
+    import types
+    fake_key = "sk-" + "ant-" + "api03-" + "B" * 30
+    vault, argvs, seen, turns = {}, [], [], []
+
+    class Done:
+        def __init__(self, rc=0, out=""):
+            self.returncode, self.stdout = rc, out
+
+    def sec(argv, input=None, **kw):
+        argvs.append(argv)
+        if argv[1] == "-i":
+            vault["key"] = input.split("-w ")[1].strip()
+            return Done()
+        if argv[1] == "find-generic-password":
+            return Done(0, vault["key"]) if "key" in vault else Done(44)
+        return Done(0) if vault.pop("key", None) else Done(44)
+
+    class St:
+        def __init__(self, kw):
+            seen.append({**kw, "messages": list(kw["messages"])})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            self.turn = turns.pop(0) if turns else None
+            for d in (self.turn or {}).get("text", ["<script>alert(1)</script> & done\n\nA **bo", "ld** word"]):
+                yield types.SimpleNamespace(type="text", text=d)
+
+        def get_final_message(self):
+            u = types.SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0, cache_creation_input_tokens=0)
+            if self.turn and self.turn.get("chart"):
+                tu = types.SimpleNamespace(type="tool_use", id="c1", name="chart", input=self.turn["chart"])
+                return types.SimpleNamespace(content=[tu], stop_reason="tool_use", usage=u)
+            if self.turn and self.turn.get("sql"):
+                tu = types.SimpleNamespace(type="tool_use", id="t1", name="run_sql", input={"sql": self.turn["sql"]})
+                return types.SimpleNamespace(content=[tu], stop_reason="tool_use", usage=u)
+            return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text="x")], stop_reason="end_turn", usage=u)
+
+    class Boom(Exception):
+        pass
+
+    class Fake:
+        def __init__(self, **kw):
+            if boom:
+                raise Boom(fake_key)
+            self.beta = types.SimpleNamespace(messages=types.SimpleNamespace(stream=lambda **k: St(k)))
+
+    boom = False
+    sdk = types.SimpleNamespace(Anthropic=Fake)
+    asst = assistant.Assistant(run=sec, sdk_loader=lambda: None, platform="darwin", env={})
+    srv.app.assistant = asst
+    p = allp()
+    check("setup command shown", "assistant-setup" in p and 'name="question"' not in p, True)
+    asst.sdk_loader = lambda: sdk
+    boom = True
+    p = allp()
+    check("key form when no credentials", ('name="apikey"' in p, 'type="password"' in p, "ant auth login" in p, 'name="question"' in p),
+          (True, True, True, False))
+    boom = False
+    p = allp()
+    check("ask form when ready", ('name="question"' in p, 'name="model"' in p, "sent to Anthropic" in p), (True, True, True))
+    ask_form = {"key": key, "question": "how many items?", "model": "claude-opus-5-5", "effort": "high"}
+    check("ask bad key 403", post("/ask", {**ask_form, "key": "wrong"})[0], 403)
+    check("ask no origin 403", post("/ask", ask_form, origin=False)[0], 403)
+    check("ask evil origin 403", post("/ask", ask_form, origin="https://evil.example")[0], 403)
+    check("ask evil host 421", post("/ask", ask_form, host="evil.example")[0], 421)
+    check("ask json 415", req("POST", "/ask", "{}", headers={"Content-Type": "application/json"})[0], 415)
+    check("ask empty 400", post("/ask", {**ask_form, "question": "  "})[0], 400)
+    check("ask too long 413", post("/ask", {**ask_form, "question": "x" * 8001})[0], 413)
+    check("ask 8000 fits", post("/ask", {**ask_form, "question": "x" * 8000})[0], 200)
+    check("ask bad model 400", post("/ask", {**ask_form, "model": "claude-evil"})[0], 400)
+    check("ask bad effort 400", post("/ask", {**ask_form, "effort": "ludicrous"})[0], 400)
+    check("ask unknown chat 409", post("/ask", {"key": key, "question": "q", "chat": "nope"})[0], 409)
+    seen.clear()
+    s, h, b = post("/ask", {**ask_form, "question": "<b>hi</b>"})
+    check("stream ok", (s, "content-length" in h, h.get("content-security-policy")), (200, False, _CSP))
+    check("model text escaped", ("<script>alert(1)</script>" in b, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; done" in b), (False, True))
+    check("bold split across deltas", "<strong>bold</strong>" in b and "**" not in b.split("<h2>Answer</h2>")[1], True)
+    check("answer div, no pre-wrap", ('<div class="answer">' in b, "white-space:pre-wrap" in b.split("<h2>Answer</h2>")[1]), (True, False))
+    check("question escaped", ("<b>hi</b>" in b, "&lt;b&gt;hi&lt;/b&gt;" in b), (False, True))
+    check("ask answer goes back to the ask tab", 'href="/?tab=ask">Back' in b, True)
+    check("stream has cost and follow-up", ("estimate" in b, 'name="chat"' in b, b.rstrip().endswith("</html>")), (True, True, True))
+    tok = b.split('name="chat" value="')[1].split('"')[0]
+    check("request used the picked model", (seen[0]["model"], seen[0]["output_config"]), ("claude-opus-5-5", {"effort": "high"}))
+    seen.clear()
+    post("/ask", {"key": key, "question": "and then?", "chat": tok})
+    check("follow-up carries history", len(seen[0]["messages"]), 3)
+    seen.clear()
+    turns.extend([{"text": ["looking **now"], "sql": "SELECT '<b>x</b>' AS q WHERE 1 < 2"}, {"text": ["done"]}])
+    s, h, b = post("/ask", ask_form)
+    a = b.split("<h2>Answer</h2>")[1]
+    check("tool call shows a details block", ("<details class=\"tool\"><summary>Ran a query</summary><pre>SELECT &#x27;&lt;b&gt;x&lt;/b&gt;&#x27; AS q WHERE 1 &lt; 2</pre></details>" in a,
+                                              "<b>x</b>" in a), (True, False))
+    check("text before a tool is flushed first", a.index("looking") < a.index("<details"), True)
+    seen.clear()
+    turns.extend([{"text": [], "chart": {"title": "<i>T</i>", "kind": "bar", "labels": ["a", "b"], "series": [{"name": "n", "values": [1, 2]}]}},
+                  {"text": ["after"]}])
+    s, h, b = post("/ask", ask_form)
+    a = b.split("<h2>Answer</h2>")[1]
+    check("chart drawn in the answer", (a.count("<figure"), "<svg" in a, "<i>T</i>" in a, "&lt;i&gt;T&lt;/i&gt;" in a), (1, True, False, True))
+    check("chart result sent back", seen[1]["messages"][-1]["content"][0]["content"], "drawn")
+    seen.clear()
+    turns.extend([{"text": ["the key is " + fake_key + " ok\n\nnext"]}])
+    s, h, b = post("/ask", ask_form)
+    a = b.split("<h2>Answer</h2>")[1]
+    check("a key inside one streamed line is masked", (fake_key in a, "[secret removed]" in a), (False, True))
+    turns.extend([{"text": ["a\udc80b\n\nc"]}])
+    s, h, b = post("/ask", ask_form)
+    check("a lone surrogate in the stream does not stop it", (s, "a?b" in b, b.rstrip().endswith("</html>")), (200, True, True))
+    real_svg, calls = charts.svg, []
+    def flaky(spec):
+        calls.append(1)
+        if len(calls) > 1:
+            raise ZeroDivisionError()
+        return real_svg(spec)
+    charts.svg = flaky
+    turns.extend([{"text": [], "chart": {"title": "T", "kind": "bar", "labels": ["a"], "series": [{"name": "n", "values": [1]}]}},
+                  {"text": ["after"]}])
+    try:
+        s, h, b = post("/ask", ask_form)
+    finally:
+        charts.svg = real_svg
+    check("a chart that cannot draw does not end the stream", (s, "could not be drawn" in b, "after" in b, b.rstrip().endswith("</html>")), (200, True, True, True))
+    for _ in range(assistant.MAX_RUNNING):
+        asst.slots.acquire()
+    status = post("/ask", {"key": key, "question": "hi", "model": "claude-opus-5-5", "effort": "high"})[0]
+    for _ in range(assistant.MAX_RUNNING):
+        asst.slots.release()
+    check("third question refused", status, 429)
+    p = allp()
+    check("summary buttons when ready", ('name="range" value="today"' in p, 'name="range" value="week"' in p, "Summarise today" in p), (True, True, True))
+    sform = {"key": key, "range": "today"}
+    check("summary bad key 403", post("/summary", {**sform, "key": "wrong"})[0], 403)
+    check("summary no key 403", post("/summary", {"range": "today"})[0], 403)
+    check("summary no origin 403", post("/summary", sform, origin=False)[0], 403)
+    check("summary evil origin 403", post("/summary", sform, origin="https://evil.example")[0], 403)
+    check("summary evil host 421", post("/summary", sform, host="evil.example")[0], 421)
+    check("summary json 415", req("POST", "/summary", "{}", headers={"Content-Type": "application/json"})[0], 415)
+    check("summary bad range 400", post("/summary", {**sform, "range": "year"})[0], 400)
+    check("summary missing range 400", post("/summary", {"key": key})[0], 400)
+    check("summary too large 413", post("/summary", {**sform, "pad": "x" * 20000})[0], 413)
+    for _ in range(assistant.MAX_RUNNING):
+        asst.slots.acquire()
+    full = post("/summary", sform)[0]
+    for _ in range(assistant.MAX_RUNNING):
+        asst.slots.release()
+    check("summary 429 when slots are full", full, 429)
+    check("nothing stored by refusals", os.path.exists(summary.path()), False)
+    seen.clear()
+    turns.extend([{"text": ["## Shipped\n\nOne <b>PR</b>.\n"], "chart": {"title": "T", "kind": "bar", "labels": ["a"], "series": [{"name": "n", "values": [3]}]}},
+                  {"text": ["## Needs you\n\nNothing."]}])
+    s, h, b = post("/summary", sform)
+    check("summary streams", (s, "content-length" in h, h.get("content-security-policy")), (200, False, _CSP))
+    check("summary question sent", ("got worse" in str(seen[0]["messages"][0]), "today (" in str(seen[0]["messages"][0])), (True, True))
+    check("summary answer goes back to overview", 'href="/?tab=overview">Back' in b, True)
+    check("summary has follow-up", ('name="chat"' in b, "Saved to the Activity section" in b), (True, True))
+    check("summary file mode", oct(os.stat(summary.path()).st_mode & 0o777), "0o600")
+    stored = open(summary.path()).read()
+    check("summary file holds no html", ("<figure" in stored, "<svg" in stored, "<strong>" in stored), (False, False, False))
+    p = allp()
+    check("summary shown on the page", ("Written " in p, p.count("<figure") >= 1, "One &lt;b&gt;PR&lt;/b&gt;." in p, "<b>PR</b>" in p), (True, True, True, False))
+    check("summary sits in Activity", p.index("<h2>Activity</h2>") < p.index("Written ") < p.index("<h2>Test queue</h2>"), True)
+    tok = b.split('name="chat" value="')[1].split('"')[0]
+    seen.clear()
+    post("/ask", {"key": key, "question": "more?", "chat": tok})
+    check("summary follow-up carries history", len(seen[0]["messages"]) >= 3, True)
+    open(summary.path(), "w").write("{broken")
+    s, h, p = req("GET", "/")
+    check("corrupt summary file still serves the page", (s, "Written " in p, "<h2>Activity</h2>" in p), (200, False, True))
+    with open(summary.path(), "w") as fh:
+        fh.write(json.dumps({"today": {"at": time.time(), "model": "m", "usd": 0, "blocks": [{"t": "text", "s": "x\udc80y"}]}}))
+    s, h, p = req("GET", "/")
+    check("a lone surrogate in a stored summary keeps the page", (s, "x?y" in allp()), (200, True))
+    srv.app.auto = types.SimpleNamespace(error="The automatic summary failed (RuntimeError). It tries again within the hour.")
+    check("auto error reaches the page", "The automatic summary failed (RuntimeError)" in allp(), True)
+    srv.app.auto = None
+    os.unlink(summary.path())
+    turns.append({"text": ["x"], "sql": "SELECT 1"})
+    seen.clear()
+    post("/summary", sform)
+    check("summary sets effort and model from defaults", (seen[0]["model"], seen[0]["output_config"]), (assistant.DEFAULT_MODEL, {"effort": assistant.DEFAULT_EFFORT}))
+    check("chat token reusable once taken and put back", asst.chats.count() >= 1, True)
+    boom = True
+    s, h, b = post("/ask", ask_form)
+    check("no credentials message", ("No Anthropic credentials" in b, fake_key in b), (True, False))
+    boom = False
+
+    check("key save 303", post("/assistant-key", {"key": key, "apikey": fake_key})[0], 303)
+    check("key saved", vault.get("key"), fake_key)
+    check("key not in argv", any(fake_key in " ".join(a) for a in argvs), False)
+    s, h, b = post("/assistant-key", {"key": key, "apikey": fake_key})
+    flash_page = req("GET", h["location"])[2]
+    check("key not in flash page", fake_key in flash_page, False)
+    check("key not in redirect", fake_key in h["location"], False)
+    check("key not in main page", fake_key in allp(), False)
+    check("saved key source shown", "Keychain" in allp(), True)
+    s, h, b = post("/assistant-key", {"key": key, "apikey": "sk-ant-short<script>"})
+    page_ = req("GET", h["location"])[2]
+    check("bad key refused, input not echoed", ("does not look like" in page_, "short" in page_), (True, False))
+    check("key form needs the page key", post("/assistant-key", {"key": "wrong", "apikey": fake_key})[0], 403)
+    s, h, b = post("/assistant-key-remove", {"key": key})
+    check("key removed", (s, "key" in vault), (303, False))
+    asst.platform = "linux"
+    s, h, b = post("/assistant-key", {"key": key, "apikey": fake_key})
+    page_ = req("GET", h["location"])[2]
+    check("no key form off mac", ("needs macOS" in page_, "key" in vault, 'name="apikey"' in allp()), (True, False, False))
+    check("item routes still need an id", post("/answer", {"key": key})[0], 400)
+
+    import io as _io
+
+    class Sink:
+        def __init__(self):
+            self.wfile, self.sent = _io.BytesIO(), []
+
+        def send_response(self, code):
+            self.sent.append(code)
+
+        def send_header(self, k, v):
+            self.sent.append((k, v))
+
+        def end_headers(self):
+            pass
+    sink = Sink()
+    Handler._send(sink, 200, "a\udc80b")
+    check("a lone surrogate cannot stop a response", (sink.wfile.getvalue(), ("Content-Length", "3") in sink.sent), (b"a?b", True))
+    calls = []
+
+    def fake_make(port, key):
+        return types.SimpleNamespace(app=types.SimpleNamespace(port=port, assistant="A", auto=None),
+                                     serve_forever=lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    import contextlib
+    import io
+    for env, want in (({}, []), ({"LEAN_ASSISTANT_AUTO_SUMMARY": "0"}, []), ({"LEAN_ASSISTANT_AUTO_SUMMARY": "1"}, ["A"])):
+        calls.clear()
+        holder = []
+
+        def fake_make2(port, key, holder=holder):
+            holder.append(fake_make(port, key))
+            return holder[0]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = main([], make=fake_make2, start=lambda a: (calls.append(a), "AUTO")[1], env=env)
+        check(f"main auto wiring {env}", (rc, calls, holder[0].app.auto), (0, want, "AUTO" if want else None))
 
     srv.shutdown()
     srv.server_close()
