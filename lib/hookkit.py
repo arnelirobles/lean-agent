@@ -6,14 +6,12 @@ and every git call has a short timeout. Standard library only, Python 3.9+.
 
   python3 lib/hookkit.py --self-test
 """
-import ast
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
-import tempfile
 import threading
 
 SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")", ";;", "|&"}
@@ -125,6 +123,7 @@ MANIFEST_EVENT_KEYS = ("event", "matcher", "if", "group", "order", "timeout")
 
 def read_manifest(path):
     """Return the HOOK literal of a hook file without importing it. Raises ValueError("PATH: reason")."""
+    import ast
     with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read(), filename=path)
     found = [node for node in tree.body if isinstance(node, ast.Assign)
@@ -225,6 +224,8 @@ RANK = {"off": 0, "note": 1, "block": 2}
 # Claude Code's managed policy files. A test replaces this list so it never reads the real ones.
 MANAGED_SETTINGS = ["/Library/Application Support/ClaudeCode/managed-settings.json",
                     "/etc/claude-code/managed-settings.json"]
+# The user's own settings file. A test replaces this so it never reads the real one.
+USER_SETTINGS = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 REPO_WHERE = "this repo's .claude/settings.json"
 PREFIX_WHERE = "the command prefix"
 
@@ -336,6 +337,8 @@ def _repo_sourced(name, value):
     for path in MANAGED_SETTINGS:
         if name in _env_block(path):
             return False
+    if _env_block(USER_SETTINGS).get(name) == value:
+        return False  # the user's own settings say the same, so this value is theirs too
     for d in dirs:
         if name in _env_block(os.path.join(d, ".claude", "settings.local.json")) and _local_is_user(d):
             return False
@@ -367,6 +370,8 @@ def guard_note(name, where, text=None):
 
 def _take_guard():
     """The waiting guard notes as one text, leaving out any already said in this session. Empty when none."""
+    if not _state.guard_text:
+        return ""
     waiting, _state.guard_text = _state.guard_text, []
     hook = os.path.basename(_hook_name())
     if hook.endswith(".py"):
@@ -375,11 +380,13 @@ def _take_guard():
     lines = []
     for name, where, said in waiting:
         if sid:  # without a session there is nothing to mark, so the note is said every time
+            import tempfile
             folder = os.path.join(tempfile.gettempdir(), "lean-agent", sid)
             try:
                 os.makedirs(folder, exist_ok=True)
                 flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                os.close(os.open(os.path.join(folder, "guard-" + re.sub(r"\W", "_", name)), flags, 0o600))
+                mark = "guard-" + re.sub(r"\W", "_", name) + "-" + re.sub(r"\W", "_", where)
+                os.close(os.open(os.path.join(folder, mark), flags, 0o600))
             except FileExistsError:
                 continue
             except OSError:
@@ -404,6 +411,24 @@ def flush_guard(code=0):
     else:
         _emit(str(_state.event.get("hook_event_name") or "PreToolUse"), text)
     _keep_notice(text)
+
+
+PROFILE_RANK = {"off": 0, "standard": 1, "strict": 2}
+
+
+def _user_profile():
+    """The LEAN_PROFILE the user set in their own settings or in a managed policy file (the stricter of the
+    two when both do), standard when neither does. An unrecognised value counts as strict."""
+    found = "standard"
+    seen = []
+    for path in [USER_SETTINGS] + list(MANAGED_SETTINGS):
+        raw = _env_block(path).get("LEAN_PROFILE")
+        if isinstance(raw, str):
+            raw = raw.strip().lower()
+            seen.append(raw if raw in PROFILES else "strict")
+    if seen:
+        found = max(seen, key=PROFILE_RANK.get)
+    return found
 
 
 def _is_guard(manifest):
@@ -433,17 +458,21 @@ def resolve_for(hook, manifest, seg=None, standard=None, bound=None, quiet=False
     guard = _is_guard(manifest)
     level = profile()
     if guard and level != "strict" and from_repo("LEAN_PROFILE"):
-        # a repository cannot loosen a guard with its own LEAN_PROFILE: resolve as if it were strict
-        if not quiet:
-            guard_note("LEAN_PROFILE", REPO_WHERE)
-        level = "strict"
+        # a repository cannot loosen a guard with its own LEAN_PROFILE: a value looser than the user's own
+        # profile (standard when they set none) is dropped, down to that profile
+        floor = _user_profile()
+        if PROFILE_RANK[level] < PROFILE_RANK[floor]:
+            if not quiet:
+                guard_note("LEAN_PROFILE", REPO_WHERE)
+            level = floor
     if level == "off":
         return "off", "profile-off"
     name = switch_name(hook)
     default = _default(manifest, standard, level)
 
     def looser(found):
-        return RANK[found] < RANK[default]
+        # an off is always a loosening of a guard, even where the default is already off
+        return found == "off" or RANK[found] < RANK[default]
 
     def drop(key, where):
         if not quiet:
@@ -1073,6 +1102,7 @@ def _switch_tests(check, scratch):
 def _guard_tests(check, scratch):
     """Guards: a loosening from a repo's settings or a command prefix is dropped, with one note per session."""
     import contextlib
+    import tempfile
     import io
     import shutil
 
@@ -1080,14 +1110,16 @@ def _guard_tests(check, scratch):
         def __init__(self, **env):
             self.env = env
 
-    global MANAGED_SETTINGS, _RECORD
+    global MANAGED_SETTINGS, USER_SETTINGS, _RECORD
     keys = ("CLAUDE_PROJECT_DIR", "LEAN_HOOK_GATE_G", "LEAN_HOOK_GATE_N", "LEAN_SKIP_GATE_G", "LEAN_HOOK_MODE",
             "LEAN_ALLOW_COMMIT_AUTHOR", "LEAN_PROFILE", "LEAN_SKIP_PUBLIC_TEXT")
     saved = {k: os.environ.pop(k, None) for k in keys}
     saved_state = (_state.name, _state.manifest, _state.mode, _state.event)
-    saved_managed, saved_record = MANAGED_SETTINGS, _RECORD
+    saved_managed, saved_record, saved_user = MANAGED_SETTINGS, _RECORD, globals().get("USER_SETTINGS")
     managed = os.path.join(scratch, "no-managed.json")
     MANAGED_SETTINGS, _RECORD = [managed], False
+    user_settings = os.path.join(scratch, "no-user.json")
+    USER_SETTINGS = user_settings
     os.environ["LEAN_PROFILE"] = "strict"
     guard = {"guard": True, "default": {"strict": "block", "standard": "note"}}
     plain = {"guard": False, "default": {"strict": "block", "standard": "note"}}
@@ -1215,7 +1247,7 @@ def _guard_tests(check, scratch):
             os.environ["LEAN_SKIP_PUBLIC_TEXT"] = "1"
             check("disabled ignores an env value the repo set", disabled("LEAN_SKIP_PUBLIC_TEXT"), False)
             flush_guard(0)
-        check("disabled says so once per session and name", captured.getvalue().count("is ignored"), 1)
+        check("disabled says so once per session, name and source", captured.getvalue().count("is ignored"), 2)
         check("disabled names the prefix", "from the command prefix" in captured.getvalue(), True)
         os.environ["CLAUDE_PROJECT_DIR"] = make_repo({})
         check("disabled keeps a user env value in a guard", disabled("LEAN_SKIP_PUBLIC_TEXT"), True)
@@ -1229,13 +1261,13 @@ def _guard_tests(check, scratch):
             os.environ["LEAN_PROFILE"] = "strict"
             return code, out
         code, out = profile_call(guard, {"LEAN_PROFILE": "off"}, LEAN_PROFILE="off")
-        check("repo LEAN_PROFILE=off does not turn a guard off", (code, "LEAN_PROFILE from this repo" in out), (2, True))
+        check("repo LEAN_PROFILE=off does not turn a guard off", (code, "LEAN_PROFILE from this repo" in out), (0, True))
         code, out = profile_call(plain, {"LEAN_PROFILE": "off"}, LEAN_PROFILE="off")
         check("repo LEAN_PROFILE=off turns a non-guard off", (code, out), (0, ""))
         code, out = profile_call(guard, {}, LEAN_PROFILE="off")
         check("a user LEAN_PROFILE=off turns a guard off", (code, out), (0, ""))
         code, out = profile_call(guard, {"LEAN_PROFILE": "standard"}, LEAN_PROFILE="standard")
-        check("repo LEAN_PROFILE=standard keeps a guard at its strict default", (code, "LEAN_PROFILE from this repo" in out), (2, True))
+        check("repo LEAN_PROFILE=standard gives a guard its standard default", (code, "LEAN_PROFILE from this repo" in out), (0, False))
 
         # the project directory below the git root, and a committed settings.local.json
         root = make_repo(None)
@@ -1340,6 +1372,69 @@ def _guard_tests(check, scratch):
             globals()["_repo_env"] = real_block
         check("fail closed: an error in the repo check blocks", (code, "this repo" in out), (2, True))
 
+        # C1: a guard whose standard default is already off: an off from a repo or a prefix is still a loosening
+        quiet = {"guard": True, "default": {"strict": "block", "standard": "off"}}
+        os.environ["LEAN_PROFILE"] = "standard"
+
+        def off_call(root, seg=None, bound=None, **env):
+            for k in ("LEAN_HOOK_GATE_Q", "LEAN_SKIP_GATE_Q", "LEAN_HOOK_MODE"):
+                os.environ.pop(k, None)
+            os.environ["CLAUDE_PROJECT_DIR"] = root
+            os.environ.update(env)
+            bind("gate-q.py", quiet, bound)
+            _state.event = {"session_id": new_session(), "cwd": root}
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                result = resolve_mode(seg)
+                flush_guard(0)
+            return result, out.getvalue() + err.getvalue()
+
+        result, out = off_call(make_repo({"LEAN_HOOK_GATE_Q": "off"}), LEAN_HOOK_GATE_Q="off")
+        check("C1: a repo off over an off default is dropped", (result, "this repo" in out), (("off", "default"), True))
+        result, out = off_call(make_repo({"LEAN_SKIP_GATE_Q": "1"}), LEAN_SKIP_GATE_Q="1")
+        check("C1: a repo LEAN_SKIP_ over an off default is dropped", (result, "this repo" in out), (("off", "default"), True))
+        result, out = off_call(make_repo({}), _Seg(LEAN_HOOK_GATE_Q="off"))
+        check("C1: a prefix off over an off default is dropped", (result, "command prefix" in out), (("off", "default"), True))
+        result, out = off_call(make_repo({"LEAN_HOOK_MODE": "GATE_Q:off"}), bound="off", LEAN_HOOK_MODE="GATE_Q:off")
+        check("C1: a repo LEAN_HOOK_MODE off over an off default is dropped",
+              (result, "LEAN_HOOK_MODE from this repo" in out), (("off", "default"), True))
+        result, out = off_call(make_repo({}), LEAN_HOOK_GATE_Q="off")
+        check("C1: a user off is kept", (result, out), (("off", "env"), ""))
+        result, out = off_call(make_repo({}))
+        check("C1: no switch is the default", (result, out), (("off", "default"), ""))
+
+        # I3: a repo LEAN_PROFILE falls back to the user's own profile, not to strict
+        os.environ["LEAN_PROFILE"] = "strict"
+        code, out = profile_call(guard, {"LEAN_PROFILE": "standard"}, LEAN_PROFILE="standard")
+        check("I3: repo standard with no user profile is standard (a note, not a block)",
+              (code, "is ignored" in out), (0, False))
+        code, out = profile_call(guard, {"LEAN_PROFILE": "off"}, LEAN_PROFILE="off")
+        check("I3: repo off with no user profile falls to standard", (code, "LEAN_PROFILE from this repo" in out), (0, True))
+        with open(user_settings, "w", encoding="utf-8") as handle:
+            json.dump({"env": {"LEAN_PROFILE": "strict"}}, handle)
+        code, out = profile_call(guard, {"LEAN_PROFILE": "off"}, LEAN_PROFILE="off")
+        check("I3: repo off with user strict is strict", (code, "LEAN_PROFILE from this repo" in out), (2, True))
+        with open(user_settings, "w", encoding="utf-8") as handle:
+            json.dump({"env": {"LEAN_PROFILE": "off"}}, handle)
+        code, out = profile_call(guard, {"LEAN_PROFILE": "off"}, LEAN_PROFILE="off")
+        check("I3: repo off with user settings also off is off", (code, out), (0, ""))
+        # 7c: the user's own settings saying the same value make it theirs
+        with open(user_settings, "w", encoding="utf-8") as handle:
+            json.dump({"env": {"LEAN_HOOK_GATE_G": "off"}}, handle)
+        os.environ["LEAN_PROFILE"] = "strict"
+        code, out = call("gate-g.py", guard, make_repo({"LEAN_HOOK_GATE_G": "off"}), new_session(), LEAN_HOOK_GATE_G="off")
+        check("7c: a repo value the user's settings also set is the user's", (code, out), (0, ""))
+        os.remove(user_settings)
+
+        # M5: the once-per-session marker is per name and per source
+        sid = new_session()
+        code, out = call("gate-g.py", guard, make_repo({"LEAN_HOOK_GATE_G": "off"}), sid, LEAN_HOOK_GATE_G="off")
+        check("M5: a repo drop is said", (code, "this repo" in out), (2, True))
+        code, out = call("gate-g.py", guard, make_repo({}), sid, _Seg(LEAN_HOOK_GATE_G="off"))
+        check("M5: a prefix drop after a repo drop is said too", (code, "command prefix" in out), (2, True))
+        code, out = call("gate-g.py", guard, make_repo({}), sid, _Seg(LEAN_HOOK_GATE_G="off"))
+        check("M5: and then not again", (code, out), (2, ""))
+
         # one JSON document on stdout
         fixture = os.path.join(scratch, "fixture-guard.py")
         here = os.path.dirname(os.path.realpath(__file__))
@@ -1391,7 +1486,7 @@ def _guard_tests(check, scratch):
         _state.event = {"cwd": repo}
         check("repo_root falls back to the event cwd", repo_root(), repo)
     finally:
-        MANAGED_SETTINGS, _RECORD = saved_managed, saved_record
+        MANAGED_SETTINGS, _RECORD, USER_SETTINGS = saved_managed, saved_record, saved_user
         _state.name, _state.manifest, _state.mode, _state.event = saved_state
         for key, val in saved.items():
             os.environ.pop(key, None)

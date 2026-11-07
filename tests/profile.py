@@ -12,6 +12,7 @@ d. LEAN_PROFILE=strict (and an unknown value): the hook from origin/main and the
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -239,6 +240,12 @@ RENAMED = [
 ]
 
 
+def table_is_stale(tag, table):
+    """True when TAG is v1.27.0 or later (the release that carries #146) and TABLE still has rows."""
+    found = re.match(r"^v(\d+)\.(\d+)\.(\d+)$", tag)
+    return bool(found and tuple(int(n) for n in found.groups()) >= (1, 27, 0) and table)
+
+
 def renamed(text):
     for old_text, new_text in RENAMED:
         text = text.replace(old_text, new_text)
@@ -361,11 +368,20 @@ def part_d():
         check("standard: Write crash is a note", (r[0], "did not run" in r[1]), (0, True))
 
 
+def part_e():
+    check("RENAMED is gone once STRICT_TAG carries #146", table_is_stale(STRICT_TAG, RENAMED), False)
+    check("the stale check fires at v1.27.0 with rows left", table_is_stale("v1.27.0", [("a", "b")]), True)
+    check("the stale check fires after v1.27.0 with rows left", table_is_stale("v1.30.2", [("a", "b")]), True)
+    check("the stale check is quiet before v1.27.0", table_is_stale("v1.26.9", [("a", "b")]), False)
+    check("the stale check is quiet with no rows", table_is_stale("v1.27.0", []), False)
+
+
 def self_test():
     part_a()
     part_b()
     part_c()
     part_d()
+    part_e()
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

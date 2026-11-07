@@ -35,7 +35,9 @@ lean.db, so a weekly count is possible.
                             environment or in the env block of your user
                             settings. Inline in front of the command, or in
                             a repository's own settings, it is ignored here
-                            (this hook is a guard)
+                            (this hook is a guard), and a commit or push that
+                            carries it there is refused like --no-verify, because
+                            the git hooks would still honour it
   secret-scan.py --self-test
 """
 import importlib.machinery
@@ -518,6 +520,12 @@ def bypasses(calls, touching, assigned):
     for name in sorted(assigned):
         if BYPASS_ENV.fullmatch(name):
             found.append(f"{name}= in the command")
+    # the installed git hooks read this skip from their own environment, so one that this hook ignores
+    # (a prefix, an export, or a value from a repository's settings) would still switch them off
+    if SKIP in assigned:
+        found.append(f"{SKIP}= in the command")
+    elif os.environ.get(SKIP) == "1" and hookkit.from_repo(SKIP):
+        found.append(f"{SKIP}=1 from this repo's settings")
     for c in calls + touching:
         for key, _value in c.config:
             low = key.lower()
@@ -821,6 +829,58 @@ def self_test():
                            ("$(printf git) commit", "$(printf git) commit -m x"), ("git -C $DIR", "git -C $DIR commit -m x"),
                            ("cd to a folder that does not exist yet", "cd nosuch && git commit -m x")):
             check(f"installed, {label}: passes", bash(cmd, bare).returncode, 0)
+
+        # a skip that reaches the guard from a cloned repo, or the command, must not reach the git hooks either
+        def repo_settings(r, values):
+            os.makedirs(os.path.join(r, ".claude"), exist_ok=True)
+            with open(os.path.join(r, ".claude", "settings.json"), "w") as f:
+                json.dump({"env": values}, f)
+
+        cloned = make("cloned")
+        put(cloned, "a.txt", "a\n")
+        commit(cloned, "base")
+        check("C1 setup: install", install(cloned).returncode, 0)
+        repo_settings(cloned, {SKIP: "1", "LEAN_HOOK_SECRET_SCAN": "off"})
+        leaky = {"file_path": os.path.join(cloned, "w.txt"), "content": "k = " + google + "\n"}
+        for profile in ("standard", "strict"):
+            for label, extra in (("LEAN_SKIP_SECRET_SCAN=1", {SKIP: "1"}), ("LEAN_HOOK_SECRET_SCAN=off", {"LEAN_HOOK_SECRET_SCAN": "off"})):
+                p = hook("Write", leaky, cloned, dict(extra, LEAN_PROFILE=profile, CLAUDE_PROJECT_DIR=cloned))
+                check(f"C1 {profile}: a repo's {label} does not turn the write scan off", p.returncode, 2)
+        nosettings = make("nosettings")
+        put(nosettings, "a.txt", "a\n")
+        commit(nosettings, "base")
+        check("C1 setup: install, no repo settings", install(nosettings).returncode, 0)
+        leaky_user = {"file_path": os.path.join(nosettings, "w.txt"), "content": "k = " + google + "\n"}
+        p = hook("Write", leaky_user, nosettings, {SKIP: "1", "LEAN_PROFILE": "standard", "CLAUDE_PROJECT_DIR": nosettings})
+        check("C1: the same skip set by the user still turns it off", p.returncode, 0)
+
+        for label, cmd in (("a prefix", "LEAN_SKIP_SECRET_SCAN=1 git commit -m x"),
+                           ("an export", "export LEAN_SKIP_SECRET_SCAN=1; git commit -m x"),
+                           ("inside bash -c", "bash -c 'LEAN_SKIP_SECRET_SCAN=1 git commit -m x'"),
+                           ("a prefix on a push", "LEAN_SKIP_SECRET_SCAN=1 git push origin main")):
+            p = bash(cmd, nosettings, {"CLAUDE_PROJECT_DIR": nosettings})
+            check(f"C2: {label} is refused, as --no-verify is", p.returncode, 2)
+            check(f"C2: {label} names the skip", SKIP in p.stderr and "without the git hooks" in p.stderr, True)
+        p = bash("LEAN_SKIP_SECRET_SCAN=1 git commit -m x", nosettings, {"LEAN_PROFILE": "standard", "CLAUDE_PROJECT_DIR": nosettings,
+                                                                  "LEAN_DB": os.path.join(tmp, "note.db")})
+        check("C2 standard: a prefix gets the --no-verify note", (p.returncode, "turned off" in p.stdout), (0, True))
+        p = bash("git commit -m x", cloned, {SKIP: "1", "CLAUDE_PROJECT_DIR": cloned})
+        check("C2: a skip from the repo's settings is refused for the git hooks", p.returncode, 2)
+        check("C2: and the message says so", "without the git hooks" in p.stderr and SKIP in p.stderr, True)
+        p = bash("git commit -m x", nosettings, {SKIP: "1", "CLAUDE_PROJECT_DIR": nosettings})
+        check("C2: a user's env skip still works for the git hooks", p.returncode, 0)
+        os.makedirs(os.path.join(tmp, ".claude"), exist_ok=True)
+        with open(os.path.join(tmp, ".claude", "settings.json"), "w") as f:
+            json.dump({"env": {SKIP: "1"}}, f)
+        p = bash("git commit -m x", cloned, {SKIP: "1", "CLAUDE_PROJECT_DIR": cloned})
+        check("C2: a repo value the user's settings also set is the user's", p.returncode, 0)
+        os.remove(os.path.join(tmp, ".claude", "settings.json"))
+        put(nosettings, "k.txt", "k = " + google + "\n")
+        sh("git", "-C", nosettings, "add", "k.txt")
+        p = sh("git", "-C", nosettings, "commit", "-qm", "x", extra={SKIP: "1"})
+        check("C2 (what the guard keeps out): the git hook honours the skip", p.returncode, 0)
+        sh("git", "-C", nosettings, "reset", "-q", "--hard", "HEAD~1")
+        shutil.rmtree(os.path.join(cloned, ".claude"))
 
         # the regression set: ordinary work in a repository with the hooks passes
         origin = os.path.join(tmp, "origin.git")

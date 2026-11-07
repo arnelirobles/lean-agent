@@ -26,6 +26,22 @@ Each hook is one `python3 hooks/<name>` process with the event on stdin, with `L
 
 Claude Code starts the group's hooks in parallel, so the serial sum is not what a tool call waits for. It is the total process work.
 
+## After the final-review fixes
+
+Same method and script, taken on 2026-11-07 on the same machine, branch extensible-core after the final review fixes (the head that follows bc889e4). `ast` and `tempfile` are imported only where used, and the guard note step returns at once when no note is waiting.
+
+| hook | median ms | p90 ms |
+|---|---|---|
+| commit-author.py | 33.1 | 33.9 |
+| secret-scan.py | 39.2 | 39.6 |
+| docs-containers.py | 31.1 | 32.1 |
+| public-text.py | 33.6 | 34.3 |
+| test-before-push.py | 31.1 | 32.0 |
+| wait-loop.py | 33.2 | 33.6 |
+| bg-bound.py | 31.0 | 31.8 |
+| script-note.py | 47.7 | 48.7 |
+| group, run serially | 280.6 | 283.4 |
+
 ## Script
 
 Run from the repository root with `python3 latency.py`.

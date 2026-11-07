@@ -237,6 +237,9 @@ def _keep_decision(value, name, dropped):
     if inner.get("behavior") != "deny":
         dropped.append(("decision", name))
         return None
+    for key in [k for k in inner if k not in ("behavior", "message", "interrupt")]:
+        del inner[key]
+        dropped.append((key, name))
     return inner
 
 
@@ -294,8 +297,10 @@ def merge(results, event_name=None):
                         kept = _keep_decision(v, name, dropped)
                         if kept is not None:
                             spec.setdefault("decision", kept)
-                    else:
+                    elif k == "hookEventName":
                         spec.setdefault(k, v)
+                    else:  # a key the merge does not know cannot reach Claude Code through a member
+                        dropped.append((k, name))
             elif key == "permissionDecision":
                 _permission(spec, value, name, dropped)
             elif key == "updatedInput":
@@ -517,6 +522,15 @@ def self_test():
     got = json.loads(out)["hookSpecificOutput"]["decision"] if out.strip() else None
     check("PermissionRequest deny kept without updatedInput", got == {"behavior": "deny", "message": "m"}
           and "dispatch: dropped updatedInput from perm_deny.py" in err, repr((out, err)))
+    perm_extra = jhook("perm_extra.py", {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "newKey": 1, "decision": {
+        "behavior": "deny", "message": "m", "interrupt": True, "updatedPermissions": [{"type": "addRules"}]}}})
+    code, out, err = one([row("perm_extra.py", perm_extra)])
+    got = json.loads(out)["hookSpecificOutput"] if out.strip() else {}
+    check("hookSpecificOutput keys outside the allowlist are dropped",
+          got.get("decision") == {"behavior": "deny", "message": "m", "interrupt": True}
+          and "newKey" not in got and "updatedPermissions" not in out
+          and "dispatch: dropped newKey from perm_extra.py" in err
+          and "dispatch: dropped updatedPermissions from perm_extra.py" in err, repr((out, err)))
     approve = jhook("approve.py", {"decision": "approve", "reason": "ok"})
     code, out, err = one([row("approve.py", approve)])
     check("never_grants approve", "approve" not in out and "dispatch: dropped decision from approve.py" in err, repr((out, err)))
@@ -525,7 +539,9 @@ def self_test():
     odd = jhook("odd.py", {"custom": 1, "hookSpecificOutput": {"hookEventName": "PreToolUse", "extra": "x"}})
     code, out, err = one([row("odd.py", odd)])
     got = json.loads(out)
-    check("unknown keys", got.get("custom") == 1 and got["hookSpecificOutput"].get("extra") == "x", repr(out))
+    check("unknown top level keys pass, unknown hookSpecificOutput keys are dropped",
+          got.get("custom") == 1 and "extra" not in got.get("hookSpecificOutput", {})
+          and "dispatch: dropped extra from odd.py" in err, repr((out, err)))
     plain = hook("plain.py", "def main():\n    hookkit.read_event()\n    print('plain words')\n    return 0")
     code, out, err = one([row("plain.py", plain)])
     check("non-JSON stdout alone", out == "plain words\n", repr(out))
