@@ -251,9 +251,9 @@ def repo_root():
 
 
 def _env_block(path):
-    """The env block of one settings file, {} when the file is missing, unreadable or odd."""
+    """The env block of one settings file the user owns, {} when the file is missing, unreadable or odd."""
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             data = json.load(handle)
         block = data.get("env") if isinstance(data, dict) else None
         return block if isinstance(block, dict) else {}
@@ -261,29 +261,74 @@ def _env_block(path):
         return {}
 
 
-def _untracked(directory, path):
-    """True only when git says PATH is not tracked. Any other answer (tracked, git missing, a timeout, an
-    error) is False, so a file git cannot vouch for does not count as the user's."""
+EVERY_NAME = object()  # a repository settings file we cannot read counts as setting every name
+
+
+def _repo_env(path):
+    """The env block of a repository's settings.json: {} when there is no such file, EVERY_NAME when the
+    file is there but does not parse (after a leading BOM is dropped) or cannot be read."""
+    if not os.path.lexists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return EVERY_NAME
+    block = data.get("env") if isinstance(data, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def _tracked_names(directory):
+    """The lower-cased base names of every path git tracks under DIRECTORY/.claude, or None when git cannot
+    say (missing, a timeout, an error). core.fsmonitor is off and no GIT_* location variable is passed on,
+    so a cloned repository's config cannot run a program or point git elsewhere."""
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
     try:
-        done = subprocess.run(["git", "-C", directory, "ls-files", "--error-unmatch", "--", path],
-                              capture_output=True, text=True, timeout=3, env=env)
+        done = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", directory, "ls-files", "-z", "--", ".claude"],
+                              capture_output=True, timeout=3, env=env)
     except Exception:
+        return None
+    if done.returncode != 0:
+        return None
+    return {os.path.basename(p).lower() for p in done.stdout.decode("utf-8", "replace").split("\0") if p}
+
+
+def _local_is_user(directory):
+    """True only when DIRECTORY/.claude/settings.local.json is the user's own: a real file under a real
+    .claude folder (no symlink), spelled exactly so, and not tracked by git under any case spelling. Any
+    doubt, including a git error, says False."""
+    claude = os.path.join(directory, ".claude")
+    local = os.path.join(claude, "settings.local.json")
+    try:
+        if os.path.islink(claude) or os.path.islink(local):
+            return False
+        real_claude, real_local = os.path.realpath(claude), os.path.realpath(local)
+        if os.path.commonpath([real_claude, real_local]) != real_claude:
+            return False
+        if "settings.local.json" not in os.listdir(claude):
+            return False
+    except (OSError, ValueError):
         return False
-    return done.returncode == 1
+    tracked = _tracked_names(directory)
+    return tracked is not None and "settings.local.json" not in tracked
 
 
 def _repo_sourced(name, value):
     dirs = _project_dirs()
-    if not any(name in _env_block(os.path.join(d, ".claude", "settings.json"))
-               and str(_env_block(os.path.join(d, ".claude", "settings.json"))[name]) == value for d in dirs):
+    found = False
+    for d in dirs:
+        block = _repo_env(os.path.join(d, ".claude", "settings.json"))
+        if block is EVERY_NAME:
+            found = True
+        elif name in block and (not isinstance(block[name], str) or block[name] == value):
+            found = True
+    if not found:
         return False
     for path in MANAGED_SETTINGS:
         if name in _env_block(path):
             return False
     for d in dirs:
-        local = os.path.join(d, ".claude", "settings.local.json")
-        if name in _env_block(local) and _untracked(d, os.path.join(".claude", "settings.local.json")):
+        if name in _env_block(os.path.join(d, ".claude", "settings.local.json")) and _local_is_user(d):
             return False
     return True
 
@@ -1198,18 +1243,63 @@ def _guard_tests(check, scratch):
                         "--no-verify", "-m", "x"], check=True, capture_output=True)
         code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
         check("a committed settings.local.json is the repo's", (code, "this repo" in out), (2, True))
-        check("a directory git cannot answer for is not untracked", _untracked(make_repo(None, git=False), "x"), False)
+        check("a directory git cannot answer for is not the user's", _local_is_user(make_repo(None, git=False)), False)
+
+        # a case variant or a symlink does not pass as the user's local settings
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"})
+        for fname in ("Settings.Local.json", "settings.local.json"):
+            with open(os.path.join(root, ".claude", fname), "w", encoding="utf-8") as handle:
+                json.dump({"env": {"LEAN_HOOK_GATE_G": "off"}}, handle)
+        subprocess.run(["git", "-C", root, "add", "-f", ".claude/Settings.Local.json"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", root, "-c", "user.email=t@example.org", "-c", "user.name=t", "commit", "-q",
+                        "--no-verify", "-m", "x"], check=True, capture_output=True)
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a committed case variant of settings.local.json is the repo's", (code, "this repo" in out), (2, True))
+        root = make_repo(None)
+        elsewhere = tempfile.mkdtemp(prefix="claude-dir-", dir=scratch)
+        for fname in ("settings.json", "settings.local.json"):
+            with open(os.path.join(elsewhere, fname), "w", encoding="utf-8") as handle:
+                json.dump({"env": {"LEAN_HOOK_GATE_G": "off"}}, handle)
+        shutil.rmtree(os.path.join(root, ".claude"))
+        os.symlink(elsewhere, os.path.join(root, ".claude"))
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a .claude symlink is not the user's", (code, "this repo" in out), (2, True))
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"}, {"LEAN_HOOK_GATE_G": "off"})
+        marker = os.path.join(scratch, "fsmonitor-ran")
+        hook_script = os.path.join(scratch, "fsmonitor.sh")
+        with open(hook_script, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\ntouch %s\n" % marker)
+        os.chmod(hook_script, 0o755)
+        subprocess.run(["git", "-C", root, "config", "core.fsmonitor", hook_script], check=True, capture_output=True)
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("the plain untracked settings.local.json still counts as the user's", (code, out), (0, ""))
+        check("the check does not run the repo's fsmonitor", os.path.exists(marker), False)
+
+        # settings the repo could use to hide a value
+        root = make_repo(None)
+        with open(os.path.join(root, ".claude", "settings.json"), "wb") as handle:
+            handle.write(b"\xef\xbb\xbf" + json.dumps({"env": {"LEAN_HOOK_GATE_G": "off"}}).encode())
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a BOM does not hide a repo setting", (code, "this repo" in out), (2, True))
+        root = make_repo(None)
+        with open(os.path.join(root, ".claude", "settings.json"), "w", encoding="utf-8") as handle:
+            handle.write('{"env": {"LEAN_HOOK_GATE_G": "off",}')
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a broken settings.json counts as setting every name", (code, "this repo" in out), (2, True))
+        root = make_repo({"LEAN_SKIP_GATE_G": 1})
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_SKIP_GATE_G="1")
+        check("a non-string repo value counts as repo-sourced", (code, "this repo" in out), (2, True))
 
         # an error while checking a loosening counts as repo-sourced
-        real_block = globals()["_env_block"]
+        real_block = globals()["_repo_env"]
 
         def broken(path):
             raise RuntimeError("injected")
-        globals()["_env_block"] = broken
+        globals()["_repo_env"] = broken
         try:
             code, out = call("gate-g.py", guard, make_repo({}), new_session(), LEAN_HOOK_GATE_G="off")
         finally:
-            globals()["_env_block"] = real_block
+            globals()["_repo_env"] = real_block
         check("fail closed: an error in the repo check blocks", (code, "this repo" in out), (2, True))
 
         # one JSON document on stdout
