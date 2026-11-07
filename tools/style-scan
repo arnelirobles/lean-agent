@@ -6,7 +6,7 @@ a preflight or CI step. It reads the lines added since the merge base with
 BASE (default origin/HEAD, then origin/main, then origin/master), including
 uncommitted and staged changes, and every line of untracked files that are not
 ignored. Each added line is checked for agent attribution and slop (the lists
-in lib/house_style.py) and for any character at or above U+2000 (dashes, curly
+in rules/, LEAN_RULES picks the sets) and for any character at or above U+2000 (dashes, curly
 quotes, arrows, emoji), which is how a stray em dash or smart quote shows up.
 
 Skipped: binary files, lock files (package-lock.json, yarn.lock, go.sum,
@@ -24,7 +24,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
-from house_style import scan, wide_char  # noqa: E402
+import rules  # noqa: E402
+from house_style import scan_sets, wide_char  # noqa: E402
 
 LOCK_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "go.sum",
               "packages.lock.json", "composer.lock", "Gemfile.lock", "Cargo.lock", "poetry.lock",
@@ -93,10 +94,11 @@ def added_lines(base, cwd="."):
 def findings(base, cwd="."):
     check_wide = "1" not in (os.environ.get("LEAN_SKIP_WIDE_CHARS"), os.environ.get("LEAN_ALLOW_WIDE_CHARS"))
     out = []
+    sets = rules.load()
     for path, number, text in added_lines(base_commit(base, cwd), cwd):
         if ALLOW_MARK in text:
             continue
-        problems = [f"{kind} {what}" for kind, what in scan(text)]
+        problems = [f"{kind} {what}" for kind, what in scan_sets(text, sets)]
         ch = wide_char(text) if check_wide else None
         if ch and not any(ch in p for p in problems):
             problems.append(f"character U+{ord(ch):04X} at or above U+2000")

@@ -142,7 +142,7 @@ STRICT_TAG = "v1.21.0"
 
 
 def extract(dest, source_dir=None):
-    """Copy hooks, lib and tools: from STRICT_TAG when source_dir is None, else from the working tree."""
+    """Copy hooks, lib, tools and rules: from STRICT_TAG when source_dir is None, else from the working tree."""
     if source_dir is None:
         found = subprocess.run(["git", "-C", ROOT, "rev-parse", "--verify", "-q", f"refs/tags/{STRICT_TAG}^{{commit}}"],
                                capture_output=True, text=True)
@@ -153,7 +153,7 @@ def extract(dest, source_dir=None):
                                  capture_output=True, check=True).stdout
         subprocess.run(["tar", "-x", "-C", dest], input=archive, check=True)
     else:
-        for part in ("hooks", "lib", "tools"):
+        for part in ("hooks", "lib", "tools", "rules"):
             shutil.copytree(os.path.join(source_dir, part), os.path.join(dest, part), ignore=shutil.ignore_patterns("__pycache__"))
 
 

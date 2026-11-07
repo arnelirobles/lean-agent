@@ -22,11 +22,12 @@ gh api calls count as writes when they send fields (-f, -F, --field,
 --raw-field), a body (--input FILE) or use POST, PATCH or PUT. A GET, or a
 graphql query that is not a mutation (read from an @file too), passes.
 Message files are resolved against the directory the command runs in, after
-any `cd`. The word and pattern lists live in lib/house_style.py.
+any `cd`. The word and pattern lists are the rule sets in rules/, loaded by lib/rules.py.
 
   LEAN_SKIP_ATTRIBUTION=1    skip the attribution check
   LEAN_SKIP_SLOP=1           skip the slop check
   LEAN_HOOK_PUBLIC_TEXT=off  turn the whole hook off
+  LEAN_RULES=-attribution    drop the attribution set (a user setting only)
 Any of them can be set in the environment or in the `env` block of your user
 Claude Code settings. Inline in front of the command, or in a repository's own
 settings, they are ignored: this hook is a guard.
@@ -40,7 +41,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
-from house_style import scan  # noqa: E402
+import rules  # noqa: E402
+from house_style import scan_sets  # noqa: E402
 
 HOOK = {
     "events": [
@@ -166,19 +168,32 @@ def prose(text):
     return REVERT_SUBJECT.sub("", text)
 
 
+def loaded_sets():
+    """The rule sets, with attribution put back when a repository's own settings dropped it."""
+    sets = rules.load()
+    if not any(s["name"] == "attribution" for s in sets) and hookkit.from_repo("LEAN_RULES"):
+        sets = rules.load(["attribution"]) + sets
+        hookkit.guard_note("LEAN_RULES", "this repo's .claude/settings.json")
+    return sets
+
+
 def problems(command, cwd="."):
     found = []
+    sets = None
     for seg in hookkit.segments(command, cwd):
         texts = published(seg)
         if texts is None or hookkit.off(seg):
             continue
+        if sets is None:
+            sets = loaded_sets()
         if not hookkit.disabled("LEAN_SKIP_ATTRIBUTION", seg):
             for where, text in [("the command", command)] + texts:
-                found += [f"{kind}: {where} contains {what}" for kind, what in scan(text, slop=False)]
+                found += [f"{kind}: {where} contains {what}"
+                          for kind, what in scan_sets(text, sets, slop=False)]
         if not hookkit.disabled("LEAN_SKIP_SLOP", seg):
             for where, text in texts:
                 found += [f"{kind}: {where} contains {what}"
-                          for kind, what in scan(prose(text), attribution=False)]
+                          for kind, what in scan_sets(prose(text), sets, attribution=False)]
     return list(dict.fromkeys(found))
 
 
@@ -335,6 +350,38 @@ def self_test():
         if got[0] != 0 or got[2]:
             print(f"FAIL LEAN_HOOK_PUBLIC_TEXT=off in the environment should turn the hook off: {got!r}")
             failures += 1
+
+    import subprocess
+
+    me = os.path.realpath(__file__)
+    clean_env = {"LEAN_HOOK_PUBLIC_TEXT": None, "LEAN_SKIP_SLOP": None, "LEAN_SKIP_ATTRIBUTION": None,
+                 "LEAN_RULES": None}
+    with tempfile.TemporaryDirectory() as there:
+        plain = {"tool_input": {"command": 'git commit -m "wait for database health"'}, "cwd": there}
+        got = hookkit.probe(me, plain, LEAN_PROFILE="strict", **dict(clean_env, LEAN_RULES="nope"))
+        if got[0] != 0:
+            print(f"FAIL LEAN_RULES=nope should leave a clean message alone: {got!r}")
+            failures += 1
+
+        def repo_with(env):
+            root = tempfile.mkdtemp(prefix="repo-", dir=there)
+            subprocess.run(["git", "-C", root, "init", "-q"], check=True, capture_output=True)
+            os.makedirs(os.path.join(root, ".claude"))
+            with open(os.path.join(root, ".claude", "settings.json"), "w", encoding="utf-8") as fh:
+                json.dump({"env": env}, fh)
+            return root
+
+        attr = 'git commit -m "x" -m "Co-Authored-By: Cla' + 'ude <noreply@example.com>"'
+        for label, repo_env, want_code, want_note in (
+                ("a repo dropping attribution is ignored", {"LEAN_RULES": "-attribution"}, 2, True),
+                ("a user dropping attribution is kept", {}, 0, False)):
+            root = repo_with(repo_env)
+            event = {"tool_input": {"command": attr}, "cwd": root, "session_id": f"rules-{os.getpid()}-{want_code}"}
+            got = hookkit.probe(me, event, LEAN_PROFILE="strict", CLAUDE_PROJECT_DIR=root,
+                                **dict(clean_env, LEAN_RULES="-attribution"))
+            if got[0] != want_code or ("LEAN_RULES from this repo" in got[2]) != want_note:
+                print(f"FAIL {label}: {got!r}")
+                failures += 1
 
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0

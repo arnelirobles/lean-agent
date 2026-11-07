@@ -5,7 +5,7 @@ PostToolUse hook on Write, Edit and MultiEdit. Release notes, pull request
 bodies and docs are usually drafted in a file first, and the style rules get
 forgotten there because they feel like chat rules. This scans only the text
 the tool call wrote (the new content of a Write, the new_string of an Edit or
-of each MultiEdit edit) with the lists in lib/house_style.py, and tells the
+of each MultiEdit edit) with the rule sets in rules/ (lib/rules.py), and tells the
 agent what it found. It never blocks: a file may quote outside text on purpose.
 
 Files it looks at: .md, .markdown, .txt, .rst, .adoc, git message files
@@ -21,7 +21,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
-from house_style import scan  # noqa: E402
+import rules  # noqa: E402
+from house_style import scan_sets  # noqa: E402
 
 HOOK = {
     "events": [
@@ -58,8 +59,9 @@ def written_text(tool_input):
 
 def hits(text):
     found = []
+    sets = rules.load()
     for number, line in enumerate(text.splitlines(), 1):
-        for kind, what in scan(line):
+        for kind, what in scan_sets(line, sets):
             found.append(f"line {number} of the new text: {kind}, {what}")
         if len(found) >= MAX_HITS:
             break

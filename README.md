@@ -153,6 +153,15 @@ Add a code host. Every script and hook reaches a host through `lib/forge.py` (re
 3. Self-test: extend `hosts_test` so the new host returns the row shape the others return, include a title holding `$(id)`, and check the other hosts' CLIs are never called.
 4. For hooks, add its create, merge and note commands and body flags to `FORGE_COMMANDS` and `FORGE_FLAGS` in `lib/hookkit.py`, and a slop-body case to the `public-text.py` self-test.
 
+Writing a rule set. The house-style lists are JSON files in `rules/`, read by `lib/rules.py`. `attribution.json` holds the agent attribution patterns and `plain-prose.json` the dashes, arrow glyph and filler words. A set looks like this:
+
+```json
+{"name": "extra", "applies_to": ["prose"],
+ "rules": [{"id": "jargon-word", "pattern": "\\bsynergy\\b", "flags": "i", "say": "the word synergy"}]}
+```
+
+`flags` is any of `i`, `m`, `s`. `say` is optional; without it a hit is reported as the matched text. Write ids so the file does not match its own patterns (an id of `synergy` would). A pattern that does not compile is reported on stderr as `lean-agent rules: <set>/<id>: <error>` and skipped, and the rest of the set still loads. `LEAN_RULES=extra` adds the set, `LEAN_RULES=-plain-prose` drops one; it is read from the environment only. `public-text`, `style-note` and `tools/style-scan` all load the same sets. Add a case to `lib/rules.py --self-test` for a new shipped set, and check `own_files_clean` still passes.
+
 Azure DevOps cannot list failed checks or escaped references through `az`, so those two columns print `unknown` for it.
 
 Known limits:
@@ -203,6 +212,7 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_MODEL_CHEAP` | `sonnet` | The model that drafts and critiques. |
 | `LEAN_MODEL_STRONG` | `opus` | The model that takes what the cheap steps could not close. |
 | `LEAN_MODEL_FAST` | `haiku` | The model for agents that read and report: code search, running the gates, the retro's fact collection. It never judges code. |
+| `LEAN_RULES` | `attribution,plain-prose` | Which rule sets the style checks load. `name` adds `rules/name.json`, `-name` drops one. `-attribution` is a user setting: `public-text` puts the set back when it comes from a repository's own settings. See Writing a rule set. |
 | `LEAN_STATS` | on | `off` stops every `lean-stats` write. |
 | `LEAN_CONTEXT_WARN` | `100000` | Context size, in tokens, where the coordinator gets a cost note. `off` turns it off. |
 | `LEAN_LOOKUP_WARN` | `10` | Read-only lookups by an Opus coordinator before it is told to use `lean:search`, or refused with `LEAN_LOOKUP_MODE=block`. `off` turns both off. |

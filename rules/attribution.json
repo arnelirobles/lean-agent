@@ -1,0 +1,38 @@
+{
+  "name": "attribution",
+  "applies_to": [
+    "prose"
+  ],
+  "rules": [
+    {
+      "id": "co-author-line",
+      "pattern": "(^|[\\\"'])\\s*co-authored-by:[^\\n]*(claude|anthropic|copilot|cursor|codex|gemini|\\[bot\\])",
+      "flags": "im"
+    },
+    {
+      "id": "session-trailer",
+      "pattern": "(^|[\\\"'])\\s*claude-session:",
+      "flags": "im"
+    },
+    {
+      "id": "session-link",
+      "pattern": "claude\\.ai/code/session_",
+      "flags": "im"
+    },
+    {
+      "id": "share-link",
+      "pattern": "claude\\.ai/(code/)?(artifact|share|chat)/",
+      "flags": "im"
+    },
+    {
+      "id": "generated-line",
+      "pattern": "generated with \\[?claude code",
+      "flags": "im"
+    },
+    {
+      "id": "vendor-noreply",
+      "pattern": "noreply@anthropic\\.com",
+      "flags": "im"
+    }
+  ]
+}

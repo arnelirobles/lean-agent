@@ -1,61 +1,47 @@
 """The house-style lists and the scan every lean-agent check shares.
 
-ATTRIBUTION catches agent attribution (an AI Co-Authored-By, a session link, a
-"Generated with" line). SLOP catches dashes, arrow glyphs and filler words.
-The hooks and tools/style-scan import this file so there is one list to edit.
-The patterns are written so this file does not match itself: `\\bword\\b` in
-source has a letter before the word, so the word boundary is not there.
+The lists live in rules/attribution.json and rules/plain-prose.json, loaded by
+lib/rules.py (LEAN_RULES picks the sets). ATTRIBUTION and SLOP are those two
+pattern lists, kept as names for old importers. scan() is the wrapper the
+hooks and tools/style-scan share. wide_char stays here.
 
   python3 lib/house_style.py --self-test
 """
-import re
+import json
+import os
 import sys
 
-ATTRIBUTION = [
-    r"(^|[\"'])\s*co-authored-by:[^\n]*(claude|anthropic|copilot|cursor|codex|gemini|\[bot\])",
-    r"(^|[\"'])\s*claude-session:",
-    r"claude\.ai/code/session_",
-    r"claude\.ai/(code/)?(artifact|share|chat)/",
-    r"generated with \[?claude code",
-    r"noreply@anthropic\.com",
-]
-SLOP = [
-    "\u2014",
-    "\u2013",
-    "\u2192",
-    r"\bcomprehensive\b",
-    r"\brobust\b",
-    r"\bseamless(ly)?\b",
-    r"\bdelv(e|es|ing)\b",
-    r"\bleverag(e|es|ed|ing)\b",
-    r"\bstreamlin(e|es|ed|ing)\b",
-    r"\bcutting-edge\b",
-    r"\belevat(e|es|ed|ing)\b",
-    r"\bsupercharg(e|es|ed|ing)\b",
-    r"\bgame-changing\b",
-    r"\bit'?s important to note\b",
-    r"\bin conclusion\b",
-    r"\bfurthermore\b",
-    r"(^|[.!?]\s+|[\"'])additionally\b",
-]
-SLOP_NAMES = {"\u2014": "an em dash", "\u2013": "an en dash", "\u2192": "an arrow glyph"}
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import rules  # noqa: E402
+
+KINDS = {"attribution": "attribution", "plain-prose": "slop"}
 WIDE_FROM = 0x2000
-FLAGS = re.IGNORECASE | re.MULTILINE
+
+
+def _patterns(name):
+    """The pattern strings of one shipped rule set, for old importers of ATTRIBUTION and SLOP."""
+    path = os.path.join(rules.RULES_DIR, name + ".json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [r["pattern"] for r in json.load(fh)["rules"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+ATTRIBUTION = _patterns("attribution")
+SLOP = _patterns("plain-prose")
+
+
+def scan_sets(text, sets, attribution=True, slop=True):
+    """List of (kind, what) for each rule in SETS that matches text. The attribution set is the
+    attribution kind, plain-prose is slop, and any other set is slop under its own name."""
+    chosen = [s for s in sets if (attribution if s["name"] == "attribution" else slop)]
+    return [(KINDS.get(name, name), what) for name, what in rules.scan(text, chosen)]
 
 
 def scan(text, attribution=True, slop=True):
-    """List of (kind, what) for each pattern that matches text."""
-    checks = []
-    if attribution:
-        checks += [("attribution", p) for p in ATTRIBUTION]
-    if slop:
-        checks += [("slop", p) for p in SLOP]
-    found = []
-    for kind, pattern in checks:
-        match = re.search(pattern, text, FLAGS)
-        if match:
-            found.append((kind, SLOP_NAMES.get(pattern) or f"'{match.group(0).strip()}'"))
-    return found
+    """List of (kind, what) for each rule of the loaded sets (LEAN_RULES) that matches text."""
+    return scan_sets(text, rules.load(), attribution, slop)
 
 
 def wide_char(text):
