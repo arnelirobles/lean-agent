@@ -62,6 +62,8 @@ else
   failed=$((failed + 1))
 fi
 
+if tools/lean-agent build --check; then echo "ok   hooks.json is current"; else echo "FAIL hooks.json is not current, run tools/lean-agent build"; failed=$((failed+1)); fi
+
 # Claude Code updates an installed plugin only when its version changes, so a change to what
 # installs, made after the current version was tagged, never reaches anyone until the version moves.
 version=$(python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')

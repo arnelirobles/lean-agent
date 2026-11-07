@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Build hooks/hooks.json and hooks/dispatch.json from the HOOK literal in each hooks/*.py.
+
+  lean-agent build [--check] [--root DIR]
+  lean-agent --self-test
+
+build writes both files. --check writes nothing, prints which file is not current and exits 1.
+A bad or missing manifest, or two entries that clash, exits 2 with the reason.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+import hookkit  # noqa: E402
+
+REPO = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+DESCRIPTION = "Generic lean-agent hooks: a note on the working mode and the open brain items at session start, the session id for brain items and answers to filed questions, public-text, commit-author, secret-scan (a commit or push needs the key-scanning git hooks installed and not skipped; a written file is checked for keys), wait-loop, background-shell and review-log checks (no logged review when a pull request goes ready or merges) that block in the strict profile and note or say nothing in the standard one (a key in a written file blocks in both), and notes on house style, stale test runs, hand-written commands a script already does, unverified claims, containers for docs-only diffs, lessons, and a coordinator whose context, own lookups or images are costing the most (an opt-in setting refuses them). A session that ends is collected into lean-stats in the background, and the brain page server starts."
+COMMAND = 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/%s"'
+
+
+def collect(root):
+    """Every (file name, event entry) of every hooks/*.py that has a HOOK literal."""
+    folder = os.path.join(root, "hooks")
+    entries = []
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".py"):
+            continue
+        path = os.path.join(folder, name)
+        manifest = hookkit.read_manifest(path)
+        for entry in manifest["events"]:
+            timeout = entry["timeout"] if "timeout" in entry else manifest.get("timeout")
+            entries.append((name, entry, timeout))
+    return entries
+
+
+def command_entry(name, entry, timeout):
+    out = {"type": "command", "command": COMMAND % name}
+    if timeout is not None:
+        out["timeout"] = timeout
+    if "if" in entry:
+        out["if"] = entry["if"]
+    return out
+
+
+def build(root):
+    """Return the text of hooks.json and dispatch.json for the hooks under root."""
+    seen = {}
+    for name, entry, _ in collect(root):
+        key = (entry["event"], entry["group"])
+        info = seen.setdefault(key, {"matchers": set(), "orders": set()})
+        info["matchers"].add(entry.get("matcher"))
+        if entry["order"] in info["orders"]:
+            raise ValueError("group %d of %s has two entries at order %d" % (key[1], key[0], entry["order"]))
+        info["orders"].add(entry["order"])
+        if len(info["matchers"]) > 1:
+            raise ValueError("group %d of %s has two matchers" % (key[1], key[0]))
+    hooks = {}
+    for event in hookkit.EVENT_ORDER:
+        groups = {}
+        for name, entry, timeout in collect(root):
+            if entry["event"] == event:
+                groups.setdefault(entry["group"], []).append((entry["order"], name, entry, timeout))
+        if not groups:
+            continue
+        out = []
+        for group in sorted(groups):
+            members = sorted(groups[group], key=lambda m: m[0])
+            block = {}
+            if "matcher" in members[0][2]:
+                block["matcher"] = members[0][2]["matcher"]
+            block["hooks"] = [command_entry(n, e, t) for _, n, e, t in members]
+            out.append(block)
+        hooks[event] = out
+    text = json.dumps({"description": DESCRIPTION, "hooks": hooks}, indent=2) + "\n"
+    return text, json.dumps({}, indent=2) + "\n"
+
+
+def main(argv):
+    check = "--check" in argv
+    root = REPO
+    if "--root" in argv:
+        root = argv[argv.index("--root") + 1]
+    try:
+        texts = build(root)
+    except (ValueError, OSError) as err:
+        print(err)
+        return 2
+    stale = False
+    for name, text in zip(("hooks.json", "dispatch.json"), texts):
+        path = os.path.join(root, "hooks", name)
+        if check:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    current = handle.read()
+            except OSError:
+                current = None
+            if current != text:
+                print("%s is not current, run tools/lean-agent build" % name)
+                stale = True
+        else:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+    return 1 if stale else 0
+
+
+def hook_source(events, timeout=10):
+    return "HOOK = %r\n" % ({"events": events, "timeout": timeout, "mode": "process", "pack": "core",
+                             "guard": False, "default": {"strict": "off", "standard": "off"}},)
+
+
+def fixture(files):
+    root = tempfile.mkdtemp()
+    os.mkdir(os.path.join(root, "hooks"))
+    for name, text in files.items():
+        with open(os.path.join(root, "hooks", name), "w", encoding="utf-8") as handle:
+            handle.write(text)
+    return root
+
+
+def run(*args):
+    done = subprocess.run([sys.executable, os.path.realpath(__file__), *args], capture_output=True, text=True)
+    return done.returncode, done.stdout + done.stderr
+
+
+def self_test():
+    fails = []
+    scratch = tempfile.mkdtemp()
+
+    def check(name, ok, detail=""):
+        if not ok:
+            fails.append("%s %s" % (name, detail))
+
+    # test_matches_today: the pre-change file comes from git, copied before anything rebuilds.
+    shown = subprocess.run(["git", "-C", REPO, "show", "c018be7:hooks/hooks.json"], capture_output=True, text=True)
+    saved = os.path.join(scratch, "hooks.json.before")
+    with open(saved, "w", encoding="utf-8") as handle:
+        handle.write(shown.stdout)
+    check("test_matches_today", shown.returncode == 0 and build(REPO)[0] == open(saved, encoding="utf-8").read())
+
+    # test_bad_manifest
+    root = fixture({"good.py": hook_source([{"event": "SessionStart", "group": 0, "order": 0}]), "nohook.py": "x = 1\n"})
+    keep = os.path.join(root, "hooks", "hooks.json")
+    with open(keep, "w", encoding="utf-8") as handle:
+        handle.write("keep\n")
+    code, text = run("build", "--root", root)
+    check("test_bad_manifest", code == 2 and "nohook.py" in text and open(keep).read() == "keep\n", repr((code, text)))
+
+    # test_matcher_clash
+    root = fixture({
+        "a.py": hook_source([{"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 0}]),
+        "b.py": hook_source([{"event": "PreToolUse", "matcher": "Write", "group": 1, "order": 1}]),
+    })
+    code, text = run("build", "--root", root)
+    check("test_matcher_clash", code == 2 and "group 1 of PreToolUse has two matchers" in text, repr((code, text)))
+
+    # test_check_stale
+    root = fixture({"a.py": hook_source([{"event": "SessionStart", "group": 0, "order": 0}])})
+    code, _ = run("build", "--root", root)
+    code_ok, _ = run("build", "--check", "--root", root)
+    path = os.path.join(root, "hooks", "hooks.json")
+    with open(path, encoding="utf-8") as handle:
+        body = handle.read()
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body + "x")
+    code_bad, text = run("build", "--check", "--root", root)
+    check("test_check_stale", code == 0 and code_ok == 0 and code_bad == 1 and "hooks.json is not current" in text,
+          repr((code, code_ok, code_bad, text)))
+
+    # test_no_timeout_key
+    root = fixture({"a.py": hook_source([{"event": "SessionStart", "group": 0, "order": 0}], timeout=None)})
+    entry = json.loads(build(root)[0])["hooks"]["SessionStart"][0]["hooks"][0]
+    check("test_no_timeout_key", "timeout" not in entry, repr(entry))
+
+    if fails:
+        print("self-test failed:\n  " + "\n  ".join(fails))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args == ["--self-test"]:
+        sys.exit(self_test())
+    if args and args[0] == "build":
+        sys.exit(main(args[1:]))
+    print("usage: lean-agent build [--check] [--root DIR] | --self-test")
+    sys.exit(2)
