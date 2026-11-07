@@ -22,7 +22,7 @@ COMMAND = 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/%s"'
 
 
 def collect(root):
-    """Every (file name, event entry) of every hooks/*.py that has a HOOK literal."""
+    """Every (file name, event entry, timeout, mode) of every hooks/*.py that has a HOOK literal."""
     folder = os.path.join(root, "hooks")
     entries = []
     for name in sorted(os.listdir(folder)):
@@ -30,9 +30,10 @@ def collect(root):
             continue
         path = os.path.join(folder, name)
         manifest = hookkit.read_manifest(path)
+        mode = manifest.get("mode", "process")
         for entry in manifest["events"]:
             timeout = entry["timeout"] if "timeout" in entry else manifest.get("timeout")
-            entries.append((name, entry, timeout))
+            entries.append((name, entry, timeout, mode))
     return entries
 
 
@@ -50,29 +51,22 @@ DISPATCH = 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py" %s %d'
 
 def dispatch_entry(event, group, members):
     """One entry that runs a whole group through hooks/dispatch.py, and the table rows the dispatcher reads."""
-    timeouts = [60 if t is None else t for _, _, _, t in members]
+    timeouts = [60 if m[3] is None else m[3] for m in members]
     rows = []
-    for _, name, entry, timeout in members:
-        row = {"name": name, "file": "hooks/" + name, "mode": MODES[name], "timeout": timeout}
+    for _, name, entry, timeout, mode in members:
+        row = {"name": name, "file": "hooks/" + name, "mode": mode, "timeout": timeout}
         if "if" in entry:
             row["if"] = entry["if"]
         rows.append(row)
     return {"type": "command", "command": DISPATCH % (event, group), "timeout": max(timeouts) + 2}, rows
 
 
-MODES = {}
-
-
 def build(root):
     """Return the text of hooks.json and dispatch.json for the hooks under root."""
     found = collect(root)
-    MODES.clear()
-    for name, _, _ in found:
-        if name not in MODES:
-            MODES[name] = hookkit.read_manifest(os.path.join(root, "hooks", name)).get("mode", "process")
     table = {}
     seen = {}
-    for name, entry, _ in found:
+    for name, entry, _, _ in found:
         key = (entry["event"], entry["group"])
         info = seen.setdefault(key, {"matchers": set(), "orders": set()})
         info["matchers"].add(entry.get("matcher"))
@@ -84,9 +78,9 @@ def build(root):
     hooks = {}
     for event in hookkit.EVENT_ORDER:
         groups = {}
-        for name, entry, timeout in found:
+        for name, entry, timeout, mode in found:
             if entry["event"] == event:
-                groups.setdefault(entry["group"], []).append((entry["order"], name, entry, timeout))
+                groups.setdefault(entry["group"], []).append((entry["order"], name, entry, timeout, mode))
         if not groups:
             continue
         out = []
@@ -95,12 +89,12 @@ def build(root):
             block = {}
             if "matcher" in members[0][2]:
                 block["matcher"] = members[0][2]["matcher"]
-            if any(MODES[n] == "inproc" for _, n, _, _ in members):
+            if any(m[4] == "inproc" for m in members):
                 one, rows = dispatch_entry(event, group, members)
                 block["hooks"] = [one]
                 table["%s:%d" % (event, group)] = rows
             else:
-                block["hooks"] = [command_entry(n, e, t) for _, n, e, t in members]
+                block["hooks"] = [command_entry(m[1], m[2], m[3]) for m in members]
             out.append(block)
         hooks[event] = out
     text = json.dumps({"description": DESCRIPTION, "hooks": hooks}, indent=2) + "\n"

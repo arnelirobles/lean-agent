@@ -10,10 +10,16 @@ and its main runs through hookkit.run on a thread with its own stdin, stdout and
 A process member runs as its own python3 process. Every member runs; a member past its
 timeout is left behind (a thread) or killed (a process) and counts as exit 0.
 
-Merge rules: any exit 2 makes the result exit 2; every member's stderr is joined by newlines. additionalContext strings join with a blank line,
-permissionDecision takes deny over ask, decision block wins, continue false wins, and
-systemMessage, reason and stopReason join with newlines. permissionDecision allow and
-updatedInput are dropped with a stderr line, so a group never grants.
+Merge rules: any exit 2 makes the result exit 2 with the stderr of the members that exited 2
+joined by newlines. Any other nonzero exit counts as 0 (with a stderr line naming the member and its
+stdout ignored). additionalContext strings join with a blank line, permissionDecision takes deny over
+ask, decision block wins, continue false wins, and systemMessage, reason and stopReason join with
+newlines. permissionDecision allow, updatedInput (top level, in hookSpecificOutput, or in a decision),
+a PermissionRequest decision that is not a deny and decision approve are dropped with a stderr line,
+so a group never grants. Plain text from a member joins additionalContext when another member printed JSON.
+
+An inproc hook must not change process-wide state (os.environ, os.chdir, module-level mutable globals):
+the members of a group share one process and run in parallel threads.
 """
 import fnmatch
 import importlib.util
@@ -123,8 +129,9 @@ def run_process(member, stdin_text, timeout, slot):
 
 
 def wanted(member, event):
-    """The member's own `if`: Bash(<glob>) is fnmatch on the Bash command, as Claude Code does it.
-    Any other form of `if` is not understood here, so the member runs."""
+    """The member's own `if`: Bash(<glob>) matches when the glob (fnmatch) matches the Bash command or any
+    simple command in it, so `cd x && git push` still runs a Bash(git push*) member. Any other form of `if`,
+    or a command that cannot be split, is not understood here, so the member runs."""
     cond = member.get("if")
     if not cond:
         return True
@@ -135,7 +142,15 @@ def wanted(member, event):
         return False
     tool_input = event.get("tool_input")
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    return isinstance(command, str) and fnmatch.fnmatchcase(command, found.group(1))
+    if not isinstance(command, str):
+        return False
+    glob = found.group(1)
+    candidates = [command.strip()]
+    try:
+        candidates += [" ".join(seg.words) for seg in hookkit.segments(command)]
+    except Exception:
+        return True
+    return any(fnmatch.fnmatchcase(c, glob) for c in candidates)
 
 
 def run_group(event, group, stdin_text, table):
@@ -170,7 +185,7 @@ def run_group(event, group, stdin_text, table):
         else:
             lines.append("dispatch: %s timed out after %ss" % (member["name"], timeout))
             results.append((member["name"], 0, "", ""))
-    code, out, err = merge(results)
+    code, out, err = merge(results, event)
     if lines:
         err = err + "\n".join(lines) + "\n"
     return code, out, err
@@ -181,14 +196,48 @@ def _join(parts, sep):
     return sep.join(parts)
 
 
-def merge(results):
-    """Merge [(name, exit code, stdout, stderr)] into (exit code, stdout, stderr)."""
-    dropped, raw = [], []
+def _keep_decision(value, name, dropped):
+    """The PermissionRequest form of hookSpecificOutput.decision: only a deny survives, and never with updatedInput."""
+    if not isinstance(value, dict):
+        dropped.append(("decision", name))
+        return None
+    inner = dict(value)
+    if "updatedInput" in inner:
+        del inner["updatedInput"]
+        dropped.append(("updatedInput", name))
+    if inner.get("behavior") != "deny":
+        dropped.append(("decision", name))
+        return None
+    return inner
+
+
+def _permission(spec, value, name, dropped):
+    """Take deny over ask; anything else (allow included) is dropped."""
+    if value in ("deny", "ask"):
+        if spec.get("permissionDecision") != "deny":
+            spec["permissionDecision"] = value
+    else:
+        dropped.append(("permissionDecision", name))
+
+
+def merge(results, event_name=None):
+    """Merge [(name, exit code, stdout, stderr)] into (exit code, stdout, stderr).
+
+    Exit code: 2 if any member exited 2, else 0. A member that exits with anything else counts as 0, its
+    stdout is ignored (Claude Code ignores JSON on a nonzero exit) and a stderr line names it, so one
+    member's exit 1 cannot hide another member's deny. On exit 2 the stderr is that of the members that
+    exited 2, otherwise every member's stderr. When any member printed JSON, the output is one JSON object
+    and plain text from the others goes into additionalContext (hookEventName from EVENT_NAME)."""
+    dropped, notices = [], []
+    raw, any_json = [], False
     top, spec = {}, {}
     contexts, system, reasons, stops, perm_reasons = [], [], [], [], []
     decision = None
     stop_run = False
-    for name, _, out, _ in results:
+    for name, code, out, _ in results:
+        if code not in (0, 2):
+            notices.append("dispatch: %s exited %s" % (name, code))
+            continue
         text = out.strip()
         if not text:
             continue
@@ -198,24 +247,30 @@ def merge(results):
             obj = None
         if not isinstance(obj, dict):
             raw.append(text)
+            contexts.append(text)
             continue
+        any_json = True
         for key, value in obj.items():
             if key == "hookSpecificOutput" and isinstance(value, dict):
                 for k, v in value.items():
                     if k == "additionalContext":
                         contexts.append(v)
                     elif k == "permissionDecision":
-                        if v in ("deny", "ask"):
-                            if spec.get(k) != "deny":
-                                spec[k] = v
-                        else:
-                            dropped.append((k, name))
+                        _permission(spec, v, name, dropped)
                     elif k == "permissionDecisionReason":
                         perm_reasons.append(v)
                     elif k == "updatedInput":
                         dropped.append((k, name))
+                    elif k == "decision":
+                        kept = _keep_decision(v, name, dropped)
+                        if kept is not None:
+                            spec.setdefault("decision", kept)
                     else:
                         spec.setdefault(k, v)
+            elif key == "permissionDecision":
+                _permission(spec, value, name, dropped)
+            elif key == "updatedInput":
+                dropped.append((key, name))
             elif key == "systemMessage":
                 system.append(value)
             elif key == "reason":
@@ -225,6 +280,8 @@ def merge(results):
             elif key == "decision":
                 if value == "block":
                     decision = "block"
+                elif value == "approve":
+                    dropped.append((key, name))
             elif key == "continue":
                 if value is False:
                     stop_run = True
@@ -242,19 +299,21 @@ def merge(results):
     if system:
         merged["systemMessage"] = _join(system, "\n")
     merged.update(top)
-    if contexts:
+    if contexts and any_json:
         spec["additionalContext"] = _join(contexts, "\n\n")
+        if event_name:
+            spec.setdefault("hookEventName", event_name)
     if perm_reasons and "permissionDecision" in spec:
         spec["permissionDecisionReason"] = _join(perm_reasons, "\n")
     if set(spec) - {"hookEventName"}:
         merged["hookSpecificOutput"] = spec
-    lines = list(raw)
+    lines = [] if any_json else list(raw)
     if merged:
         lines.append(json.dumps(merged))
     codes = [c for _, c, _, _ in results]
-    code = 2 if 2 in codes else (1 if any(codes) else 0)
-    errs = [e.rstrip("\n") for _, _, _, e in results if e.strip()]
-    errs += ["dispatch: dropped %s from %s" % (key, name) for key, name in dropped]
+    code = 2 if 2 in codes else 0
+    errs = [e.rstrip("\n") for _, c, _, e in results if e.strip() and (code != 2 or c == 2)]
+    errs += ["dispatch: dropped %s from %s" % (key, name) for key, name in dropped] + notices
     return code, "\n".join(lines) + ("\n" if lines else ""), "\n".join(errs) + ("\n" if errs else "")
 
 
@@ -399,6 +458,77 @@ def self_test():
     got = json.loads(out)
     check("merge_fields", got == {"continue": False, "stopReason": "stop", "decision": "block", "reason": "r1\nr2",
                                   "systemMessage": "s1\ns2"}, repr(out))
+
+    def jhook(name, obj):
+        return hook(name, printing(obj))
+
+    def one(members, command="git status"):
+        return run_group("PreToolUse", 1, event(command), group(members))
+
+    # R1: on a block only the blocking members' stderr is joined
+    chatty = hook("chatty.py", "def main():\n    hookkit.read_event()\n    print('chatter', file=sys.stderr)\n    return 0")
+    code, out, err = one([row("blocker.py", blocker), row("chatty.py", chatty)])
+    check("block stderr only from blockers", code == 2 and err == "no\n", repr(err))
+
+    # never_grants, top level and PermissionRequest forms
+    top_grant = jhook("top_grant.py", {"permissionDecision": "allow", "updatedInput": {"command": "x"}})
+    code, out, err = one([row("top_grant.py", top_grant), row("note_a.py", note_a)])
+    check("never_grants top level", "permissionDecision" not in out and "updatedInput" not in out and "alpha" in out
+          and "dispatch: dropped permissionDecision from top_grant.py" in err
+          and "dispatch: dropped updatedInput from top_grant.py" in err, repr((out, err)))
+    perm_allow = jhook("perm_allow.py", {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+        "behavior": "allow", "updatedInput": {"command": "x"}}}})
+    code, out, err = one([row("perm_allow.py", perm_allow), row("note_a.py", note_a)])
+    check("never_grants PermissionRequest allow", "allow" not in out and "updatedInput" not in out and "alpha" in out
+          and "dispatch: dropped decision from perm_allow.py" in err
+          and "dispatch: dropped updatedInput from perm_allow.py" in err, repr((out, err)))
+    perm_deny = jhook("perm_deny.py", {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+        "behavior": "deny", "message": "m", "updatedInput": {"command": "x"}}}})
+    code, out, err = one([row("perm_deny.py", perm_deny)])
+    got = json.loads(out)["hookSpecificOutput"]["decision"] if out.strip() else None
+    check("PermissionRequest deny kept without updatedInput", got == {"behavior": "deny", "message": "m"}
+          and "dispatch: dropped updatedInput from perm_deny.py" in err, repr((out, err)))
+    approve = jhook("approve.py", {"decision": "approve", "reason": "ok"})
+    code, out, err = one([row("approve.py", approve)])
+    check("never_grants approve", "approve" not in out and "dispatch: dropped decision from approve.py" in err, repr((out, err)))
+
+    # unknown keys pass through, plain text, permissionDecisionReason joins
+    odd = jhook("odd.py", {"custom": 1, "hookSpecificOutput": {"hookEventName": "PreToolUse", "extra": "x"}})
+    code, out, err = one([row("odd.py", odd)])
+    got = json.loads(out)
+    check("unknown keys", got.get("custom") == 1 and got["hookSpecificOutput"].get("extra") == "x", repr(out))
+    plain = hook("plain.py", "def main():\n    hookkit.read_event()\n    print('plain words')\n    return 0")
+    code, out, err = one([row("plain.py", plain)])
+    check("non-JSON stdout alone", out == "plain words\n", repr(out))
+    deny_a = jhook("deny_a.py", {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                         "permissionDecisionReason": "ra"}})
+    deny_b = jhook("deny_b.py", {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                         "permissionDecisionReason": "rb"}})
+    code, out, err = one([row("deny_a.py", deny_a), row("deny_b.py", deny_b)])
+    check("permissionDecisionReason joins", json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"] == "ra\nrb", repr(out))
+
+    # S2: plain text beside JSON is folded into one object
+    code, out, err = one([row("plain.py", plain), row("deny.py", deny)])
+    try:
+        got = json.loads(out)
+    except ValueError:
+        got = {}
+    spec_out = got.get("hookSpecificOutput", {})
+    check("one JSON object", spec_out.get("permissionDecision") == "deny" and spec_out.get("additionalContext") == "plain words"
+          and spec_out.get("hookEventName") == "PreToolUse", repr(out))
+
+    # S3: an exit 1 counts as 0 and cannot hide a deny
+    failing = hook("failing.py", "def main():\n    hookkit.read_event()\n    print('oops', file=sys.stderr)\n    return 1")
+    code, out, err = one([row("failing.py", failing), row("deny.py", deny)])
+    check("exit 1 is 0", code == 0 and "deny" in out and "dispatch: failing.py exited 1" in err, repr((code, out, err)))
+
+    # if_filter on commands with several parts
+    code, out, err = one([gated], "cd x && git status")
+    check("if_filter segment runs", "alpha" in out, repr(out))
+    code, out, err = one([row("note_a.py", note_a, cond="Bash(git push*)")], "FOO=1 cd x && git push origin main")
+    check("if_filter push after cd", "alpha" in out, repr(out))
+    code, out, err = one([gated], "ls && echo hi")
+    check("if_filter no segment", out == "", repr(out))
 
     # the real stdout is untouched and the dispatcher exits 0 on its own error, 2 on a block, after a hang
     table = os.path.join(tmp, "table.json")

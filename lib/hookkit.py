@@ -26,10 +26,12 @@ GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", 
 class _State(threading.local):
     """Per-thread hook state: the last event read (for the session id and cwd of a recorded fire) and, when
     the dispatcher binds one, the hook's own name, manifest and mode. Unbound, the name is sys.argv[0]."""
-    event = {}
-    name = None
-    manifest = None
-    mode = None
+
+    def __init__(self):  # runs once per thread, so no thread shares an event dict
+        self.event = {}
+        self.name = None
+        self.manifest = None
+        self.mode = None
 
 
 _state = _State()
