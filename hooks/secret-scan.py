@@ -869,12 +869,6 @@ def self_test():
         check("C2: and the message says so", "without the git hooks" in p.stderr and SKIP in p.stderr, True)
         p = bash("git commit -m x", nosettings, {SKIP: "1", "CLAUDE_PROJECT_DIR": nosettings})
         check("C2: a user's env skip still works for the git hooks", p.returncode, 0)
-        os.makedirs(os.path.join(tmp, ".claude"), exist_ok=True)
-        with open(os.path.join(tmp, ".claude", "settings.json"), "w") as f:
-            json.dump({"env": {SKIP: "1"}}, f)
-        p = bash("git commit -m x", cloned, {SKIP: "1", "CLAUDE_PROJECT_DIR": cloned})
-        check("C2: a repo value the user's settings also set is the user's", p.returncode, 0)
-        os.remove(os.path.join(tmp, ".claude", "settings.json"))
         put(nosettings, "k.txt", "k = " + google + "\n")
         sh("git", "-C", nosettings, "add", "k.txt")
         p = sh("git", "-C", nosettings, "commit", "-qm", "x", extra={SKIP: "1"})

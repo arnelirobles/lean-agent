@@ -225,7 +225,17 @@ RANK = {"off": 0, "note": 1, "block": 2}
 MANAGED_SETTINGS = ["/Library/Application Support/ClaudeCode/managed-settings.json",
                     "/etc/claude-code/managed-settings.json"]
 # The user's own settings file. A test replaces this so it never reads the real one.
-USER_SETTINGS = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+def _account_settings():
+    """The user's settings path from the account database, never from HOME (a repo's settings can set HOME).
+    None when the lookup fails, so user settings count as absent."""
+    try:
+        import pwd
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "settings.json")
+    except Exception:
+        return None
+
+
+USER_SETTINGS = _account_settings()
 REPO_WHERE = "this repo's .claude/settings.json"
 PREFIX_WHERE = "the command prefix"
 
@@ -337,7 +347,7 @@ def _repo_sourced(name, value):
     for path in MANAGED_SETTINGS:
         if name in _env_block(path):
             return False
-    if _env_block(USER_SETTINGS).get(name) == value:
+    if USER_SETTINGS and _env_block(USER_SETTINGS).get(name) == value:
         return False  # the user's own settings say the same, so this value is theirs too
     for d in dirs:
         if name in _env_block(os.path.join(d, ".claude", "settings.local.json")) and _local_is_user(d):
@@ -421,7 +431,7 @@ def _user_profile():
     two when both do), standard when neither does. An unrecognised value counts as strict."""
     found = "standard"
     seen = []
-    for path in [USER_SETTINGS] + list(MANAGED_SETTINGS):
+    for path in ([USER_SETTINGS] if USER_SETTINGS else []) + list(MANAGED_SETTINGS):
         raw = _env_block(path).get("LEAN_PROFILE")
         if isinstance(raw, str):
             raw = raw.strip().lower()
@@ -1425,6 +1435,30 @@ def _guard_tests(check, scratch):
         code, out = call("gate-g.py", guard, make_repo({"LEAN_HOOK_GATE_G": "off"}), new_session(), LEAN_HOOK_GATE_G="off")
         check("7c: a repo value the user's settings also set is the user's", (code, out), (0, ""))
         os.remove(user_settings)
+
+        # HOME is not where user settings come from: a repo can set it
+        fake_home = tempfile.mkdtemp(prefix="home-", dir=scratch)
+        os.makedirs(os.path.join(fake_home, ".claude"))
+        with open(os.path.join(fake_home, ".claude", "settings.json"), "w", encoding="utf-8") as handle:
+            json.dump({"env": {"LEAN_HOOK_GATE_G": "off"}}, handle)
+        real_home, real_default = os.environ.get("HOME"), _account_settings()
+        os.environ["HOME"] = fake_home
+        try:
+            check("HOME does not change the default user settings path", _account_settings(), real_default)
+            USER_SETTINGS = _account_settings()
+            check("the default path is not under the HOME the repo set",
+                  USER_SETTINGS is None or not USER_SETTINGS.startswith(fake_home), True)
+            USER_SETTINGS = user_settings  # a temp path, so the real home file is never read
+            code, out = call("gate-g.py", guard, make_repo({"LEAN_HOOK_GATE_G": "off"}), new_session(),
+                             LEAN_HOOK_GATE_G="off", HOME=fake_home)
+            check("a settings file under a repo-set HOME does not make the value the user's",
+                  (code, "this repo" in out), (2, True))
+        finally:
+            if real_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = real_home
+        os.environ["LEAN_PROFILE"] = "strict"
 
         # M5: the once-per-session marker is per name and per source
         sid = new_session()
