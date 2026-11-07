@@ -561,7 +561,7 @@ def bash_verdict(command, cwd):
     touching = [c for c in touching if not hookkit.disabled(SKIP, c)]
     if not touching:
         return None
-    skip_note = f"Put {SKIP}=1 in front of the command to skip the scan on purpose."
+    skip_note = f"Set {SKIP}=1 in the env block of your own settings (~/.claude/settings.json) to skip the scan on purpose."
     found = bypasses(calls, touching, assigned)
     if found:
         return "note", ("Blocked by lean-agent: this command commits or pushes without the git hooks that scan "
@@ -660,7 +660,7 @@ def blocked(reason, standard="nothing"):
                 "Reinstall or update the lean-agent plugin to restore it.")
     return hookkit.refuse(
         "PreToolUse", f"Blocked by lean-agent: the secret scan check could not run ({reason}), so nothing was checked. "
-        f"Fix that, or set {SKIP}=1 in front of the command or in the env block of Claude Code settings.",
+        f"Fix that, or set {SKIP}=1 in the env block of your own settings (~/.claude/settings.json).",
         standard=standard, note=note)
 
 
@@ -695,7 +695,7 @@ def main():
     if found:
         return hookkit.refuse(
             "PreToolUse", tool.message(found, what)
-            + f"\n{SKIP}=1 in front of the command, or in the env block of Claude Code settings, turns this check off.",
+            + f"\nSet {SKIP}=1 in the env block of your own settings (~/.claude/settings.json) to turn this check off.",
             standard="block")
     return 0
 

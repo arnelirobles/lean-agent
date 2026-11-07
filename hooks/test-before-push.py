@@ -75,8 +75,8 @@ def message(command, cwd):
         if not marker or not os.path.exists(marker):
             return ("No passing test run is recorded in this repository, and this pushes source "
                     "changes. Which test can observe this change? Run that one first (a --no-build "
-                    "run does not count). LEAN_SKIP_TEST_BEFORE_PUSH=1, inline or in settings env, "
-                    "turns this note off.")
+                    "run does not count). Set LEAN_SKIP_TEST_BEFORE_PUSH=1 in the env block of your own settings "
+                    "(~/.claude/settings.json) to turn this note off.")
         ran_at = os.path.getmtime(marker)
         stale = [n for n in changed if os.path.getmtime(os.path.join(root, n)) > ran_at]
         if not stale:
@@ -87,7 +87,7 @@ def message(command, cwd):
         return (f"These files changed after the last passing test run ({last}):\n  {listed}\n"
                 "A suite that passed before this edit is not evidence about it. Rerun the suite "
                 "that can observe the change, not only the fast one. "
-                "LEAN_SKIP_TEST_BEFORE_PUSH=1, inline or in settings env, turns this note off.")
+                "Set LEAN_SKIP_TEST_BEFORE_PUSH=1 in the env block of your own settings (~/.claude/settings.json) to turn this note off.")
     return None
 
 

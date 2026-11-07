@@ -353,8 +353,8 @@ def main():
                 + "\n  ".join(found)
                 + "\nRewrite it plainly (commas, periods or parentheses for dashes, "
                 "words for arrows, no attribution) and run the command again. If the text is "
-                "right as it is, LEAN_SKIP_SLOP=1 or LEAN_SKIP_ATTRIBUTION=1 in front of the "
-                "command, or in the env block of Claude Code settings, turns that check off.")
+                "right as it is, set LEAN_SKIP_SLOP=1 or LEAN_SKIP_ATTRIBUTION=1 in the env block of "
+                "your own settings (~/.claude/settings.json) to turn that check off.")
         note = ("This public text may read badly:\n  " + "\n  ".join(found)
                 + "\nConsider rewriting it plainly (commas, periods or parentheses for dashes, "
                 "words for arrows, no attribution) before it goes out.")

@@ -147,8 +147,8 @@ def main():
     if found:
         text = ("Blocked by lean-agent, the commit author email is wrong: " + "; ".join(found)
                 + ". Set it with git config user.email (or -c user.email=... on this commit) "
-                "and run the command again. LEAN_HOOK_COMMIT_AUTHOR=off in front of the command, or in "
-                "the env block of Claude Code settings, turns this check off.")
+                "and run the command again. Set LEAN_HOOK_COMMIT_AUTHOR=off in the env block of "
+                "your own settings (~/.claude/settings.json) to turn this check off.")
         note = ("The commit author email looks wrong: " + "; ".join(found)
                 + ". Consider git config user.email (or -c user.email=... on this commit) before committing.")
         return hookkit.refuse("PreToolUse", text, note=note)

@@ -212,6 +212,30 @@ RENAMED = [
     ("LEAN_ALLOW_SLOP=1 or LEAN_ALLOW_ATTRIBUTION=1 in front of the",
      "LEAN_SKIP_SLOP=1 or LEAN_SKIP_ATTRIBUTION=1 in front of the"),
     ("LEAN_DIRECT_TEST=allow turns this block off.", "LEAN_DIRECT_TEST=on turns this block off."),
+    # task 5: a guard's switch is set in the user's own settings, never in front of the command
+    ("LEAN_HOOK_COMMIT_AUTHOR=off in front of the command, or in the env block of Claude Code settings, "
+     "turns this check off.",
+     "Set LEAN_HOOK_COMMIT_AUTHOR=off in the env block of your own settings (~/.claude/settings.json) "
+     "to turn this check off."),
+    ("LEAN_SKIP_SLOP=1 or LEAN_SKIP_ATTRIBUTION=1 in front of the command, or in the env block of Claude Code "
+     "settings, turns that check off.",
+     "set LEAN_SKIP_SLOP=1 or LEAN_SKIP_ATTRIBUTION=1 in the env block of your own settings "
+     "(~/.claude/settings.json) to turn that check off."),
+    ("Put LEAN_SKIP_SECRET_SCAN=1 in front of the command to skip the scan on purpose.",
+     "Set LEAN_SKIP_SECRET_SCAN=1 in the env block of your own settings (~/.claude/settings.json) "
+     "to skip the scan on purpose."),
+    ("Fix that, or set LEAN_SKIP_SECRET_SCAN=1 in front of the command or in the env block of Claude Code settings.",
+     "Fix that, or set LEAN_SKIP_SECRET_SCAN=1 in the env block of your own settings (~/.claude/settings.json)."),
+    ("LEAN_SKIP_SECRET_SCAN=1 in front of the command, or in the env block of Claude Code settings, "
+     "turns this check off.",
+     "Set LEAN_SKIP_SECRET_SCAN=1 in the env block of your own settings (~/.claude/settings.json) "
+     "to turn this check off."),
+    ("LEAN_SKIP_TEST_BEFORE_PUSH=1, inline or in settings env, turns this note off.",
+     "Set LEAN_SKIP_TEST_BEFORE_PUSH=1 in the env block of your own settings (~/.claude/settings.json) "
+     "to turn this note off."),
+    ("LEAN_SKIP_VERIFY_CLAIM=1, inline or in settings env, turns this note off.",
+     "Set LEAN_SKIP_VERIFY_CLAIM=1 in the env block of your own settings (~/.claude/settings.json) "
+     "to turn this note off."),
 ]
 
 
@@ -315,6 +339,8 @@ def part_d():
             ev = {"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}, "cwd": work}
             r = run_cmd(f'python3 "{tree}/hooks/secret-scan.py"', json.dumps(ev), env, cwd=work)
             crash[tree] = (r[0], normalise(r[1], [tree]), normalise(r[2], [tree]))
+            if tree == old:
+                crash[tree] = (crash[tree][0], renamed(crash[tree][1]), renamed(crash[tree][2]))
         check("strict identical: secret-scan crash", crash[new], crash[old])
         check("the crash case blocks", crash[new][0], 2)
         env = clean_env(home, LEAN_PROFILE="standard")
@@ -327,6 +353,8 @@ def part_d():
             env = clean_env(home, LEAN_PROFILE="strict")
             r = run_cmd(f'python3 "{tree}/hooks/secret-scan.py"', json.dumps(wev), env, cwd=work)
             wr[tree] = (r[0], normalise(r[1], [tree]), normalise(r[2], [tree]))
+            if tree == old:
+                wr[tree] = (wr[tree][0], renamed(wr[tree][1]), renamed(wr[tree][2]))
         check("strict identical: secret-scan crash on Write", wr[new], wr[old])
         check("the Write crash blocks in strict", wr[new][0], 2)
         r = run_cmd(f'python3 "{new}/hooks/secret-scan.py"', json.dumps(wev), clean_env(home, LEAN_PROFILE="standard"), cwd=work)

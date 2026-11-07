@@ -39,7 +39,7 @@ NOTE = ("Before this posts: is every claim in it checked? If it says something f
         "is slow, find the caller (is it awaited, is the error swallowed?). If it recommends a "
         "change, read the config that governs it (auth, flags, defaults) first. Anything not "
         "checked gets \"I think\" and a line on what is unverified. "
-        "LEAN_SKIP_VERIFY_CLAIM=1, inline or in settings env, turns this note off.")
+        "Set LEAN_SKIP_VERIFY_CLAIM=1 in the env block of your own settings (~/.claude/settings.json) to turn this note off.")
 
 
 def body_text(call):

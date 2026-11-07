@@ -33,6 +33,8 @@ class _State(threading.local):
         self.name = None
         self.manifest = None
         self.mode = None
+        self.guard_text = []  # guard notes waiting to go out with the hook's own output
+        self.emitted = False  # a JSON note already went to stdout in this call
 
 
 _state = _State()
@@ -53,6 +55,8 @@ def bind(name, manifest, mode=None):
     _state.manifest = manifest
     _state.mode = mode
     _state.event = {}
+    _state.guard_text = []
+    _state.emitted = False
 
 
 def _hook_name():
@@ -225,19 +229,25 @@ REPO_WHERE = "this repo's .claude/settings.json"
 PREFIX_WHERE = "the command prefix"
 
 
-def repo_root():
-    """The first directory at or above CLAUDE_PROJECT_DIR (else the event cwd, else the current directory)
-    that holds .git, file or directory. With none, the starting directory itself."""
+def _project_dirs():
+    """The start directory (CLAUDE_PROJECT_DIR, else the event cwd, else the current directory) and every
+    parent up to and including the first one that holds .git (file or directory). With no .git, just the start."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or str(_state.event.get("cwd") or "") or os.getcwd()
     start = os.path.abspath(start)
-    here = start
+    found, here = [], start
     while True:
+        found.append(here)
         if os.path.exists(os.path.join(here, ".git")):
-            return here
+            return found
         parent = os.path.dirname(here)
         if parent == here:
-            return start
+            return [start]
         here = parent
+
+
+def repo_root():
+    """The first directory at or above the project directory that holds .git, else the project directory."""
+    return _project_dirs()[-1] if os.path.exists(os.path.join(_project_dirs()[-1], ".git")) else _project_dirs()[0]
 
 
 def _env_block(path):
@@ -251,45 +261,90 @@ def _env_block(path):
         return {}
 
 
+def _untracked(directory, path):
+    """True only when git says PATH is not tracked. Any other answer (tracked, git missing, a timeout, an
+    error) is False, so a file git cannot vouch for does not count as the user's."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+    try:
+        done = subprocess.run(["git", "-C", directory, "ls-files", "--error-unmatch", "--", path],
+                              capture_output=True, text=True, timeout=3, env=env)
+    except Exception:
+        return False
+    return done.returncode == 1
+
+
+def _repo_sourced(name, value):
+    dirs = _project_dirs()
+    if not any(name in _env_block(os.path.join(d, ".claude", "settings.json"))
+               and str(_env_block(os.path.join(d, ".claude", "settings.json"))[name]) == value for d in dirs):
+        return False
+    for path in MANAGED_SETTINGS:
+        if name in _env_block(path):
+            return False
+    for d in dirs:
+        local = os.path.join(d, ".claude", "settings.local.json")
+        if name in _env_block(local) and _untracked(d, os.path.join(".claude", "settings.local.json")):
+            return False
+    return True
+
+
 def from_repo(name):
-    """True when the repository's .claude/settings.json sets NAME to the value now in the environment, and
-    neither its settings.local.json nor a managed policy file sets NAME. Those two count as the user's."""
+    """True when a repository's .claude/settings.json (the project directory's, or any parent up to the git
+    root) sets NAME to the value now in the environment, and the user did not also set it: not in a managed
+    policy file, and not in a settings.local.json that git does not track (a committed one is the repo's).
+    An error while checking counts as repo-sourced, so a loosening is never honoured on a doubt."""
     value = os.environ.get(name)
     if value is None:
         return False
     try:
-        claude = os.path.join(repo_root(), ".claude")
-        theirs = _env_block(os.path.join(claude, "settings.json"))
-        if name not in theirs or str(theirs[name]) != value:
-            return False
-        for path in [os.path.join(claude, "settings.local.json")] + list(MANAGED_SETTINGS):
-            if name in _env_block(path):
-                return False
-        return True
+        return _repo_sourced(name, value)
     except Exception:
-        return False
+        return True
 
 
 def guard_note(name, where):
-    """Say once per session and NAME that a guard ignored a loosening. The marker is a file under the
-    temp folder, so the hook that runs next in the same session stays quiet."""
+    """Record that a guard ignored a loosening of NAME from WHERE. The note itself is said once per session
+    and name, when it goes out: with the hook's own note, on stderr with a block, or by itself when the hook
+    ends (flush_guard). It waits because the session id is known only after the hook has read its event."""
+    if (name, where) not in _state.guard_text:
+        _state.guard_text.append((name, where))
+
+
+def _take_guard():
+    """The waiting guard notes as one text, leaving out any already said in this session. Empty when none."""
+    waiting, _state.guard_text = _state.guard_text, []
     hook = os.path.basename(_hook_name())
     if hook.endswith(".py"):
         hook = hook[:-3]
     sid = session_id(_state.event.get("session_id"))
-    if sid:  # without a session there is nothing to mark, so the note is said every time
-        folder = os.path.join(tempfile.gettempdir(), "lean-agent", sid)
-        try:
-            os.makedirs(folder, exist_ok=True)
-            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            os.close(os.open(os.path.join(folder, "guard-" + re.sub(r"\W", "_", name)), flags, 0o600))
-        except FileExistsError:
-            return
-        except OSError:
-            pass  # no marker: say it every time rather than never
-    text = (f"{name} from {where} is ignored: {hook} is a guard. "
-            "Set it in your user settings (~/.claude/settings.json) to change it.")
-    _emit(str(_state.event.get("hook_event_name") or "PreToolUse"), text)  # not a fire: the hook's own outcome is
+    lines = []
+    for name, where in waiting:
+        if sid:  # without a session there is nothing to mark, so the note is said every time
+            folder = os.path.join(tempfile.gettempdir(), "lean-agent", sid)
+            try:
+                os.makedirs(folder, exist_ok=True)
+                flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                os.close(os.open(os.path.join(folder, "guard-" + re.sub(r"\W", "_", name)), flags, 0o600))
+            except FileExistsError:
+                continue
+            except OSError:
+                pass  # no marker: say it every time rather than never
+        lines.append(f"{name} from {where} is ignored: {hook} is a guard. "
+                     "Set it in your user settings (~/.claude/settings.json) to change it.")
+    return " ".join(lines)
+
+
+def flush_guard(code=0):
+    """Send the waiting guard notes: to stderr when the call is blocked (code 2) or a note already went out
+    (one JSON document at most), else as one note. Hooks that go through run() never call this."""
+    text = _take_guard()
+    if not text:
+        return
+    if code == 2 or _state.emitted:
+        print(text, file=sys.stderr)
+        sys.stderr.flush()
+    else:
+        _emit(str(_state.event.get("hook_event_name") or "PreToolUse"), text)
     _keep_notice(text)
 
 
@@ -297,8 +352,8 @@ def _is_guard(manifest):
     return bool(isinstance(manifest, dict) and manifest.get("guard"))
 
 
-def _default(manifest, standard):
-    level = profile()
+def _default(manifest, standard, level=None):
+    level = level or profile()
     if standard is not None and level != "strict":
         # a per-call standard= replaces the manifest default; strict has always blocked
         return {"nothing": "off", "off": "off", "note": "note"}.get(standard, "block")
@@ -317,11 +372,17 @@ def resolve_for(hook, manifest, seg=None, standard=None, bound=None, quiet=False
     For a guard, a prefix value looser than the default is dropped, and so is an env value the repository's
     own settings put there. Resolution goes on to the next layer, and a note says so once unless QUIET.
     """
-    if profile() == "off":
+    guard = _is_guard(manifest)
+    level = profile()
+    if guard and level != "strict" and from_repo("LEAN_PROFILE"):
+        # a repository cannot loosen a guard with its own LEAN_PROFILE: resolve as if it were strict
+        if not quiet:
+            guard_note("LEAN_PROFILE", REPO_WHERE)
+        level = "strict"
+    if level == "off":
         return "off", "profile-off"
     name = switch_name(hook)
-    default = _default(manifest, standard)
-    guard = _is_guard(manifest)
+    default = _default(manifest, standard, level)
 
     def looser(found):
         return RANK[found] < RANK[default]
@@ -407,18 +468,21 @@ def run(main, manifest=None):
         _state.manifest = manifest
     found, source = resolve_mode()
     if found == "off" and source != "default":
+        flush_guard(0)
         sys.exit(0)
     try:
         code = main()
     except SystemExit as exc:
         if exc.code == 2:
             _fire("block")
+        flush_guard(exc.code if isinstance(exc.code, int) else 0)
         raise
     except Exception as exc:  # a broken hook must not block the tool call
         print(f"lean-agent hook error ignored: {exc!r}", file=sys.stderr)
         code = 0
     if code == 2:
         _fire("block")
+    flush_guard(code or 0)
     sys.exit(code or 0)
 
 
@@ -437,13 +501,17 @@ def tool_input(event):
 
 
 def _emit(event_name, text):
+    _state.emitted = True
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event_name, "additionalContext": text}}))
     sys.stdout.flush()
 
 
 def note(event_name, text):
-    """Print a non-blocking note that Claude reads with the tool result."""
+    """Print a non-blocking note that Claude reads with the tool result. Waiting guard notes join it."""
+    if _state.guard_text and not _state.emitted:
+        waiting = _take_guard()
+        text = text + ("\n" + waiting if waiting else "")
     _emit(event_name, text)
     _fire("note")
     _keep_notice(text)
@@ -948,6 +1016,7 @@ def _guard_tests(check, scratch):
     """Guards: a loosening from a repo's settings or a command prefix is dropped, with one note per session."""
     import contextlib
     import io
+    import shutil
 
     class _Seg:
         def __init__(self, **env):
@@ -973,7 +1042,7 @@ def _guard_tests(check, scratch):
     def make_repo(settings=None, local=None, git=True):
         root = tempfile.mkdtemp(prefix="repo-", dir=scratch)
         if git:
-            os.makedirs(os.path.join(root, ".git"))
+            subprocess.run(["git", "-C", root, "init", "-q"], check=True, capture_output=True)
         os.makedirs(os.path.join(root, ".claude"))
         for fname, env in (("settings.json", settings), ("settings.local.json", local)):
             if env is not None:
@@ -989,13 +1058,14 @@ def _guard_tests(check, scratch):
         os.environ.update(env)
         bind(name, manifest, bound)
         _state.event = {"session_id": sid, "cwd": root}
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             if seg is None:
                 code = refuse("PreToolUse", "REFUSED")
             else:  # refuse() sees no command prefix, so a per-segment check goes through mode(seg)
                 code = 2 if mode(seg) == "block" else 0
-        return code, out.getvalue()
+            flush_guard(code)
+        return code, out.getvalue() + err.getvalue().replace("REFUSED\n", "")
 
     try:
         sid = new_session()
@@ -1086,6 +1156,7 @@ def _guard_tests(check, scratch):
                   disabled("LEAN_SKIP_PUBLIC_TEXT", _Seg(LEAN_SKIP_PUBLIC_TEXT="1")), False)
             os.environ["LEAN_SKIP_PUBLIC_TEXT"] = "1"
             check("disabled ignores an env value the repo set", disabled("LEAN_SKIP_PUBLIC_TEXT"), False)
+            flush_guard(0)
         check("disabled says so once per session and name", captured.getvalue().count("is ignored"), 1)
         check("disabled names the prefix", "from the command prefix" in captured.getvalue(), True)
         os.environ["CLAUDE_PROJECT_DIR"] = make_repo({})
@@ -1093,6 +1164,87 @@ def _guard_tests(check, scratch):
         bind("gate-n.py", plain)
         check("disabled keeps a prefix in a non-guard",
               disabled("LEAN_SKIP_PUBLIC_TEXT", _Seg(LEAN_SKIP_PUBLIC_TEXT="1")), True)
+
+        # LEAN_PROFILE from the repo
+        def profile_call(manifest, repo_env, **env):
+            code, out = call("gate-g.py", manifest, make_repo(repo_env), new_session(), **env)
+            os.environ["LEAN_PROFILE"] = "strict"
+            return code, out
+        code, out = profile_call(guard, {"LEAN_PROFILE": "off"}, LEAN_PROFILE="off")
+        check("repo LEAN_PROFILE=off does not turn a guard off", (code, "LEAN_PROFILE from this repo" in out), (2, True))
+        code, out = profile_call(plain, {"LEAN_PROFILE": "off"}, LEAN_PROFILE="off")
+        check("repo LEAN_PROFILE=off turns a non-guard off", (code, out), (0, ""))
+        code, out = profile_call(guard, {}, LEAN_PROFILE="off")
+        check("a user LEAN_PROFILE=off turns a guard off", (code, out), (0, ""))
+        code, out = profile_call(guard, {"LEAN_PROFILE": "standard"}, LEAN_PROFILE="standard")
+        check("repo LEAN_PROFILE=standard keeps a guard at its strict default", (code, "LEAN_PROFILE from this repo" in out), (2, True))
+
+        # the project directory below the git root, and a committed settings.local.json
+        root = make_repo(None)
+        os.makedirs(os.path.join(root, "app", ".claude"))
+        with open(os.path.join(root, "app", ".claude", "settings.json"), "w", encoding="utf-8") as handle:
+            json.dump({"env": {"LEAN_HOOK_GATE_G": "off"}}, handle)
+        code, out = call("gate-g.py", guard, os.path.join(root, "app"), new_session(), LEAN_HOOK_GATE_G="off")
+        check("settings in the project dir below the git root count as the repo's", (code, "this repo" in out), (2, True))
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"})
+        os.makedirs(os.path.join(root, "app"))
+        code, out = call("gate-g.py", guard, os.path.join(root, "app"), new_session(), LEAN_HOOK_GATE_G="off")
+        check("settings at the git root count when the project dir is below it", (code, "this repo" in out), (2, True))
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"}, {"LEAN_HOOK_GATE_G": "off"})
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("an untracked settings.local.json is the user's", (code, out), (0, ""))
+        subprocess.run(["git", "-C", root, "add", "-f", ".claude/settings.local.json"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", root, "-c", "user.email=t@example.org", "-c", "user.name=t", "commit", "-q",
+                        "--no-verify", "-m", "x"], check=True, capture_output=True)
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a committed settings.local.json is the repo's", (code, "this repo" in out), (2, True))
+        check("a directory git cannot answer for is not untracked", _untracked(make_repo(None, git=False), "x"), False)
+
+        # an error while checking a loosening counts as repo-sourced
+        real_block = globals()["_env_block"]
+
+        def broken(path):
+            raise RuntimeError("injected")
+        globals()["_env_block"] = broken
+        try:
+            code, out = call("gate-g.py", guard, make_repo({}), new_session(), LEAN_HOOK_GATE_G="off")
+        finally:
+            globals()["_env_block"] = real_block
+        check("fail closed: an error in the repo check blocks", (code, "this repo" in out), (2, True))
+
+        # one JSON document on stdout
+        fixture = os.path.join(scratch, "fixture-guard.py")
+        here = os.path.dirname(os.path.realpath(__file__))
+        with open(fixture, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import sys\nsys.path.insert(0, %r)\nimport hookkit\n"
+                "HOOK = {'events': [], 'guard': True, 'default': {'strict': 'block', 'standard': 'note'}}\n"
+                "def main():\n    hookkit.read_event()\n    hookkit.guard_note('LEAN_SKIP_X', 'the command prefix')\n"
+                "    if len(sys.argv) > 1:\n        return hookkit.refuse('PreToolUse', 'REFUSED')\n"
+                "    hookkit.note('PreToolUse', 'HOOKNOTE')\n    return 0\n"
+                "if __name__ == '__main__':\n    hookkit.run(main, HOOK)\n" % here)
+        ev = {"session_id": new_session(), "tool_name": "Bash", "tool_input": {"command": "x"}}
+        done = subprocess.run([sys.executable, fixture], input=json.dumps(ev), capture_output=True, text=True,
+                              env=dict(os.environ, LEAN_PROFILE="strict"))
+        try:
+            doc = json.loads(done.stdout)
+            text = doc["hookSpecificOutput"]["additionalContext"]
+        except (ValueError, KeyError):
+            text = ""
+        check("a guard note and the hook's own note are one JSON document", ("HOOKNOTE" in text, "is ignored" in text), (True, True))
+        ev["session_id"] = new_session()
+        done = subprocess.run([sys.executable, fixture, "block"], input=json.dumps(ev), capture_output=True, text=True,
+                              env=dict(os.environ, LEAN_PROFILE="strict"))
+        check("on a block the guard note goes to stderr", (done.returncode, done.stdout, "is ignored" in done.stderr), (2, "", True))
+        verify = os.path.join(here, "..", "hooks", "verify-claim.py")
+        ev = {"session_id": new_session(), "tool_name": "Bash", "cwd": scratch,
+              "tool_input": {"command": "LEAN_SKIP_VERIFY_CLAIM=1 gh pr review 4 --approve"}}
+        code, out, err = probe(verify, ev, LEAN_PROFILE="strict")
+        try:
+            text = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        except (ValueError, KeyError):
+            text = ""
+        check("verify-claim gives one JSON document with both notes", (code, "is ignored" in text, "Thinking" in text or "verify" in text.lower()), (0, True, True))
 
         # root finding
         base = make_repo(None, git=False)
@@ -1103,7 +1255,7 @@ def _guard_tests(check, scratch):
         os.makedirs(os.path.join(repo, "x", "y"))
         os.environ["CLAUDE_PROJECT_DIR"] = os.path.join(repo, "x", "y")
         check("repo_root walks up to .git", repo_root(), repo)
-        os.rmdir(os.path.join(repo, ".git"))
+        shutil.rmtree(os.path.join(repo, ".git"))
         with open(os.path.join(repo, ".git"), "w", encoding="utf-8") as handle:
             handle.write("gitdir: elsewhere\n")
         check("repo_root accepts a .git file", repo_root(), repo)

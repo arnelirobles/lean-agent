@@ -628,6 +628,21 @@ def self_test():
                     check("and is not passed a looser LEAN_HOOK_MODE " + kind, "env=None" in out and "SEEN_GUARD:off" not in out, repr(out))
                 else:
                     check("a guard is skipped when the user says off " + kind, "mode=" not in out, repr(out))
+        # a repository's LEAN_PROFILE=off does not skip a guard, a user's does
+        for who, settings, runs in (("repo", {"LEAN_PROFILE": "off"}, True), ("user", {}, False)):
+            repo = tempfile.mkdtemp(prefix="guard-repo-", dir=tmp)
+            os.makedirs(os.path.join(repo, ".git"))
+            os.makedirs(os.path.join(repo, ".claude"))
+            with open(os.path.join(repo, ".claude", "settings.json"), "w", encoding="utf-8") as handle:
+                json.dump({"env": settings}, handle)
+            os.environ["CLAUDE_PROJECT_DIR"] = repo
+            os.environ["LEAN_PROFILE"] = "off"
+            try:
+                code, out, err = run_group("PreToolUse", 1, event(), group([row("seen_guard.py", guard_seen, "inproc")]))
+            finally:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                os.environ["LEAN_PROFILE"] = "strict"
+            check("a guard under LEAN_PROFILE=off from the %s runs: %s" % (who, runs), ("mode=block" in out) == runs, repr(out))
     finally:
         hookkit.MANAGED_SETTINGS = saved_managed
 
