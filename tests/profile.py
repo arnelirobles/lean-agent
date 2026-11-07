@@ -192,7 +192,7 @@ def corpus(work, repo_hooks, db):
         ("secret-scan init and commit", "secret-scan.py", bash("git init -q d && git -C d commit -m x"), {}),
         ("secret-scan unknown repo", "secret-scan.py", bash('git -C "$WT" commit -m x', repo_hooks["plain"]), {}),
         ("secret-scan no hooks", "secret-scan.py", bash("git commit -m x"), {}),
-        ("secret-scan skipped", "secret-scan.py", bash("LEAN_SKIP_SECRET_SCAN=1 git commit -m x"), {}),
+        ("secret-scan skipped", "secret-scan.py", bash("git commit -m x"), {"LEAN_SKIP_SECRET_SCAN": "1"}),
         ("context-cost image", "context-cost.py",
          {"hook_event_name": "PreToolUse", "session_id": "ps-1", "tool_name": "Read",
           "tool_input": {"file_path": "a.png"}, "transcript_path": repo_hooks["transcript"]}, {"LEAN_IMAGE_MODE": "block"}),

@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 
 SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")", ";;", "|&"}
@@ -189,27 +190,111 @@ def _manifest():
 _WARNED = set()
 
 
-def _layer(env, name, quiet=False):
-    """The mode one layer (an env prefix dict or the process env) asks for, or None.
-
-    LEAN_HOOK_<NAME> takes off, note or block; LEAN_SKIP_<NAME>=1 and the old name of the switch, set to its
-    old value, both mean off. Any other value is ignored with one stderr line.
-    """
+def _candidates(env, name, quiet=False):
+    """Every (mode, key) one layer asks for, in the order they win: LEAN_HOOK_<NAME> first, then
+    LEAN_SKIP_<NAME>=1, then the old name of the switch at its old value (the last two both mean off).
+    Any other value of LEAN_HOOK_<NAME> is ignored with one stderr line."""
     key = "LEAN_HOOK_" + name
     value = env.get(key)
     if value is not None:
         if value in ("off", "note", "block"):
-            return value
-        if not quiet and (key, value) not in _WARNED:
+            yield value, key
+        elif not quiet and (key, value) not in _WARNED:
             _WARNED.add((key, value))
             print(f"lean-agent: {key}={value} is not one of off, note, block; ignored.", file=sys.stderr)
     if env.get("LEAN_SKIP_" + name) == "1":
-        return "off"
+        yield "off", "LEAN_SKIP_" + name
     if key in ALIASES:
         old, old_value = ALIASES[key]
         if env.get(old) == old_value:
-            return "off"
+            yield "off", old
+
+
+def _layer(env, name, quiet=False):
+    """The mode one layer (an env prefix dict or the process env) asks for, or None."""
+    for found, _key in _candidates(env, name, quiet):
+        return found
     return None
+
+
+RANK = {"off": 0, "note": 1, "block": 2}
+# Claude Code's managed policy files. A test replaces this list so it never reads the real ones.
+MANAGED_SETTINGS = ["/Library/Application Support/ClaudeCode/managed-settings.json",
+                    "/etc/claude-code/managed-settings.json"]
+REPO_WHERE = "this repo's .claude/settings.json"
+PREFIX_WHERE = "the command prefix"
+
+
+def repo_root():
+    """The first directory at or above CLAUDE_PROJECT_DIR (else the event cwd, else the current directory)
+    that holds .git, file or directory. With none, the starting directory itself."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or str(_state.event.get("cwd") or "") or os.getcwd()
+    start = os.path.abspath(start)
+    here = start
+    while True:
+        if os.path.exists(os.path.join(here, ".git")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            return start
+        here = parent
+
+
+def _env_block(path):
+    """The env block of one settings file, {} when the file is missing, unreadable or odd."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        block = data.get("env") if isinstance(data, dict) else None
+        return block if isinstance(block, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def from_repo(name):
+    """True when the repository's .claude/settings.json sets NAME to the value now in the environment, and
+    neither its settings.local.json nor a managed policy file sets NAME. Those two count as the user's."""
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    try:
+        claude = os.path.join(repo_root(), ".claude")
+        theirs = _env_block(os.path.join(claude, "settings.json"))
+        if name not in theirs or str(theirs[name]) != value:
+            return False
+        for path in [os.path.join(claude, "settings.local.json")] + list(MANAGED_SETTINGS):
+            if name in _env_block(path):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def guard_note(name, where):
+    """Say once per session and NAME that a guard ignored a loosening. The marker is a file under the
+    temp folder, so the hook that runs next in the same session stays quiet."""
+    hook = os.path.basename(_hook_name())
+    if hook.endswith(".py"):
+        hook = hook[:-3]
+    sid = session_id(_state.event.get("session_id"))
+    if sid:  # without a session there is nothing to mark, so the note is said every time
+        folder = os.path.join(tempfile.gettempdir(), "lean-agent", sid)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            os.close(os.open(os.path.join(folder, "guard-" + re.sub(r"\W", "_", name)), flags, 0o600))
+        except FileExistsError:
+            return
+        except OSError:
+            pass  # no marker: say it every time rather than never
+    text = (f"{name} from {where} is ignored: {hook} is a guard. "
+            "Set it in your user settings (~/.claude/settings.json) to change it.")
+    _emit(str(_state.event.get("hook_event_name") or "PreToolUse"), text)  # not a fire: the hook's own outcome is
+    _keep_notice(text)
+
+
+def _is_guard(manifest):
+    return bool(isinstance(manifest, dict) and manifest.get("guard"))
 
 
 def _default(manifest, standard):
@@ -228,20 +313,40 @@ def resolve_for(hook, manifest, seg=None, standard=None, bound=None, quiet=False
 
     1. LEAN_PROFILE=off. 2. The command's env prefix. 3. The process env, or BOUND, the mode the dispatcher
     resolved from it. 4. (the extension layer comes later.) 5. STANDARD when given, else the manifest default.
+
+    For a guard, a prefix value looser than the default is dropped, and so is an env value the repository's
+    own settings put there. Resolution goes on to the next layer, and a note says so once unless QUIET.
     """
     if profile() == "off":
         return "off", "profile-off"
     name = switch_name(hook)
+    default = _default(manifest, standard)
+    guard = _is_guard(manifest)
+
+    def looser(found):
+        return RANK[found] < RANK[default]
+
+    def drop(key, where):
+        if not quiet:
+            guard_note(key, where)
+
     if seg is not None:
-        found = _layer(seg.env, name, quiet)
-        if found:
+        for found, key in _candidates(seg.env, name, quiet):
+            if guard and looser(found):
+                drop(key, PREFIX_WHERE)
+                continue
             return found, "prefix"
     if bound in ("off", "note", "block"):
-        return bound, "env"
-    found = _layer(os.environ, name, quiet)
-    if found:
+        if guard and looser(bound) and from_repo("LEAN_HOOK_MODE"):
+            drop("LEAN_HOOK_MODE", REPO_WHERE)
+        else:
+            return bound, "env"
+    for found, key in _candidates(os.environ, name, quiet):
+        if guard and looser(found) and from_repo(key):
+            drop(key, REPO_WHERE)
+            continue
         return found, "env"
-    return _default(manifest, standard), "default"
+    return default, "default"
 
 
 def resolve_mode(seg=None, standard=None):
@@ -331,11 +436,15 @@ def tool_input(event):
     return value if isinstance(value, dict) else {}
 
 
-def note(event_name, text):
-    """Print a non-blocking note that Claude reads with the tool result."""
+def _emit(event_name, text):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": event_name, "additionalContext": text}}))
     sys.stdout.flush()
+
+
+def note(event_name, text):
+    """Print a non-blocking note that Claude reads with the tool result."""
+    _emit(event_name, text)
     _fire("note")
     _keep_notice(text)
 
@@ -365,13 +474,25 @@ ALIASES = {
 
 
 def disabled(name, seg=None, values=("1",)):
-    """True when NAME, or its old alias, has an accepted value in the environment or in this command's env prefix."""
+    """True when NAME, or its old alias, has an accepted value in the environment or in this command's env prefix.
+
+    Inside a guard hook, the prefix never counts (a note says so), and an env value the repository's own
+    settings put there does not count either.
+    """
     pairs = [(name, tuple(values))]
     if name in ALIASES:
         old, old_value = ALIASES[name]
         pairs.append((old, (old_value,)))
+    guard = _is_guard(_manifest())
     for key, accepted in pairs:
-        if os.environ.get(key) in accepted or bool(seg and seg.env.get(key) in accepted):
+        if seg is not None and seg.env.get(key) in accepted:
+            if not guard:
+                return True
+            guard_note(key, PREFIX_WHERE)
+        if os.environ.get(key) in accepted:
+            if guard and from_repo(key):
+                guard_note(key, REPO_WHERE)
+                continue
             return True
     return False
 
@@ -823,6 +944,182 @@ def _switch_tests(check, scratch):
     return None
 
 
+def _guard_tests(check, scratch):
+    """Guards: a loosening from a repo's settings or a command prefix is dropped, with one note per session."""
+    import contextlib
+    import io
+
+    class _Seg:
+        def __init__(self, **env):
+            self.env = env
+
+    global MANAGED_SETTINGS, _RECORD
+    keys = ("CLAUDE_PROJECT_DIR", "LEAN_HOOK_GATE_G", "LEAN_HOOK_GATE_N", "LEAN_SKIP_GATE_G", "LEAN_HOOK_MODE",
+            "LEAN_ALLOW_COMMIT_AUTHOR", "LEAN_PROFILE", "LEAN_SKIP_PUBLIC_TEXT")
+    saved = {k: os.environ.pop(k, None) for k in keys}
+    saved_state = (_state.name, _state.manifest, _state.mode, _state.event)
+    saved_managed, saved_record = MANAGED_SETTINGS, _RECORD
+    managed = os.path.join(scratch, "no-managed.json")
+    MANAGED_SETTINGS, _RECORD = [managed], False
+    os.environ["LEAN_PROFILE"] = "strict"
+    guard = {"guard": True, "default": {"strict": "block", "standard": "note"}}
+    plain = {"guard": False, "default": {"strict": "block", "standard": "note"}}
+    counter = [0]
+
+    def new_session():
+        counter[0] += 1
+        return "guard-test-%d-%d" % (os.getpid(), counter[0])
+
+    def make_repo(settings=None, local=None, git=True):
+        root = tempfile.mkdtemp(prefix="repo-", dir=scratch)
+        if git:
+            os.makedirs(os.path.join(root, ".git"))
+        os.makedirs(os.path.join(root, ".claude"))
+        for fname, env in (("settings.json", settings), ("settings.local.json", local)):
+            if env is not None:
+                with open(os.path.join(root, ".claude", fname), "w", encoding="utf-8") as handle:
+                    json.dump({"env": env}, handle)
+        return root
+
+    def call(name, manifest, root, sid, seg=None, bound=None, **env):
+        """(exit code, stdout) of one refusal by the hook NAME, with ENV in the environment."""
+        for k in ("LEAN_HOOK_GATE_G", "LEAN_HOOK_GATE_N", "LEAN_SKIP_GATE_G", "LEAN_HOOK_MODE", "LEAN_ALLOW_COMMIT_AUTHOR"):
+            os.environ.pop(k, None)
+        os.environ["CLAUDE_PROJECT_DIR"] = root
+        os.environ.update(env)
+        bind(name, manifest, bound)
+        _state.event = {"session_id": sid, "cwd": root}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            if seg is None:
+                code = refuse("PreToolUse", "REFUSED")
+            else:  # refuse() sees no command prefix, so a per-segment check goes through mode(seg)
+                code = 2 if mode(seg) == "block" else 0
+        return code, out.getvalue()
+
+    try:
+        sid = new_session()
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"})
+        code, out = call("gate-g.py", guard, root, sid, LEAN_HOOK_GATE_G="off")
+        check("repo_loosen_ignored: blocks", code, 2)
+        check("repo_loosen_ignored: names the repo settings",
+              "LEAN_HOOK_GATE_G from this repo's .claude/settings.json is ignored: gate-g is a guard" in out, True)
+        check("repo_loosen_ignored: the note says to use user settings", "~/.claude/settings.json" in out, True)
+        code, out = call("gate-g.py", guard, root, sid, LEAN_HOOK_GATE_G="off")
+        check("repo_loosen_ignored: second call blocks without a second note", (code, out), (2, ""))
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("repo_loosen_ignored: a new session gets its own note", (code, "is ignored" in out), (2, True))
+
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"}, {"LEAN_HOOK_GATE_G": "off"})
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("local_loosen_kept", (code, out), (0, ""))
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"})
+        with open(managed, "w", encoding="utf-8") as handle:
+            json.dump({"env": {"LEAN_HOOK_GATE_G": "off"}}, handle)
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("managed_loosen_kept", (code, out), (0, ""))
+        os.remove(managed)
+
+        root = make_repo({})
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("user_loosen_kept", (code, out), (0, ""))
+        root = make_repo({"LEAN_HOOK_GATE_G": "block"})
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a repo value that differs from the env is not the repo's", (code, out), (0, ""))
+        root = make_repo(None, git=False)
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("no repo settings file", (code, out), (0, ""))
+
+        root = make_repo({})
+        code, out = call("gate-g.py", guard, root, new_session(), _Seg(LEAN_HOOK_GATE_G="off"))
+        check("prefix_loosen_ignored: blocks", code, 2)
+        check("prefix_loosen_ignored: names the command prefix",
+              "LEAN_HOOK_GATE_G from the command prefix is ignored" in out, True)
+        code, out = call("gate-g.py", guard, root, new_session(), _Seg(LEAN_SKIP_GATE_G="1"))
+        check("a prefix LEAN_SKIP_ is ignored too", (code, "LEAN_SKIP_GATE_G from the command prefix" in out), (2, True))
+        code, out = call("gate-g.py", guard, root, new_session(), _Seg(LEAN_HOOK_GATE_G="note"))
+        check("a prefix note over a block default is ignored", (code, "is ignored" in out), (2, True))
+        code, out = call("gate-g.py", guard, root, new_session(), _Seg(LEAN_HOOK_GATE_G="off"), LEAN_HOOK_GATE_G="off")
+        check("a dropped prefix falls through to a user env loosening", (code, out.count("is ignored")), (0, 1))
+
+        os.environ["LEAN_PROFILE"] = "standard"
+        code, out = call("gate-g.py", guard, root, new_session(), _Seg(LEAN_HOOK_GATE_G="block"))
+        check("prefix_tighten_kept", (code, out), (2, ""))
+        code, out = call("gate-g.py", guard, make_repo({"LEAN_HOOK_GATE_G": "block"}), new_session(),
+                         LEAN_HOOK_GATE_G="block")
+        check("a tighter repo value is kept", (code, out), (2, ""))
+        os.environ["LEAN_PROFILE"] = "strict"
+        code, out = call("gate-n.py", plain, root, new_session(), _Seg(LEAN_HOOK_GATE_N="off"))
+        check("non_guard_prefix_kept", (code, out), (0, ""))
+        code, out = call("gate-n.py", plain, make_repo({"LEAN_HOOK_GATE_N": "off"}), new_session(),
+                         LEAN_HOOK_GATE_N="off")
+        check("a non-guard repo loosening is kept", (code, out), (0, ""))
+
+        # the old names are covered too
+        root = make_repo({"LEAN_ALLOW_COMMIT_AUTHOR": "1"})
+        code, out = call("commit-author.py", guard, root, new_session(), LEAN_ALLOW_COMMIT_AUTHOR="1")
+        check("an old name in repo settings does not loosen a guard",
+              (code, "LEAN_ALLOW_COMMIT_AUTHOR from this repo" in out), (2, True))
+        code, out = call("commit-author.py", guard, make_repo({}), new_session(), _Seg(LEAN_ALLOW_COMMIT_AUTHOR="1"))
+        check("an old name in the prefix does not loosen a guard",
+              (code, "LEAN_ALLOW_COMMIT_AUTHOR from the command prefix" in out), (2, True))
+        code, out = call("commit-author.py", guard, make_repo({}), new_session(), LEAN_ALLOW_COMMIT_AUTHOR="1")
+        check("an old name in the user env still loosens", (code, out), (0, ""))
+
+        # a tagged LEAN_HOOK_MODE the repo put there
+        root = make_repo({"LEAN_HOOK_MODE": "GATE_G:off"})
+        code, out = call("gate-g.py", guard, root, new_session(), bound="off", LEAN_HOOK_MODE="GATE_G:off")
+        check("a looser LEAN_HOOK_MODE from the repo is dropped", (code, "LEAN_HOOK_MODE from this repo" in out), (2, True))
+        code, out = call("gate-g.py", guard, make_repo({}), new_session(), bound="off", LEAN_HOOK_MODE="GATE_G:off")
+        check("a looser LEAN_HOOK_MODE from the user is kept", (code, out), (0, ""))
+
+        # disabled() inside a guard
+        for k in ("LEAN_HOOK_MODE", "LEAN_ALLOW_COMMIT_AUTHOR"):
+            os.environ.pop(k, None)
+        bind("gate-g.py", guard)
+        root = make_repo({"LEAN_SKIP_PUBLIC_TEXT": "1"})
+        os.environ["CLAUDE_PROJECT_DIR"] = root
+        _state.event = {"session_id": new_session(), "cwd": root}
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            check("disabled ignores a prefix in a guard",
+                  disabled("LEAN_SKIP_PUBLIC_TEXT", _Seg(LEAN_SKIP_PUBLIC_TEXT="1")), False)
+            os.environ["LEAN_SKIP_PUBLIC_TEXT"] = "1"
+            check("disabled ignores an env value the repo set", disabled("LEAN_SKIP_PUBLIC_TEXT"), False)
+        check("disabled says so once per session and name", captured.getvalue().count("is ignored"), 1)
+        check("disabled names the prefix", "from the command prefix" in captured.getvalue(), True)
+        os.environ["CLAUDE_PROJECT_DIR"] = make_repo({})
+        check("disabled keeps a user env value in a guard", disabled("LEAN_SKIP_PUBLIC_TEXT"), True)
+        bind("gate-n.py", plain)
+        check("disabled keeps a prefix in a non-guard",
+              disabled("LEAN_SKIP_PUBLIC_TEXT", _Seg(LEAN_SKIP_PUBLIC_TEXT="1")), True)
+
+        # root finding
+        base = make_repo(None, git=False)
+        os.environ["CLAUDE_PROJECT_DIR"] = os.path.join(base, "a", "b")
+        check("no_git_root: falls back to the start directory", repo_root(), os.path.join(base, "a", "b"))
+        check("no_git_root: from_repo does not raise", from_repo("LEAN_HOOK_GATE_G"), False)
+        repo = make_repo({})
+        os.makedirs(os.path.join(repo, "x", "y"))
+        os.environ["CLAUDE_PROJECT_DIR"] = os.path.join(repo, "x", "y")
+        check("repo_root walks up to .git", repo_root(), repo)
+        os.rmdir(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git"), "w", encoding="utf-8") as handle:
+            handle.write("gitdir: elsewhere\n")
+        check("repo_root accepts a .git file", repo_root(), repo)
+        os.environ.pop("CLAUDE_PROJECT_DIR")
+        _state.event = {"cwd": repo}
+        check("repo_root falls back to the event cwd", repo_root(), repo)
+    finally:
+        MANAGED_SETTINGS, _RECORD = saved_managed, saved_record
+        _state.name, _state.manifest, _state.mode, _state.event = saved_state
+        for key, val in saved.items():
+            os.environ.pop(key, None)
+            if val is not None:
+                os.environ[key] = val
+        os.environ["LEAN_PROFILE"] = "strict"
+
+
 def with_standard(level, standard):
     saved = os.environ.get("LEAN_PROFILE")
     os.environ["LEAN_PROFILE"] = level
@@ -1192,6 +1489,7 @@ def self_test():
         check("child gets a scratch brain", bool(child_db) and os.path.realpath(child_db) != real_db, True)
         check("child kept its notice in the scratch brain", child_rows, "[('-c', 'child')]")
         _switch_tests(check, scratch)
+        _guard_tests(check, scratch)
         os.environ["LEAN_PROFILE"] = "strict"
     finally:
         _RECORD, _state.event = False, {}

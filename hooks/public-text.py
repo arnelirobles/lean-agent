@@ -27,8 +27,9 @@ any `cd`. The word and pattern lists live in lib/house_style.py.
   LEAN_SKIP_ATTRIBUTION=1    skip the attribution check
   LEAN_SKIP_SLOP=1           skip the slop check
   LEAN_HOOK_PUBLIC_TEXT=off  turn the whole hook off
-Any of them can be set in the environment, in the `env` block of Claude Code
-settings, or inline in front of the command (LEAN_SKIP_SLOP=1 git commit ...).
+Any of them can be set in the environment or in the `env` block of your user
+Claude Code settings. Inline in front of the command, or in a repository's own
+settings, they are ignored: this hook is a guard.
 
   public-text.py --self-test
 """
@@ -211,6 +212,13 @@ def self_test():
         "LEAN_ALLOW_SLOP=1 git commit -m 'x' -m 'Claude-" + "Session: x'",
         "LEAN_SKIP_ATTRIBUTION=1 git commit -m 'a rob" + "ust retry'",
         "LEAN_SKIP_SLOP=1 git commit -m 'x' -m 'Claude-" + "Session: x'",
+        # a guard: a loosening in the command's own prefix is ignored, so these block (with the guard note)
+        "LEAN_ALLOW_SLOP=1 git commit -m 'a rob" + "ust retry'",
+        "LEAN_SKIP_SLOP=1 git commit -m 'a rob" + "ust retry'",
+        "LEAN_HOOK_PUBLIC_TEXT=off git commit -m 'a rob" + "ust retry'",
+        "LEAN_HOOK_PUBLIC_TEXT=off git commit -m 'x' -m 'Claude-" + "Session: x'",
+        "LEAN_ALLOW_SLOP=1 glab mr create --description 'a rob" + "ust retry'",
+        "LEAN_SKIP_SLOP=1 glab mr create --description 'a rob" + "ust retry'",
         "gh pr create --title t --body 'a rob" + "ust fix, see `code`'",
         "gh pr merge 4 --squash --body 'a rob" + "ust retry'",
         'glab mr create --title t --description "fast \u2014 and safe"',
@@ -251,10 +259,6 @@ def self_test():
         "git commit -m 'the hook blocks the word `rob" + "ust`'",
         "gh pr create --title t --body 'output:\n```\nstep 1 \u2014 ok\n```'",
         "git commit -m 'Revert \"add a rob" + "ust retry\"' -m 'This reverts commit abc.'",
-        "LEAN_ALLOW_SLOP=1 git commit -m 'a rob" + "ust retry'",
-        "LEAN_SKIP_SLOP=1 git commit -m 'a rob" + "ust retry'",
-        "LEAN_HOOK_PUBLIC_TEXT=off git commit -m 'a rob" + "ust retry'",
-        "LEAN_HOOK_PUBLIC_TEXT=off git commit -m 'x' -m 'Claude-" + "Session: x'",
         "git add . # a rob" + "ust comment\ngit commit -m x",
         "git tag -l 'rob" + "ust*'",
         "gh api repos/o/r/issues -F per_page=100 --jq '.[].title | select(test(\"rob" + "ust\"))'",
@@ -267,8 +271,6 @@ def self_test():
         "az repos pr create --title t && echo - a rob" + "ust fix",
         "az repos pr update --id 3 --auto-complete true",
         "az repos pr show --id 3 --query title",
-        "LEAN_ALLOW_SLOP=1 glab mr create --description 'a rob" + "ust retry'",
-        "LEAN_SKIP_SLOP=1 glab mr create --description 'a rob" + "ust retry'",
         "echo glab mr create --description 'a rob" + "ust retry'",
     ]
     failures = 0

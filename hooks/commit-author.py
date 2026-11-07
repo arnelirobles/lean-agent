@@ -19,10 +19,10 @@ When git cannot be asked (the directory is not a repository, for example
 because it came from a shell expression the hook cannot evaluate), it lets
 the commit through rather than guess.
 
-  LEAN_HOOK_COMMIT_AUTHOR=off  turn it off, in the environment, in the env
-                               block of Claude Code settings, or inline in
-                               front of the command (only off is read for
-                               now)
+  LEAN_HOOK_COMMIT_AUTHOR=off  turn it off, in the environment or in the env
+                               block of your user settings. Inline in front
+                               of the command, or in a repository's own
+                               settings, it is ignored (this hook is a guard)
   commit-author.py --self-test
 """
 import os
@@ -208,12 +208,17 @@ def self_test():
             subprocess.run(["git", "-C", repo, "config", "user.email", "jane@example.org"], check=True)
             for command in ('cd "$(git rev-parse --show-toplevel)" && git commit -m x',
                             'git -C "$WT" commit -m x', "cd nowhere && git commit -m x",
-                            "LEAN_ALLOW_COMMIT_AUTHOR=1 git -c user.email=user@devbox commit -m x",
+                            ):
+                if problems(command, repo, hosts):
+                    print(f"FAIL {command!r} blocked: {problems(command, repo, hosts)}")
+                    failures += 1
+            # a guard: a loosening in the command's own prefix is ignored, so these block (with the guard note)
+            for command in ("LEAN_ALLOW_COMMIT_AUTHOR=1 git -c user.email=user@devbox commit -m x",
                             "env LEAN_ALLOW_COMMIT_AUTHOR=1 git -c user.email=user@devbox commit -m x",
                             "LEAN_HOOK_COMMIT_AUTHOR=off git -c user.email=user@devbox commit -m x",
                             "env LEAN_HOOK_COMMIT_AUTHOR=off git -c user.email=user@devbox commit -m x"):
-                if problems(command, repo, hosts):
-                    print(f"FAIL {command!r} blocked: {problems(command, repo, hosts)}")
+                if not problems(command, repo, hosts):
+                    print(f"FAIL {command!r} should block: a prefix cannot loosen a guard")
                     failures += 1
             subprocess.run(["git", "-C", repo, "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
             if not problems("GIT_AUTHOR_EMAIL=a@corp.internal git commit -m x", repo, hosts):

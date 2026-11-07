@@ -601,6 +601,36 @@ def self_test():
             os.environ["LEAN_PROFILE"] = "strict"
         check("profile off skips every member " + kind, (code, out) == (0, ""), repr((code, out)))
 
+    # guards: a loosening that the repository's settings put in the env is not passed on as LEAN_HOOK_MODE
+    guard_seen = hook("seen_guard.py", "HOOK = {'events': [], 'guard': True, 'default': {'strict': 'block', 'standard': 'note'}}\n"
+                      "def main():\n    import os\n    hookkit.read_event()\n"
+                      "    hookkit.note('PreToolUse', 'mode=%s source=%s env=%s' % (hookkit.mode(), hookkit.resolve_mode()[1], "
+                      "os.environ.get('LEAN_HOOK_MODE')))\n    return 0")
+    saved_managed = hookkit.MANAGED_SETTINGS
+    hookkit.MANAGED_SETTINGS = [os.path.join(tmp, "no-managed.json")]
+    try:
+        for kind in ("inproc", "process"):
+            for who, settings in (("repo", {"LEAN_HOOK_SEEN_GUARD": "off"}), ("user", {})):
+                repo = tempfile.mkdtemp(prefix="guard-repo-", dir=tmp)
+                os.makedirs(os.path.join(repo, ".git"))
+                os.makedirs(os.path.join(repo, ".claude"))
+                with open(os.path.join(repo, ".claude", "settings.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"env": settings}, handle)
+                os.environ["CLAUDE_PROJECT_DIR"] = repo
+                os.environ["LEAN_HOOK_SEEN_GUARD"] = "off"
+                try:
+                    code, out, err = run_group("PreToolUse", 1, event(), group([row("seen_guard.py", guard_seen, kind)]))
+                finally:
+                    os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                    os.environ.pop("LEAN_HOOK_SEEN_GUARD", None)
+                if who == "repo":
+                    check("a guard runs when only the repo says off " + kind, "mode=block source=default" in out, repr(out))
+                    check("and is not passed a looser LEAN_HOOK_MODE " + kind, "env=None" in out and "SEEN_GUARD:off" not in out, repr(out))
+                else:
+                    check("a guard is skipped when the user says off " + kind, "mode=" not in out, repr(out))
+    finally:
+        hookkit.MANAGED_SETTINGS = saved_managed
+
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
         return 1

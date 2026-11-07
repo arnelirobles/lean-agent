@@ -9,7 +9,8 @@ can crash startup when its caller swallows the error. Someone may act on the
 comment. It never blocks, and it stays quiet for a short body (under 30 words
 passed with --body/-b or --body-file/-F, or glab's --message/-m), since an acknowledgement makes no case.
 
-  LEAN_SKIP_VERIFY_CLAIM=1   turn it off (environment, settings env, or inline)
+  LEAN_SKIP_VERIFY_CLAIM=1   turn it off (environment or your user settings env;
+                              inline and repository settings are ignored: a guard)
   verify-claim.py --self-test
 """
 import os
@@ -95,10 +96,12 @@ def self_test():
                  "gh issue comment 9 --body-file long.md", f"gh pr review 4 --comment -b '{long_body}'",
                  "gh pr comment 4 --body-file=long.md", "gh issue comment 9 --body-file missing.md",
                  f"glab mr note 4 -m '{long_body}'", f"glab mr note create 4 --message '{long_body}'",
-                 f"glab issue note 9 --message='{long_body}'", "glab mr note 4"]
+                 f"glab issue note 9 --message='{long_body}'", "glab mr note 4",
+                 # a guard: the command's own prefix cannot turn it off (the guard note is printed too)
+                 "LEAN_SKIP_VERIFY_CLAIM=1 gh pr review 4 --approve"]
         quiet = ["gh pr comment 4 --body 'Thanks, merged.'", "gh issue comment 9 -F short.md",
                  "gh pr view 4 --comments", "gh issue list", "echo gh pr comment",
-                 "gh pr create --body 'x'", "LEAN_SKIP_VERIFY_CLAIM=1 gh pr review 4 --approve",
+                 "gh pr create --body 'x'",
                  "glab mr note 4 -m 'Thanks, merged.'", "glab mr view 4 --comments", "glab mr create -d 'x'",
                  "az repos pr create --description 'x'", "echo glab mr note 4"]
         for command in noted:

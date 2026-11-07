@@ -267,12 +267,21 @@ Every hook has one switch, `LEAN_HOOK_<NAME>`, where NAME is the hook file name 
 | Order | Source |
 |---|---|
 | 1 | `LEAN_PROFILE=off` turns every hook off |
-| 2 | the env prefix of the command (`LEAN_HOOK_COMMIT_AUTHOR=off git commit ...`) |
-| 3 | the environment (the `env` block of Claude Code settings) |
+| 2 | the env prefix of the command (`LEAN_HOOK_COMMIT_AUTHOR=off git commit ...`); a guard ignores a loosening here |
+| 3 | the environment (the `env` block of Claude Code settings); a guard ignores a loosening that the repository's `.claude/settings.json` set |
 | 4 | reserved for extensions, not built yet |
 | 5 | the hook's default for the profile |
 
 The dispatcher resolves layers 1 to 3 once per hook, skips a hook that is off, and hands the result to the hook as `LEAN_HOOK_MODE=<NAME>:<mode>` (a bare value, or another hook's name, is ignored). A prefix `note` or `block` only counts in hooks that read the command line, and a prefix `off` is honoured where a hook already did so.
+
+### Guards
+
+`secret-scan`, `commit-author`, `public-text`, `test-before-push` and `verify-claim` are guards (`"guard": True` in the hook's `HOOK` literal). Only you can loosen a guard. A loosening is `off`, or `note` over a `block` default, and a guard ignores it when it comes from:
+
+- the command's own env prefix (`LEAN_HOOK_SECRET_SCAN=off git push`, `LEAN_SKIP_SECRET_SCAN=1 git commit ...`, or an old `LEAN_ALLOW_*` name), because the agent writes that prefix, not you;
+- the `env` block of the repository's `.claude/settings.json`, because a cloned repository could otherwise switch a guard off.
+
+The guard says so once per session and name, and tells you to set the value in `~/.claude/settings.json`. Tightening works from anywhere. The repository is the git root of `CLAUDE_PROJECT_DIR` (the current directory when there is none). The repository's `.claude/settings.local.json` and managed policy settings count as yours, so a value in either keeps working. The same rule covers `LEAN_SKIP_ATTRIBUTION` and `LEAN_SKIP_SLOP` in `public-text`. The git hooks that `secret-scan install` writes still read `LEAN_SKIP_SECRET_SCAN` from their own environment.
 
 The git hooks that `secret-scan install` writes do not read `LEAN_PROFILE`. A person has them only after running install, so they keep blocking a key in a commit or push in every profile. `LEAN_SKIP_SECRET_SCAN=1` or an `allow-secret` line is how to get past them.
 

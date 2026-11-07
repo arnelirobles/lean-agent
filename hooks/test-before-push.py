@@ -13,7 +13,8 @@ than the run record-test-run.py keeps, or says no run is recorded.
 It never blocks.
 
   LEAN_SKIP_TEST_BEFORE_PUSH=1   turn it off (and record-test-run.py), in the
-                                 environment, settings env, or inline
+                                 environment or your user settings env (inline
+                                 and repository settings are ignored: a guard)
   test-before-push.py --self-test
 """
 import os
@@ -152,9 +153,12 @@ def self_test():
                     "az repos pr update --id 3 --status completed", "cd . && glab mr merge 3"):
             check(f"edit after the run warns on {cmd}", message(cmd, tmp), True)
         for cmd in ("glab mr list", "glab mr note 3 -m hi", "az repos pr update --id 3 --title t",
-                    "az repos pr list", "echo glab mr merge 3", "LEAN_SKIP_TEST_BEFORE_PUSH=1 glab mr merge 3"):
+                    "az repos pr list", "echo glab mr merge 3"):
             check(f"edit after the run is quiet on {cmd}", message(cmd, tmp), False)
-        check("inline off switch", message("LEAN_SKIP_TEST_BEFORE_PUSH=1 git push", tmp), False)
+        # a guard: the command's own prefix cannot turn it off, so these still warn (with the guard note)
+        check("edit after the run warns despite an inline skip on glab mr merge",
+              message("LEAN_SKIP_TEST_BEFORE_PUSH=1 glab mr merge 3", tmp), True)
+        check("inline off switch is ignored, a guard", message("LEAN_SKIP_TEST_BEFORE_PUSH=1 git push", tmp), True)
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
 

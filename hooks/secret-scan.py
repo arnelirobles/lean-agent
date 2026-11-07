@@ -32,8 +32,10 @@ with `allow-secret` on it is skipped. Each block is recorded as a hook fire in
 lean.db, so a weekly count is possible.
 
   LEAN_SKIP_SECRET_SCAN=1   turn it off, here and in the git hooks: in the
-                            environment, in the env block of Claude Code
-                            settings, or inline in front of the command
+                            environment or in the env block of your user
+                            settings. Inline in front of the command, or in
+                            a repository's own settings, it is ignored here
+                            (this hook is a guard)
   secret-scan.py --self-test
 """
 import importlib.machinery
@@ -553,7 +555,7 @@ def bash_verdict(command, cwd):
         if not hookkit.disabled(SKIP, c):
             touching += effective(c)
     unplaced = odd and re.search(r"\b(commit|push)\b", hookkit.prepare(command)[0])
-    if unplaced and SKIP + "=1" not in command:
+    if unplaced:
         for args in odd:
             touching.append(Call("commit", args, cwd, cwd, None, None, {}, True, []))
     touching = [c for c in touching if not hookkit.disabled(SKIP, c)]
@@ -779,9 +781,10 @@ def self_test():
         check("no hooks: echo git commit passes", bash("echo git commit", bare).returncode, 0)
         check("no hooks: gh pr create text that says git commit passes",
               bash('gh pr create --title "x" --body "run git commit, then git push; cd $HOME"', bare).returncode, 0)
-        check("no hooks: skip inline", bash("LEAN_SKIP_SECRET_SCAN=1 git commit -m x", bare).returncode, 0)
+        check("no hooks: skip inline is ignored, a guard", bash("LEAN_SKIP_SECRET_SCAN=1 git commit -m x", bare).returncode, 2)
         check("no hooks: skip in env", bash("git commit -m x", bare, {SKIP: "1"}).returncode, 0)
-        check("no hooks: skip inside bash -c", bash("bash -c 'LEAN_SKIP_SECRET_SCAN=1 git commit -m x'", bare).returncode, 0)
+        check("no hooks: skip inside bash -c is ignored, a guard",
+              bash("bash -c 'LEAN_SKIP_SECRET_SCAN=1 git commit -m x'", bare).returncode, 2)
         check("outside a repository a literal commit passes", bash("git commit -m x", tmp).returncode, 0)
         sh("git", "-C", bare, "config", "alias.ci", "commit")
         sh("git", "-C", bare, "config", "alias.st", "status")
@@ -885,7 +888,8 @@ def self_test():
             p = bash(cmd, bare)
             check(f"bypass, {label}: blocks", p.returncode, 2)
             check(f"bypass, {label}: says why", "without the git hooks" in p.stderr, True)
-        check("bypass with skip set passes", bash("LEAN_SKIP_SECRET_SCAN=1 git commit --no-verify -m x", bare).returncode, 0)
+        check("bypass with an inline skip still blocks, a guard",
+              bash("LEAN_SKIP_SECRET_SCAN=1 git commit --no-verify -m x", bare).returncode, 2)
         for label, cmd in (("a variable git word without a skip flag", "g=git; $g commit -m x"),
                            ("a backtick body that is not a commit", "echo `git status`"),
                            ("a backtick in a commit message", 'git commit -m "use `foo` here"'),
