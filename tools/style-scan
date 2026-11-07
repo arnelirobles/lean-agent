@@ -16,7 +16,6 @@ skipped, for test data that has to spell the thing it tests.
 
   style-scan [--base REF]    exit 0 clean, 1 on a hit, 2 when it cannot run
   LEAN_SKIP_WIDE_CHARS=1     skip the U+2000 check (text in other scripts)
-                             (the old LEAN_ALLOW_WIDE_CHARS=1 still works)
   style-scan --self-test
 """
 import os

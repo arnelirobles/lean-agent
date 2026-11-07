@@ -27,7 +27,6 @@ any `cd`. The word and pattern lists live in lib/house_style.py.
   LEAN_SKIP_ATTRIBUTION=1    skip the attribution check
   LEAN_SKIP_SLOP=1           skip the slop check
   LEAN_HOOK_PUBLIC_TEXT=off  turn the whole hook off
-The old names LEAN_ALLOW_ATTRIBUTION=1 and LEAN_ALLOW_SLOP=1 still work.
 Any of them can be set in the environment, in the `env` block of Claude Code
 settings, or inline in front of the command (LEAN_SKIP_SLOP=1 git commit ...).
 
@@ -323,6 +322,17 @@ def self_test():
     with tempfile.TemporaryDirectory() as there:
         slop = {"tool_input": {"command": 'git commit -m "a rob' + 'ust retry"'}, "cwd": there}
         want("slop is a note", std(slop), 0, True)
+        clear = {"LEAN_HOOK_PUBLIC_TEXT": None, "LEAN_SKIP_SLOP": None, "LEAN_SKIP_ATTRIBUTION": None,
+                 "LEAN_ALLOW_SLOP": None, "LEAN_ALLOW_ATTRIBUTION": None}
+        got = hookkit.probe(os.path.realpath(__file__), slop, LEAN_PROFILE="strict", **clear)
+        if got[0] != 2 or "LEAN_SKIP_SLOP=1" not in got[2] or "LEAN_ALLOW" in got[2]:
+            print(f"FAIL strict message should name only the new switches: {got!r}")
+            failures += 1
+        got = hookkit.probe(os.path.realpath(__file__), slop, LEAN_PROFILE="strict",
+                            **dict(clear, LEAN_HOOK_PUBLIC_TEXT="off"))
+        if got[0] != 0 or got[2]:
+            print(f"FAIL LEAN_HOOK_PUBLIC_TEXT=off in the environment should turn the hook off: {got!r}")
+            failures += 1
 
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0

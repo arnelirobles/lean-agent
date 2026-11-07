@@ -22,7 +22,7 @@ the commit through rather than guess.
   LEAN_HOOK_COMMIT_AUTHOR=off  turn it off, in the environment, in the env
                                block of Claude Code settings, or inline in
                                front of the command (only off is read for
-                               now; LEAN_ALLOW_COMMIT_AUTHOR=1 still works)
+                               now)
   commit-author.py --self-test
 """
 import os
@@ -255,6 +255,19 @@ def self_test():
                          GIT_CONFIG_NOSYSTEM="1", HOME=there)[0] != 2:
             print("FAIL strict should still block a bad author email")
             failures += 1
+        clear = {"LEAN_HOOK_COMMIT_AUTHOR": None, "LEAN_ALLOW_COMMIT_AUTHOR": None}
+        got = hookkit.probe(os.path.realpath(__file__), bad_author, LEAN_PROFILE="strict",
+                            GIT_CONFIG_NOSYSTEM="1", HOME=there, **clear)
+        if got[0] != 2 or "LEAN_HOOK_COMMIT_AUTHOR=off" not in got[2] or "LEAN_ALLOW" in got[2]:
+            print(f"FAIL strict message should name only the new switch: {got!r}")
+            failures += 1
+        for name, value in (("LEAN_HOOK_COMMIT_AUTHOR", "off"), ("LEAN_ALLOW_COMMIT_AUTHOR", "1")):
+            env = dict(clear, **{name: value})
+            got = hookkit.probe(os.path.realpath(__file__), bad_author, LEAN_PROFILE="strict",
+                                GIT_CONFIG_NOSYSTEM="1", HOME=there, **env)
+            if got[0] != 0:
+                print(f"FAIL {name}={value} in the environment should turn the check off: {got!r}")
+                failures += 1
 
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0

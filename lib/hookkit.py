@@ -659,23 +659,35 @@ def self_test():
             self.env = env
 
     for new, (old, old_value) in ALIASES.items():
-        for value in ("1",):
-            for key in (new, old):
-                os.environ.pop(new, None)
-                os.environ.pop(old, None)
-                check(f"{key} unset is not disabled", disabled(new), False)
-                os.environ[key] = value
-                check(f"{key}={value} in the environment disables {new}", disabled(new), True)
-                os.environ.pop(key)
-                check(f"{key}={value} in the env prefix disables {new}", disabled(new, _Seg(**{key: value})), True)
-                check(f"{key}=0 in the env prefix does not disable {new}", disabled(new, _Seg(**{key: "0"})), False)
+        value = "1"
+        for key in (new, old):
+            os.environ.pop(new, None)
+            os.environ.pop(old, None)
+            check(f"{key} unset is not disabled", disabled(new), False)
+            os.environ[key] = value
+            check(f"{key}={value} in the environment disables {new}", disabled(new), True)
+            os.environ.pop(key)
+            check(f"{key}={value} in the env prefix disables {new}", disabled(new, _Seg(**{key: value})), True)
+            check(f"{key}=0 in the env prefix does not disable {new}", disabled(new, _Seg(**{key: "0"})), False)
     for new, old, value in (("LEAN_HOOK_COMMIT_AUTHOR", "LEAN_ALLOW_COMMIT_AUTHOR", "off"),
                             ("LEAN_HOOK_SCRATCHPAD_ROOT", "LEAN_ALLOW_SCRATCHPAD_ROOT", "off"),
                             ("LEAN_HOOK_PUBLIC_TEXT", None, "off")):
-        check(f"{new}=off in the environment", disabled(new, values=(value,), seg=_Seg(**{new: value})), True)
-        check(f"{new}=1 is not the new value", disabled(new, _Seg(**{new: "1"}), (value,)), False)
+        os.environ.pop(new, None)
         if old:
-            check(f"{old}=1 still works for {new}", disabled(new, _Seg(**{old: "1"}), (value,)), True)
+            os.environ.pop(old, None)
+        check(f"{new} unset is not disabled", disabled(new, values=(value,)), False)
+        os.environ[new] = value
+        check(f"{new}=off in the environment", disabled(new, values=(value,)), True)
+        os.environ[new] = "1"
+        check(f"{new}=1 in the environment is not the new value", disabled(new, values=(value,)), False)
+        os.environ.pop(new)
+        check(f"{new}=off in the env prefix", disabled(new, _Seg(**{new: value}), (value,)), True)
+        check(f"{new}=1 in the env prefix is not the new value", disabled(new, _Seg(**{new: "1"}), (value,)), False)
+        if old:
+            os.environ[old] = "1"
+            check(f"{old}=1 in the environment still works for {new}", disabled(new, values=(value,)), True)
+            os.environ.pop(old)
+            check(f"{old}=1 in the env prefix still works for {new}", disabled(new, _Seg(**{old: "1"}), (value,)), True)
 
     with tempfile.TemporaryDirectory() as tmp:
         def manifest_error(body):

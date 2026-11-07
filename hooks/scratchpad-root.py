@@ -10,8 +10,7 @@ directory in $CLAUDE_SCRATCHPAD when that is set. The same names one level
 down (scratchpad/<task>/pr-body.md) pass.
 
   LEAN_HOOK_SCRATCHPAD_ROOT=off  turn it off (environment or the settings env block;
-                                 only off is read for now, and the old
-                                 LEAN_ALLOW_SCRATCHPAD_ROOT=1 still works)
+                                 only off is read for now)
   scratchpad-root.py --self-test
 """
 import fnmatch
