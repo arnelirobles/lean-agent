@@ -67,6 +67,7 @@ The scripts live in `${CLAUDE_PLUGIN_ROOT}/tools/`. They are on PATH when the se
 - `check-conflict-markers.sh`, `check-top-level-md.sh`, `check-workflow-keys.py`, `check-runtime.sh`: cheap repository checks, run them in the preflight.
 - `script-repeats [--days N]`: counts the commands agents wrote by hand in recent transcripts, per family, with the script that covers each. The retro runs it.
 - `retro-signals.sh`, `lean-stats`, `workflow-cost.py`: the retro's facts and what a run cost.
+- `lean-agent build [--check]`: builds hooks/hooks.json from the HOOK literals in hooks/*.py; `--check` says whether it is current.
 
 ### Drafter brief (`lean:draft`)
 Coding agents call these instead of writing the command again:
