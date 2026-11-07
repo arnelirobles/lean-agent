@@ -92,11 +92,11 @@ def resolve(member):
 
 def process_env(member, bound=None):
     """The environment of a process member. LEAN_HOOK_MODE is set only when BOUND (the mode the dispatcher
-    got from the user's env); an inherited LEAN_HOOK_MODE is removed otherwise."""
+    got from the user's env), as "<NAME>:<mode>"; an inherited LEAN_HOOK_MODE is removed otherwise."""
     env = dict(os.environ)
     env.pop("LEAN_HOOK_MODE", None)
     if bound:
-        env["LEAN_HOOK_MODE"] = bound
+        env["LEAN_HOOK_MODE"] = "%s:%s" % (hookkit.switch_name(member["name"]), bound)
     return env
 
 
@@ -581,7 +581,7 @@ def self_test():
         finally:
             os.environ.pop("LEAN_HOOK_SEEN_MODE", None)
         check("switch from env reaches the hook " + kind, "source=env" in out and "mode=note" in out, repr(out))
-        check("env sets LEAN_HOOK_MODE only for a process member", ("env=note" in out) == (kind == "process"), repr(out))
+        check("env sets LEAN_HOOK_MODE only for a process member", ("env=SEEN_MODE:note" in out) == (kind == "process"), repr(out))
         os.environ["LEAN_HOOK_MODE"] = "block"  # a stray inherited value must not reach a member
         try:
             code, out, err = run_group("PreToolUse", 1, event(), group([row("seen_mode.py", seen, kind)]))

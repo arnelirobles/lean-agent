@@ -245,11 +245,12 @@ def resolve_for(hook, manifest, seg=None, standard=None, bound=None, quiet=False
 
 
 def resolve_mode(seg=None, standard=None):
-    """(mode, source) for the running hook. Inside a dispatcher-bound hook, LEAN_HOOK_MODE stands in for layer 3."""
+    """(mode, source) for the running hook. Inside a dispatcher-bound hook, a LEAN_HOOK_MODE tagged with this hook's name stands in for layer 3."""
     bound = _state.mode
     if bound is None and _state.name is None:
-        raw = os.environ.get("LEAN_HOOK_MODE")
-        bound = raw if raw in ("off", "note", "block") else None
+        # the dispatcher writes "<NAME>:<mode>"; a bare value or another hook's name is ignored
+        who, _, raw = os.environ.get("LEAN_HOOK_MODE", "").partition(":")
+        bound = raw if who == switch_name(_hook_name()) and raw in ("off", "note", "block") else None
     return resolve_for(_hook_name(), _manifest(), seg, standard, bound)
 
 
@@ -770,9 +771,15 @@ def _switch_tests(check, scratch):
     check("a bad value is ignored and named", (got[0], "LEAN_HOOK_FIXTURE_GATE=loud" in got[2]), (2, True))
     got = fire(LEAN_PROFILE="off", LEAN_HOOK_FIXTURE_GATE="block")
     check("profile off beats the switch", (got[0], got[1], got[3]), (0, False, False))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="FIXTURE_GATE:off")
+    check("LEAN_HOOK_MODE with the hook's own name stands in for the env layer", (got[0], got[3]), (0, False))
     got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="off")
-    check("LEAN_HOOK_MODE stands in for the env layer", (got[0], got[3]), (0, False))
-    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="off", LEAN_HOOK_FIXTURE_GATE="block")
+    check("a bare LEAN_HOOK_MODE is ignored", (got[0], got[3]), (2, True))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="SECRET_SCAN:off")
+    check("another hook's LEAN_HOOK_MODE is ignored", (got[0], got[2].strip(), got[3]), (2, "REFUSED", True))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="FIXTURE_GATE:loud")
+    check("a bad tagged mode is ignored", (got[0], got[3]), (2, True))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="FIXTURE_GATE:off", LEAN_HOOK_FIXTURE_GATE="block")
     check("a hook switch in the env does not beat a bound mode", (got[0], got[3]), (0, False))
     got = fire(LEAN_PROFILE="strict", LEAN_HOOK_FIXTURE_GATE="off", LEAN_HOOK_MODE=None)
     check("probe drops a caller's LEAN_HOOK_MODE", got[3], False)

@@ -272,7 +272,7 @@ Every hook has one switch, `LEAN_HOOK_<NAME>`, where NAME is the hook file name 
 | 4 | reserved for extensions, not built yet |
 | 5 | the hook's default for the profile |
 
-The dispatcher resolves layers 1 to 3 once per hook, skips a hook that is off, and hands the result to the hook as `LEAN_HOOK_MODE`.
+The dispatcher resolves layers 1 to 3 once per hook, skips a hook that is off, and hands the result to the hook as `LEAN_HOOK_MODE=<NAME>:<mode>` (a bare value, or another hook's name, is ignored). A prefix `note` or `block` only counts in hooks that read the command line, and a prefix `off` is honoured where a hook already did so.
 
 The git hooks that `secret-scan install` writes do not read `LEAN_PROFILE`. A person has them only after running install, so they keep blocking a key in a commit or push in every profile. `LEAN_SKIP_SECRET_SCAN=1` or an `allow-secret` line is how to get past them.
 
