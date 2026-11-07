@@ -26,7 +26,8 @@ written. A session id outside [A-Za-z0-9-]{1,100} or a
 folder that cannot be trusted means no note. A hook error never fails the session.
 
   LEAN_SCRIPT_NOTE=off   turn the notes off (environment or settings env)
-  LEAN_DIRECT_TEST=allow turn the direct test run block off (environment, settings env or inline)
+  LEAN_DIRECT_TEST=on    turn the direct test run block off (environment, settings env or inline;
+                         the old value allow still works)
   script-note.py --self-test
 """
 import importlib.machinery
@@ -132,7 +133,7 @@ def direct_test(command, cwd):
 def block_message(cwd):
     return ("Do not run tests directly. Queue them: `%s queue add %s <test project> --filter ...`, then end "
             "the turn; the orchestrator runs `%s`. If it cannot run here, `%s --doctor` shows what is missing. "
-            "LEAN_DIRECT_TEST=allow turns this block off." % (
+            "LEAN_DIRECT_TEST=on turns this block off." % (
                 hookkit.tool_path("brain"), cwd, hookkit.tool_path("test-phase"), hookkit.tool_path("test-phase")))
 
 
@@ -359,7 +360,7 @@ def self_test():
                            ("env prefix", "CI=1 npm test"), ("after a note", "echo hi; npx vitest")):
         rc, text, err = fire(command, "dt-" + label.replace(" ", "-"))
         check("block " + label, rc == 2 and text == "" and "brain" in err and "queue add" in err
-              and "test-phase --doctor" in err and "LEAN_DIRECT_TEST=allow" in err, repr((rc, err)))
+              and "test-phase --doctor" in err and "LEAN_DIRECT_TEST=on turns this block off" in err, repr((rc, err)))
     rc, _, _ = fire("dotnet test X", "dt-again")
     rc2, _, _ = fire("dotnet test X", "dt-again")
     check("block is not once per session", rc == 2 and rc2 == 2)
@@ -390,11 +391,17 @@ def self_test():
     check("npm lockfile has no lane", fire("npm test", "dtn-npm", lock_only)[0] == 0)
     check("dotnet with a project is blocked", fire("dotnet test", "dtn-sln", lanes)[0] == 2)
     rc, _, err = fire("LEAN_DIRECT_TEST=allow dotnet test X", "dt-inline")
-    check("allow inline", rc == 0 and not err, repr(err))
+    check("old value inline passes", rc == 0 and not err, repr(err))
+    rc, _, err = fire("LEAN_DIRECT_TEST=on dotnet test X", "dt-inline-on")
+    check("on inline passes", rc == 0 and not err, repr(err))
     os.environ["LEAN_DIRECT_TEST"] = "allow"
-    check("allow from the environment", fire("npm test", "dt-env")[0] == 0)
+    check("old value from the environment passes", fire("npm test", "dt-env")[0] == 0)
     os.environ["LEAN_DIRECT_TEST"] = "ALLOW"
-    check("allow, any case", fire("npx vitest", "dt-env")[0] == 0)
+    check("old value, any case, passes", fire("npx vitest", "dt-env")[0] == 0)
+    os.environ["LEAN_DIRECT_TEST"] = "on"
+    check("on from the environment passes", fire("npm test", "dt-env-on")[0] == 0)
+    os.environ["LEAN_DIRECT_TEST"] = "ON"
+    check("on, any case, passes", fire("npx vitest", "dt-env-on")[0] == 0)
     del os.environ["LEAN_DIRECT_TEST"]
     os.environ["LEAN_SCRIPT_NOTE"] = "off"
     check("note switch leaves the block on", fire("dotnet test X", "dt-note")[0] == 2)

@@ -12,7 +12,7 @@ import re
 RUN = re.compile(
     r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:time\s+)?"
     r"(?:(?P<dotnet>dotnet\s+test)|(?P<node>(?:npm|pnpm|yarn)(?:\s+run)?\s+test|npx\s+vitest|vitest\s+run))(?![\w:.-])")
-INLINE_ALLOW = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*LEAN_DIRECT_TEST=allow\b", re.I)
+INLINE_OFF = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*LEAN_DIRECT_TEST=(?:on|allow)\b", re.I)
 
 
 def stop_at(cwd):
@@ -83,7 +83,7 @@ def package_json_near(cwd):
 def lane_job(segment, cwd):
     """True when the segment is a direct test run that test-phase can take."""
     m = RUN.search(segment)
-    if not m or INLINE_ALLOW.search(segment) or "--list-tests" in segment:
+    if not m or INLINE_OFF.search(segment) or "--list-tests" in segment:
         return False
     if m.group("dotnet"):
         return reach(cwd, ("*.sln", "*.csproj"))
@@ -95,8 +95,8 @@ def lane_job(segment, cwd):
 
 
 def blocks(segments, cwd):
-    """True when LEAN_DIRECT_TEST is not allow and any segment is a lane job."""
-    if os.environ.get("LEAN_DIRECT_TEST", "").lower() == "allow":
+    """True when LEAN_DIRECT_TEST is not on (or the old allow) and any segment is a lane job."""
+    if os.environ.get("LEAN_DIRECT_TEST", "").lower() in ("on", "allow"):
         return False
     return any(lane_job(s, cwd) for s in segments)
 
@@ -153,6 +153,13 @@ def _self_test():
         want("a jest package.json above the git root", blocks(["pnpm test"], os.path.join(d, "outer2", "proj", "src")), True)
         want("a lock at the git root", blocks(["pnpm test"], os.path.join(d, "repo", "pkg")), True)
         want("a lock in the cwd", blocks(["pnpm test"], os.path.join(d, "plain")), True)
+        vdir = os.path.join(d, "vite")
+        for value in ("on", "ON", "allow", "ALLOW"):
+            os.environ["LEAN_DIRECT_TEST"] = value
+            want(f"LEAN_DIRECT_TEST={value} in the environment", blocks(["pnpm test"], vdir), False)
+            del os.environ["LEAN_DIRECT_TEST"]
+            want(f"LEAN_DIRECT_TEST={value} inline", blocks(["LEAN_DIRECT_TEST=%s pnpm test" % value], vdir), False)
+        want("LEAN_DIRECT_TEST=one inline is not a switch", blocks(["LEAN_DIRECT_TEST=one pnpm test"], vdir), True)
     if old is not None:
         os.environ["LEAN_DIRECT_TEST"] = old
     if fails:

@@ -24,10 +24,12 @@ graphql query that is not a mutation (read from an @file too), passes.
 Message files are resolved against the directory the command runs in, after
 any `cd`. The word and pattern lists live in lib/house_style.py.
 
-  LEAN_ALLOW_ATTRIBUTION=1   skip the attribution check
-  LEAN_ALLOW_SLOP=1          skip the slop check
-Either can be set in the environment, in the `env` block of Claude Code
-settings, or inline in front of the command (LEAN_ALLOW_SLOP=1 git commit ...).
+  LEAN_SKIP_ATTRIBUTION=1    skip the attribution check
+  LEAN_SKIP_SLOP=1           skip the slop check
+  LEAN_HOOK_PUBLIC_TEXT=off  turn the whole hook off
+The old names LEAN_ALLOW_ATTRIBUTION=1 and LEAN_ALLOW_SLOP=1 still work.
+Any of them can be set in the environment, in the `env` block of Claude Code
+settings, or inline in front of the command (LEAN_SKIP_SLOP=1 git commit ...).
 
   public-text.py --self-test
 """
@@ -168,12 +170,12 @@ def problems(command, cwd="."):
     found = []
     for seg in hookkit.segments(command, cwd):
         texts = published(seg)
-        if texts is None:
+        if texts is None or hookkit.disabled("LEAN_HOOK_PUBLIC_TEXT", seg, ("off",)):
             continue
-        if not hookkit.disabled("LEAN_ALLOW_ATTRIBUTION", seg):
+        if not hookkit.disabled("LEAN_SKIP_ATTRIBUTION", seg):
             for where, text in [("the command", command)] + texts:
                 found += [f"{kind}: {where} contains {what}" for kind, what in scan(text, slop=False)]
-        if not hookkit.disabled("LEAN_ALLOW_SLOP", seg):
+        if not hookkit.disabled("LEAN_SKIP_SLOP", seg):
             for where, text in texts:
                 found += [f"{kind}: {where} contains {what}"
                           for kind, what in scan(prose(text), attribution=False)]
@@ -208,6 +210,10 @@ def self_test():
         "nice git commit -m 'a rob" + "ust retry'",
         "LEAN_ALLOW_ATTRIBUTION=1 git commit -m 'a rob" + "ust retry'",
         "LEAN_ALLOW_SLOP=1 git commit -m 'x' -m 'Claude-" + "Session: x'",
+        "LEAN_SKIP_ATTRIBUTION=1 git commit -m 'a rob" + "ust retry'",
+        "LEAN_SKIP_SLOP=1 git commit -m 'x' -m 'Claude-" + "Session: x'",
+        "LEAN_HOOK_PUBLIC_TEXT=off git commit -m 'a rob" + "ust retry'",
+        "LEAN_HOOK_PUBLIC_TEXT=off git commit -m 'x' -m 'Claude-" + "Session: x'",
         "gh pr create --title t --body 'a rob" + "ust fix, see `code`'",
         "gh pr merge 4 --squash --body 'a rob" + "ust retry'",
         'glab mr create --title t --description "fast \u2014 and safe"',
@@ -249,6 +255,7 @@ def self_test():
         "gh pr create --title t --body 'output:\n```\nstep 1 \u2014 ok\n```'",
         "git commit -m 'Revert \"add a rob" + "ust retry\"' -m 'This reverts commit abc.'",
         "LEAN_ALLOW_SLOP=1 git commit -m 'a rob" + "ust retry'",
+        "LEAN_SKIP_SLOP=1 git commit -m 'a rob" + "ust retry'",
         "git add . # a rob" + "ust comment\ngit commit -m x",
         "git tag -l 'rob" + "ust*'",
         "gh api repos/o/r/issues -F per_page=100 --jq '.[].title | select(test(\"rob" + "ust\"))'",
@@ -262,6 +269,7 @@ def self_test():
         "az repos pr update --id 3 --auto-complete true",
         "az repos pr show --id 3 --query title",
         "LEAN_ALLOW_SLOP=1 glab mr create --description 'a rob" + "ust retry'",
+        "LEAN_SKIP_SLOP=1 glab mr create --description 'a rob" + "ust retry'",
         "echo glab mr create --description 'a rob" + "ust retry'",
     ]
     failures = 0
@@ -323,7 +331,8 @@ def self_test():
 def main():
     if sys.argv[1:] == ["--self-test"]:
         return self_test()
-    if hookkit.disabled("LEAN_ALLOW_ATTRIBUTION") and hookkit.disabled("LEAN_ALLOW_SLOP"):
+    if hookkit.disabled("LEAN_HOOK_PUBLIC_TEXT", values=("off",)) or (
+            hookkit.disabled("LEAN_SKIP_ATTRIBUTION") and hookkit.disabled("LEAN_SKIP_SLOP")):
         return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command") or ""
@@ -333,7 +342,7 @@ def main():
                 + "\n  ".join(found)
                 + "\nRewrite it plainly (commas, periods or parentheses for dashes, "
                 "words for arrows, no attribution) and run the command again. If the text is "
-                "right as it is, LEAN_ALLOW_SLOP=1 or LEAN_ALLOW_ATTRIBUTION=1 in front of the "
+                "right as it is, LEAN_SKIP_SLOP=1 or LEAN_SKIP_ATTRIBUTION=1 in front of the "
                 "command, or in the env block of Claude Code settings, turns that check off.")
         note = ("This public text may read badly:\n  " + "\n  ".join(found)
                 + "\nConsider rewriting it plainly (commas, periods or parentheses for dashes, "

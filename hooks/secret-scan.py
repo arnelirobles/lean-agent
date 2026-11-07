@@ -885,7 +885,7 @@ def self_test():
             p = bash(cmd, bare)
             check(f"bypass, {label}: blocks", p.returncode, 2)
             check(f"bypass, {label}: says why", "without the git hooks" in p.stderr, True)
-        check("bypass with skip set is allowed", bash("LEAN_SKIP_SECRET_SCAN=1 git commit --no-verify -m x", bare).returncode, 0)
+        check("bypass with skip set passes", bash("LEAN_SKIP_SECRET_SCAN=1 git commit --no-verify -m x", bare).returncode, 0)
         for label, cmd in (("a variable git word without a skip flag", "g=git; $g commit -m x"),
                            ("a backtick body that is not a commit", "echo `git status`"),
                            ("a backtick in a commit message", 'git commit -m "use `foo` here"'),

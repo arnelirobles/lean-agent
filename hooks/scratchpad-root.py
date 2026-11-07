@@ -9,7 +9,9 @@ plan.md written directly into a directory named "scratchpad", or into the
 directory in $CLAUDE_SCRATCHPAD when that is set. The same names one level
 down (scratchpad/<task>/pr-body.md) pass.
 
-  LEAN_ALLOW_SCRATCHPAD_ROOT=1   turn it off (environment or the settings env block)
+  LEAN_HOOK_SCRATCHPAD_ROOT=off  turn it off (environment or the settings env block;
+                                 only off is read for now, and the old
+                                 LEAN_ALLOW_SCRATCHPAD_ROOT=1 still works)
   scratchpad-root.py --self-test
 """
 import fnmatch
@@ -50,7 +52,7 @@ def problem(path, cwd, scratchpad=None):
 
 
 def main():
-    if hookkit.disabled("LEAN_ALLOW_SCRATCHPAD_ROOT"):
+    if hookkit.disabled("LEAN_HOOK_SCRATCHPAD_ROOT", values=("off",)):
         return 0
     event = hookkit.read_event()
     path = hookkit.tool_input(event).get("file_path") or ""
@@ -60,7 +62,7 @@ def main():
     if found:
         return hookkit.refuse(
             "PreToolUse", "Blocked by lean-agent: " + found
-            + " LEAN_ALLOW_SCRATCHPAD_ROOT=1 in the env block of Claude Code settings turns this check off.",
+            + " LEAN_HOOK_SCRATCHPAD_ROOT=off in the env block of Claude Code settings turns this check off.",
             standard="nothing")
     return 0
 
@@ -98,6 +100,19 @@ def self_test():
 
     want("scratchpad root passes silently",
          std({"tool_name": "Write", "tool_input": {"file_path": "/tmp/s/scratchpad/notes.md"}, "cwd": "/"}), 0)
+
+    event = {"tool_name": "Write", "tool_input": {"file_path": "/tmp/s/scratchpad/notes.md"}, "cwd": "/"}
+    path = os.path.realpath(__file__)
+    for label, env, rc in (
+            ("strict blocks the scratchpad root", {}, 2),
+            ("LEAN_HOOK_SCRATCHPAD_ROOT=off turns it off", {"LEAN_HOOK_SCRATCHPAD_ROOT": "off"}, 0),
+            ("LEAN_ALLOW_SCRATCHPAD_ROOT=1 still turns it off", {"LEAN_ALLOW_SCRATCHPAD_ROOT": "1"}, 0)):
+        base = {"LEAN_HOOK_SCRATCHPAD_ROOT": None, "LEAN_ALLOW_SCRATCHPAD_ROOT": None, "LEAN_PROFILE": "strict"}
+        base.update(env)
+        got = hookkit.probe(path, event, **base)
+        if got[0] != rc or (rc == 2 and "LEAN_HOOK_SCRATCHPAD_ROOT=off" not in got[2]):
+            print(f"FAIL {label}: {got!r}")
+            failures += 1
 
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0

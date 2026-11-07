@@ -19,9 +19,10 @@ When git cannot be asked (the directory is not a repository, for example
 because it came from a shell expression the hook cannot evaluate), it lets
 the commit through rather than guess.
 
-  LEAN_ALLOW_COMMIT_AUTHOR=1   turn it off, in the environment, in the env
+  LEAN_HOOK_COMMIT_AUTHOR=off  turn it off, in the environment, in the env
                                block of Claude Code settings, or inline in
-                               front of the command
+                               front of the command (only off is read for
+                               now; LEAN_ALLOW_COMMIT_AUTHOR=1 still works)
   commit-author.py --self-test
 """
 import os
@@ -125,7 +126,7 @@ def problems(command, cwd, hosts=None):
         call = hookkit.git_call(seg)
         if not call or call[0] != "commit" or "--dry-run" in call[1]:
             continue
-        if hookkit.disabled("LEAN_ALLOW_COMMIT_AUTHOR", seg):
+        if hookkit.disabled("LEAN_HOOK_COMMIT_AUTHOR", seg, ("off",)):
             continue
         email = effective_email(seg, call)
         if email is None:
@@ -138,7 +139,7 @@ def problems(command, cwd, hosts=None):
 
 
 def main():
-    if hookkit.disabled("LEAN_ALLOW_COMMIT_AUTHOR"):
+    if hookkit.disabled("LEAN_HOOK_COMMIT_AUTHOR", values=("off",)):
         return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command") or ""
@@ -148,7 +149,7 @@ def main():
     if found:
         text = ("Blocked by lean-agent, the commit author email is wrong: " + "; ".join(found)
                 + ". Set it with git config user.email (or -c user.email=... on this commit) "
-                "and run the command again. LEAN_ALLOW_COMMIT_AUTHOR=1 in front of the command, or in "
+                "and run the command again. LEAN_HOOK_COMMIT_AUTHOR=off in front of the command, or in "
                 "the env block of Claude Code settings, turns this check off.")
         note = ("The commit author email looks wrong: " + "; ".join(found)
                 + ". Consider git config user.email (or -c user.email=... on this commit) before committing.")
@@ -169,7 +170,7 @@ def self_test():
             "a@xn--80ak6aa92e.xn--p1ai"]
     for email in bad:
         if not email_problem(email, hosts):
-            print(f"FAIL allowed bad email {email!r}")
+            print(f"FAIL passed bad email {email!r}")
             failures += 1
     for email in ("a@acme.internal", "a@corp.local", "a@build.lan"):
         if not email_problem(email, hosts, github=True) or email_problem(email, hosts, github=False):
@@ -210,7 +211,9 @@ def self_test():
             for command in ('cd "$(git rev-parse --show-toplevel)" && git commit -m x',
                             'git -C "$WT" commit -m x', "cd nowhere && git commit -m x",
                             "LEAN_ALLOW_COMMIT_AUTHOR=1 git -c user.email=user@devbox commit -m x",
-                            "env LEAN_ALLOW_COMMIT_AUTHOR=1 git -c user.email=user@devbox commit -m x"):
+                            "env LEAN_ALLOW_COMMIT_AUTHOR=1 git -c user.email=user@devbox commit -m x",
+                            "LEAN_HOOK_COMMIT_AUTHOR=off git -c user.email=user@devbox commit -m x",
+                            "env LEAN_HOOK_COMMIT_AUTHOR=off git -c user.email=user@devbox commit -m x"):
                 if problems(command, repo, hosts):
                     print(f"FAIL {command!r} blocked: {problems(command, repo, hosts)}")
                     failures += 1

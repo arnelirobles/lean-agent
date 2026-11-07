@@ -74,7 +74,7 @@ check() { # $1 optional base; runs in the repository root
     echo "check-top-level-md: $bad of $n new top-level Markdown file(s) refused (above)"
     return 1
   fi
-  echo "check-top-level-md: examined $n new top-level Markdown file(s) against $base, all allowed"
+  echo "check-top-level-md: examined $n new top-level Markdown file(s) against $base, all pass"
 }
 
 self_test() {
@@ -89,7 +89,7 @@ self_test() {
   }
   expect "nothing new" 0 'examined 0 new'
   echo x > CHANGELOG.md; git add CHANGELOG.md
-  expect "default allowlist, staged" 0 'examined 1 new'
+  expect "default list, staged" 0 'examined 1 new'
   echo x > pr-body.md
   expect "untracked pr body" 1 'pr-body.md: named like a pull request body'
   rm pr-body.md; echo x > NOTES.md; git add NOTES.md; git commit -qm notes
@@ -97,13 +97,13 @@ self_test() {
   git rm -q NOTES.md; git commit -qm rm; echo x > DESIGN.md
   expect "unlisted name" 1 'DESIGN.md: not on the allowlist'
   mkdir -p .lean; printf 'DESIGN.md\n# comment\nADR-*.md\np*.md\n' > .lean/top-level-md.allow
-  expect "allow file exact" 0 'examined 2 new'
+  expect "list file exact" 0 'examined 2 new'
   echo x > ADR-001.md
-  expect "allow file glob" 0 'examined 3 new'
+  expect "list file glob" 0 'examined 3 new'
   echo x > plan.md
-  expect "glob allows a non-pr name" 0 'examined 4 new'
+  expect "glob passes a non-pr name" 0 'examined 4 new'
   echo x > pr.md
-  expect "glob does not allow a pr name" 1 'pr.md: named like'
+  expect "glob does not pass a pr name" 1 'pr.md: named like'
   rm pr.md; mkdir -p docs; echo x > docs/pr-notes.md
   expect "nested file is not top-level" 0 'examined 4 new'
   expect_base() { out=$(check no-such-branch); [ $? = 2 ] || { echo "self-test failed: bad base did not exit 2"; fails=$((fails + 1)); }; }

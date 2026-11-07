@@ -476,7 +476,7 @@ def self_test():
         # an edit job never runs on the tool's own folder, above it or below it
         for place in (ROOT, os.path.dirname(ROOT), os.path.join(ROOT, "tools")):
             r = run(job_args(wtree=place), env(LEAN_CREDIT_RUNS="on", LEAN_CREDIT_TOTAL_USD="2.0"))
-            check(one_line(r) and "holds this tool" in r.stderr and rec_json() is None, f"edit job allowed at {place}: {r.stderr!r}")
+            check(one_line(r) and "holds this tool" in r.stderr and rec_json() is None, f"edit job passes at {place}: {r.stderr!r}")
         # --spent and --key-help work with the switch off
         r = run(["--spent"], env())
         check(r.returncode == 0 and "local estimate" in r.stdout and "Console" in r.stdout, f"--spent: {r.stdout!r}")
@@ -518,7 +518,7 @@ def self_test():
             check(opts.get("settings", {}).get("advisorModel") == "opus", "advisor not passed")
             check("fastMode" not in opts.get("settings", {}), "fastMode set without --fast")
             check(opts.get("settings", {}).get("attribution") is False, "attribution not turned off")
-            check(not {"Edit", "Write"} & set(opts["allowedTools"]), "Edit or Write allowed outside the worktree")
+            check(not {"Edit", "Write"} & set(opts["allowedTools"]), "Edit or Write passes outside the worktree")
             check(any(x.startswith("Write(//") and x.endswith("/**)") for x in opts["allowedTools"]), "Write not scoped to the worktree")
             check("Write(**/.git/**)" in opts["disallowedTools"] and "Edit(**/.git/**)" in opts["disallowedTools"], "git metadata not denied")
             check("Bash(git * --out*)" in opts["disallowedTools"], "git --output not denied")

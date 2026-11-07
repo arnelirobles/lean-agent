@@ -15,7 +15,8 @@ vendor/, third_party/, dist/). A line containing `style-scan: allow` is
 skipped, for test data that has to spell the thing it tests.
 
   style-scan [--base REF]    exit 0 clean, 1 on a hit, 2 when it cannot run
-  LEAN_ALLOW_WIDE_CHARS=1    skip the U+2000 check (text in other scripts)
+  LEAN_SKIP_WIDE_CHARS=1     skip the U+2000 check (text in other scripts)
+                             (the old LEAN_ALLOW_WIDE_CHARS=1 still works)
   style-scan --self-test
 """
 import os
@@ -91,7 +92,7 @@ def added_lines(base, cwd="."):
 
 
 def findings(base, cwd="."):
-    check_wide = os.environ.get("LEAN_ALLOW_WIDE_CHARS") != "1"
+    check_wide = "1" not in (os.environ.get("LEAN_SKIP_WIDE_CHARS"), os.environ.get("LEAN_ALLOW_WIDE_CHARS"))
     out = []
     for path, number, text in added_lines(base_commit(base, cwd), cwd):
         if ALLOW_MARK in text:
@@ -164,6 +165,10 @@ def self_test():
         run("checkout", "-q", "--", "README.md")
         write("notes/new.txt", "caf\u00e9 is fine, \u201csmart quotes\u201d are not\n")
         expect("untracked wide char", ["notes/new.txt"])
+        for name in ("LEAN_SKIP_WIDE_CHARS", "LEAN_ALLOW_WIDE_CHARS"):
+            os.environ[name] = "1"
+            expect(f"{name}=1 skips the wide char check", [])
+            del os.environ[name]
         os.remove(os.path.join(tmp, "notes/new.txt"))
         write("package-lock.json", f"{word}\n")
         write("node_modules/x/README.md", f"{word}\n")

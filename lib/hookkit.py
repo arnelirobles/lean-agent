@@ -249,9 +249,26 @@ def _keep_notice(text):
         pass
 
 
-def disabled(name, seg=None):
-    """True when NAME=1 is in the environment, or in the env prefix of this command."""
-    return os.environ.get(name) == "1" or bool(seg and seg.env.get(name) == "1")
+# Each new switch name and the old name that still works, with the value the old name took.
+ALIASES = {
+    "LEAN_HOOK_COMMIT_AUTHOR": ("LEAN_ALLOW_COMMIT_AUTHOR", "1"),
+    "LEAN_HOOK_SCRATCHPAD_ROOT": ("LEAN_ALLOW_SCRATCHPAD_ROOT", "1"),
+    "LEAN_SKIP_ATTRIBUTION": ("LEAN_ALLOW_ATTRIBUTION", "1"),
+    "LEAN_SKIP_SLOP": ("LEAN_ALLOW_SLOP", "1"),
+    "LEAN_SKIP_WIDE_CHARS": ("LEAN_ALLOW_WIDE_CHARS", "1"),
+}
+
+
+def disabled(name, seg=None, values=("1",)):
+    """True when NAME, or its old alias, has an accepted value in the environment or in this command's env prefix."""
+    pairs = [(name, tuple(values))]
+    if name in ALIASES:
+        old, old_value = ALIASES[name]
+        pairs.append((old, (old_value,)))
+    for key, accepted in pairs:
+        if os.environ.get(key) in accepted or bool(seg and seg.env.get(key) in accepted):
+            return True
+    return False
 
 
 def resolve(path, cwd):
@@ -636,6 +653,29 @@ def self_test():
         if got != want:
             print(f"FAIL {name}: got {got!r}, want {want!r}")
             failures += 1
+
+    class _Seg:
+        def __init__(self, **env):
+            self.env = env
+
+    for new, (old, old_value) in ALIASES.items():
+        for value in ("1",):
+            for key in (new, old):
+                os.environ.pop(new, None)
+                os.environ.pop(old, None)
+                check(f"{key} unset is not disabled", disabled(new), False)
+                os.environ[key] = value
+                check(f"{key}={value} in the environment disables {new}", disabled(new), True)
+                os.environ.pop(key)
+                check(f"{key}={value} in the env prefix disables {new}", disabled(new, _Seg(**{key: value})), True)
+                check(f"{key}=0 in the env prefix does not disable {new}", disabled(new, _Seg(**{key: "0"})), False)
+    for new, old, value in (("LEAN_HOOK_COMMIT_AUTHOR", "LEAN_ALLOW_COMMIT_AUTHOR", "off"),
+                            ("LEAN_HOOK_SCRATCHPAD_ROOT", "LEAN_ALLOW_SCRATCHPAD_ROOT", "off"),
+                            ("LEAN_HOOK_PUBLIC_TEXT", None, "off")):
+        check(f"{new}=off in the environment", disabled(new, values=(value,), seg=_Seg(**{new: value})), True)
+        check(f"{new}=1 is not the new value", disabled(new, _Seg(**{new: "1"}), (value,)), False)
+        if old:
+            check(f"{old}=1 still works for {new}", disabled(new, _Seg(**{old: "1"}), (value,)), True)
 
     with tempfile.TemporaryDirectory() as tmp:
         def manifest_error(body):

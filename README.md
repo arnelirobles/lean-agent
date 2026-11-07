@@ -213,7 +213,7 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_BRAIN_RESUME` | on | `off` stops the startup hook from printing the brain digest. |
 | `LEAN_SKIP_SECRET_SCAN` | off | `1` turns off `secret-scan`, the Claude hook and the git hooks it installs, in every profile. A line with `allow-secret` on it is skipped without this. |
 | `LEAN_SCRIPT_NOTE` | on | `off` stops the note that names the script behind a hand-written command. |
-| `LEAN_DIRECT_TEST` | block in `strict`, nothing in `standard` | `allow` stops the block on a direct `dotnet test`, `npm test`, `npx vitest` or `vitest run` where test-phase can take the job. Tests go through `brain queue add` and `test-phase`. A `package.json` that uses jest and not vitest is left alone, and so is a `pnpm -r`, `--filter`, `turbo` or `nx` script, since the queue has no jest runner. |
+| `LEAN_DIRECT_TEST` | block in `strict`, nothing in `standard` | `on` stops the block on a direct `dotnet test`, `npm test`, `npx vitest` or `vitest run` where test-phase can take the job. Tests go through `brain queue add` and `test-phase`. A `package.json` that uses jest and not vitest is left alone, and so is a `pnpm -r`, `--filter`, `turbo` or `nx` script, since the queue has no jest runner. |
 | `LEAN_NPM_REGISTRY` | `npm config get registry`, else `https://registry.npmjs.org` | The npm registry `pkg-version` asks. |
 | `LEAN_NUGET_REGISTRY` | `https://api.nuget.org/v3-flatcontainer` | The nuget flat container `pkg-version` asks. |
 | `LEAN_CREDIT_RUNS` | off | `on` lets `credit-run` start a job. Anything else exits 2 and starts nothing. |
@@ -256,9 +256,11 @@ Every off switch for a hook is in [Settings](https://github.com/arnelirobles/lea
 | the secret scan hook crashed or is missing, Write or Edit | blocks | note (the key scan did not run) |
 | `LEAN_LOOKUP_MODE=block`, `LEAN_IMAGE_MODE=block` | refuses | refuses |
 
-The explicit settings win in every profile: `LEAN_ALLOW_*`, `LEAN_SKIP_*`, `LEAN_DIRECT_TEST=allow` and the other off switches behave as before. The two opt-in refusals keep refusing under `standard` because you asked for them.
+The explicit settings win in every profile: `LEAN_SKIP_*`, `LEAN_HOOK_*`, `LEAN_DIRECT_TEST=on` and the other off switches behave as before. The two opt-in refusals keep refusing under `standard` because you asked for them.
 
-A direct test run gets no wait-loop note under `standard` either, unless `LEAN_DIRECT_TEST=allow` is set, which is the one case that note already covered.
+A direct test run gets no wait-loop note under `standard` either, unless `LEAN_DIRECT_TEST=on` is set, which is the one case that note already covered.
+
+Switch names no longer say "allow". `LEAN_HOOK_COMMIT_AUTHOR=off`, `LEAN_HOOK_SCRATCHPAD_ROOT=off`, `LEAN_SKIP_ATTRIBUTION=1`, `LEAN_SKIP_SLOP=1`, `LEAN_SKIP_WIDE_CHARS=1`, `LEAN_HOOK_PUBLIC_TEXT=off` (the whole public-text hook) and `LEAN_DIRECT_TEST=on` replace `LEAN_ALLOW_COMMIT_AUTHOR=1`, `LEAN_ALLOW_SCRATCHPAD_ROOT=1`, `LEAN_ALLOW_ATTRIBUTION=1`, `LEAN_ALLOW_SLOP=1`, `LEAN_ALLOW_WIDE_CHARS=1` and `LEAN_DIRECT_TEST=allow`. The old names keep working until the next major release. `LEAN_HOOK_COMMIT_AUTHOR` and `LEAN_HOOK_SCRATCHPAD_ROOT` accept only `off` for now.
 
 The git hooks that `secret-scan install` writes do not read `LEAN_PROFILE`. A person has them only after running install, so they keep blocking a key in a commit or push in every profile. `LEAN_SKIP_SECRET_SCAN=1` or an `allow-secret` line is how to get past them.
 

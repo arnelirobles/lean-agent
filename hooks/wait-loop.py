@@ -348,6 +348,7 @@ def self_test():
     direct = {"tool_input": {"command": "dotnet test App.sln"}, "cwd": sln_dir}
     want("a direct test run gets no wait-loop note", std(direct, LEAN_DIRECT_TEST=None), 0)
     want("with LEAN_DIRECT_TEST=allow the one existing note stays", std(direct, LEAN_DIRECT_TEST="allow"), 0, True)
+    want("with LEAN_DIRECT_TEST=on the one existing note stays", std(direct, LEAN_DIRECT_TEST="on"), 0, True)
 
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0
