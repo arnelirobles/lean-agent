@@ -260,7 +260,19 @@ The explicit settings win in every profile: `LEAN_SKIP_*`, `LEAN_HOOK_*`, `LEAN_
 
 A direct test run gets no wait-loop note under `standard` either, unless `LEAN_DIRECT_TEST=on` is set, which is the one case that note already covered.
 
-Switch names no longer say "allow". `LEAN_HOOK_COMMIT_AUTHOR=off`, `LEAN_HOOK_SCRATCHPAD_ROOT=off`, `LEAN_SKIP_ATTRIBUTION=1`, `LEAN_SKIP_SLOP=1`, `LEAN_SKIP_WIDE_CHARS=1`, `LEAN_HOOK_PUBLIC_TEXT=off` (the whole public-text hook) and `LEAN_DIRECT_TEST=on` replace `LEAN_ALLOW_COMMIT_AUTHOR=1`, `LEAN_ALLOW_SCRATCHPAD_ROOT=1`, `LEAN_ALLOW_ATTRIBUTION=1`, `LEAN_ALLOW_SLOP=1`, `LEAN_ALLOW_WIDE_CHARS=1` and `LEAN_DIRECT_TEST=allow`. The old names keep working until the next major release. `LEAN_HOOK_COMMIT_AUTHOR` and `LEAN_HOOK_SCRATCHPAD_ROOT` accept only `off` for now.
+Switch names no longer say "allow". `LEAN_HOOK_COMMIT_AUTHOR=off`, `LEAN_HOOK_SCRATCHPAD_ROOT=off`, `LEAN_SKIP_ATTRIBUTION=1`, `LEAN_SKIP_SLOP=1`, `LEAN_SKIP_WIDE_CHARS=1`, `LEAN_HOOK_PUBLIC_TEXT=off` (the whole public-text hook) and `LEAN_DIRECT_TEST=on` replace `LEAN_ALLOW_COMMIT_AUTHOR=1`, `LEAN_ALLOW_SCRATCHPAD_ROOT=1`, `LEAN_ALLOW_ATTRIBUTION=1`, `LEAN_ALLOW_SLOP=1`, `LEAN_ALLOW_WIDE_CHARS=1` and `LEAN_DIRECT_TEST=allow`. The old names keep working until the next major release.
+
+Every hook has one switch, `LEAN_HOOK_<NAME>`, where NAME is the hook file name in capitals with underscores (`commit-author.py` is `LEAN_HOOK_COMMIT_AUTHOR`). It takes `off`, `note` or `block`; any other value is ignored and named on stderr. `LEAN_SKIP_<NAME>=1` and the old `LEAN_ALLOW_*` names count as `off`. First match wins:
+
+| Order | Source |
+|---|---|
+| 1 | `LEAN_PROFILE=off` turns every hook off |
+| 2 | the env prefix of the command (`LEAN_HOOK_COMMIT_AUTHOR=off git commit ...`) |
+| 3 | the environment (the `env` block of Claude Code settings) |
+| 4 | reserved for extensions, not built yet |
+| 5 | the hook's default for the profile |
+
+The dispatcher resolves layers 1 to 3 once per hook, skips a hook that is off, and hands the result to the hook as `LEAN_HOOK_MODE`.
 
 The git hooks that `secret-scan install` writes do not read `LEAN_PROFILE`. A person has them only after running install, so they keep blocking a key in a commit or push in every profile. `LEAN_SKIP_SECRET_SCAN=1` or an `allow-secret` line is how to get past them.
 

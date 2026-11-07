@@ -286,7 +286,7 @@ def main():
         return 0
     text = message(command, event.get("cwd") or os.getcwd())
     if text:
-        return hookkit.refuse("PreToolUse", text, standard="nothing")
+        return hookkit.refuse("PreToolUse", text)
     return 0
 
 

@@ -51,8 +51,6 @@ def problem(path, cwd, scratchpad=None):
 
 
 def main():
-    if hookkit.disabled("LEAN_HOOK_SCRATCHPAD_ROOT", values=("off",)):
-        return 0
     event = hookkit.read_event()
     path = hookkit.tool_input(event).get("file_path") or ""
     if not path:
@@ -61,8 +59,7 @@ def main():
     if found:
         return hookkit.refuse(
             "PreToolUse", "Blocked by lean-agent: " + found
-            + " LEAN_HOOK_SCRATCHPAD_ROOT=off in the env block of Claude Code settings turns this check off.",
-            standard="nothing")
+            + " LEAN_HOOK_SCRATCHPAD_ROOT=off in the env block of Claude Code settings turns this check off.")
     return 0
 
 

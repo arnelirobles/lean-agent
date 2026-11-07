@@ -95,7 +95,7 @@ def main():
     text = verdict(hookkit.tool_input(event))
     if not text:
         return 0
-    return hookkit.refuse("PreToolUse", text, standard="nothing")
+    return hookkit.refuse("PreToolUse", text)
 
 
 def self_test():

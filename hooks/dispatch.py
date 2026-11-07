@@ -71,9 +71,33 @@ def install():
             sys.stdin, sys.stdout, sys.stderr = _Proxy("stdin"), _Proxy("stdout"), _Proxy("stderr")
 
 
-def process_env(member):
-    """The environment of a process member. Task 4 sets LEAN_HOOK_MODE here."""
-    return dict(os.environ)
+_manifests = {}
+
+
+def manifest_of(member):
+    """The member's HOOK literal, read once without importing the file; None when it has none."""
+    path = member_path(member)
+    if path not in _manifests:
+        try:
+            _manifests[path] = hookkit.read_manifest(path)
+        except (OSError, ValueError, SyntaxError):
+            _manifests[path] = None
+    return _manifests[path]
+
+
+def resolve(member):
+    """(mode, source) of a member with no command prefix, resolved before it starts."""
+    return hookkit.resolve_for(member["name"], manifest_of(member), quiet=True)
+
+
+def process_env(member, bound=None):
+    """The environment of a process member. LEAN_HOOK_MODE is set only when BOUND (the mode the dispatcher
+    got from the user's env); an inherited LEAN_HOOK_MODE is removed otherwise."""
+    env = dict(os.environ)
+    env.pop("LEAN_HOOK_MODE", None)
+    if bound:
+        env["LEAN_HOOK_MODE"] = bound
+    return env
 
 
 def member_path(member):
@@ -102,13 +126,14 @@ def exit_code(exc, err):
     return 1
 
 
-def run_inproc(member, stdin_text, slot):
+def run_inproc(member, stdin_text, slot, bound=None):
     out, err = io.StringIO(), io.StringIO()
     _local.stdin, _local.stdout, _local.stderr = io.StringIO(stdin_text), out, err
     code = 0
     try:
-        hookkit.bind(member["name"], None, "inproc")
         module = load(member_path(member))
+        manifest = getattr(module, "HOOK", None)
+        hookkit.bind(member["name"], manifest if isinstance(manifest, dict) else None, bound)
         hookkit.run(module.main)
     except SystemExit as exc:
         code = exit_code(exc, err)
@@ -117,10 +142,10 @@ def run_inproc(member, stdin_text, slot):
     slot["result"] = (code, out.getvalue(), err.getvalue())
 
 
-def run_process(member, stdin_text, timeout, slot):
+def run_process(member, stdin_text, timeout, slot, bound=None):
     try:
         done = subprocess.run([sys.executable, member_path(member)], input=stdin_text, capture_output=True,
-                              text=True, env=process_env(member), timeout=timeout)
+                              text=True, env=process_env(member, bound), timeout=timeout)
         slot["result"] = (done.returncode, done.stdout, done.stderr)
     except subprocess.TimeoutExpired:
         slot["timeout"] = True
@@ -169,12 +194,16 @@ def run_group(event, group, stdin_text, table):
     for member in members:
         if not wanted(member, parsed):
             continue
+        found, source = resolve(member)
+        if source == "profile-off" or (found == "off" and source != "default"):
+            continue
+        bound = found if source == "env" else None
         timeout = member.get("timeout") or DEFAULT_TIMEOUT
         slot = {}
         if member.get("mode") == "inproc":
-            thread = threading.Thread(target=run_inproc, args=(member, stdin_text, slot), daemon=True)
+            thread = threading.Thread(target=run_inproc, args=(member, stdin_text, slot, bound), daemon=True)
         else:
-            thread = threading.Thread(target=run_process, args=(member, stdin_text, timeout, slot), daemon=True)
+            thread = threading.Thread(target=run_process, args=(member, stdin_text, timeout, slot, bound), daemon=True)
         thread.start()
         running.append((member, timeout, thread, slot))
     results, lines = [], []
@@ -540,6 +569,37 @@ def self_test():
     done = subprocess.run([sys.executable, os.path.realpath(__file__), "PreToolUse", "9", table], input=event(),
                           capture_output=True, text=True, timeout=20)
     check("main error", done.returncode == 0 and "lean-agent dispatch error ignored" in done.stderr, repr((done.returncode, done.stderr)))
+
+    # hook switches: off skips a member, LEAN_HOOK_MODE reaches a member only from the user's env
+    seen = hook("seen_mode.py", "def main():\n    import os\n    hookkit.read_event()\n"
+                "    hookkit.note('PreToolUse', 'mode=%s source=%s env=%s' % (hookkit.mode(), hookkit.resolve_mode()[1], "
+                "os.environ.get('LEAN_HOOK_MODE')))\n    return 0")
+    for kind in ("inproc", "process"):
+        os.environ["LEAN_HOOK_SEEN_MODE"] = "note"
+        try:
+            code, out, err = run_group("PreToolUse", 1, event(), group([row("seen_mode.py", seen, kind)]))
+        finally:
+            os.environ.pop("LEAN_HOOK_SEEN_MODE", None)
+        check("switch from env reaches the hook " + kind, "source=env" in out and "mode=note" in out, repr(out))
+        check("env sets LEAN_HOOK_MODE only for a process member", ("env=note" in out) == (kind == "process"), repr(out))
+        os.environ["LEAN_HOOK_MODE"] = "block"  # a stray inherited value must not reach a member
+        try:
+            code, out, err = run_group("PreToolUse", 1, event(), group([row("seen_mode.py", seen, kind)]))
+        finally:
+            os.environ.pop("LEAN_HOOK_MODE", None)
+        check("an inherited LEAN_HOOK_MODE is dropped " + kind, "source=default" in out and ("env=None" in out or kind == "inproc"), repr(out))
+        os.environ["LEAN_HOOK_NOTE_A"] = "off"
+        try:
+            code, out, err = run_group("PreToolUse", 1, event(), group([row("note_a.py", note_a, kind), row("note_b.py", note_b, kind)]))
+        finally:
+            os.environ.pop("LEAN_HOOK_NOTE_A", None)
+        check("an off member is skipped " + kind, "alpha" not in out and "beta" in out, repr(out))
+        os.environ["LEAN_PROFILE"] = "off"
+        try:
+            code, out, err = run_group("PreToolUse", 1, event(), group([row("note_a.py", note_a, kind)]))
+        finally:
+            os.environ["LEAN_PROFILE"] = "strict"
+        check("profile off skips every member " + kind, (code, out) == (0, ""), repr((code, out)))
 
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))

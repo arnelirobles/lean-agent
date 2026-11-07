@@ -293,6 +293,19 @@ def part_d():
             if run_cmd(f'python3 "{new}/hooks/{name}"', json.dumps(event), env, cwd=work)[0] == 2:
                 refused += 1
         check("the corpus has at least 14 refusals", refused >= 14, True)
+        # LEAN_HOOK_<NAME>=off turns each hook off on its own blocking input
+        from hookkit import switch_name
+        switched = set()
+        for label, name, event, extra in cases:
+            env = clean_env(home, LEAN_PROFILE="strict", **extra)
+            if run_cmd(f'python3 "{new}/hooks/{name}"', json.dumps(event), env, cwd=work)[0] != 2:
+                continue
+            key = "LEAN_HOOK_" + switch_name(name)
+            env = clean_env(home, LEAN_PROFILE="strict", **dict(extra, **{key: "off"}))
+            check(f"{key}=off: {label}", run_cmd(f'python3 "{new}/hooks/{name}"', json.dumps(event), env, cwd=work)[::2], (0, ""))
+            switched.add(name)
+        check("a LEAN_HOOK_<NAME>=off case for each blocking hook", sorted(switched), sorted(
+            {n for _, n, _, _ in cases if n != "mode.py"}))
         # the crash site: no scanner in either tree
         for tree in (old, new):
             os.remove(os.path.join(tree, "tools", "secret-scan"))

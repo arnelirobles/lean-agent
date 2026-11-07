@@ -181,7 +181,7 @@ def main():
         return 0
     kind, text = found
     if kind == "deny":
-        return hookkit.refuse("PreToolUse", text, standard="note", note=NOTE_WAIT)
+        return hookkit.refuse("PreToolUse", text, note=NOTE_WAIT)
     hookkit.note("PreToolUse", text)
     return 0
 

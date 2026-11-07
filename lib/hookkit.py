@@ -168,16 +168,111 @@ def profile():
     return raw if raw in PROFILES else "strict"
 
 
-def refuse(event_name, text, *, standard="note", note=None):
-    """Refuse a tool call the way the profile says. Strict prints TEXT and returns 2, as ever.
+def switch_name(hook):
+    """The switch name of a hook file: "commit-author.py" gives "COMMIT_AUTHOR"."""
+    base = os.path.basename(hook)
+    if base.endswith(".py"):
+        base = base[:-3]
+    return re.sub(r"[^A-Za-z0-9]", "_", base).upper()
 
-    Standard: "note" gives Claude NOTE (or TEXT) and lets the call run, "nothing" lets it run silently,
-    "block" or any other value is the same as strict. Returns the hook's exit code.
+
+def _manifest():
+    """This hook's manifest: the bound one, else the HOOK literal of the script that is running."""
+    if _state.manifest is not None:
+        return _state.manifest
+    if _state.name is None:
+        found = getattr(sys.modules.get("__main__"), "HOOK", None)
+        return found if isinstance(found, dict) else None
+    return None
+
+
+_WARNED = set()
+
+
+def _layer(env, name, quiet=False):
+    """The mode one layer (an env prefix dict or the process env) asks for, or None.
+
+    LEAN_HOOK_<NAME> takes off, note or block; LEAN_SKIP_<NAME>=1 and the old name of the switch, set to its
+    old value, both mean off. Any other value is ignored with one stderr line.
     """
-    if profile() == "strict" or standard not in ("note", "nothing"):
+    key = "LEAN_HOOK_" + name
+    value = env.get(key)
+    if value is not None:
+        if value in ("off", "note", "block"):
+            return value
+        if not quiet and (key, value) not in _WARNED:
+            _WARNED.add((key, value))
+            print(f"lean-agent: {key}={value} is not one of off, note, block; ignored.", file=sys.stderr)
+    if env.get("LEAN_SKIP_" + name) == "1":
+        return "off"
+    if key in ALIASES:
+        old, old_value = ALIASES[key]
+        if env.get(old) == old_value:
+            return "off"
+    return None
+
+
+def _default(manifest, standard):
+    level = profile()
+    if standard is not None and level != "strict":
+        # a per-call standard= replaces the manifest default; strict has always blocked
+        return {"nothing": "off", "off": "off", "note": "note"}.get(standard, "block")
+    default = (manifest or {}).get("default") or {}
+    if level in default:
+        return default[level]
+    return "block" if level == "strict" else "note"
+
+
+def resolve_for(hook, manifest, seg=None, standard=None, bound=None, quiet=False):
+    """(mode, source) for the hook file HOOK. source is "profile-off", "prefix", "env" or "default".
+
+    1. LEAN_PROFILE=off. 2. The command's env prefix. 3. The process env, or BOUND, the mode the dispatcher
+    resolved from it. 4. (the extension layer comes later.) 5. STANDARD when given, else the manifest default.
+    """
+    if profile() == "off":
+        return "off", "profile-off"
+    name = switch_name(hook)
+    if seg is not None:
+        found = _layer(seg.env, name, quiet)
+        if found:
+            return found, "prefix"
+    if bound in ("off", "note", "block"):
+        return bound, "env"
+    found = _layer(os.environ, name, quiet)
+    if found:
+        return found, "env"
+    return _default(manifest, standard), "default"
+
+
+def resolve_mode(seg=None, standard=None):
+    """(mode, source) for the running hook. Inside a dispatcher-bound hook, LEAN_HOOK_MODE stands in for layer 3."""
+    bound = _state.mode
+    if bound is None and _state.name is None:
+        raw = os.environ.get("LEAN_HOOK_MODE")
+        bound = raw if raw in ("off", "note", "block") else None
+    return resolve_for(_hook_name(), _manifest(), seg, standard, bound)
+
+
+def mode(seg=None, standard=None):
+    return resolve_mode(seg, standard)[0]
+
+
+def off(seg=None):
+    """True when the user turned this hook off, in the prefix or the environment (a default of off is not that)."""
+    found, source = resolve_mode(seg)
+    return found == "off" and source != "default"
+
+
+def refuse(event_name, text, *, standard=None, note=None):
+    """Refuse a tool call the way the hook's mode says: block prints TEXT and returns 2, note gives Claude NOTE
+    (or TEXT) and returns 0, off returns 0. STANDARD ("note", "nothing", "block") replaces the manifest
+    default outside strict, as before; strict blocks unless the user switched the hook.
+    """
+    found = mode(standard=standard)
+    if found == "block":
         print(text, file=sys.stderr)
         return 2
-    if standard == "note":
+    if found == "note":
         globals()["note"](event_name, note or text)
     return 0
 
@@ -185,6 +280,8 @@ def refuse(event_name, text, *, standard="note", note=None):
 def probe(script, event, **env):
     """Self-test helper: run a hook script on EVENT with env overrides (None removes). Returns (code, stdout, stderr)."""
     full = dict(os.environ)
+    for key in [k for k in full if k.startswith(("LEAN_HOOK_", "LEAN_SKIP_"))]:
+        full.pop(key)  # the caller's shell must not leak a switch in
     for key, value in env.items():
         if value is None:
             full.pop(key, None)
@@ -194,9 +291,16 @@ def probe(script, event, **env):
     return p.returncode, p.stdout, p.stderr
 
 
-def run(main):
-    """Run a hook's main and exit with its code; an internal error exits 0."""
-    if profile() == "off":
+def run(main, manifest=None):
+    """Run a hook's main and exit with its code; an internal error exits 0.
+
+    Exits 0 at once when the user switched the hook off. A mode the dispatcher bound is kept.
+    """
+    manifest = manifest or getattr(main, "__globals__", {}).get("HOOK")
+    if isinstance(manifest, dict):
+        _state.manifest = manifest
+    found, source = resolve_mode()
+    if found == "off" and source != "default":
         sys.exit(0)
     try:
         code = main()
@@ -630,6 +734,97 @@ def forge_flag_values(call, flags, args=None):
             yield tuple(word.split("=", 1))
 
 
+def _switch_tests(check, scratch):
+    """The LEAN_HOOK_<NAME> resolution order, on a fixture hook with the default block in strict, note in standard."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    fixture = os.path.join(scratch, "fixture-gate.py")
+    marker = os.path.join(scratch, "ran")
+    with open(fixture, "w", encoding="utf-8") as handle:
+        handle.write(
+            "import sys\nsys.path.insert(0, %r)\nimport hookkit\n"
+            "HOOK = {'events': [], 'default': {'strict': 'block', 'standard': 'note'}}\n"
+            "def main():\n    open(%r, 'a').close()\n    hookkit.read_event()\n"
+            "    return hookkit.refuse('PreToolUse', 'REFUSED')\n"
+            "if __name__ == '__main__':\n    hookkit.run(main, HOOK)\n" % (here, marker))
+    event = {"tool_name": "Bash", "tool_input": {"command": "x"}}
+
+    def fire(**env):
+        if os.path.exists(marker):
+            os.remove(marker)
+        code, out, err = probe(fixture, event, **env)
+        return code, bool(out.strip()), err, os.path.exists(marker)
+
+    check("switch_name", switch_name("review-log-check.py"), "REVIEW_LOG_CHECK")
+    check("switch_name with a path", switch_name("/x/hooks/commit-author.py"), "COMMIT_AUTHOR")
+    check("fixture strict blocks", fire(LEAN_PROFILE="strict")[:2], (2, False))
+    check("fixture standard notes", fire(LEAN_PROFILE="standard")[:2], (0, True))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_FIXTURE_GATE="note")
+    check("env note in strict gives a note", got[:2], (0, True))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_FIXTURE_GATE="off")
+    check("env off gives nothing and main does not run", (got[0], got[1], got[3]), (0, False, False))
+    got = fire(LEAN_PROFILE="strict", LEAN_SKIP_FIXTURE_GATE="1")
+    check("LEAN_SKIP_<NAME>=1 is off", (got[0], got[1], got[3]), (0, False, False))
+    got = fire(LEAN_PROFILE="standard", LEAN_HOOK_FIXTURE_GATE="block")
+    check("env block in standard", got[:2], (2, False))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_FIXTURE_GATE="loud")
+    check("a bad value is ignored and named", (got[0], "LEAN_HOOK_FIXTURE_GATE=loud" in got[2]), (2, True))
+    got = fire(LEAN_PROFILE="off", LEAN_HOOK_FIXTURE_GATE="block")
+    check("profile off beats the switch", (got[0], got[1], got[3]), (0, False, False))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="off")
+    check("LEAN_HOOK_MODE stands in for the env layer", (got[0], got[3]), (0, False))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_MODE="off", LEAN_HOOK_FIXTURE_GATE="block")
+    check("a hook switch in the env does not beat a bound mode", (got[0], got[3]), (0, False))
+    got = fire(LEAN_PROFILE="strict", LEAN_HOOK_FIXTURE_GATE="off", LEAN_HOOK_MODE=None)
+    check("probe drops a caller's LEAN_HOOK_MODE", got[3], False)
+
+    class _Seg:
+        def __init__(self, **env):
+            self.env = env
+
+    saved = {k: os.environ.pop(k, None) for k in ("LEAN_HOOK_FIXTURE_GATE", "LEAN_SKIP_FIXTURE_GATE", "LEAN_HOOK_MODE")}
+    saved_name, saved_manifest, saved_mode = _state.name, _state.manifest, _state.mode
+    try:
+        bind("fixture-gate.py", {"default": {"strict": "block", "standard": "note"}})
+        os.environ["LEAN_HOOK_FIXTURE_GATE"] = "off"
+        check("prefix block beats env off", resolve_mode(_Seg(LEAN_HOOK_FIXTURE_GATE="block")), ("block", "prefix"))
+        check("prefix skip is off", resolve_mode(_Seg(LEAN_SKIP_FIXTURE_GATE="1")), ("off", "prefix"))
+        check("env off", resolve_mode(), ("off", "env"))
+        os.environ.pop("LEAN_HOOK_FIXTURE_GATE")
+        check("default in strict", resolve_mode(), ("block", "default"))
+        check("per-call standard beats the default outside strict", with_standard("standard", "nothing"), ("off", "default"))
+        check("strict ignores a per-call standard", with_standard("strict", "nothing"), ("block", "default"))
+        bind("fixture-gate.py", {"default": {"strict": "block", "standard": "note"}}, "note")
+        os.environ["LEAN_HOOK_FIXTURE_GATE"] = "block"
+        check("a bound mode stands in for the env layer", resolve_mode(), ("note", "env"))
+        check("prefix still beats a bound mode", resolve_mode(_Seg(LEAN_HOOK_FIXTURE_GATE="off")), ("off", "prefix"))
+        bind("commit-author.py", {"default": {"strict": "block", "standard": "note"}})
+        os.environ.pop("LEAN_HOOK_FIXTURE_GATE")
+        os.environ["LEAN_ALLOW_COMMIT_AUTHOR"] = "1"
+        check("the old name counts as off in the env", resolve_mode(), ("off", "env"))
+        os.environ.pop("LEAN_ALLOW_COMMIT_AUTHOR")
+        check("the old name counts as off in the prefix",
+              resolve_mode(_Seg(LEAN_ALLOW_COMMIT_AUTHOR="1")), ("off", "prefix"))
+        check("the old name with another value does not", resolve_mode(_Seg(LEAN_ALLOW_COMMIT_AUTHOR="0")),
+              ("block", "default"))
+    finally:
+        _state.name, _state.manifest, _state.mode = saved_name, saved_manifest, saved_mode
+        os.environ.pop("LEAN_HOOK_FIXTURE_GATE", None)
+        os.environ.pop("LEAN_ALLOW_COMMIT_AUTHOR", None)
+        for key, val in saved.items():
+            if val is not None:
+                os.environ[key] = val
+    return None
+
+
+def with_standard(level, standard):
+    saved = os.environ.get("LEAN_PROFILE")
+    os.environ["LEAN_PROFILE"] = level
+    try:
+        return resolve_mode(standard=standard)
+    finally:
+        os.environ["LEAN_PROFILE"] = saved if saved is not None else "strict"
+
+
 def self_test():
     import contextlib
     import io
@@ -833,6 +1028,7 @@ def self_test():
     check("profile is case-insensitive", with_profile(" OFF ", "nothing")[3], "off")
     check("strict prints and returns 2", with_profile("strict", "nothing")[:3], (2, "", "T\n"))
     check("standard nothing", with_profile("standard", "nothing")[:3], (0, "", ""))
+    check("standard nothing, no manifest, no output", with_profile("standard", "nothing")[:2], (0, ""))
     check("standard block", with_profile("standard", "block")[:3], (2, "", "T\n"))
     check("standard note uses the note", json.loads(with_profile("standard", "note", "N")[1])["hookSpecificOutput"]["additionalContext"], "N")
     check("standard note falls back to the text", json.loads(with_profile("standard", "note")[1])["hookSpecificOutput"]["additionalContext"], "T")
@@ -988,6 +1184,8 @@ def self_test():
         real_db = os.path.realpath(os.path.expanduser("~/.local/share/lean/brain.db"))
         check("child gets a scratch brain", bool(child_db) and os.path.realpath(child_db) != real_db, True)
         check("child kept its notice in the scratch brain", child_rows, "[('-c', 'child')]")
+        _switch_tests(check, scratch)
+        os.environ["LEAN_PROFILE"] = "strict"
     finally:
         _RECORD, _state.event = False, {}
         shutil.rmtree(scratch, ignore_errors=True)

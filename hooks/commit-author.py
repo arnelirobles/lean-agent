@@ -126,7 +126,7 @@ def problems(command, cwd, hosts=None):
         call = hookkit.git_call(seg)
         if not call or call[0] != "commit" or "--dry-run" in call[1]:
             continue
-        if hookkit.disabled("LEAN_HOOK_COMMIT_AUTHOR", seg, ("off",)):
+        if hookkit.off(seg):
             continue
         email = effective_email(seg, call)
         if email is None:
@@ -139,8 +139,6 @@ def problems(command, cwd, hosts=None):
 
 
 def main():
-    if hookkit.disabled("LEAN_HOOK_COMMIT_AUTHOR", values=("off",)):
-        return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command") or ""
     if "commit" not in command:
@@ -153,7 +151,7 @@ def main():
                 "the env block of Claude Code settings, turns this check off.")
         note = ("The commit author email looks wrong: " + "; ".join(found)
                 + ". Consider git config user.email (or -c user.email=... on this commit) before committing.")
-        return hookkit.refuse("PreToolUse", text, standard="note", note=note)
+        return hookkit.refuse("PreToolUse", text, note=note)
     return 0
 
 

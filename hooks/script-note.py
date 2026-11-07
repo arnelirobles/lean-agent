@@ -210,7 +210,7 @@ def main():
         return 0
     cwd = event.get("cwd") or os.getcwd()
     if direct_test(command, cwd):
-        return hookkit.refuse("PreToolUse", block_message(cwd), standard="nothing")
+        return hookkit.refuse("PreToolUse", block_message(cwd))
     if os.environ.get("LEAN_SCRIPT_NOTE", "").lower() == "off":
         return 0
     found = candidates(command)

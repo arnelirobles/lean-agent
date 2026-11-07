@@ -169,7 +169,7 @@ def problems(command, cwd="."):
     found = []
     for seg in hookkit.segments(command, cwd):
         texts = published(seg)
-        if texts is None or hookkit.disabled("LEAN_HOOK_PUBLIC_TEXT", seg, ("off",)):
+        if texts is None or hookkit.off(seg):
             continue
         if not hookkit.disabled("LEAN_SKIP_ATTRIBUTION", seg):
             for where, text in [("the command", command)] + texts:
@@ -341,8 +341,7 @@ def self_test():
 def main():
     if sys.argv[1:] == ["--self-test"]:
         return self_test()
-    if hookkit.disabled("LEAN_HOOK_PUBLIC_TEXT", values=("off",)) or (
-            hookkit.disabled("LEAN_SKIP_ATTRIBUTION") and hookkit.disabled("LEAN_SKIP_SLOP")):
+    if hookkit.disabled("LEAN_SKIP_ATTRIBUTION") and hookkit.disabled("LEAN_SKIP_SLOP"):
         return 0
     event = hookkit.read_event()
     command = hookkit.tool_input(event).get("command") or ""
@@ -357,7 +356,7 @@ def main():
         note = ("This public text may read badly:\n  " + "\n  ".join(found)
                 + "\nConsider rewriting it plainly (commas, periods or parentheses for dashes, "
                 "words for arrows, no attribution) before it goes out.")
-        return hookkit.refuse("PreToolUse", text, standard="note", note=note)
+        return hookkit.refuse("PreToolUse", text, note=note)
     return 0
 
 
