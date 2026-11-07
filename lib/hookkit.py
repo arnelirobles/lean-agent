@@ -240,25 +240,38 @@ REPO_WHERE = "this repo's .claude/settings.json"
 PREFIX_WHERE = "the command prefix"
 
 
-def _project_dirs():
-    """The start directory (CLAUDE_PROJECT_DIR, else the event cwd, else the current directory) and every
-    parent up to and including the first one that holds .git (file or directory). With no .git, just the start."""
-    start = os.environ.get("CLAUDE_PROJECT_DIR") or str(_state.event.get("cwd") or "") or os.getcwd()
+def _walk_up(start):
+    """START and its parents up to and including the first one that holds .git (file or directory); just
+    START when there is no .git."""
     start = os.path.abspath(start)
-    found, here = [], start
+    walk, here = [], start
     while True:
-        found.append(here)
+        walk.append(here)
         if os.path.exists(os.path.join(here, ".git")):
-            return found
+            return walk
         parent = os.path.dirname(here)
         if parent == here:
             return [start]
         here = parent
 
 
+def _project_dirs():
+    """Every start directory (CLAUDE_PROJECT_DIR, the event cwd, the current directory, each when set) with
+    its parents up to its first .git. The union, in that order, without duplicates. A repository's settings
+    can set CLAUDE_PROJECT_DIR, so no single start is trusted to lead to the repository."""
+    starts = [os.environ.get("CLAUDE_PROJECT_DIR"), str(_state.event.get("cwd") or ""), os.getcwd()]
+    found = []
+    for start in starts:
+        if start:
+            found.extend(d for d in _walk_up(start) if d not in found)
+    return found
+
+
 def repo_root():
-    """The first directory at or above the project directory that holds .git, else the project directory."""
-    return _project_dirs()[-1] if os.path.exists(os.path.join(_project_dirs()[-1], ".git")) else _project_dirs()[0]
+    """The first directory at or above the project directory (CLAUDE_PROJECT_DIR, else the event cwd, else the
+    current directory) that holds .git, else the project directory."""
+    walk = _walk_up(os.environ.get("CLAUDE_PROJECT_DIR") or str(_state.event.get("cwd") or "") or os.getcwd())
+    return walk[-1] if os.path.exists(os.path.join(walk[-1], ".git")) else walk[0]
 
 
 def _env_block(path):
@@ -340,6 +353,8 @@ def _repo_sourced(name, value):
         block = _repo_env(os.path.join(d, ".claude", "settings.json"))
         if block is EVERY_NAME:
             found = True
+        elif "CLAUDE_PROJECT_DIR" in block or "HOME" in block:
+            found = True  # the repo moves where we look for it, so fail closed
         elif name in block and (not isinstance(block[name], str) or block[name] == value):
             found = True
     if not found:
@@ -1225,6 +1240,26 @@ def _guard_tests(check, scratch):
                          LEAN_HOOK_GATE_N="off")
         check("a non-guard repo loosening is kept", (code, out), (0, ""))
 
+        # a repository must not steer the walk away from its own settings file
+        elsewhere = tempfile.mkdtemp(prefix="elsewhere-", dir=scratch)
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"})
+        code, out = call("gate-g.py", guard, root, new_session(), CLAUDE_PROJECT_DIR=elsewhere, LEAN_HOOK_GATE_G="off")
+        check("project_dir_steered: CLAUDE_PROJECT_DIR outside the repo, event cwd in it, blocks", code, 2)
+        root = make_repo({"LEAN_HOOK_GATE_G": "off", "CLAUDE_PROJECT_DIR": elsewhere})
+        code, out = call("gate-g.py", guard, root, new_session(), CLAUDE_PROJECT_DIR=elsewhere, LEAN_HOOK_GATE_G="off")
+        check("project_dir_steered: repo sets CLAUDE_PROJECT_DIR, blocks", code, 2)
+        root = make_repo({"LEAN_HOOK_GATE_G": "off", "HOME": elsewhere})
+        code, out = call("gate-g.py", guard, root, new_session(), CLAUDE_PROJECT_DIR=elsewhere, HOME=elsewhere,
+                         LEAN_HOOK_GATE_G="off")
+        check("project_dir_steered: repo sets HOME, blocks", code, 2)
+        # the settings file is found by the project dir itself, so only the new fail-closed rule can catch these
+        for moved in ("CLAUDE_PROJECT_DIR", "HOME"):
+            root = make_repo({"LEAN_HOOK_GATE_G": "block", moved: elsewhere})
+            code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+            check("project_dir_steered: repo sets %s, any value, blocks" % moved, code, 2)
+        code, out = call("gate-g.py", guard, make_repo({}), new_session(), LEAN_HOOK_GATE_G="off")
+        check("project_dir_steered: user env only, no repo settings, still passes", (code, out), (0, ""))
+
         # the old names are covered too
         root = make_repo({"LEAN_ALLOW_COMMIT_AUTHOR": "1"})
         code, out = call("commit-author.py", guard, root, new_session(), LEAN_ALLOW_COMMIT_AUTHOR="1")
@@ -1260,6 +1295,7 @@ def _guard_tests(check, scratch):
         check("disabled says so once per session, name and source", captured.getvalue().count("is ignored"), 2)
         check("disabled names the prefix", "from the command prefix" in captured.getvalue(), True)
         os.environ["CLAUDE_PROJECT_DIR"] = make_repo({})
+        _state.event = {"session_id": _state.event.get("session_id"), "cwd": os.environ["CLAUDE_PROJECT_DIR"]}
         check("disabled keeps a user env value in a guard", disabled("LEAN_SKIP_PUBLIC_TEXT"), True)
         bind("gate-n.py", plain)
         check("disabled keeps a prefix in a non-guard",

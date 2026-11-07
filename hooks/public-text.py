@@ -404,6 +404,7 @@ def self_test():
             print(f"FAIL a repo dropping plain-prose is ignored: {got!r}")
             failures += 1
         rob["session_id"] = f"rules-slop-user-{os.getpid()}"
+        rob["cwd"] = there
         got = hookkit.probe(me, rob, LEAN_PROFILE="strict", CLAUDE_PROJECT_DIR=there,
                             **dict(clean_env, LEAN_RULES="-plain-prose"))
         if got[0] != 0:
