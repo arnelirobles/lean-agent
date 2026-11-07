@@ -286,12 +286,15 @@ stall_suite() { # the watchdog, always through the python helper
   out=$( (HEAVY_FAIL_STALL=abc run_lane f3 true) 2>&1 ); rc=$?
   [ "$rc" = 2 ] || { echo "self-test failed: bad HEAVY_FAIL_STALL accepted ($rc)"; fails=$((fails + 1)); }
   # A stray HEAVY_HELD=1 on a lane another process holds must wait like any run and must not hurt the holder.
-  (run_lane f4 sh -c 'sleep 6; echo holder done' </dev/null >"$t/f4.out" 2>&1) &
-  sleep 1
+  # The holder keeps the lane until the release file appears, so no check depends on wall time.
+  # It writes the up file once it runs, which is after it took the lock.
+  (run_lane f4 sh -c ': > "$1"; while [ ! -e "$0" ]; do sleep 0.2; done; echo holder done' "$t/f4.release" "$t/f4.up" </dev/null >"$t/f4.out" 2>&1) &
+  for i in $(seq 1 150); do [ -e "$t/f4.up" ] && break; sleep 0.2; done
   out=$( (HEAVY_HELD=1 HEAVY_WAIT=1 run_lane f4 sh -c 'echo ran') 2>&1 ); rc=$?
   [ "$rc" = 75 ] || { echo "self-test failed: HEAVY_HELD=1 on a lane someone else holds must time out ($rc): $out"; fails=$((fails + 1)); }
   out=$( (HEAVY_HELD="$HEAVY_LOCK_DIR/f4.lock:$$:guess" HEAVY_WAIT=1 run_lane f4 sh -c 'echo ran') 2>&1 ); rc=$?
   [ "$rc" = 75 ] || { echo "self-test failed: a guessed HEAVY_HELD claim must time out ($rc): $out"; fails=$((fails + 1)); }
+  : > "$t/f4.release"
   wait
   grep -q 'holder done' "$t/f4.out" || { echo "self-test failed: the holder was killed by a HEAVY_HELD run: $(cat "$t/f4.out")"; fails=$((fails + 1)); }
   return "$fails"
