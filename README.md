@@ -214,7 +214,7 @@ Set these in the `env` block of your Claude Code settings. The defaults run the 
 | `LEAN_MODEL_FAST` | `haiku` | The model for agents that read and report: code search, running the gates, the retro's fact collection. It never judges code. |
 | `LEAN_RULES` | `attribution,plain-prose` | Which rule sets the style checks load. `name` adds `rules/name.json`, `-name` drops one. `-attribution` is a user setting: `public-text` puts the set back when it comes from a repository's own settings. See Writing a rule set. |
 | `LEAN_HOOK_<NAME>` | the hook's profile default | One switch per hook: `off`, `note` or `block`. NAME is the hook file name in capitals with underscores. Resolution order and guards are under [Profiles](#profiles). |
-| `LEAN_SKIP_<NAME>` | off | `1` counts as `LEAN_HOOK_<NAME>=off`. Read for `SECRET_SCAN`, `PUBLIC_TEXT`, `ATTRIBUTION`, `SLOP`, `WIDE_CHARS`, `TEST_BEFORE_PUSH`, `VERIFY_CLAIM`, `DOCS_CONTAINERS`, `LESSON_LOG`, `PR_MERGE_BLOCKED`, `REVIEW_LOG_CHECK` and `STYLE_NOTE`. |
+| `LEAN_SKIP_<NAME>` | off | `1` counts as `LEAN_HOOK_<NAME>=off`. Read for `SECRET_SCAN`, `PUBLIC_TEXT`, `TEST_BEFORE_PUSH`, `VERIFY_CLAIM`, `DOCS_CONTAINERS`, `LESSON_LOG`, `PR_MERGE_BLOCKED`, `REVIEW_LOG_CHECK` and `STYLE_NOTE`. `ATTRIBUTION`, `SLOP` and `WIDE_CHARS` are not hooks: `1` skips that one check. |
 | `LEAN_STATS` | on | `off` stops every `lean-stats` write. |
 | `LEAN_CONTEXT_WARN` | `100000` | Context size, in tokens, where the coordinator gets a cost note. `off` turns it off. |
 | `LEAN_LOOKUP_WARN` | `10` | Read-only lookups by an Opus coordinator before it is told to use `lean:search`, or refused with `LEAN_LOOKUP_MODE=block`. `off` turns both off. |
