@@ -1,38 +1,28 @@
 name: ci
-
 on:
-  pull_request:
   push:
     branches: [main]
-
-permissions:
-  contents: read
-
+  pull_request:
 jobs:
-  self-tests:
+  plain-files:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
-          # run-all.sh compares against the current version's tag, so it needs the tags.
-          fetch-depth: 0
-      - run: git config --global user.email ci@example.com && git config --global user.name ci
-      - run: bash tests/run-all.sh
-
-  extension:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: vscode
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: vscode/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npx vitest run
+      - name: Only Markdown, text, JSON, YAML and images
+        run: |
+          bad=0
+          while IFS= read -r f; do
+            case "$f" in
+              *.md|*.txt|*.json|*.yml|*.yaml|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico|LICENSE|.gitignore) ;;
+              *) echo "not an allowed type: $f"; bad=1 ;;
+            esac
+            if head -c 2 "$f" | grep -q '^#!'; then echo "starts with #!: $f"; bad=1; fi
+            case "$f" in
+              *.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) ;;
+              *) if LC_ALL=C grep -q -P '\x00' "$f"; then echo "NUL byte: $f"; bad=1; fi
+                 iconv -f UTF-8 -t UTF-8 "$f" > /dev/null 2>&1 || { echo "not UTF-8: $f"; bad=1; } ;;
+            esac
+          done < <(git ls-files)
+          exit $bad
+      - name: JSON parses
+        run: for f in $(git ls-files '*.json'); do python3 -m json.tool "$f" > /dev/null || exit 1; done

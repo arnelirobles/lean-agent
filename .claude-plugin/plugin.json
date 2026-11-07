@@ -1,31 +1,12 @@
 {
   "name": "lean-agent",
-  "version": "1.27.1",
-  "description": "Run coding agents over a backlog without burning a plan: agent-ready tickets, scripted gates, an adversarial critic, and a retro that improves the method from numbers.",
+  "version": "2.0.0",
+  "description": "Four skills for running coding agents over a backlog: working rules, agent-ready tickets, an adversarial review and a retro, as plain Markdown with no scripts.",
   "author": {
     "name": "Arnel Robles",
     "url": "https://github.com/arnelirobles"
   },
   "homepage": "https://github.com/arnelirobles/lean-agent",
   "repository": "https://github.com/arnelirobles/lean-agent",
-  "license": "MIT",
-  "mcpServers": {
-    "brain": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/tools/brain-mcp"
-    }
-  },
-  "userConfig": {
-    "serve_mode": {
-      "type": "string",
-      "title": "Brain page",
-      "description": "When the brain page server runs: always (from login, after brain serve --install always), session (started with a session, stops 30 minutes after the last one), or manual (brain serve)",
-      "default": "manual"
-    },
-    "worktree_roots": {
-      "type": "string",
-      "title": "Worktree folders",
-      "description": "Comma-separated folders the brain page searches for git worktrees, besides the repositories brain already knows",
-      "default": ""
-    }
-  }
+  "license": "MPL-2.0"
 }

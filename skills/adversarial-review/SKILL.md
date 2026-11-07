@@ -24,15 +24,11 @@ Three rules shape everything below.
    it is now, and the wrong result. If a runnable check would settle it in a minute, it is run.
 3. **The repository's rules beat general taste.** Read the rules file before looking at code.
 
-With `LEAN_AGENTS=one` there are no fresh agents. Steps 3 and 4 run as two passes in this session:
+With one agent only, there are no fresh agents. Steps 3 and 4 run as two passes in this session:
 write the hunt's candidates down first, then refute each one from the code and a check, not from
 the hunt's reasoning. The report says the finder and the judge shared a context.
 
-With mixed models, the hunter and the refuter both start on the cheap model: `sonnet`, or the
-model the session-start note names. The hunter and the refuter never run on the fast model (`LEAN_MODEL_FAST`): a small model that wrongly refutes a finding drops a real defect with no trace. The strong model is not a second critic. It gets the branch
-and the surviving list only when a finding is not fixed in one round, or a tier 2 answer is unsure.
-
-With `LEAN_CREDIT_RUNS=on`, run the hunter and the refuter through `credit-run --read-only --role hunt` (or `refute`) in place of an Agent, on the same model, each with its own brief. Put the diff in the brief: a read-only job has no Bash. Stay on an Agent when credit-run refuses or the review needs a command run.
+The hunter and the refuter both start on a cheaper model, not the smallest one: a small model that wrongly refutes a finding drops a real defect with no trace. The strongest model is not a second critic. It gets the branch and the surviving list only when a finding is not fixed in one round, or a tier 2 answer is unsure.
 
 ## Inputs
 
@@ -66,7 +62,7 @@ test that loses assertions.
 ## 3. Hunt (agent one, fresh context)
 
 Start the hunter with the description `lean:hunt <owner/repo>#<pr>` (or `@<branch>` before the pull
-request exists), so lean-stats can tie its cost and its misses to the change.
+request exists), so its cost and its misses can be tied to the change.
 
 Give the hunter the diff, the PR description and linked issue, the rules file, and a checkout it
 can build and test. It reads whole files around each hunk and every caller of a changed symbol,
@@ -107,8 +103,9 @@ comparison, rate limits); stability (timeouts, bounded lists, cache staleness un
 shutdown); data integrity (ordering of side effects against failures, replay and duplicates);
 missing behaviour (the handler, default, rollback or check that should be in the diff and is not);
 tests that pass for the wrong reason (a disabled retry, an empty collection, a mock asserting on itself).
-To check that a test fails without the code it names, run `${CLAUDE_PLUGIN_ROOT}/tools/holdout.sh --spec <description file>`
-rather than reverting a line by hand.
+To check that a test fails without the code it names, take the production hunk out in a scratch
+copy of the checkout, run the named test, and confirm it fails. Never do this over uncommitted work.
+With lean-agent-tools installed, holdout.sh does this for you.
 
 The hunter writes candidates as `category | severity | file:line | input | path | wrong result |
 proposed fix`, and states what it did not check.
@@ -151,27 +148,25 @@ If nothing survives, say so, and list what was checked. A clean review is a resu
 - **No finding is left as a follow-up by default.** Fix it in the change or drop it. File an issue
   only for something that needs a different repository or a decision nobody in the change can make.
 
-Before a review body goes out with `gh ... --body-file`, put the file in the checkout and run
-`${CLAUDE_PLUGIN_ROOT}/tools/style-scan`. It reads added lines and untracked files, so it catches dashes and slop in the body. Delete the file right after the scan so it is never committed.
+Before a review body goes out with `gh ... --body-file`, read the file once for dashes, arrows and
+slop words, and delete the file afterwards so it is never committed. With lean-agent-tools installed,
+style-scan does this for you.
 
 ## 7. Record
 
-Append one line per review with `${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh`, so each batch can compare what this caught against
-CI and any review bot:
+Append one row per review to `docs/review-log.md`, so each batch can compare what this caught against
+CI and any review bot. Keep one table, with this header:
 
-```bash
-${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/log-review.sh <repo> <pr> <confirmed> <refuted> <blockers> "<categories>" "<caught elsewhere first>"
+```
+| date | repo | pr | confirmed | refuted | blockers | categories | caught elsewhere first | escaped |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
 ```
 
-The same row goes into the lean-stats database (`~/.lean/lean.db`), where `${CLAUDE_PLUGIN_ROOT}/tools/lean-stats report` joins
-it to the agents that worked on the change. Logging the same pull request again replaces its row
-there, which is how `escaped` gets filled in later.
+Logging the same pull request again replaces its row. That is how `escaped` gets filled in later.
 
 The log row is the last step of every review. Log it by pull request number before marking the
-pull request ready or merging it. With `LEAN_PROFILE=strict` the `review-log-check` hook refuses `gh pr ready`, `gh pr merge`
-and `az repos pr update --draft false` (or `--status completed`) when `lean.db` has no row in
-`reviews` for that pull request, once the repo has a logged review. If the change was deliberately not reviewed, set
-`LEAN_SKIP_REVIEW_LOG_CHECK=1` for that command.
+pull request ready or merging it. If the change was deliberately not reviewed, say so in the pull
+request. With lean-agent-tools installed, a hook refuses the merge when the review is not logged.
 
 When a category keeps surviving refutation, turn it into a scripted check. When a tier has
 produced nothing for three batches, stop running the full review on it.

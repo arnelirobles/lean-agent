@@ -1,1 +1,0 @@
-run-failed: no ./gradlew in app or above; the Gradle runner runs only the repo's own wrapper

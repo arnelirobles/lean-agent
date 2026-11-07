@@ -1,6 +1,6 @@
 {
   "name": "lean-agent",
-  "description": "Lean agent as a Claude Code plugin.",
+  "description": "Lean agent's skills as plain Markdown.",
   "owner": {
     "name": "Arnel Robles",
     "url": "https://github.com/arnelirobles"
@@ -9,7 +9,7 @@
     {
       "name": "lean-agent",
       "source": "./",
-      "description": "Agent-ready tickets, scripted gates, an adversarial critic, and a retro that improves the method from numbers."
+      "description": "Working rules, agent-ready tickets, an adversarial review and a retro for coding agents on a backlog."
     }
   ]
 }
