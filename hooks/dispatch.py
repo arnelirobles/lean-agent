@@ -10,8 +10,7 @@ and its main runs through hookkit.run on a thread with its own stdin, stdout and
 A process member runs as its own python3 process. Every member runs; a member past its
 timeout is left behind (a thread) or killed (a process) and counts as exit 0.
 
-Merge rules: any exit 2 makes the result exit 2 with the stderr of the members that
-exited 2 joined by newlines. additionalContext strings join with a blank line,
+Merge rules: any exit 2 makes the result exit 2; every member's stderr is joined by newlines. additionalContext strings join with a blank line,
 permissionDecision takes deny over ask, decision block wins, continue false wins, and
 systemMessage, reason and stopReason join with newlines. permissionDecision allow and
 updatedInput are dropped with a stderr line, so a group never grants.
@@ -218,19 +217,19 @@ def merge(results):
                     else:
                         spec.setdefault(k, v)
             elif key == "systemMessage":
-                system.append(v)
+                system.append(value)
             elif key == "reason":
-                reasons.append(v)
+                reasons.append(value)
             elif key == "stopReason":
-                stops.append(v)
+                stops.append(value)
             elif key == "decision":
-                if v == "block":
+                if value == "block":
                     decision = "block"
             elif key == "continue":
-                if v is False:
+                if value is False:
                     stop_run = True
             else:
-                top.setdefault(key, v)
+                top.setdefault(key, value)
     merged = {}
     if stop_run:
         merged["continue"] = False
@@ -253,12 +252,8 @@ def merge(results):
     if merged:
         lines.append(json.dumps(merged))
     codes = [c for _, c, _, _ in results]
-    if 2 in codes:
-        code = 2
-        errs = [e.rstrip("\n") for _, c, _, e in results if c == 2 and e.strip()]
-    else:
-        code = 1 if any(codes) else 0
-        errs = [e.rstrip("\n") for _, _, _, e in results if e.strip()]
+    code = 2 if 2 in codes else (1 if any(codes) else 0)
+    errs = [e.rstrip("\n") for _, _, _, e in results if e.strip()]
     errs += ["dispatch: dropped %s from %s" % (key, name) for key, name in dropped]
     return code, "\n".join(lines) + ("\n" if lines else ""), "\n".join(errs) + ("\n" if errs else "")
 
