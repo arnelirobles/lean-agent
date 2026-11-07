@@ -13,6 +13,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 
 SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")", ";;", "|&"}
 PIPES = {"|", "|&"}
@@ -20,7 +21,18 @@ ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
 HEREDOC = re.compile(r"<<(-?)[ \t]*((?:'[^'\n]*'|\"(?:[^\"\\\n]|\\.)*\"|\\.|[^\s;&|()<>'\"\\])+)")
 HEREDOC_MARK = re.compile(r"__lean_heredoc_(\d+)__")
 GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
-_EVENT = {}  # the last event read, for the session id and cwd of a recorded fire
+
+
+class _State(threading.local):
+    """Per-thread hook state: the last event read (for the session id and cwd of a recorded fire) and, when
+    the dispatcher binds one, the hook's own name, manifest and mode. Unbound, the name is sys.argv[0]."""
+    event = {}
+    name = None
+    manifest = None
+    mode = None
+
+
+_state = _State()
 _RECORD = "--self-test" not in sys.argv[1:]  # a hook's own self-test must not write to the real database
 if not _RECORD and not os.environ.get("LEAN_BRAIN_DB"):
     # a self-test, and every hook it spawns, must write to a scratch brain and never the real one
@@ -32,14 +44,26 @@ if not _RECORD and not os.environ.get("LEAN_BRAIN_DB"):
     os.environ["LEAN_BRAIN_DB"] = os.path.join(_scratch, "brain.db")
 
 
+def bind(name, manifest, mode=None):
+    """Make NAME this thread's current hook, in place of sys.argv[0]. The dispatcher calls it per member."""
+    _state.name = name
+    _state.manifest = manifest
+    _state.mode = mode
+    _state.event = {}
+
+
+def _hook_name():
+    return _state.name or os.path.basename(sys.argv[0])
+
+
 def _fire(outcome):
     """Record this hook's fire for lean-stats. Any failure is dropped: statistics never touch the tool call."""
     if not _RECORD:
         return
     try:
         import leanstats
-        leanstats.record_fire(os.path.basename(sys.argv[0]), outcome,
-                              str(_EVENT.get("session_id") or ""), str(_EVENT.get("cwd") or ""))
+        leanstats.record_fire(_hook_name(), outcome,
+                              str(_state.event.get("session_id") or ""), str(_state.event.get("cwd") or ""))
     except Exception:
         pass
 
@@ -71,7 +95,7 @@ def tools_on_path():
     written it yet, or the write may have failed."""
     if TOOLS in [os.path.normpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]:
         return True
-    marker = marker_file(_EVENT.get("session_id"))
+    marker = marker_file(_state.event.get("session_id"))
     try:
         with open(marker, encoding="utf-8") as f:
             return f.read().strip() == TOOLS
@@ -187,13 +211,12 @@ def run(main):
 
 
 def read_event():
-    global _EVENT
     try:
         event = json.load(sys.stdin)
     except ValueError:
         event = {}
-    _EVENT = event if isinstance(event, dict) else {}
-    return _EVENT
+    _state.event = event if isinstance(event, dict) else {}
+    return _state.event
 
 
 def tool_input(event):
@@ -217,8 +240,8 @@ def _keep_notice(text):
     try:
         from brain import records, store
         con = store.connect(timeout=1)
-        records.add_notice(con, os.path.basename(sys.argv[0]), text,
-                           str(_EVENT.get("session_id") or ""), str(_EVENT.get("cwd") or ""))
+        records.add_notice(con, _hook_name(), text,
+                           str(_state.event.get("session_id") or ""), str(_state.event.get("cwd") or ""))
         con.close()
     except (SystemExit, Exception):  # a locked or newer database must not change the hook's output
         pass
@@ -596,7 +619,7 @@ def self_test():
 
     import leanstats
 
-    global _RECORD, _EVENT
+    global _RECORD
 
     os.environ["LEAN_PROFILE"] = "strict"
     failures = 0
@@ -780,7 +803,7 @@ def self_test():
 
     with tempfile.TemporaryDirectory() as tmp:
         db = os.path.join(tmp, "lean.db")
-        _RECORD, _EVENT = True, {"session_id": "s1", "cwd": "/w"}
+        _RECORD, _state.event = True, {"session_id": "s1", "cwd": "/w"}
         try:
             with leanstats.temp_env(LEAN_DB=db, LEAN_STATS=None):
                 check("note output", noted(), want_note)
@@ -808,21 +831,21 @@ def self_test():
                 noted()
                 check("a self-test run records nothing", os.path.exists(quiet), False)
         finally:
-            _RECORD, _EVENT = False, {}
+            _RECORD, _state.event = False, {}
     saved_env = {k: os.environ.get(k) for k in ("CLAUDE_ENV_FILE", "PATH", "HOME")}
-    saved_event = _EVENT
+    saved_event = _state.event
     home = tempfile.mkdtemp(prefix="hookkit-home-")
     try:
         os.environ.pop("CLAUDE_ENV_FILE", None)
         os.environ["PATH"] = "/usr/bin"
         os.environ["HOME"] = home
-        _EVENT = {}
+        _state.event = {}
         check("tool_path is absolute and exists", (os.path.isabs(tool_path("brain")), os.path.exists(TOOLS + "/brain")), (True, True))
         os.environ["CLAUDE_ENV_FILE"] = os.path.join(home, "no-such-dir", "env")  # session-env cannot write it
-        _EVENT = {"hook_event_name": "SessionStart", "session_id": "m-1"}
+        _state.event = {"hook_event_name": "SessionStart", "session_id": "m-1"}
         check("SessionStart with an unwritable env file and no marker gives the absolute path",
               tool_path("brain"), shlex.quote(os.path.join(TOOLS, "brain")))
-        _EVENT = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
+        _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
         check("CLAUDE_ENV_FILE alone does not count outside SessionStart", tools_on_path(), False)
         os.environ.pop("CLAUDE_ENV_FILE")
         marker = marker_file("m-1")
@@ -830,18 +853,18 @@ def self_test():
         with open(marker, "w") as fh:
             fh.write(TOOLS)
         check("the session's marker puts the tools on PATH", tool_path("brain"), "brain")
-        _EVENT = {"hook_event_name": "PreToolUse", "session_id": "m-2"}
+        _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-2"}
         check("another session has no marker", tool_path("brain").startswith("/"), True)
         with open(marker, "w") as fh:
             fh.write("/old/tools")
-        _EVENT = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
+        _state.event = {"hook_event_name": "PreToolUse", "session_id": "m-1"}
         check("a marker for another folder does not count", tools_on_path(), False)
-        _EVENT = {}
+        _state.event = {}
         os.environ["PATH"] = "/usr/bin" + os.pathsep + TOOLS
         check("tool_path is the bare name when PATH names the tools", tool_path("brain"), "brain")
         check("tool_path with a base stays a path", tool_path("brain", "/a/tools"), "/a/tools/brain")
     finally:
-        _EVENT = saved_event
+        _state.event = saved_event
         shutil.rmtree(home, True)
         for k, v in saved_env.items():
             if v is None:
@@ -871,7 +894,7 @@ def self_test():
             os.environ["LEAN_BRAIN_DB"] = bdb
             os.environ.pop("LEAN_NOTICES", None)
             with leanstats.temp_env(LEAN_DB=os.path.join(tmp, "lean.db"), LEAN_STATS=None):
-                _RECORD, _EVENT = True, {"session_id": "s1", "cwd": "/w"}
+                _RECORD, _state.event = True, {"session_id": "s1", "cwd": "/w"}
                 check("note output with notices on", noted(), want_note)
                 check("note leaves one notice", notice_rows(bdb), [("hookkit.py", "hello", "s1", "/w")])
                 os.environ["LEAN_NOTICES"] = "off"
@@ -912,7 +935,7 @@ def self_test():
         check("child gets a scratch brain", bool(child_db) and os.path.realpath(child_db) != real_db, True)
         check("child kept its notice in the scratch brain", child_rows, "[('-c', 'child')]")
     finally:
-        _RECORD, _EVENT = False, {}
+        _RECORD, _state.event = False, {}
         shutil.rmtree(scratch, ignore_errors=True)
         for key, val in (("LEAN_BRAIN_DB", saved_brain), ("LEAN_NOTICES", saved_notices)):
             if val is None:

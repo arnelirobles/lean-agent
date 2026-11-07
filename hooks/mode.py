@@ -220,7 +220,7 @@ def self_test():
             print(f"FAIL tools note should name a real tools folder: {note}")
             failures += 1
         os.environ["CLAUDE_ENV_FILE"] = "/nonexistent-lean-dir/env"
-        hookkit._EVENT = {"hook_event_name": "SessionStart", "session_id": "m-1"}
+        hookkit._state.event = {"hook_event_name": "SessionStart", "session_id": "m-1"}
         note = tools_note()
         if "are on PATH" in note or "/tools/brain" not in note:
             print(f"FAIL an env file session-env may not have written must not put bare brain on PATH: {note}")

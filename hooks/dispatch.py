@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Run the hooks of one event group in one Python process and merge what they print.
+
+  dispatch.py EVENT GROUP        the event JSON on stdin; reads hooks/dispatch.json
+  dispatch.py --self-test
+
+tools/lean-agent build writes one hooks.json entry for a group that has an inproc hook,
+and the members of that group into hooks/dispatch.json. An inproc member is loaded once
+and its main runs through hookkit.run on a thread with its own stdin, stdout and stderr.
+A process member runs as its own python3 process. Every member runs; a member past its
+timeout is left behind (a thread) or killed (a process) and counts as exit 0.
+
+Merge rules: any exit 2 makes the result exit 2 with the stderr of the members that
+exited 2 joined by newlines. additionalContext strings join with a blank line,
+permissionDecision takes deny over ask, decision block wins, continue false wins, and
+systemMessage, reason and stopReason join with newlines. permissionDecision allow and
+updatedInput are dropped with a stderr line, so a group never grants.
+"""
+import fnmatch
+import importlib.util
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+import hookkit  # noqa: E402
+
+DEFAULT_TIMEOUT = 60
+_REAL = {"stdin": sys.stdin, "stdout": sys.stdout, "stderr": sys.stderr}
+_local = threading.local()
+_modules = {}
+_load_lock = threading.Lock()
+_install_lock = threading.Lock()
+
+
+class _Proxy(object):
+    """Stands in for a standard stream: forwards to this thread's StringIO when it has one."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def _target(self):
+        return getattr(_local, self._name, None) or _REAL[self._name]
+
+    def __getattr__(self, attr):
+        return getattr(self._target(), attr)
+
+    def __iter__(self):
+        return iter(self._target())
+
+    def __next__(self):
+        return next(self._target())
+
+
+def install():
+    """Replace sys.stdin, sys.stdout and sys.stderr by proxies, once."""
+    with _install_lock:
+        if not isinstance(sys.stdout, _Proxy):
+            sys.stdin, sys.stdout, sys.stderr = _Proxy("stdin"), _Proxy("stdout"), _Proxy("stderr")
+
+
+def process_env(member):
+    """The environment of a process member. Task 4 sets LEAN_HOOK_MODE here."""
+    return dict(os.environ)
+
+
+def member_path(member):
+    return os.path.join(ROOT, member["file"])
+
+
+def load(path):
+    """Import a hook file once under a private module name, so its __main__ block never runs."""
+    with _load_lock:
+        if path not in _modules:
+            name = "leanhook_" + re.sub(r"\W", "_", os.path.basename(path)[:-3])
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _modules[path] = module
+        return _modules[path]
+
+
+def exit_code(exc, err):
+    code = exc.code
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    err.write(str(code) + "\n")
+    return 1
+
+
+def run_inproc(member, stdin_text, slot):
+    out, err = io.StringIO(), io.StringIO()
+    _local.stdin, _local.stdout, _local.stderr = io.StringIO(stdin_text), out, err
+    code = 0
+    try:
+        hookkit.bind(member["name"], None, "inproc")
+        module = load(member_path(member))
+        hookkit.run(module.main)
+    except SystemExit as exc:
+        code = exit_code(exc, err)
+    except BaseException as exc:  # a broken member must not break the group
+        err.write("lean-agent hook error ignored: %r\n" % (exc,))
+    slot["result"] = (code, out.getvalue(), err.getvalue())
+
+
+def run_process(member, stdin_text, timeout, slot):
+    try:
+        done = subprocess.run([sys.executable, member_path(member)], input=stdin_text, capture_output=True,
+                              text=True, env=process_env(member), timeout=timeout)
+        slot["result"] = (done.returncode, done.stdout, done.stderr)
+    except subprocess.TimeoutExpired:
+        slot["timeout"] = True
+    except Exception as exc:
+        slot["result"] = (0, "", "lean-agent hook error ignored: %r\n" % (exc,))
+
+
+def wanted(member, event):
+    """The member's own `if`: Bash(<glob>) is fnmatch on the Bash command, as Claude Code does it.
+    Any other form of `if` is not understood here, so the member runs."""
+    cond = member.get("if")
+    if not cond:
+        return True
+    found = re.match(r"^Bash\((.*)\)$", cond, re.S)
+    if not found:
+        return True
+    if event.get("tool_name", "Bash") != "Bash":
+        return False
+    tool_input = event.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    return isinstance(command, str) and fnmatch.fnmatchcase(command, found.group(1))
+
+
+def run_group(event, group, stdin_text, table):
+    """Run every member of table["EVENT:GROUP"] and return (exit code, stdout, stderr)."""
+    members = table.get("%s:%s" % (event, group))
+    if members is None:
+        raise ValueError("no group %s:%s in the dispatch table" % (event, group))
+    try:
+        parsed = json.loads(stdin_text)
+    except ValueError:
+        parsed = {}
+    parsed = parsed if isinstance(parsed, dict) else {}
+    install()
+    started = time.time()
+    running = []
+    for member in members:
+        if not wanted(member, parsed):
+            continue
+        timeout = member.get("timeout") or DEFAULT_TIMEOUT
+        slot = {}
+        if member.get("mode") == "inproc":
+            thread = threading.Thread(target=run_inproc, args=(member, stdin_text, slot), daemon=True)
+        else:
+            thread = threading.Thread(target=run_process, args=(member, stdin_text, timeout, slot), daemon=True)
+        thread.start()
+        running.append((member, timeout, thread, slot))
+    results, lines = [], []
+    for member, timeout, thread, slot in running:
+        thread.join(max(0.0, started + timeout - time.time()) + (1.0 if member.get("mode") != "inproc" else 0.0))
+        if "result" in slot:
+            results.append((member["name"],) + slot["result"])
+        else:
+            lines.append("dispatch: %s timed out after %ss" % (member["name"], timeout))
+            results.append((member["name"], 0, "", ""))
+    code, out, err = merge(results)
+    if lines:
+        err = err + "\n".join(lines) + "\n"
+    return code, out, err
+
+
+def _join(parts, sep):
+    parts = [p for p in parts if isinstance(p, str) and p]
+    return sep.join(parts)
+
+
+def merge(results):
+    """Merge [(name, exit code, stdout, stderr)] into (exit code, stdout, stderr)."""
+    dropped, raw = [], []
+    top, spec = {}, {}
+    contexts, system, reasons, stops, perm_reasons = [], [], [], [], []
+    decision = None
+    stop_run = False
+    for name, _, out, _ in results:
+        text = out.strip()
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            obj = None
+        if not isinstance(obj, dict):
+            raw.append(text)
+            continue
+        for key, value in obj.items():
+            if key == "hookSpecificOutput" and isinstance(value, dict):
+                for k, v in value.items():
+                    if k == "additionalContext":
+                        contexts.append(v)
+                    elif k == "permissionDecision":
+                        if v in ("deny", "ask"):
+                            if spec.get(k) != "deny":
+                                spec[k] = v
+                        else:
+                            dropped.append((k, name))
+                    elif k == "permissionDecisionReason":
+                        perm_reasons.append(v)
+                    elif k == "updatedInput":
+                        dropped.append((k, name))
+                    else:
+                        spec.setdefault(k, v)
+            elif key == "systemMessage":
+                system.append(v)
+            elif key == "reason":
+                reasons.append(v)
+            elif key == "stopReason":
+                stops.append(v)
+            elif key == "decision":
+                if v == "block":
+                    decision = "block"
+            elif key == "continue":
+                if v is False:
+                    stop_run = True
+            else:
+                top.setdefault(key, v)
+    merged = {}
+    if stop_run:
+        merged["continue"] = False
+    if stops:
+        merged["stopReason"] = _join(stops, "\n")
+    if decision:
+        merged["decision"] = decision
+    if reasons:
+        merged["reason"] = _join(reasons, "\n")
+    if system:
+        merged["systemMessage"] = _join(system, "\n")
+    merged.update(top)
+    if contexts:
+        spec["additionalContext"] = _join(contexts, "\n\n")
+    if perm_reasons and "permissionDecision" in spec:
+        spec["permissionDecisionReason"] = _join(perm_reasons, "\n")
+    if set(spec) - {"hookEventName"}:
+        merged["hookSpecificOutput"] = spec
+    lines = list(raw)
+    if merged:
+        lines.append(json.dumps(merged))
+    codes = [c for _, c, _, _ in results]
+    if 2 in codes:
+        code = 2
+        errs = [e.rstrip("\n") for _, c, _, e in results if c == 2 and e.strip()]
+    else:
+        code = 1 if any(codes) else 0
+        errs = [e.rstrip("\n") for _, _, _, e in results if e.strip()]
+    errs += ["dispatch: dropped %s from %s" % (key, name) for key, name in dropped]
+    return code, "\n".join(lines) + ("\n" if lines else ""), "\n".join(errs) + ("\n" if errs else "")
+
+
+def main(argv):
+    try:
+        if len(argv) not in (2, 3):
+            raise ValueError("usage: dispatch.py EVENT GROUP")
+        table_path = argv[2] if len(argv) == 3 else os.path.join(HERE, "dispatch.json")
+        with open(table_path, encoding="utf-8") as handle:
+            table = json.load(handle)
+        code, out, err = run_group(argv[0], argv[1], _REAL["stdin"].read(), table)
+    except Exception as exc:
+        code, out, err = 0, "", "lean-agent dispatch error ignored: %r\n" % (exc,)
+    # the real streams, not the proxies: a member left hanging must not write into the answer
+    _REAL["stdout"].write(out)
+    _REAL["stderr"].write(err)
+    _REAL["stdout"].flush()
+    _REAL["stderr"].flush()
+    os._exit(code)
+
+
+def self_test():
+    import tempfile
+    import sqlite3
+
+    fails = []
+
+    def check(name, ok, detail=""):
+        if not ok:
+            fails.append("%s %s" % (name, detail))
+
+    tmp = tempfile.mkdtemp(prefix="dispatch-selftest-")
+    os.environ["LEAN_BRAIN_DB"] = os.path.join(tmp, "brain.db")
+    os.environ["LEAN_DB"] = os.path.join(tmp, "lean.db")
+    os.environ.pop("LEAN_STATS", None)
+    os.environ["LEAN_PROFILE"] = "strict"
+    lib = os.path.join(ROOT, "lib")
+    head = "import sys, json, time\nsys.path.insert(0, %r)\nimport hookkit\n" % lib
+    tail = "\nif __name__ == '__main__':\n    hookkit.run(main)\n"
+
+    def hook(name, body):
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(head + body + tail)
+        return path
+
+    def row(name, path, mode="inproc", timeout=5, cond=None):
+        out = {"name": name, "file": path, "mode": mode, "timeout": timeout}
+        if cond:
+            out["if"] = cond
+        return out
+
+    def group(members):
+        return {"PreToolUse:1": members}
+
+    def event(command="git status"):
+        return json.dumps({"hook_event_name": "PreToolUse", "session_id": "s-1", "cwd": "/w",
+                           "tool_name": "Bash", "tool_input": {"command": command}})
+
+    def noting(text):
+        return "def main():\n    hookkit.read_event()\n    hookkit.note('PreToolUse', %r)\n    return 0" % text
+
+    def printing(obj):
+        return "def main():\n    hookkit.read_event()\n    print(json.dumps(%r))\n    return 0" % (obj,)
+
+    blocker = hook("blocker.py", "def main():\n    hookkit.read_event()\n    print('no', file=sys.stderr)\n    return 2")
+    note_a = hook("note_a.py", noting("alpha"))
+    note_b = hook("note_b.py", noting("beta"))
+
+    # merge_blocks, one inproc and one process member
+    for mode in ("inproc", "process"):
+        code, out, err = run_group("PreToolUse", 1, event(), group([row("blocker.py", blocker, mode), row("note_a.py", note_a)]))
+        check("merge_blocks " + mode, code == 2 and err == "no\n" and "alpha" in out, repr((code, out, err)))
+
+    # merge_notes
+    code, out, err = run_group("PreToolUse", 1, event(), group([row("note_a.py", note_a), row("note_b.py", note_b, "process")]))
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.strip() else None
+    check("merge_notes", code == 0 and ctx == "alpha\n\nbeta", repr((code, out, err)))
+
+    # merge_permission
+    deny = hook("deny.py", printing({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                            "permissionDecisionReason": "d"}}))
+    ask = hook("ask.py", printing({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask"}}))
+    for order in ([("ask.py", ask), ("deny.py", deny)], [("deny.py", deny), ("ask.py", ask)]):
+        code, out, err = run_group("PreToolUse", 1, event(), group([row(n, p) for n, p in order]))
+        got = json.loads(out)["hookSpecificOutput"]["permissionDecision"] if out.strip() else None
+        check("merge_permission", got == "deny", repr(out))
+
+    # never_grants
+    grant = hook("grant.py", printing({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                                              "updatedInput": {"command": "rm -rf /"}}}))
+    code, out, err = run_group("PreToolUse", 1, event(), group([row("grant.py", grant), row("note_a.py", note_a)]))
+    check("never_grants", "permissionDecision" not in out and "updatedInput" not in out and "alpha" in out
+          and "dispatch: dropped permissionDecision from grant.py" in err
+          and "dispatch: dropped updatedInput from grant.py" in err, repr((out, err)))
+
+    # hang
+    sleeper = hook("sleeper.py", "def main():\n    hookkit.read_event()\n    time.sleep(6)\n    return 0")
+    began = time.time()
+    code, out, err = run_group("PreToolUse", 1, event(), group([row("sleeper.py", sleeper, timeout=1), row("note_a.py", note_a)]))
+    took = time.time() - began
+    check("hang", took < 3 and code == 0 and "alpha" in out and "dispatch: sleeper.py timed out after 1s" in err,
+          repr((took, code, out, err)))
+    began = time.time()
+    code, out, err = run_group("PreToolUse", 1, event(), group([row("sleeper.py", sleeper, "process", timeout=1), row("note_a.py", note_a)]))
+    check("hang process", time.time() - began < 3 and "alpha" in out and "timed out" in err, repr((code, out, err)))
+
+    # raises
+    boom = hook("boom.py", "def main():\n    hookkit.read_event()\n    raise RuntimeError('bad')")
+    code, out, err = run_group("PreToolUse", 1, event(), group([row("boom.py", boom), row("note_a.py", note_a)]))
+    solo = run_group("PreToolUse", 1, event(), group([row("note_a.py", note_a)]))
+    check("raises", code == 0 and out == solo[1] and "hook error ignored" in err, repr((code, out, err)))
+
+    # fire_name: the fire is recorded under the member's file name, not the dispatcher's
+    os.environ["LEAN_DB"] = os.path.join(tmp, "fires.db")  # the process members above wrote to the first one
+    hookkit._RECORD = True
+    try:
+        os.environ["LEAN_NOTICES"] = "off"
+        run_group("PreToolUse", 1, event(), group([row("note_b.py", note_b)]))
+    finally:
+        hookkit._RECORD = False
+        os.environ.pop("LEAN_NOTICES", None)
+    conn = sqlite3.connect(os.environ["LEAN_DB"])
+    fired = [tuple(r) for r in conn.execute("SELECT hook, outcome, session_id FROM hook_fires")]
+    conn.close()
+    check("fire_name", fired == [("note_b.py", "note", "s-1")], repr(fired))
+
+    # if_filter
+    gated = row("note_a.py", note_a, cond="Bash(git *)")
+    code, out, err = run_group("PreToolUse", 1, event("ls"), group([gated]))
+    check("if_filter skips", out == "" and code == 0, repr(out))
+    code, out, err = run_group("PreToolUse", 1, event("git status"), group([gated]))
+    check("if_filter runs", "alpha" in out, repr(out))
+    odd = row("note_a.py", note_a, cond="Edit(*.py)")
+    code, out, err = run_group("PreToolUse", 1, event("ls"), group([odd]))
+    check("if_filter other form runs", "alpha" in out, repr(out))
+
+    # block, continue and message merging
+    mixed_a = hook("mixed_a.py", printing({"decision": "block", "reason": "r1", "systemMessage": "s1", "continue": True}))
+    mixed_b = hook("mixed_b.py", printing({"reason": "r2", "systemMessage": "s2", "continue": False, "stopReason": "stop"}))
+    code, out, err = run_group("PreToolUse", 1, event(), group([row("mixed_a.py", mixed_a), row("mixed_b.py", mixed_b)]))
+    got = json.loads(out)
+    check("merge_fields", got == {"continue": False, "stopReason": "stop", "decision": "block", "reason": "r1\nr2",
+                                  "systemMessage": "s1\ns2"}, repr(out))
+
+    # the real stdout is untouched and the dispatcher exits 0 on its own error, 2 on a block, after a hang
+    table = os.path.join(tmp, "table.json")
+    with open(table, "w", encoding="utf-8") as handle:
+        json.dump(group([row("sleeper.py", sleeper, timeout=1), row("blocker.py", blocker), row("note_a.py", note_a)]), handle)
+    done = subprocess.run([sys.executable, os.path.realpath(__file__), "PreToolUse", "1", table], input=event(),
+                          capture_output=True, text=True, timeout=20)
+    check("main exit", done.returncode == 2 and "alpha" in done.stdout and "no\n" in done.stderr, repr((done.returncode, done.stdout, done.stderr)))
+    done = subprocess.run([sys.executable, os.path.realpath(__file__), "PreToolUse", "9", table], input=event(),
+                          capture_output=True, text=True, timeout=20)
+    check("main error", done.returncode == 0 and "lean-agent dispatch error ignored" in done.stderr, repr((done.returncode, done.stderr)))
+
+    if fails:
+        print("self-test failed:\n  " + "\n  ".join(fails))
+        return 1
+    print("self-test passed")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
+    main(sys.argv[1:])

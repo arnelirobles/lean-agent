@@ -26,7 +26,7 @@ def collect(root):
     folder = os.path.join(root, "hooks")
     entries = []
     for name in sorted(os.listdir(folder)):
-        if not name.endswith(".py"):
+        if not name.endswith(".py") or name == "dispatch.py":  # the dispatcher is not a hook
             continue
         path = os.path.join(folder, name)
         manifest = hookkit.read_manifest(path)
@@ -45,9 +45,32 @@ def command_entry(name, entry, timeout):
     return out
 
 
+DISPATCH = 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py" %s %d'
+
+
+def dispatch_entry(event, group, members):
+    """One entry that runs a whole group through hooks/dispatch.py, and the table rows the dispatcher reads."""
+    timeouts = [60 if t is None else t for _, _, _, t in members]
+    rows = []
+    for _, name, entry, timeout in members:
+        row = {"name": name, "file": "hooks/" + name, "mode": MODES[name], "timeout": timeout}
+        if "if" in entry:
+            row["if"] = entry["if"]
+        rows.append(row)
+    return {"type": "command", "command": DISPATCH % (event, group), "timeout": max(timeouts) + 2}, rows
+
+
+MODES = {}
+
+
 def build(root):
     """Return the text of hooks.json and dispatch.json for the hooks under root."""
     found = collect(root)
+    MODES.clear()
+    for name, _, _ in found:
+        if name not in MODES:
+            MODES[name] = hookkit.read_manifest(os.path.join(root, "hooks", name)).get("mode", "process")
+    table = {}
     seen = {}
     for name, entry, _ in found:
         key = (entry["event"], entry["group"])
@@ -72,11 +95,16 @@ def build(root):
             block = {}
             if "matcher" in members[0][2]:
                 block["matcher"] = members[0][2]["matcher"]
-            block["hooks"] = [command_entry(n, e, t) for _, n, e, t in members]
+            if any(MODES[n] == "inproc" for _, n, _, _ in members):
+                one, rows = dispatch_entry(event, group, members)
+                block["hooks"] = [one]
+                table["%s:%d" % (event, group)] = rows
+            else:
+                block["hooks"] = [command_entry(n, e, t) for _, n, e, t in members]
             out.append(block)
         hooks[event] = out
     text = json.dumps({"description": DESCRIPTION, "hooks": hooks}, indent=2) + "\n"
-    return text, json.dumps({}, indent=2) + "\n"
+    return text, json.dumps(table, indent=2) + "\n"
 
 
 def main(argv):
@@ -116,8 +144,8 @@ def main(argv):
     return 1 if stale else 0
 
 
-def hook_source(events, timeout=10):
-    return "HOOK = %r\n" % ({"events": events, "timeout": timeout, "mode": "process", "pack": "core",
+def hook_source(events, timeout=10, mode="process"):
+    return "HOOK = %r\n" % ({"events": events, "timeout": timeout, "mode": mode, "pack": "core",
                              "guard": False, "default": {"strict": "off", "standard": "off"}},)
 
 
@@ -181,6 +209,29 @@ def self_test():
     root = fixture({"a.py": hook_source([{"event": "SessionStart", "group": 0, "order": 0}], timeout=None)})
     entry = json.loads(build(root)[0])["hooks"]["SessionStart"][0]["hooks"][0]
     check("test_no_timeout_key", "timeout" not in entry, repr(entry))
+
+    # grouping: a group with an inproc member is one dispatch entry, a process-only group stays direct
+    root = fixture({
+        "a.py": hook_source([{"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 0, "if": "Bash(git *)"}], mode="inproc"),
+        "b.py": hook_source([{"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 1}], timeout=30),
+        "c.py": hook_source([{"event": "PreToolUse", "matcher": "Write", "group": 2, "order": 0}]),
+        "d.py": hook_source([{"event": "PreToolUse", "matcher": "Write", "group": 2, "order": 1}], timeout=None),
+        "dispatch.py": "x = 1\n",
+    })
+    hooks_text, table_text = build(root)
+    blocks = json.loads(hooks_text)["hooks"]["PreToolUse"]
+    first, second = blocks[0]["hooks"], blocks[1]["hooks"]
+    want_table = {"PreToolUse:1": [
+        {"name": "a.py", "file": "hooks/a.py", "mode": "inproc", "timeout": 10, "if": "Bash(git *)"},
+        {"name": "b.py", "file": "hooks/b.py", "mode": "process", "timeout": 30},
+    ]}
+    check("grouping one entry", len(first) == 1 and first[0] == {
+        "type": "command", "command": 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py" PreToolUse 1', "timeout": 32}, repr(first))
+    check("grouping direct entries", [h["command"].rsplit("/", 1)[1] for h in second] == ['c.py"', 'd.py"'] and "timeout" not in second[1], repr(second))
+    check("grouping table", json.loads(table_text) == want_table, table_text)
+    root = fixture({"d.py": hook_source([{"event": "PreToolUse", "group": 3, "order": 0}], timeout=None, mode="inproc")})
+    one = json.loads(build(root)[0])["hooks"]["PreToolUse"][0]["hooks"][0]
+    check("grouping no timeout counts 60", one["timeout"] == 62, repr(one))
 
     if fails:
         print("self-test failed:\n  " + "\n  ".join(fails))
