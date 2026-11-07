@@ -278,25 +278,29 @@ def _repo_env(path):
     return block if isinstance(block, dict) else {}
 
 
-def _tracked_names(directory):
-    """The lower-cased base names of every path git tracks under DIRECTORY/.claude, or None when git cannot
-    say (missing, a timeout, an error). core.fsmonitor is off and no GIT_* location variable is passed on,
-    so a cloned repository's config cannot run a program or point git elsewhere."""
+def _git_list(directory, *args):
+    """The NUL-separated entries of `git ls-files -z ARGS` run in DIRECTORY, or None when git cannot say
+    (missing, a timeout, an error). core.fsmonitor is off and no GIT_* location variable is passed on, so a
+    cloned repository's config cannot run a program or point git elsewhere."""
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
     try:
-        done = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", directory, "ls-files", "-z", "--", ".claude"],
+        done = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", directory, "ls-files", "-z", *args],
                               capture_output=True, timeout=3, env=env)
     except Exception:
         return None
     if done.returncode != 0:
         return None
-    return {os.path.basename(p).lower() for p in done.stdout.decode("utf-8", "replace").split("\0") if p}
+    return [p for p in done.stdout.decode("utf-8", "replace").split("\0") if p]
+
+
+def _lists_local(entries):
+    return any(os.path.basename(p.split("\t")[-1]).lower() == "settings.local.json" for p in entries)
 
 
 def _local_is_user(directory):
     """True only when DIRECTORY/.claude/settings.local.json is the user's own: a real file under a real
-    .claude folder (no symlink), spelled exactly so, and not tracked by git under any case spelling. Any
-    doubt, including a git error, says False."""
+    .claude folder (no symlink), spelled exactly so, and not tracked by git under any case spelling, by the
+    outer repo or by a repo that holds .claude itself (a submodule). Any doubt, including a git error, says False."""
     claude = os.path.join(directory, ".claude")
     local = os.path.join(claude, "settings.local.json")
     try:
@@ -309,8 +313,13 @@ def _local_is_user(directory):
             return False
     except (OSError, ValueError):
         return False
-    tracked = _tracked_names(directory)
-    return tracked is not None and "settings.local.json" not in tracked
+    if os.path.lexists(os.path.join(claude, ".git")):
+        return False  # .claude is a submodule or a work tree of its own
+    outer = _git_list(directory, "-s", "--", ".claude")
+    if outer is None or any(e.startswith("160000 ") for e in outer) or _lists_local(outer):
+        return False
+    inner = _git_list(claude)  # whichever repo actually holds the folder answers here
+    return inner is not None and not _lists_local(inner)
 
 
 def _repo_sourced(name, value):
@@ -1274,6 +1283,31 @@ def _guard_tests(check, scratch):
         code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
         check("the plain untracked settings.local.json still counts as the user's", (code, out), (0, ""))
         check("the check does not run the repo's fsmonitor", os.path.exists(marker), False)
+
+        # .claude as a submodule, or marked as a work tree of its own
+        git_id = ["-c", "user.email=t@example.org", "-c", "user.name=t"]
+        inner = tempfile.mkdtemp(prefix="claude-sub-", dir=scratch)
+        subprocess.run(["git", "-C", inner, "init", "-q"], check=True, capture_output=True)
+        for fname in ("settings.json", "settings.local.json"):
+            with open(os.path.join(inner, fname), "w", encoding="utf-8") as handle:
+                json.dump({"env": {"LEAN_HOOK_GATE_G": "off"}}, handle)
+        subprocess.run(["git", "-C", inner, "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", inner] + git_id + ["commit", "-q", "--no-verify", "-m", "x"], check=True, capture_output=True)
+        outer = make_repo(None)
+        shutil.rmtree(os.path.join(outer, ".claude"))
+        added = subprocess.run(["git", "-c", "protocol.file.allow=always", "-C", outer, "submodule", "add", "-q",
+                                inner, ".claude"], capture_output=True, text=True)
+        check("the submodule fixture was built", added.returncode, 0)
+        code, out = call("gate-g.py", guard, outer, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a settings.local.json inside a .claude submodule is the repo's", (code, "this repo" in out), (2, True))
+        check("a submodule .claude is not the user's", _local_is_user(outer), False)
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"}, {"LEAN_HOOK_GATE_G": "off"})
+        with open(os.path.join(root, ".claude", ".git"), "w", encoding="utf-8") as handle:
+            handle.write("gitdir: ../elsewhere\n")
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("a .claude/.git file alone is the repo's", (code, "this repo" in out), (2, True))
+        root = make_repo({"LEAN_HOOK_GATE_G": "off"}, {"LEAN_HOOK_GATE_G": "off"})
+        check("the plain untracked case is still the user's", _local_is_user(root), True)
 
         # settings the repo could use to hide a value
         root = make_repo(None)
