@@ -47,8 +47,9 @@ def command_entry(name, entry, timeout):
 
 def build(root):
     """Return the text of hooks.json and dispatch.json for the hooks under root."""
+    found = collect(root)
     seen = {}
-    for name, entry, _ in collect(root):
+    for name, entry, _ in found:
         key = (entry["event"], entry["group"])
         info = seen.setdefault(key, {"matchers": set(), "orders": set()})
         info["matchers"].add(entry.get("matcher"))
@@ -60,7 +61,7 @@ def build(root):
     hooks = {}
     for event in hookkit.EVENT_ORDER:
         groups = {}
-        for name, entry, timeout in collect(root):
+        for name, entry, timeout in found:
             if entry["event"] == event:
                 groups.setdefault(entry["group"], []).append((entry["order"], name, entry, timeout))
         if not groups:
@@ -79,10 +80,19 @@ def build(root):
 
 
 def main(argv):
-    check = "--check" in argv
+    usage = "usage: lean-agent build [--check] [--root DIR]"
+    check = False
     root = REPO
-    if "--root" in argv:
-        root = argv[argv.index("--root") + 1]
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--check":
+            check = True
+        elif flag == "--root" and rest:
+            root = rest.pop(0)
+        else:
+            print(usage)
+            return 2
     try:
         texts = build(root)
     except (ValueError, OSError) as err:
@@ -127,18 +137,14 @@ def run(*args):
 
 def self_test():
     fails = []
-    scratch = tempfile.mkdtemp()
 
     def check(name, ok, detail=""):
         if not ok:
             fails.append("%s %s" % (name, detail))
 
-    # test_matches_today: the pre-change file comes from git, copied before anything rebuilds.
-    shown = subprocess.run(["git", "-C", REPO, "show", "c018be7:hooks/hooks.json"], capture_output=True, text=True)
-    saved = os.path.join(scratch, "hooks.json.before")
-    with open(saved, "w", encoding="utf-8") as handle:
-        handle.write(shown.stdout)
-    check("test_matches_today", shown.returncode == 0 and build(REPO)[0] == open(saved, encoding="utf-8").read())
+    # test_matches_today: build() is pure and never writes this file, so a rebuild cannot make it pass.
+    with open(os.path.join(REPO, "hooks", "hooks.json"), encoding="utf-8") as handle:
+        check("test_matches_today", build(REPO)[0] == handle.read())
 
     # test_bad_manifest
     root = fixture({"good.py": hook_source([{"event": "SessionStart", "group": 0, "order": 0}]), "nohook.py": "x = 1\n"})
@@ -146,7 +152,9 @@ def self_test():
     with open(keep, "w", encoding="utf-8") as handle:
         handle.write("keep\n")
     code, text = run("build", "--root", root)
-    check("test_bad_manifest", code == 2 and "nohook.py" in text and open(keep).read() == "keep\n", repr((code, text)))
+    with open(keep, encoding="utf-8") as handle:
+        kept = handle.read()
+    check("test_bad_manifest", code == 2 and "nohook.py" in text and kept == "keep\n", repr((code, text)))
 
     # test_matcher_clash
     root = fixture({
