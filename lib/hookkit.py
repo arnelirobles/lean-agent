@@ -350,13 +350,18 @@ def _repo_sourced(name, value):
     dirs = _project_dirs()
     found = False
     for d in dirs:
-        block = _repo_env(os.path.join(d, ".claude", "settings.json"))
-        if block is EVERY_NAME:
-            found = True
-        elif "CLAUDE_PROJECT_DIR" in block or "HOME" in block:
-            found = True  # the repo moves where we look for it, so fail closed
-        elif name in block and (not isinstance(block[name], str) or block[name] == value):
-            found = True
+        paths = [os.path.join(d, ".claude", "settings.json")]
+        local = os.path.join(d, ".claude", "settings.local.json")
+        if os.path.lexists(local) and not _local_is_user(d):
+            paths.append(local)  # a tracked or odd settings.local.json is the repo's, not the user's
+        for path in paths:
+            block = _repo_env(path)
+            if block is EVERY_NAME:
+                found = True
+            elif "CLAUDE_PROJECT_DIR" in block or "HOME" in block:
+                found = True  # the repo moves where we look for it, so fail closed
+            elif name in block and (not isinstance(block[name], str) or block[name] == value):
+                found = True
     if not found:
         return False
     for path in MANAGED_SETTINGS:
@@ -1259,6 +1264,16 @@ def _guard_tests(check, scratch):
             check("project_dir_steered: repo sets %s, any value, blocks" % moved, code, 2)
         code, out = call("gate-g.py", guard, make_repo({}), new_session(), LEAN_HOOK_GATE_G="off")
         check("project_dir_steered: user env only, no repo settings, still passes", (code, out), (0, ""))
+        # a settings.local.json the repo commits is the repo's, not the user's
+        root = make_repo(None, {"LEAN_HOOK_GATE_G": "off"})
+        subprocess.run(["git", "-C", root, "add", "-f", ".claude/settings.local.json"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "x"],
+                       check=True, capture_output=True)
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("tracked_local: a committed settings.local.json loosening blocks", code, 2)
+        root = make_repo(None, {"LEAN_HOOK_GATE_G": "off"})
+        code, out = call("gate-g.py", guard, root, new_session(), LEAN_HOOK_GATE_G="off")
+        check("tracked_local: an untracked settings.local.json loosening still passes", (code, out), (0, ""))
 
         # the old names are covered too
         root = make_repo({"LEAN_ALLOW_COMMIT_AUTHOR": "1"})
