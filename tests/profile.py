@@ -178,7 +178,6 @@ def corpus(work, repo_hooks, db):
         ("wait-loop loop", "wait-loop.py", bash("until grep -q x f; do sleep 5; done"), {}),
         ("review-log-check", "review-log-check.py", bash("gh pr merge 6", repo_hooks["review"]), {"LEAN_DB": db}),
         ("script-note direct test", "script-note.py", bash("pnpm test", repo_hooks["pnpm"]), {}),
-        ("script-note direct test passes with on", "script-note.py", bash("LEAN_DIRECT_TEST=on pnpm test", repo_hooks["pnpm"]), {}),
         ("script-note direct test passes with the old value", "script-note.py", bash("LEAN_DIRECT_TEST=allow pnpm test", repo_hooks["pnpm"]), {}),
         ("secret-scan write key", "secret-scan.py",
          {"tool_name": "Write", "tool_input": {"file_path": os.path.join(work, "k.txt"), "content": "k = " + key() + "\n"},
@@ -203,6 +202,23 @@ def corpus(work, repo_hooks, db):
         ("mode", "mode.py", {"hook_event_name": "SessionStart"}, {}),
     ]
     return cases
+
+
+# The strict messages that #146 changed on purpose. The old tree still prints the left side.
+# Delete this table when STRICT_TAG moves to the release that carries #146.
+RENAMED = [
+    ("LEAN_ALLOW_COMMIT_AUTHOR=1 in front of the command", "LEAN_HOOK_COMMIT_AUTHOR=off in front of the command"),
+    ("LEAN_ALLOW_SCRATCHPAD_ROOT=1 in the env block", "LEAN_HOOK_SCRATCHPAD_ROOT=off in the env block"),
+    ("LEAN_ALLOW_SLOP=1 or LEAN_ALLOW_ATTRIBUTION=1 in front of the",
+     "LEAN_SKIP_SLOP=1 or LEAN_SKIP_ATTRIBUTION=1 in front of the"),
+    ("LEAN_DIRECT_TEST=allow turns this block off.", "LEAN_DIRECT_TEST=on turns this block off."),
+]
+
+
+def renamed(text):
+    for old_text, new_text in RENAMED:
+        text = text.replace(old_text, new_text)
+    return text
 
 
 def normalise(text, roots):
@@ -258,12 +274,18 @@ def part_d():
                     env = clean_env(home, LEAN_PROFILE=variant, **extra)
                     results.append(run_cmd(f'python3 "{tree}/hooks/{name}"', json.dumps(event), env, cwd=work))
                 a, b = results
-                a = (a[0], normalise(a[1], [old]), normalise(a[2], [old]))
+                a = (a[0], renamed(normalise(a[1], [old])), renamed(normalise(a[2], [old])))
                 b = (b[0], normalise(b[1], [new]), normalise(b[2], [new]))
                 if label == "mode" and variant != "strict":
                     check(f"{variant}: mode warns about the unknown value", "LEAN_PROFILE=loose is not one of" in b[1], True)
                     continue
                 check(f"{variant} identical: {label}", b, a)
+        for variant in ("strict", "Loose"):
+            env = clean_env(home, LEAN_PROFILE=variant)
+            ev_on = {"tool_name": "Bash", "tool_input": {"command": "LEAN_DIRECT_TEST=on pnpm test"},
+                     "cwd": places["pnpm"], "session_id": "p1"}
+            got = run_cmd(f'python3 "{new}/hooks/script-note.py"', json.dumps(ev_on), env, cwd=work)
+            check(f"{variant}: LEAN_DIRECT_TEST=on pnpm test passes", got, (0, "", ""))
         # the corpus must hold refusals, or the comparison proves nothing
         refused = 0
         for label, name, event, extra in cases:
