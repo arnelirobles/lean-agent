@@ -33,6 +33,17 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PostToolUse", "matcher": "Bash", "if": "Bash(git *)", "group": 0, "order": 0},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "note", "standard": "note"},
+}
+
 LESSON = re.compile(r"\b(hot)?(fix|fixes|fixed|fixing|revert|reverts|reverted|reverting|flaky|flake|flakes|"
                     r"flakiness|silent|silently|gate|gates|gated|gating|regress|regresses|regressed|"
                     r"regression|regressions)\b", re.I)

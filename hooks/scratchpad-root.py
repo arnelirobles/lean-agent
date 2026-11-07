@@ -19,6 +19,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Write", "group": 2, "order": 0},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "block", "standard": "off"},
+}
+
 SHARED_NAMES = ("pr-body.md", "body*.md", "notes.md", "plan.md")
 
 

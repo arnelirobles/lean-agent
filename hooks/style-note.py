@@ -23,6 +23,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import hookkit  # noqa: E402
 from house_style import scan  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PostToolUse", "matcher": "Edit|MultiEdit|Write", "group": 1, "order": 0},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "note", "standard": "note"},
+}
+
 PROSE_EXT = {".md", ".markdown", ".txt", ".rst", ".adoc"}
 GIT_MESSAGES = {"commit_editmsg", "tag_editmsg", "merge_msg", "squash_msg"}
 MESSAGE_NAME = re.compile(r"(commit|message|msg|body|notes|release|changelog)", re.I)

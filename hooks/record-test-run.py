@@ -27,6 +27,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PostToolUse", "matcher": "Bash", "group": 0, "order": 4},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "note", "standard": "note"},
+}
+
 
 def is_test_run(words):
     if not words:

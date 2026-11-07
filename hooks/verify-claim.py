@@ -18,6 +18,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "if": "Bash(gh *)", "group": 1, "order": 10},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": True,
+    "default": {"strict": "note", "standard": "note"},
+}
+
 SHORT_WORDS = 30
 # Commands that post a comment or review, from the table in lib/hookkit.py, and the flags that hold the body.
 COMMENTS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"),

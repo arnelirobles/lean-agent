@@ -20,6 +20,18 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PostToolUse", "matcher": "Bash", "group": 0, "order": 3},
+        {"event": "PostToolUseFailure", "matcher": "Bash", "group": 0, "order": 0},
+    ],
+    "timeout": None,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "note", "standard": "note"},
+}
+
 REFUSAL = re.compile(
     r"not mergeable|base branch policy|protected branch|required status check|GH006|GH013"
     r"|merge strategy for .* is set by the merge queue|review is required|changes requested"

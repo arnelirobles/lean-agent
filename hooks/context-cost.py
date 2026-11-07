@@ -46,6 +46,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import hookkit  # noqa: E402
 import leanstats  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PostToolUse", "group": 2, "order": 0},
+        {"event": "PreToolUse", "group": 0, "order": 0},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "block", "standard": "block"},
+}
+
 CONTEXT_DEFAULT = 100000
 LOOKUP_DEFAULT = 10
 IMAGE_DEFAULT = 60000

@@ -27,6 +27,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "SessionStart", "group": 0, "order": 0},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "note", "standard": "note"},
+}
+
 CHOICES = {"LEAN_AGENTS": ("many", "one"), "LEAN_MODELS": ("mixed", "one")}
 ALIASES = ("sonnet", "opus", "haiku", "fable")
 ROLES = {"LEAN_MODEL_CHEAP": "sonnet", "LEAN_MODEL_STRONG": "opus", "LEAN_MODEL_FAST": "haiku"}

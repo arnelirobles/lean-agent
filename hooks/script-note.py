@@ -44,6 +44,17 @@ sys.path.insert(0, os.path.join(HERE, "..", "lib"))
 import direct_test as direct  # noqa: E402
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 9},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "block", "standard": "off"},
+}
+
 REPEATS = os.path.join(HERE, "..", "tools", "script-repeats")
 PATH_FAMILY = "versioned-plugin-path"
 BIN_PATH = re.compile(r"lean-agent/lean-agent/\d+\.\d+\.\d+/(?:bin|tools)/([A-Za-z0-9][\w.-]*)")

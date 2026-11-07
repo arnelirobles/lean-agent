@@ -20,6 +20,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 8},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "block", "standard": "off"},
+}
+
 BOUNDED = os.path.join(hookkit.TOOLS, "bounded")
 OWN_LANES = ("bounded", "test-phase", "heavy.sh")
 

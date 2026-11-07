@@ -32,6 +32,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "if": "Bash(git *)", "group": 1, "order": 0},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": True,
+    "default": {"strict": "block", "standard": "note"},
+}
+
 LOCAL_SUFFIXES = {"local", "localdomain", "localhost", "lan", "home", "internal", "intranet",
                   "corp", "private", "test", "invalid", "example", "arpa"}
 

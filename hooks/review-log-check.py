@@ -45,6 +45,18 @@ import urllib.parse
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "if": "Bash(gh *)", "group": 1, "order": 5},
+        {"event": "PreToolUse", "matcher": "Bash", "if": "Bash(az *)", "group": 1, "order": 6},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "block", "standard": "off"},
+}
+
 try:
     import forge  # noqa: E402
 except Exception:  # a missing or broken lib/forge.py: GitHub keeps its own lookup below, other hosts allow

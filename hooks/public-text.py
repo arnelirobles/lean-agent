@@ -40,6 +40,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import hookkit  # noqa: E402
 from house_style import scan  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 3},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": True,
+    "default": {"strict": "block", "standard": "note"},
+}
+
 GIT_WRITES = {"commit", "tag", "notes"}
 API_FIELD_FLAGS = {"-f", "-F", "--field", "--raw-field"}
 FENCE = re.compile(r"(```|~~~).*?(\1|\Z)", re.S)

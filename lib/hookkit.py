@@ -6,6 +6,7 @@ and every git call has a short timeout. Standard library only, Python 3.9+.
 
   python3 lib/hookkit.py --self-test
 """
+import ast
 import json
 import os
 import re
@@ -86,6 +87,51 @@ def tool_path(name, base=None):
 
 
 PROFILES = ("strict", "standard", "off")
+EVENT_ORDER = ("SessionStart", "PostToolUse", "PreToolUse", "PostToolUseFailure", "SessionEnd", "UserPromptSubmit")
+MANIFEST_KEYS = ("events", "timeout", "mode", "pack", "guard", "default")
+MANIFEST_EVENT_KEYS = ("event", "matcher", "if", "group", "order", "timeout")
+
+
+def read_manifest(path):
+    """Return the HOOK literal of a hook file without importing it. Raises ValueError("PATH: reason")."""
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=path)
+    found = [node for node in tree.body if isinstance(node, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "HOOK" for t in node.targets)]
+    if not found:
+        raise ValueError(f"{path}: no HOOK literal")
+    if len(found) > 1:
+        raise ValueError(f"{path}: two HOOK literals")
+    try:
+        manifest = ast.literal_eval(found[0].value)
+    except ValueError:
+        raise ValueError(f"{path}: HOOK is not a literal") from None
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{path}: HOOK is not a literal dict")
+    for key in manifest:
+        if key not in MANIFEST_KEYS:
+            raise ValueError(f"{path}: unknown key {key!r}")
+    events = manifest.get("events")
+    if not isinstance(events, list):
+        raise ValueError(f"{path}: events must be a list")
+    for entry in events:
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: an event entry is not a dict")
+        for key in entry:
+            if key not in MANIFEST_EVENT_KEYS:
+                raise ValueError(f"{path}: unknown event key {key!r}")
+        if entry.get("event") not in EVENT_ORDER:
+            raise ValueError(f"{path}: unknown event {entry.get('event')!r}")
+        for key in ("group", "order"):
+            if not isinstance(entry.get(key), int):
+                raise ValueError(f"{path}: event {entry['event']} is missing {key!r}")
+    default = manifest.get("default", {})
+    if not isinstance(default, dict):
+        raise ValueError(f"{path}: default must be a dict")
+    for level, value in default.items():
+        if value not in ("off", "note", "block"):
+            raise ValueError(f"{path}: default {value!r} for {level!r} is not off, note or block")
+    return manifest
 
 
 def profile():
@@ -565,6 +611,37 @@ def self_test():
         if got != want:
             print(f"FAIL {name}: got {got!r}, want {want!r}")
             failures += 1
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def manifest_error(body):
+            target = os.path.join(tmp, "h.py")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            try:
+                read_manifest(target)
+            except ValueError as exc:
+                return str(exc)
+            return ""
+
+        good = ('HOOK = {"events": [{"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 0}],\n'
+                '        "timeout": 10, "mode": "process", "pack": "core", "guard": False,\n'
+                '        "default": {"strict": "block", "standard": "off"}}\n')
+        target = os.path.join(tmp, "good.py")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("import os\n" + good)
+        check("read_manifest good", read_manifest(target)["events"][0]["group"], 1)
+        check("read_manifest default", read_manifest(target)["default"]["standard"], "off")
+        for name, body, want in (
+            ("none", "x = 1\n", "no HOOK literal"),
+            ("two", good + good, "two HOOK literals"),
+            ("call", "HOOK = dict(a=1)\n", "not a literal"),
+            ("key", good.replace('"mode"', '"mode2"'), "unknown key 'mode2'"),
+            ("event", good.replace('"PreToolUse"', '"PreTool"'), "unknown event 'PreTool'"),
+            ("group", good.replace('"group": 1, ', ""), "missing 'group'"),
+            ("order", good.replace(', "order": 0', ""), "missing 'order'"),
+            ("default", good.replace('"off"', '"warn"'), "default 'warn'"),
+        ):
+            check("read_manifest " + name, want in manifest_error(body), True)
 
     with tempfile.TemporaryDirectory() as tmp:
         base, r = os.path.join(tmp, "w"), os.path.join(tmp, "r")

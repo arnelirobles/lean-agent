@@ -24,6 +24,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 import direct_test  # noqa: E402
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 7},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "block", "standard": "note"},
+}
+
 BRAIN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tools", "brain")
 KEYWORDS = {"do", "then", "else", "elif", "!", "{", "}", "time"}
 LOOP_OPEN = {"until", "while", "for"}

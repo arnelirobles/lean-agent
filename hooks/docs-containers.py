@@ -19,6 +19,17 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 2},
+    ],
+    "timeout": 10,
+    "mode": "process",
+    "pack": "core",
+    "guard": False,
+    "default": {"strict": "note", "standard": "note"},
+}
+
 COMPOSE_VALUE_FLAGS = {"-f", "--file", "-p", "--project-name", "--env-file", "--profile",
                        "--project-directory", "--ansi", "--parallel"}
 DOCKER_VALUE_FLAGS = {"-c", "--context", "-H", "--host", "--config", "-l", "--log-level"}

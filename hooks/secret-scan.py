@@ -47,6 +47,18 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 import hookkit  # noqa: E402
 
+HOOK = {
+    "events": [
+        {"event": "PreToolUse", "matcher": "Bash", "group": 1, "order": 1},
+        {"event": "PreToolUse", "matcher": "Edit|MultiEdit|Write|NotebookEdit", "group": 3, "order": 0},
+    ],
+    "timeout": 30,
+    "mode": "process",
+    "pack": "core",
+    "guard": True,
+    "default": {"strict": "block", "standard": "off"},
+}
+
 SKIP = "LEAN_SKIP_SECRET_SCAN"
 
 
