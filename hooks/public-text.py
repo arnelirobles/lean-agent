@@ -169,11 +169,17 @@ def prose(text):
 
 
 def loaded_sets():
-    """The rule sets, with attribution put back when a repository's own settings dropped it."""
-    sets = rules.load()
-    if not any(s["name"] == "attribution" for s in sets) and hookkit.from_repo("LEAN_RULES"):
-        sets = rules.load(["attribution"]) + sets
+    """The rule sets. A repository's own LEAN_RULES cannot remove a default set: they come back, with a note.
+    When attribution is expected and cannot load, the hook says so once per session and goes on."""
+    names = rules.selected(os.environ.get("LEAN_RULES"))
+    removed = [n for n in rules.DEFAULTS if n not in names]
+    if removed and hookkit.from_repo("LEAN_RULES"):
+        names = removed + names
         hookkit.guard_note("LEAN_RULES", "this repo's .claude/settings.json")
+    sets = rules.load(names)
+    if "attribution" in names and not any(s["name"] == "attribution" for s in sets):
+        hookkit.guard_note("rules-missing", "", "lean-agent rules: the attribution set could not load, "
+                           "so public-text is not checking attribution")
     return sets
 
 
@@ -382,6 +388,78 @@ def self_test():
             if got[0] != want_code or ("LEAN_RULES from this repo" in got[2]) != want_note:
                 print(f"FAIL {label}: {got!r}")
                 failures += 1
+
+    with tempfile.TemporaryDirectory() as there:
+        rob = {"tool_input": {"command": 'git commit -m "a rob' + 'ust retry"'}, "cwd": there}
+        root = tempfile.mkdtemp(prefix="repo-", dir=there)
+        subprocess.run(["git", "-C", root, "init", "-q"], check=True, capture_output=True)
+        os.makedirs(os.path.join(root, ".claude"))
+        with open(os.path.join(root, ".claude", "settings.json"), "w", encoding="utf-8") as fh:
+            json.dump({"env": {"LEAN_RULES": "-plain-prose"}}, fh)
+        rob["cwd"] = root
+        rob["session_id"] = f"rules-slop-{os.getpid()}"
+        got = hookkit.probe(me, rob, LEAN_PROFILE="strict", CLAUDE_PROJECT_DIR=root,
+                            **dict(clean_env, LEAN_RULES="-plain-prose"))
+        if got[0] != 2 or "LEAN_RULES from this repo" not in got[2]:
+            print(f"FAIL a repo dropping plain-prose is ignored: {got!r}")
+            failures += 1
+        rob["session_id"] = f"rules-slop-user-{os.getpid()}"
+        got = hookkit.probe(me, rob, LEAN_PROFILE="strict", CLAUDE_PROJECT_DIR=there,
+                            **dict(clean_env, LEAN_RULES="-plain-prose"))
+        if got[0] != 0:
+            print(f"FAIL a user dropping plain-prose is kept: {got!r}")
+            failures += 1
+
+        # in process: a repo value that drops one default and adds a set, and a rules folder that is gone
+        import contextlib
+        import io
+        saved = {k: os.environ.get(k) for k in ("LEAN_RULES", "CLAUDE_PROJECT_DIR")}
+        real_dir = rules.RULES_DIR
+        try:
+            full = os.path.join(there, "full")
+            os.makedirs(full)
+            for name in ("attribution", "plain-prose"):
+                with open(os.path.join(real_dir, name + ".json"), encoding="utf-8") as src:
+                    with open(os.path.join(full, name + ".json"), "w", encoding="utf-8") as dst:
+                        dst.write(src.read())
+            with open(os.path.join(full, "extra.json"), "w", encoding="utf-8") as fh:
+                json.dump({"name": "extra", "applies_to": ["prose"],
+                           "rules": [{"id": "plain-x", "pattern": "\\bzork\\b", "say": "zork"}]}, fh)
+            with open(os.path.join(root, ".claude", "settings.json"), "w", encoding="utf-8") as fh:
+                json.dump({"env": {"LEAN_RULES": "-attribution,extra"}}, fh)
+            os.environ["LEAN_RULES"] = "-attribution,extra"
+            os.environ["CLAUDE_PROJECT_DIR"] = root
+            rules.RULES_DIR = full
+            hookkit._state.event = {"session_id": f"rules-extra-{os.getpid()}", "cwd": root}
+            got = sorted(s["name"] for s in loaded_sets())
+            if got != ["attribution", "extra", "plain-prose"]:
+                print(f"FAIL a repo value keeps its added set and restores the defaults: {got!r}")
+                failures += 1
+            hookkit._state.guard_text = []
+
+            os.environ.pop("LEAN_RULES")
+            empty = os.path.join(there, "empty")
+            os.makedirs(empty)
+            rules.RULES_DIR = empty
+            sid = f"rules-empty-{os.getpid()}"
+            hookkit._state.event = {"session_id": sid, "cwd": there}
+            for turn in (1, 2):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    found = problems('git commit -m "x" -m "Co-Authored-By: Cla' + 'ude <noreply@example.com>"', there)
+                    hookkit.flush_guard(0)
+                said = out.getvalue().count("the attribution set could not load, so public-text is not checking attribution")
+                if found or said != (1 if turn == 1 else 0):
+                    print(f"FAIL a missing attribution set (turn {turn}): found {found!r}, said {said}")
+                    failures += 1
+        finally:
+            rules.RULES_DIR = real_dir
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            hookkit._state.guard_text = []
 
     print("self-test: ok" if failures == 0 else f"self-test: {failures} failed")
     return 1 if failures else 0

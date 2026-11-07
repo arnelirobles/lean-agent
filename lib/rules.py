@@ -40,7 +40,11 @@ def _compile(directory, name):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         _warn(f"{name}: cannot read {path}: {exc}")
         return None
-    out = {"name": str(data.get("name") or name), "applies_to": list(data.get("applies_to") or []), "rules": []}
+    applies = data.get("applies_to", [])
+    if not isinstance(applies, list):
+        _warn(f"{name}: applies_to must be a list, set skipped")
+        return None
+    out = {"name": str(data.get("name") or name), "applies_to": applies, "rules": []}
     for rule in raw if isinstance(raw, list) else []:
         try:
             flags = 0
@@ -164,6 +168,8 @@ def self_test():
             with open(os.path.join(tmp, "extra.json"), "w", encoding="utf-8") as fh:
                 json.dump({"name": "extra", "applies_to": ["prose"],
                            "rules": [{"id": "plain-x", "pattern": "\\bzork\\b", "flags": "i", "say": "zork"}]}, fh)
+            with open(os.path.join(tmp, "oddly.json"), "w", encoding="utf-8") as fh:
+                json.dump({"name": "oddly", "applies_to": 5, "rules": []}, fh)
             with open(os.path.join(tmp, "broken.json"), "w", encoding="utf-8") as fh:
                 json.dump({"name": "broken", "applies_to": ["prose"],
                            "rules": [{"id": "open-paren", "pattern": "("},
@@ -178,6 +184,10 @@ def self_test():
                 got, err = quiet(load)
                 check("unknown_set names", [s["name"] for s in got], ["attribution", "plain-prose"])
                 check("unknown_set message", "unknown set 'nope'" in err, True)
+                os.environ["LEAN_RULES"] = "oddly"
+                got, err = quiet(load)
+                check("bad applies_to skips the set", [s["name"] for s in got], ["attribution", "plain-prose"])
+                check("bad applies_to message", "lean-agent rules: oddly: applies_to" in err, True)
                 os.environ["LEAN_RULES"] = "broken"
                 got, err = quiet(load)
                 check("bad_regex message", "lean-agent rules: broken/open-paren:" in err, True)

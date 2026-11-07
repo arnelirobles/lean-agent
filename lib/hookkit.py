@@ -356,12 +356,13 @@ def from_repo(name):
         return True
 
 
-def guard_note(name, where):
+def guard_note(name, where, text=None):
     """Record that a guard ignored a loosening of NAME from WHERE. The note itself is said once per session
     and name, when it goes out: with the hook's own note, on stderr with a block, or by itself when the hook
-    ends (flush_guard). It waits because the session id is known only after the hook has read its event."""
-    if (name, where) not in _state.guard_text:
-        _state.guard_text.append((name, where))
+    ends (flush_guard). It waits because the session id is known only after the hook has read its event.
+    TEXT, when given, is the whole sentence said instead of the "is ignored" one (NAME is still the once key)."""
+    if (name, where, text) not in _state.guard_text:
+        _state.guard_text.append((name, where, text))
 
 
 def _take_guard():
@@ -372,7 +373,7 @@ def _take_guard():
         hook = hook[:-3]
     sid = session_id(_state.event.get("session_id"))
     lines = []
-    for name, where in waiting:
+    for name, where, said in waiting:
         if sid:  # without a session there is nothing to mark, so the note is said every time
             folder = os.path.join(tempfile.gettempdir(), "lean-agent", sid)
             try:
@@ -383,6 +384,9 @@ def _take_guard():
                 continue
             except OSError:
                 pass  # no marker: say it every time rather than never
+        if said:  # a fixed sentence instead of the "is ignored" one
+            lines.append(said)
+            continue
         lines.append(f"{name} from {where} is ignored: {hook} is a guard. "
                      "Set it in your user settings (~/.claude/settings.json) to change it.")
     return " ".join(lines)
