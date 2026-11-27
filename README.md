@@ -9,7 +9,7 @@ Four skills for running coding agents over a backlog, written as plain Markdown.
 /plugin install lean-agent-tools@lean-agent-tools
 ```
 
-Then update lean-agent to 2.0.0 from the `/plugin` menu.
+Then update lean-agent from the `/plugin` menu.
 
 Your settings carry over. The `LEAN_*` names, `brain`, `test-phase` and the `lean-agent` command keep their names.
 
@@ -24,7 +24,7 @@ From the Claude plugin directory, search for `lean-agent` and install it. Or add
 
 ## Skills
 
-- `method`: the working rules. Plan in one-agent tickets, keep changes small, run the repository's own gate, test only what the change touches, and finish a batch with a review and a retro. Loads on its own when you plan, review or finish work.
+- `method`: the working rules. Plan in one-agent tickets, keep changes small, run the repository's own gate, test only what the change touches, follow a maintainer's design to the letter when sending a change to their project, and finish a batch with a review and a retro. Loads on its own when you plan, review or finish work.
 - `shape-ticket`: writes or refines an issue in an agent-ready shape (Goal, Where, Covers, Done when, Risks, Constraints, Out of scope), after searching for an issue it belongs to.
 - `adversarial-review`: reviews one change as an adversary. One fresh agent hunts for defects against fixed questions and the repository's rules. A second fresh agent tries to disprove each finding. Only survivors are reported, with proof. The review log is a Markdown file in the repo.
 - `lean-retro`: a retro after a batch merges. Facts come from `git log` and `gh pr list`. Fixed triggers decide what to propose, and a person approves every change.

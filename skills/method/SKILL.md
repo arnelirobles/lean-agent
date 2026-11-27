@@ -1,6 +1,6 @@
 ---
 name: method
-description: Lean agent's working rules for coding agents on a backlog. Load whenever planning, filing or triaging issues, starting or reviewing a change, running agents in parallel, writing a script, or finishing a batch.
+description: Lean agent's working rules for coding agents on a backlog. Load whenever planning, filing or triaging issues, starting or reviewing a change, sending a change to a project you do not own, running agents in parallel, writing a script, or finishing a batch.
 user-invocable: false
 ---
 
@@ -22,6 +22,13 @@ This is the plain Markdown edition. It needs only git, gh, the repository's own 
 - Bigger tickets get a cheap spec review (read the ticket and the code, list what could go wrong) before anyone builds.
 - Plan the steps that need a person up front: merges without a standing authorisation, production, writes to outside services, destructive git. Record any standing authorisation with its scope (which changes, until when, what it excludes). End a run with one block of exact commands for the person.
 - Do not stack pull requests on Azure DevOps: `az` cannot change a target branch, so each retarget is a person in the web UI. Open each pull request against the default branch. Either open the next one after the one before merges, or open it against the default branch now and name in its body which commits belong to the earlier pull request.
+
+## Changes to a project you do not own
+- Send a change upstream when your own work hits the problem. Search the project's open issues and pull requests first, then file the issue in its own template (not the agent-ready shape) with the smallest failing case, ask whether the maintainers see it as a bug, and offer to fix it.
+- Read the whole issue thread before you design anything. When a maintainer has already named a design or an existing feature to copy, that is the design. Open that feature and list its public signatures, its parameter and property types, its merge logic and its tests, then mirror each one. Copying the behaviour without the shape is the usual miss, and the maintainer ends up redoing it before the merge.
+- When no maintainer has named a design and the fix adds or reshapes public API, post the planned signatures on the issue first, for example "I would add `WithItems(ComposableList<string>)`, matching how `WithNames` takes it. OK?", and build after a maintainer agrees. A fix with no API change can go up with the issue.
+- Quote the maintainers' words in the drafter's brief, not a summary of them. Do not add a goal of your own, such as "no new public API", as if they had asked for it.
+- Run the `adversarial-review` skill before the branch goes public, with the issue thread as input. Keep the review log row in your own repository; nothing from the review goes into the upstream branch.
 
 ## While working
 - Scripts, not instructions: run the repository's full gate script (its preflight), not the one gate that seems relevant.
