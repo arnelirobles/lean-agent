@@ -1,6 +1,6 @@
 {
   "name": "lean-agent",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Four skills for running coding agents over a backlog: working rules, agent-ready tickets, an adversarial review and a retro, as plain Markdown with no scripts.",
   "author": {
     "name": "Arnel Robles",

@@ -52,7 +52,8 @@ git worktree add "$(mktemp -d)/review" "origin/<branch>"
 ## 2. Gate on the diff, not the ticket
 
 Run the gate script if the repository has one. Any rule it prints means a full review. Nothing
-printed means a light review: steps 3 and 4 on the six questions only.
+printed means a light review: steps 3 and 4 on the six questions only, plus the pattern question
+when the issue, the ticket or a maintainer names a feature to copy.
 
 When there is no gate script, a full review is required if the diff touches authentication or
 permissions, anything reachable without signing in, raw SQL, schema or migrations, secrets or
@@ -64,8 +65,9 @@ test that loses assertions.
 Start the hunter with the description `lean:hunt <owner/repo>#<pr>` (or `@<branch>` before the pull
 request exists), so its cost and its misses can be tied to the change.
 
-Give the hunter the diff, the PR description and linked issue, the rules file, and a checkout it
-can build and test. It reads whole files around each hunk and every caller of a changed symbol,
+Give the hunter the diff, the PR description, the linked issue with its whole comment thread (a
+maintainer's words on the design are quoted as written, never summarised), the rules file, and a
+checkout it can build and test. It reads whole files around each hunk and every caller of a changed symbol,
 then answers, each with the line that proves it:
 
 **The six questions (always):**
@@ -93,6 +95,12 @@ every other route, job, message handler or write path that reads or writes the s
 Does each one apply the same check, in the same order relative to hooks and transactions? A rule
 enforced on the route in the ticket and skipped on its sibling is the most common surviving
 finding.
+
+**The pattern question (always):** when the issue, the ticket or a maintainer names an existing
+feature to copy ("like X", "the same way Y does it"), list that feature's public signatures,
+parameter and property types, merge logic and tests, and check that the diff mirrors each one.
+Each part it does not mirror is a finding, quoting the words that named the pattern. Matching
+behaviour reached through a different shape still counts as not mirrored.
 
 **The rules file (always):** every rule in it, answered yes or no with a line.
 
